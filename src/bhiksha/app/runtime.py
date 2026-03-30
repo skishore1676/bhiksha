@@ -369,6 +369,7 @@ class BhikshaRuntime:
             runner=self._instrument_execution_runner(
                 supervisor,
                 bar.symbol,
+                reconcile_trigger=reconcile_trigger,
                 action="hard_flat",
                 inner=self._make_hard_flat_runner(
                 supervisor,
@@ -416,6 +417,7 @@ class BhikshaRuntime:
                 runner=self._instrument_execution_runner(
                     supervisor,
                     bar.symbol,
+                    reconcile_trigger=reconcile_trigger,
                     action="manage",
                     inner=self._make_manage_position_runner(
                     supervisor,
@@ -449,6 +451,7 @@ class BhikshaRuntime:
                     runner=self._instrument_execution_runner(
                         supervisor,
                         bar.symbol,
+                        reconcile_trigger=reconcile_trigger,
                         action="exit",
                         inner=self._make_exit_runner(
                         supervisor,
@@ -485,6 +488,7 @@ class BhikshaRuntime:
                     runner=self._instrument_execution_runner(
                         supervisor,
                         bar.symbol,
+                        reconcile_trigger=reconcile_trigger,
                         action="entry",
                         inner=self._make_entry_runner(
                         supervisor,
@@ -530,6 +534,7 @@ class BhikshaRuntime:
         supervisor: ExecutionSupervisor,
         symbol: str,
         *,
+        reconcile_trigger: asyncio.Event,
         action: str,
         inner,
     ):
