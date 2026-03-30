@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import os
 from typing import AsyncIterator
 from typing import Any
@@ -24,6 +24,9 @@ class PolygonBarSource(UnderlyingBarSource):
         if not self.api_key:
             raise ValueError("POLYGON_API_KEY is not set")
 
+    async def close(self) -> None:
+        return None
+
     async def warm_start(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
         start_date = start.date()
         end_date = end.date()
@@ -44,6 +47,13 @@ class PolygonBarSource(UnderlyingBarSource):
 
     async def stream_closed_bars(self, symbols: list[str]) -> AsyncIterator[Bar]:
         raise NotImplementedError("Polygon is only used for warm-start data in Day 1")
+
+    async def fetch_latest_completed_bar(self, symbol: str, *, now: datetime | None = None) -> Bar | None:
+        end = now or datetime.now(UTC)
+        bars = await self.warm_start(symbol, end - timedelta(minutes=5), end)
+        minute_floor = end.replace(second=0, microsecond=0)
+        completed = [bar for bar in bars if bar.timestamp < minute_floor]
+        return completed[-1] if completed else None
 
     @staticmethod
     def _parse_bars(symbol: str, payload: dict[str, Any]) -> list[Bar]:

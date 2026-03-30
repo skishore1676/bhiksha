@@ -46,18 +46,7 @@ class SchwabBarSource(UnderlyingBarSource):
         last_seen: dict[str, datetime] = {}
         while True:
             for symbol in symbols:
-                end = datetime.now(UTC)
-                start = end - timedelta(minutes=5)
-                payload = await self.client.price_history(
-                    symbol,
-                    period_type="day",
-                    period=1,
-                    frequency_type="minute",
-                    frequency=1,
-                    start_date=start,
-                    end_date=end,
-                )
-                bar = self._latest_completed_bar(symbol, payload.get("candles", []), now=end)
+                bar = await self.fetch_latest_completed_bar(symbol)
                 if bar is None:
                     continue
                 previous = last_seen.get(symbol)
@@ -65,6 +54,20 @@ class SchwabBarSource(UnderlyingBarSource):
                     last_seen[symbol] = bar.timestamp
                     yield bar
             await asyncio.sleep(self.poll_interval_seconds)
+
+    async def fetch_latest_completed_bar(self, symbol: str, *, now: datetime | None = None) -> Bar | None:
+        end = now or datetime.now(UTC)
+        start = end - timedelta(minutes=5)
+        payload = await self.client.price_history(
+            symbol,
+            period_type="day",
+            period=1,
+            frequency_type="minute",
+            frequency=1,
+            start_date=start,
+            end_date=end,
+        )
+        return self._latest_completed_bar(symbol, payload.get("candles", []), now=end)
 
     @staticmethod
     def _bar_from_candle(symbol: str, candle: dict) -> Bar:

@@ -214,6 +214,12 @@ Recommended internal split:
 - `RollingBarStore`: in-memory per-symbol buffers,
 - `SessionGuard`: ET session validation.
 
+Current Bhiksha runtime implementation:
+
+- Day 1 uses an in-process event bus backed by `asyncio.Queue`.
+- A runtime-owned `DataIngestionDaemon` wakes on the closed-bar heartbeat and publishes `BarClosedEvent`.
+- The runtime trading session consumes those events and performs reconciliation, feature enrichment, strategy evaluation, and execution handling.
+
 ### 4. Feature Service
 
 This layer wraps the Newton pipeline.

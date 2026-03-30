@@ -18,3 +18,6 @@ class UnderlyingBarSource(ABC):
     async def stream_closed_bars(self, symbols: list[str]) -> AsyncIterator[Bar]:
         """Yield closed 1-minute bars as they become available."""
 
+    @abstractmethod
+    async def fetch_latest_completed_bar(self, symbol: str, *, now: datetime | None = None) -> Bar | None:
+        """Fetch the latest completed 1-minute bar for a symbol."""

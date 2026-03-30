@@ -286,3 +286,35 @@ Next steps:
 1. Build the in-memory `EventBus`.
 2. Promote the current polling loop into a runtime-owned `DataIngestionDaemon`.
 3. Publish `BarClosedEvent` and lifecycle transition events from the daemon/runtime path.
+
+### 2026-03-30 (Runtime Event Bus And Heartbeat Daemon)
+
+Completed:
+
+- Added an in-memory event bus in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/app/event_bus.py`.
+- Added a runtime-owned `DataIngestionDaemon` in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/market_data/daemon.py`.
+- Extended the bar-source interface so providers can fetch the latest completed 1-minute bar directly.
+- Upgraded `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/app/runtime.py` so the runtime now owns the trading session loop:
+  warm start,
+  reconciliation,
+  heartbeat-driven `BarClosedEvent` publication,
+  and bar-by-bar execution handling.
+- Reduced `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/dry_run_live_loop.py` to a thin wrapper over the runtime-owned session path.
+- Added direct tests for the event bus and heartbeat daemon.
+
+Verification:
+
+- `42` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- `BhikshaRuntime.start()` still acts as a simple started-flag boundary; the full session entrypoint currently lives in `run_session(...)`.
+- Lifecycle transitions are now runtime-managed, but are not yet emitted as their own typed domain events.
+- The daemon currently fetches bars on the exact heartbeat and publishes in-process only; external bus support is still future work.
+
+Next steps:
+
+1. Emit typed lifecycle transition events onto the event bus.
+2. Add session-summary and operator-audit reporting on top of the event stream.
+3. Decide whether to collapse `run_session(...)` into a richer async `start(...)` API or keep the current split.
