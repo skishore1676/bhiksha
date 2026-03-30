@@ -33,9 +33,11 @@ class PositionMonitor:
         deployments_by_id: dict[str, DeploymentManifest],
         *,
         enriched_frames: dict[str, pl.DataFrame] | None = None,
+        positions: list[TrackedPosition] | None = None,
     ) -> list[ExitEvaluation]:
         evaluations: list[ExitEvaluation] = []
-        for position in self.position_tracker.active_positions():
+        active_positions = positions if positions is not None else self.position_tracker.active_positions()
+        for position in active_positions:
             if position.symbol != symbol or position.quantity <= 0:
                 continue
             deployment = deployments_by_id.get(position.deployment_id)

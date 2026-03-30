@@ -517,3 +517,30 @@ Notes recorded for follow-up:
   `strategy_plus_virtual_target_then_trail`,
   `strategy_plus_underlying_trailing_exit`.
 - We are not yet locking a global target policy because the right choice still depends on comparing realized Bhiksha outcomes to Mala’s holdout expectations.
+
+### 2026-03-30 (Background Reconciliation Snapshot)
+
+Completed:
+
+- Removed inline broker portfolio sync from the per-bar worker path.
+- Added a runtime-owned reconciliation loop that refreshes broker/account state on a periodic interval and on explicit post-execution triggers.
+- Added an in-memory reconciliation snapshot so symbol workers read the latest reconciled position state without blocking on broker HTTP.
+- Added a staleness metric so bar workers record how old the current reconciled snapshot is.
+- Updated `PositionMonitor` so it can evaluate against a supplied position snapshot instead of always reading the live tracker directly.
+
+Verification:
+
+- `57` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- The currently running live tmux session was started before this refactor, so it still uses the older inline-sync behavior until the next restart.
+- Reconciliation still refreshes the whole account snapshot, not symbol-scoped subsets.
+- We have not yet added threshold warnings around snapshot staleness.
+
+Next steps:
+
+1. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
+2. Add thresholded warnings or alert markers when heartbeat lag / sync latency / execution latency drift beyond acceptable bounds.
+3. Decide whether execution-triggered reconciliation should be immediate for all actions or only for broker-mutating actions.

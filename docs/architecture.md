@@ -227,6 +227,7 @@ Current Bhiksha runtime implementation:
 - Symbol workers preserve in-symbol ordering while allowing `QQQ`, `SPY`, and future symbols to progress independently.
 - Broker-affecting work is handed off to a per-symbol execution dispatcher so entry, exit, hard-flat, and position-management HTTP does not block bar evaluation.
 - Execution queue keys are deduplicated per symbol so repeated entry or exit attempts are not stacked while an earlier action is already queued or running.
+- Account reconciliation runs in a background loop and publishes a shared in-memory snapshot so symbol workers no longer call broker portfolio sync inline on every bar.
 - Background token daemons refresh Public and Schwab credentials ahead of expiry, with request-path refresh retained only as a fallback.
 - Runtime metrics are persisted as event rows for heartbeat lag, sync latency, feature-prep latency, queue depth, and execution wait/run timing so operator summaries can surface system health, not just trading decisions.
 

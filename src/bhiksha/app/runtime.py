@@ -31,8 +31,16 @@ from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup
 from bhiksha.persistence.sqlite import SQLiteEventRepository
 from bhiksha.persistence.sqlite import SQLiteTradeStateRepository
+from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
+
+
+@dataclass(slots=True)
+class ReconciliationSnapshot:
+    positions: list[TrackedPosition] = field(default_factory=list)
+    last_synced_at: datetime | None = None
+    signature: str = ""
 
 
 @dataclass(slots=True)
@@ -129,6 +137,9 @@ class BhikshaRuntime:
         execution_dispatcher.start(symbols)
         queue = self.event_bus.subscribe(BarClosedEvent)
         sync_lock = asyncio.Lock()
+        reconcile_trigger = asyncio.Event()
+        stop_event = asyncio.Event()
+        reconciliation_snapshot = ReconciliationSnapshot()
         symbol_queues = {symbol: asyncio.Queue() for symbol in symbols}
         symbol_tasks = [
             asyncio.create_task(
@@ -136,9 +147,10 @@ class BhikshaRuntime:
                     symbol,
                     symbol_queues[symbol],
                     sync_lock=sync_lock,
+                    reconciliation_snapshot=reconciliation_snapshot,
+                    reconcile_trigger=reconcile_trigger,
                     live=live,
                     store=store,
-                    broker=broker,
                     supervisor=supervisor,
                     position_monitor=position_monitor,
                     evaluator=evaluator,
@@ -155,17 +167,14 @@ class BhikshaRuntime:
             startup_snapshot = self.startup_snapshot(live=live, max_bars=max_bars)
             output("STARTUP_CONFIG " + json.dumps(startup_snapshot, sort_keys=True))
             await event_repository.append("startup_config", startup_snapshot)
-            portfolio = await broker.get_portfolio()
-            open_trades = await supervisor.trade_state_repository.get_open_trades()
-            tracker_positions = reconcile_public_positions(
-                portfolio.get("positions", []),
-                self.enabled_deployments,
-                orders=portfolio.get("orders", []),
-                known_trades=open_trades,
+            await self._refresh_reconciliation(
+                broker=broker,
+                supervisor=supervisor,
+                sync_lock=sync_lock,
+                reconciliation_snapshot=reconciliation_snapshot,
+                output=output,
+                reason="startup",
             )
-            supervisor.planner.position_tracker.replace_positions(tracker_positions)
-            await supervisor.sync_lifecycle()
-            output(f"SYNC positions={len(tracker_positions)}")
 
             for symbol in symbols:
                 warmed = await self.warm_start_symbol(symbol)
@@ -179,6 +188,17 @@ class BhikshaRuntime:
             output("Waiting for newly closed 1-minute bars...")
             public_token_task = asyncio.create_task(public_token_daemon.run())
             schwab_token_task = asyncio.create_task(schwab_token_daemon.run())
+            reconciliation_task = asyncio.create_task(
+                self._reconciliation_loop(
+                    broker=broker,
+                    supervisor=supervisor,
+                    sync_lock=sync_lock,
+                    reconciliation_snapshot=reconciliation_snapshot,
+                    reconcile_trigger=reconcile_trigger,
+                    stop_event=stop_event,
+                    output=output,
+                )
+            )
             daemon_task = asyncio.create_task(daemon.run(max_bars=max_bars))
             seen = 0
             while True:
@@ -200,18 +220,24 @@ class BhikshaRuntime:
                 await queue_.put(None)
             public_token_daemon.stop()
             schwab_token_daemon.stop()
+            stop_event.set()
+            reconcile_trigger.set()
             with suppress(asyncio.CancelledError):
                 await daemon_task
             with suppress(asyncio.CancelledError):
                 await public_token_task
             with suppress(asyncio.CancelledError):
                 await schwab_token_task
+            with suppress(asyncio.CancelledError):
+                await reconciliation_task
             for task in symbol_tasks:
                 with suppress(asyncio.CancelledError):
                     await task
         finally:
             public_token_daemon.stop()
             schwab_token_daemon.stop()
+            stop_event.set()
+            reconcile_trigger.set()
             await execution_dispatcher.stop()
             await supervisor.close()
             await source.close()
@@ -238,9 +264,10 @@ class BhikshaRuntime:
         queue: asyncio.Queue,
         *,
         sync_lock: asyncio.Lock,
+        reconciliation_snapshot: ReconciliationSnapshot,
+        reconcile_trigger: asyncio.Event,
         live: bool,
         store: RollingBarStore,
-        broker,
         supervisor: ExecutionSupervisor,
         position_monitor: PositionMonitor,
         evaluator: ReplaySignalEvaluator,
@@ -256,9 +283,10 @@ class BhikshaRuntime:
             await self._handle_bar_event(
                 event,
                 sync_lock=sync_lock,
+                reconciliation_snapshot=reconciliation_snapshot,
+                reconcile_trigger=reconcile_trigger,
                 live=live,
                 store=store,
-                broker=broker,
                 supervisor=supervisor,
                 position_monitor=position_monitor,
                 evaluator=evaluator,
@@ -281,9 +309,10 @@ class BhikshaRuntime:
         event: BarClosedEvent,
         *,
         sync_lock: asyncio.Lock,
+        reconciliation_snapshot: ReconciliationSnapshot,
+        reconcile_trigger: asyncio.Event,
         live: bool,
         store: RollingBarStore,
-        broker,
         supervisor: ExecutionSupervisor,
         position_monitor: PositionMonitor,
         evaluator: ReplaySignalEvaluator,
@@ -312,33 +341,27 @@ class BhikshaRuntime:
             },
         )
 
-        sync_started_at = time.perf_counter()
         async with sync_lock:
-            portfolio = await broker.get_portfolio()
-            open_trades = await supervisor.trade_state_repository.get_open_trades()
-            tracker_positions = reconcile_public_positions(
-                portfolio.get("positions", []),
-                self.enabled_deployments,
-                orders=portfolio.get("orders", []),
-                known_trades=open_trades,
-            )
-            supervisor.planner.position_tracker.replace_positions(tracker_positions)
-            await supervisor.sync_lifecycle()
-            if tracker_positions:
-                joined = ",".join(
-                    f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
-                    for position in tracker_positions
-                )
-                output(f"SYNC positions={joined}")
+            tracker_positions = list(reconciliation_snapshot.positions)
+            last_synced_at = reconciliation_snapshot.last_synced_at
         await supervisor.event_repository.append(
             "runtime_metric",
             {
-                "metric": "portfolio_sync_ms",
+                "metric": "reconciliation_staleness_ms",
                 "symbol": bar.symbol,
-                "value": round((time.perf_counter() - sync_started_at) * 1000.0, 3),
+                "value": round(
+                    max(((datetime.now(UTC) - last_synced_at).total_seconds() * 1000.0), 0.0) if last_synced_at else 0.0,
+                    3,
+                ),
                 "unit": "ms",
             },
         )
+        if tracker_positions:
+            joined = ",".join(
+                f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
+                for position in tracker_positions
+            )
+            output(f"SYNC positions={joined}")
 
         hard_flat_enqueued = execution_dispatcher.submit(
             bar.symbol,
@@ -364,7 +387,7 @@ class BhikshaRuntime:
         deployments_for_bar: dict[str, DeploymentManifest] = {
             deployment.deployment_id: deployment for deployment in deployments_by_symbol[bar.symbol]
         }
-        for position in supervisor.planner.position_tracker.active_positions():
+        for position in tracker_positions:
             if position.symbol != bar.symbol:
                 continue
             deployment = deployments_by_id.get(position.deployment_id)
@@ -381,7 +404,7 @@ class BhikshaRuntime:
                 "unit": "ms",
             },
         )
-        for position in list(supervisor.planner.position_tracker.active_positions()):
+        for position in list(tracker_positions):
             if position.symbol != bar.symbol:
                 continue
             deployment = deployments_by_id.get(position.deployment_id)
@@ -412,6 +435,7 @@ class BhikshaRuntime:
             frame,
             deployments_by_id,
             enriched_frames=enriched_frames,
+            positions=tracker_positions,
         )
         for evaluation in exit_evaluations:
             output(
@@ -526,6 +550,7 @@ class BhikshaRuntime:
             try:
                 await inner()
             finally:
+                reconcile_trigger.set()
                 await supervisor.event_repository.append(
                     "runtime_metric",
                     {
@@ -538,6 +563,76 @@ class BhikshaRuntime:
                 )
 
         return runner
+
+    async def _reconciliation_loop(
+        self,
+        *,
+        broker,
+        supervisor: ExecutionSupervisor,
+        sync_lock: asyncio.Lock,
+        reconciliation_snapshot: ReconciliationSnapshot,
+        reconcile_trigger: asyncio.Event,
+        stop_event: asyncio.Event,
+        output: callable,
+    ) -> None:
+        interval = max(self.app_config.reconciliation_interval_seconds, 1)
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(reconcile_trigger.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            reconcile_trigger.clear()
+            if stop_event.is_set():
+                return
+            await self._refresh_reconciliation(
+                broker=broker,
+                supervisor=supervisor,
+                sync_lock=sync_lock,
+                reconciliation_snapshot=reconciliation_snapshot,
+                output=output,
+                reason="periodic",
+            )
+
+    async def _refresh_reconciliation(
+        self,
+        *,
+        broker,
+        supervisor: ExecutionSupervisor,
+        sync_lock: asyncio.Lock,
+        reconciliation_snapshot: ReconciliationSnapshot,
+        output: callable,
+        reason: str,
+    ) -> None:
+        sync_started_at = time.perf_counter()
+        portfolio = await broker.get_portfolio()
+        open_trades = await supervisor.trade_state_repository.get_open_trades()
+        tracker_positions = reconcile_public_positions(
+            portfolio.get("positions", []),
+            self.enabled_deployments,
+            orders=portfolio.get("orders", []),
+            known_trades=open_trades,
+        )
+        async with sync_lock:
+            supervisor.planner.position_tracker.replace_positions(tracker_positions)
+            await supervisor.sync_lifecycle()
+            reconciliation_snapshot.positions = list(tracker_positions)
+            reconciliation_snapshot.last_synced_at = datetime.now(UTC)
+            reconciliation_snapshot.signature = ",".join(
+                f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
+                for position in tracker_positions
+            )
+        await supervisor.event_repository.append(
+            "runtime_metric",
+            {
+                "metric": "portfolio_sync_ms",
+                "symbol": "ALL",
+                "value": round((time.perf_counter() - sync_started_at) * 1000.0, 3),
+                "unit": "ms",
+                "reason": reason,
+            },
+        )
+        if reason == "startup" or tracker_positions:
+            output(f"SYNC positions={reconciliation_snapshot.signature or len(tracker_positions)}")
 
     def _make_entry_runner(
         self,

@@ -16,6 +16,7 @@ class AppConfig(BaseModel):
     sqlite_path: str = "bhiksha.db"
     rolling_bar_capacity: int = 20000
     bar_poll_interval_seconds: int = 15
+    reconciliation_interval_seconds: int = 15
     order_fill_poll_seconds: int = 2
     order_fill_timeout_seconds: int = 20
 
