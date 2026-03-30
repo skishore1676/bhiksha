@@ -504,3 +504,16 @@ Next steps:
 1. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
 2. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
 3. Add thresholded warnings or alert markers when heartbeat lag / sync latency / execution latency drift beyond acceptable bounds.
+
+### 2026-03-30 (Exit Policy Notes)
+
+Notes recorded for follow-up:
+
+- Startup config visibility should improve with a compiled operator snapshot so the bot prints exactly what it sees after YAML merge and env resolution before trading begins.
+- For option-based exits, `stop_to_breakeven_after_r_multiple` currently looks like the cleanest next protection step because it respects the option-premium stop model without forcing a noisy trailing-stop policy too early.
+- A possible future policy ladder is:
+  `pure_strategy`,
+  `strategy_plus_breakeven_after_r`,
+  `strategy_plus_virtual_target_then_trail`,
+  `strategy_plus_underlying_trailing_exit`.
+- We are not yet locking a global target policy because the right choice still depends on comparing realized Bhiksha outcomes to Mala’s holdout expectations.

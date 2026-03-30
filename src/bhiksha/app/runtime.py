@@ -6,6 +6,8 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
 import time
 
 import polars as pl
@@ -105,8 +107,9 @@ class BhikshaRuntime:
 
         store = RollingBarStore(max_bars_per_symbol=self.app_config.rolling_bar_capacity)
         evaluator = ReplaySignalEvaluator(FeatureService(), self.strategy_registry)
+        event_repository = SQLiteEventRepository(self.app_config.sqlite_path)
         supervisor = ExecutionSupervisor(
-            event_repository=SQLiteEventRepository(self.app_config.sqlite_path),
+            event_repository=event_repository,
             app_config=self.app_config,
             event_bus=self.event_bus,
             trade_state_repository=SQLiteTradeStateRepository(self.app_config.sqlite_path),
@@ -149,6 +152,9 @@ class BhikshaRuntime:
         ]
 
         try:
+            startup_snapshot = self.startup_snapshot(live=live, max_bars=max_bars)
+            output("STARTUP_CONFIG " + json.dumps(startup_snapshot, sort_keys=True))
+            await event_repository.append("startup_config", startup_snapshot)
             portfolio = await broker.get_portfolio()
             open_trades = await supervisor.trade_state_repository.get_open_trades()
             tracker_positions = reconcile_public_positions(
@@ -210,6 +216,21 @@ class BhikshaRuntime:
             await supervisor.close()
             await source.close()
             self.stop()
+
+    def startup_snapshot(self, *, live: bool, max_bars: int | None) -> dict:
+        payload = {
+            "app": self.app_config.model_dump(),
+            "providers": self.provider_config.model_dump(),
+            "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
+            "session": {
+                "live": live,
+                "max_bars": max_bars,
+            },
+        }
+        payload["config_fingerprint"] = hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        return payload
 
     async def _symbol_worker(
         self,

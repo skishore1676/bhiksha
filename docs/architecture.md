@@ -182,6 +182,10 @@ Config precedence:
 
 `env override > deployment file > shared defaults`
 
+Operator refinement:
+
+- On startup, Bhiksha should emit one compiled config snapshot that shows the fully merged app, provider, and enabled deployment configuration after env resolution, along with a config fingerprint for quick pre-open verification.
+
 ### 2. Deployment Registry
 
 The registry is responsible for answering:
