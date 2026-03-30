@@ -31,6 +31,8 @@ class PositionMonitor:
         symbol: str,
         frame: pl.DataFrame,
         deployments_by_id: dict[str, DeploymentManifest],
+        *,
+        enriched_frames: dict[str, pl.DataFrame] | None = None,
     ) -> list[ExitEvaluation]:
         evaluations: list[ExitEvaluation] = []
         for position in self.position_tracker.active_positions():
@@ -39,6 +41,10 @@ class PositionMonitor:
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None or not deployment.exit.use_algorithmic_exit:
                 continue
-            decision = self.evaluator.evaluate_exit(deployment, frame, position)
+            enriched = (enriched_frames or {}).get(deployment.deployment_id)
+            if enriched is not None:
+                decision = self.evaluator.evaluate_exit_on_enriched(deployment, enriched, position)
+            else:
+                decision = self.evaluator.evaluate_exit(deployment, frame, position)
             evaluations.append(ExitEvaluation(deployment=deployment, position=position, decision=decision))
         return evaluations

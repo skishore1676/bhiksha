@@ -311,6 +311,16 @@ class BhikshaRuntime:
             output(f"EXECUTION_ENQUEUED {bar.symbol} hard_flat_check")
 
         frame = _frame_from_bars(bar.symbol, store.get(bar.symbol))
+        deployments_for_bar: dict[str, DeploymentManifest] = {
+            deployment.deployment_id: deployment for deployment in deployments_by_symbol[bar.symbol]
+        }
+        for position in supervisor.planner.position_tracker.active_positions():
+            if position.symbol != bar.symbol:
+                continue
+            deployment = deployments_by_id.get(position.deployment_id)
+            if deployment is not None:
+                deployments_for_bar[deployment.deployment_id] = deployment
+        enriched_frames = evaluator.prepare_enriched_frames(frame, list(deployments_for_bar.values()))
         for position in list(supervisor.planner.position_tracker.active_positions()):
             if position.symbol != bar.symbol:
                 continue
@@ -332,7 +342,12 @@ class BhikshaRuntime:
                 output(f"{deployment.deployment_id}: manage_enqueued option={position.option_symbol}")
 
         exited_deployments: set[str] = set()
-        exit_evaluations = position_monitor.evaluate_symbol(bar.symbol, frame, deployments_by_id)
+        exit_evaluations = position_monitor.evaluate_symbol(
+            bar.symbol,
+            frame,
+            deployments_by_id,
+            enriched_frames=enriched_frames,
+        )
         for evaluation in exit_evaluations:
             output(
                 f"{evaluation.deployment.deployment_id}: exit={evaluation.decision.exit} "
@@ -359,7 +374,11 @@ class BhikshaRuntime:
             if deployment.deployment_id in exited_deployments:
                 output(f"{deployment.deployment_id}: entry_skipped_after_exit")
                 continue
-            decision = evaluator.evaluate_entry(deployment, frame)
+            enriched = enriched_frames.get(deployment.deployment_id)
+            if enriched is not None:
+                decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
+            else:
+                decision = evaluator.evaluate_entry(deployment, frame)
             output(
                 f"{deployment.deployment_id}: signal={decision.signal} "
                 f"direction={decision.direction.value if decision.direction else None} "

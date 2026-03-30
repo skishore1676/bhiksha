@@ -240,6 +240,7 @@ Important implementation choice:
 
 - Day 1 may recompute enrichment against the rolling window on each bar close for correctness and speed of delivery.
 - Incremental transform optimization is a later performance task.
+- The runtime should still prepare enriched frames once per symbol bar and reuse them across entry and exit evaluation for deployments with the same required feature set.
 
 This is acceptable because Day 1 symbol count is tiny.
 

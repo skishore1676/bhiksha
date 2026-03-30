@@ -451,7 +451,32 @@ Open items:
 
 Next steps:
 
-1. Reuse one enriched frame per symbol bar for both exit and entry evaluation.
-2. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
-3. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
-4. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
+1. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
+2. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+3. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
+
+### 2026-03-30 (Shared Enriched Frame Reuse)
+
+Completed:
+
+- Changed `ReplaySignalEvaluator` so the runtime can prepare enriched frames once per symbol bar and reuse them across both exit and entry evaluation.
+- Grouped deployments by strategy key and required feature set so identical feature requests share one Newton enrichment pass.
+- Updated `PositionMonitor` to consume pre-enriched frames when the runtime has already prepared them.
+- Updated the runtime bar handler to prepare enriched frames once per symbol bar and feed both exit and entry paths from that shared map.
+- Added a replay-evaluator test proving same-feature deployments share a single feature-enrichment call.
+
+Verification:
+
+- `54` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- The currently running live tmux session was started before this optimization, so the reduced Newton-pass behavior will only appear after the next restart.
+- The optimization currently groups by strategy key and required-feature set, which is correct for the current plugin model but should be revisited if future strategies require feature enrichment with hidden non-feature-side configuration effects.
+
+Next steps:
+
+1. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
+2. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+3. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.

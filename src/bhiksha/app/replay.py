@@ -18,20 +18,53 @@ class ReplaySignalEvaluator:
         self.feature_service = feature_service
         self.strategy_registry = strategy_registry
 
-    def _enrich(self, deployment: DeploymentManifest, frame: pl.DataFrame) -> pl.DataFrame:
+    def _normalize_frame(self, deployment: DeploymentManifest, frame: pl.DataFrame) -> pl.DataFrame:
         strategy = self.strategy_registry.get(deployment.strategy.key)
         working = frame
         if "symbol" not in working.columns:
             working = working.with_columns(pl.lit(deployment.symbol).alias("symbol"))
-        return self.feature_service.enrich_for_features(
-            working,
-            strategy.required_features(deployment.strategy.params),
-        )
+        return working
+
+    def _required_features(self, deployment: DeploymentManifest) -> set[str]:
+        strategy = self.strategy_registry.get(deployment.strategy.key)
+        return strategy.required_features(deployment.strategy.params)
+
+    def prepare_enriched_frames(
+        self,
+        frame: pl.DataFrame,
+        deployments: list[DeploymentManifest],
+    ) -> dict[str, pl.DataFrame]:
+        if not deployments:
+            return {}
+        normalized = self._normalize_frame(deployments[0], frame)
+        grouped: dict[tuple[str, tuple[str, ...]], list[DeploymentManifest]] = {}
+        for deployment in deployments:
+            required = tuple(sorted(self._required_features(deployment)))
+            grouped.setdefault((deployment.strategy.key, required), []).append(deployment)
+
+        prepared: dict[str, pl.DataFrame] = {}
+        for (_, required), grouped_deployments in grouped.items():
+            enriched = self.feature_service.enrich_for_features(normalized, set(required))
+            for deployment in grouped_deployments:
+                prepared[deployment.deployment_id] = enriched
+        return prepared
+
+    def evaluate_entry_on_enriched(self, deployment: DeploymentManifest, enriched: pl.DataFrame) -> SignalDecision:
+        strategy = self.strategy_registry.get(deployment.strategy.key)
+        return strategy.evaluate_entry(enriched, deployment.deployment_id, deployment.strategy.params)
+
+    def evaluate_exit_on_enriched(
+        self,
+        deployment: DeploymentManifest,
+        enriched: pl.DataFrame,
+        position: TrackedPosition,
+    ) -> ExitDecision:
+        strategy = self.strategy_registry.get(deployment.strategy.key)
+        return strategy.evaluate_exit(enriched, deployment.deployment_id, deployment.strategy.params, position)
 
     def evaluate_entry(self, deployment: DeploymentManifest, frame: pl.DataFrame) -> SignalDecision:
-        strategy = self.strategy_registry.get(deployment.strategy.key)
-        enriched = self._enrich(deployment, frame)
-        return strategy.evaluate_entry(enriched, deployment.deployment_id, deployment.strategy.params)
+        enriched = self.prepare_enriched_frames(frame, [deployment])[deployment.deployment_id]
+        return self.evaluate_entry_on_enriched(deployment, enriched)
 
     def evaluate_exit(
         self,
@@ -39,6 +72,5 @@ class ReplaySignalEvaluator:
         frame: pl.DataFrame,
         position: TrackedPosition,
     ) -> ExitDecision:
-        strategy = self.strategy_registry.get(deployment.strategy.key)
-        enriched = self._enrich(deployment, frame)
-        return strategy.evaluate_exit(enriched, deployment.deployment_id, deployment.strategy.params, position)
+        enriched = self.prepare_enriched_frames(frame, [deployment])[deployment.deployment_id]
+        return self.evaluate_exit_on_enriched(deployment, enriched, position)
