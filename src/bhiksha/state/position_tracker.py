@@ -10,6 +10,7 @@ from dataclasses import dataclass
 class TrackedPosition:
     symbol: str
     deployment_id: str
+    trade_id: str | None = None
     option_symbol: str | None = None
     quantity: int = 0
     entry_price: float | None = None
@@ -42,6 +43,9 @@ class PositionTracker:
     def active_positions(self) -> list[TrackedPosition]:
         return list(self._positions)
 
+    def find_by_option_symbol(self, option_symbol: str) -> list[TrackedPosition]:
+        return [position for position in self._positions if position.option_symbol == option_symbol]
+
     def replace_positions(self, positions: list[TrackedPosition]) -> None:
         self._positions = list(positions)
         self._rebuild_counters()
@@ -51,6 +55,7 @@ class PositionTracker:
         symbol: str,
         deployment_id: str,
         *,
+        trade_id: str | None = None,
         option_symbol: str | None = None,
         quantity: int = 0,
         entry_price: float | None = None,
@@ -65,8 +70,10 @@ class PositionTracker:
             if (
                 existing.symbol == symbol
                 and existing.deployment_id == deployment_id
+                and existing.trade_id == trade_id
                 and existing.option_symbol == option_symbol
             ):
+                existing.trade_id = trade_id
                 existing.quantity = quantity
                 existing.entry_price = entry_price
                 existing.source = source
@@ -82,6 +89,7 @@ class PositionTracker:
             TrackedPosition(
                 symbol=symbol,
                 deployment_id=deployment_id,
+                trade_id=trade_id,
                 option_symbol=option_symbol,
                 quantity=quantity,
                 entry_price=entry_price,

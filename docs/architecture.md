@@ -127,6 +127,7 @@ Persist:
 - signals,
 - orders,
 - positions,
+- durable trade sessions with `trade_id` ownership,
 - reconciliation snapshots,
 - event log,
 - application checkpoints and health markers.
@@ -338,6 +339,13 @@ Day 1 recommendation:
 - refactor them behind Bhiksha interfaces,
 - keep quote and option-chain retrieval isolated from order placement.
 
+Current Bhiksha refinement:
+
+- every trade receives a durable local `trade_id`,
+- the Public entry order uses that same UUID as its `orderId`,
+- Bhiksha persists the active entry/stop/target ownership chain in SQLite for restart recovery,
+- restart reconciliation prefers durable known trade ownership before falling back to symbol-only matching.
+
 ### 9. Position Tracker
 
 Avoid the old "everything in one giant FSM" trap.
@@ -366,6 +374,12 @@ Suggested order states:
 - `FILLED`
 - `CANCELED`
 - `REJECTED`
+
+Important Public constraint:
+
+- Public aggregates account positions by option symbol.
+- That means two deployments cannot safely own the exact same option contract unless Bhiksha later grows explicit synthetic split-ownership support.
+- The current reconciliation design treats same-contract multi-deployment ownership as ambiguous and refuses to auto-attach it.
 - `EXPIRED`
 
 This keeps the lifecycle understandable without hard-coding strategy-specific states.

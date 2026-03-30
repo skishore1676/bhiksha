@@ -14,10 +14,10 @@ from bhiksha.config.models import AppConfig
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import SignalDirection
-from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan
+from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.market_data.session import as_et_time
-from bhiksha.persistence.repository import EventRepository, NullEventRepository
+from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
 from bhiksha.state.lifecycle import LifecycleTransition, TradeLifecycleStore
 from bhiksha.state.position_tracker import TrackedPosition
 
@@ -32,9 +32,11 @@ class ExecutionSupervisor:
         app_config: AppConfig | None = None,
         lifecycle_store: TradeLifecycleStore | None = None,
         event_bus: InMemoryEventBus | None = None,
+        trade_state_repository: TradeStateRepository | None = None,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
+        self.trade_state_repository = trade_state_repository or NullTradeStateRepository()
         self.app_config = app_config or AppConfig()
         self.lifecycle_store = lifecycle_store or TradeLifecycleStore()
         self.event_bus = event_bus
@@ -80,6 +82,18 @@ class ExecutionSupervisor:
             plan = await self.planner.plan_entry(deployment, decision, dry_run=dry_run)
             if plan is not None:
                 if plan.order_id:
+                    await self._upsert_trade_record(
+                        TradeRecord(
+                            trade_id=plan.trade_id,
+                            deployment_id=deployment.deployment_id,
+                            symbol=deployment.symbol,
+                            option_symbol=plan.option_symbol,
+                            quantity=plan.quantity,
+                            entry_price=plan.estimated_entry_price,
+                            status="pending_entry",
+                            entry_order_id=plan.order_id,
+                        )
+                    )
                     transition = self.lifecycle_store.begin_entry(
                         deployment.symbol,
                         deployment.deployment_id,
@@ -90,6 +104,18 @@ class ExecutionSupervisor:
                 if not dry_run and plan.order_id:
                     plan = await self._protect_live_entry(plan, deployment)
                 elif dry_run and plan.order_id:
+                    await self._upsert_trade_record(
+                        TradeRecord(
+                            trade_id=plan.trade_id,
+                            deployment_id=deployment.deployment_id,
+                            symbol=deployment.symbol,
+                            option_symbol=plan.option_symbol,
+                            quantity=plan.quantity,
+                            entry_price=plan.estimated_entry_price,
+                            status="open_unprotected",
+                            entry_order_id=plan.order_id,
+                        )
+                    )
                     transition = self.lifecycle_store.mark_open(
                         deployment.symbol,
                         deployment.deployment_id,
@@ -124,6 +150,7 @@ class ExecutionSupervisor:
                 option_symbol=plan.option_symbol,
                 order_id=plan.order_id,
             )
+            await self.trade_state_repository.mark_closed(plan.trade_id)
             transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
             await self._emit_lifecycle_transition(transition, reason="entry_unfilled_closed")
             return plan
@@ -166,6 +193,7 @@ class ExecutionSupervisor:
         self.planner.position_tracker.open_position(
             deployment.symbol,
             deployment.deployment_id,
+            trade_id=plan.trade_id,
             option_symbol=plan.option_symbol,
             quantity=plan.quantity,
             entry_price=plan.estimated_entry_price,
@@ -175,6 +203,22 @@ class ExecutionSupervisor:
             stop_price=stop_price,
             target_order_id=target_order_id,
             target_price=target_price,
+        )
+        await self._upsert_trade_record(
+            TradeRecord(
+                trade_id=plan.trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                option_symbol=plan.option_symbol,
+                quantity=plan.quantity,
+                entry_price=plan.estimated_entry_price,
+                status="target_active" if target_order_id else "open_protected",
+                entry_order_id=plan.order_id,
+                stop_order_id=stop_result.order_id,
+                stop_price=stop_price,
+                target_order_id=target_order_id,
+                target_price=target_price,
+            )
         )
         if target_order_id:
             transition = self.lifecycle_store.mark_target_active(
@@ -485,6 +529,7 @@ class ExecutionSupervisor:
             self.planner.position_tracker.open_position(
                 updated.symbol,
                 updated.deployment_id,
+                trade_id=updated.trade_id,
                 option_symbol=updated.option_symbol,
                 quantity=updated.quantity,
                 entry_price=updated.entry_price,
@@ -495,6 +540,23 @@ class ExecutionSupervisor:
                 target_order_id=updated.target_order_id,
                 target_price=updated.target_price,
             )
+            if updated.trade_id is not None and updated.option_symbol is not None:
+                await self._upsert_trade_record(
+                    TradeRecord(
+                        trade_id=updated.trade_id,
+                        deployment_id=updated.deployment_id,
+                        symbol=updated.symbol,
+                        option_symbol=updated.option_symbol,
+                        quantity=updated.quantity,
+                        entry_price=updated.entry_price,
+                        status="target_active" if updated.target_order_id else "open_protected",
+                        entry_order_id=updated.order_id,
+                        stop_order_id=updated.stop_order_id,
+                        stop_price=updated.stop_price,
+                        target_order_id=updated.target_order_id,
+                        target_price=updated.target_price,
+                    )
+                )
         return updated
 
     def _supports_concurrent_exit_orders(self) -> bool:
@@ -586,6 +648,7 @@ class ExecutionSupervisor:
 
         if decision.action != "square_off":
             return ExitPlan(
+                trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
                 deployment_id=deployment.deployment_id,
                 symbol=position.symbol,
                 option_symbol=position.option_symbol,
@@ -617,6 +680,7 @@ class ExecutionSupervisor:
                     },
                 )
                 return ExitPlan(
+                    trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
                     deployment_id=deployment.deployment_id,
                     symbol=position.symbol,
                     option_symbol=position.option_symbol,
@@ -634,9 +698,12 @@ class ExecutionSupervisor:
             position.deployment_id,
             option_symbol=position.option_symbol,
         )
+        if position.trade_id is not None:
+            await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
         transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
         await self._emit_lifecycle_transition(transition, reason="exit_closed")
         plan = ExitPlan(
+            trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
             deployment_id=deployment.deployment_id,
             symbol=position.symbol,
             option_symbol=position.option_symbol,
@@ -725,9 +792,12 @@ class ExecutionSupervisor:
                 position.deployment_id,
                 option_symbol=position.option_symbol,
             )
+            if position.trade_id is not None:
+                await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
             transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
             await self._emit_lifecycle_transition(transition, reason="hard_flat_closed")
             trade_plan = TradePlan(
+                trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
                 deployment_id=position.deployment_id,
                 symbol=position.symbol,
                 direction=SignalDirection(str(deployment.strategy.params.get("direction", "short")).lower()),
@@ -756,6 +826,25 @@ class ExecutionSupervisor:
         transitions = self.lifecycle_store.sync_from_positions(self.planner.position_tracker.active_positions())
         for transition in transitions:
             await self._emit_lifecycle_transition(transition, reason="broker_reconciliation_sync")
+        for position in self.planner.position_tracker.active_positions():
+            if position.trade_id is None or position.option_symbol is None:
+                continue
+            await self._upsert_trade_record(
+                TradeRecord(
+                    trade_id=position.trade_id,
+                    deployment_id=position.deployment_id,
+                    symbol=position.symbol,
+                    option_symbol=position.option_symbol,
+                    quantity=position.quantity,
+                    entry_price=position.entry_price,
+                    status="target_active" if position.target_order_id else "open_protected",
+                    entry_order_id=position.order_id,
+                    stop_order_id=position.stop_order_id,
+                    stop_price=position.stop_price,
+                    target_order_id=position.target_order_id,
+                    target_price=position.target_price,
+                )
+            )
 
     async def _emit_lifecycle_transition(
         self,
@@ -789,6 +878,9 @@ class ExecutionSupervisor:
                     reason=reason,
                 )
             )
+
+    async def _upsert_trade_record(self, record: TradeRecord) -> None:
+        await self.trade_state_repository.upsert_trade(record)
 
 
 def _parse_et_time(value: str) -> time:

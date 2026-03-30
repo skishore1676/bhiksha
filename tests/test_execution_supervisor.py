@@ -110,6 +110,7 @@ def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
 
     deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
     plan = TradePlan(
+        trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
         direction=SignalDirection.SHORT,
@@ -145,6 +146,7 @@ def test_execution_supervisor_publishes_lifecycle_transition_event(tmp_path) -> 
 
     deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
     plan = TradePlan(
+        trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
         direction=SignalDirection.SHORT,
@@ -315,6 +317,7 @@ def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:
         order_id="ENTRY123",
     )
     plan = TradePlan(
+        trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
         direction=SignalDirection.SHORT,
@@ -420,6 +423,7 @@ def test_execution_supervisor_arms_virtual_profit_target_when_broker_supports_si
         }
     )
     plan = TradePlan(
+        trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
         direction=SignalDirection.SHORT,
@@ -478,6 +482,7 @@ def test_execution_supervisor_places_profit_target_when_broker_supports_concurre
         }
     )
     plan = TradePlan(
+        trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
         direction=SignalDirection.SHORT,

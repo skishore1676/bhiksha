@@ -47,6 +47,7 @@ class ExitDecision:
 
 @dataclass(slots=True, frozen=True)
 class ExitPlan:
+    trade_id: str
     deployment_id: str
     symbol: str
     option_symbol: str
@@ -118,6 +119,7 @@ class OptionSelection:
 
 @dataclass(slots=True, frozen=True)
 class TradePlan:
+    trade_id: str
     deployment_id: str
     symbol: str
     direction: SignalDirection
@@ -129,3 +131,20 @@ class TradePlan:
     order_id: str | None = None
     stop_order_id: str | None = None
     target_order_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class TradeRecord:
+    trade_id: str
+    deployment_id: str
+    symbol: str
+    option_symbol: str | None = None
+    quantity: int = 0
+    entry_price: float | None = None
+    status: str = "pending_entry"
+    entry_order_id: str | None = None
+    stop_order_id: str | None = None
+    stop_price: float | None = None
+    target_order_id: str | None = None
+    target_price: float | None = None
+    exit_order_id: str | None = None

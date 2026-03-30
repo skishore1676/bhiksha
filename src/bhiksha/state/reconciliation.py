@@ -6,6 +6,7 @@ import re
 from typing import Iterable
 
 from bhiksha.config.models import DeploymentManifest
+from bhiksha.domain.models import TradeRecord
 from bhiksha.execution.order_manager import normalize_option_symbol
 from bhiksha.state.position_tracker import TrackedPosition
 
@@ -18,10 +19,22 @@ def reconcile_public_positions(
     deployments: list[DeploymentManifest],
     *,
     orders: Iterable[dict] | None = None,
+    known_trades: Iterable[TradeRecord] | None = None,
 ) -> list[TrackedPosition]:
     """Map Public portfolio positions into tracked deployment positions."""
-    deployments_by_symbol = {deployment.symbol: deployment for deployment in deployments}
+    deployments_by_symbol: dict[str, list[DeploymentManifest]] = {}
+    for deployment in deployments:
+        deployments_by_symbol.setdefault(deployment.symbol, []).append(deployment)
     stop_orders_by_symbol, target_orders_by_symbol = _index_open_exit_orders(orders or [])
+    known_trades = list(known_trades or [])
+    trades_by_option_symbol: dict[str, list[TradeRecord]] = {}
+    trades_by_order_id: dict[str, TradeRecord] = {}
+    for trade in known_trades:
+        if trade.option_symbol:
+            trades_by_option_symbol.setdefault(trade.option_symbol, []).append(trade)
+        for order_id in (trade.entry_order_id, trade.stop_order_id, trade.target_order_id):
+            if order_id:
+                trades_by_order_id[order_id] = trade
     tracked: list[TrackedPosition] = []
 
     for position in positions:
@@ -30,7 +43,28 @@ def reconcile_public_positions(
             continue
         option_symbol = normalize_option_symbol(str(instrument.get("symbol", "")))
         symbol = _parse_option_root(option_symbol)
-        deployment = deployments_by_symbol.get(symbol)
+        stop_order = stop_orders_by_symbol.get(option_symbol) or {}
+        target_order = target_orders_by_symbol.get(option_symbol) or {}
+        matched_trade = _resolve_trade(
+            option_symbol,
+            stop_order_id=stop_order.get("order_id"),
+            target_order_id=target_order.get("order_id"),
+            trades_by_option_symbol=trades_by_option_symbol,
+            trades_by_order_id=trades_by_order_id,
+        )
+        deployment = None
+        trade_id = None
+        entry_price = _parse_entry_price(position)
+        if matched_trade is not None:
+            deployment = next((candidate for candidate in deployments if candidate.deployment_id == matched_trade.deployment_id), None)
+            trade_id = matched_trade.trade_id
+            entry_price = entry_price or matched_trade.entry_price
+        else:
+            symbol_deployments = deployments_by_symbol.get(symbol, [])
+            if len(symbol_deployments) == 1:
+                deployment = symbol_deployments[0]
+            else:
+                continue
         if deployment is None:
             continue
         quantity = int(float(position.get("quantity", "0") or 0))
@@ -40,17 +74,36 @@ def reconcile_public_positions(
             TrackedPosition(
                 symbol=symbol,
                 deployment_id=deployment.deployment_id,
+                trade_id=trade_id,
                 option_symbol=option_symbol,
                 quantity=quantity,
-                entry_price=_parse_entry_price(position),
+                entry_price=entry_price,
                 source="broker_sync",
-                stop_order_id=(stop_orders_by_symbol.get(option_symbol) or {}).get("order_id"),
-                stop_price=(stop_orders_by_symbol.get(option_symbol) or {}).get("price"),
-                target_order_id=(target_orders_by_symbol.get(option_symbol) or {}).get("order_id"),
-                target_price=(target_orders_by_symbol.get(option_symbol) or {}).get("price"),
+                order_id=matched_trade.entry_order_id if matched_trade is not None else None,
+                stop_order_id=stop_order.get("order_id") or (matched_trade.stop_order_id if matched_trade is not None else None),
+                stop_price=stop_order.get("price") or (matched_trade.stop_price if matched_trade is not None else None),
+                target_order_id=target_order.get("order_id") or (matched_trade.target_order_id if matched_trade is not None else None),
+                target_price=target_order.get("price") or (matched_trade.target_price if matched_trade is not None else None),
             )
         )
     return tracked
+
+
+def _resolve_trade(
+    option_symbol: str,
+    *,
+    stop_order_id: str | None,
+    target_order_id: str | None,
+    trades_by_option_symbol: dict[str, list[TradeRecord]],
+    trades_by_order_id: dict[str, TradeRecord],
+) -> TradeRecord | None:
+    for order_id in (stop_order_id, target_order_id):
+        if order_id and order_id in trades_by_order_id:
+            return trades_by_order_id[order_id]
+    option_trades = trades_by_option_symbol.get(option_symbol, [])
+    if len(option_trades) == 1:
+        return option_trades[0]
+    return None
 
 
 def _parse_option_root(option_symbol: str) -> str:

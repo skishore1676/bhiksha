@@ -27,6 +27,7 @@ from bhiksha.market_data.daemon import DataIngestionDaemon
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup
 from bhiksha.persistence.sqlite import SQLiteEventRepository
+from bhiksha.persistence.sqlite import SQLiteTradeStateRepository
 from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
 
@@ -107,6 +108,7 @@ class BhikshaRuntime:
             event_repository=SQLiteEventRepository(self.app_config.sqlite_path),
             app_config=self.app_config,
             event_bus=self.event_bus,
+            trade_state_repository=SQLiteTradeStateRepository(self.app_config.sqlite_path),
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker
@@ -147,10 +149,12 @@ class BhikshaRuntime:
 
         try:
             portfolio = await broker.get_portfolio()
+            open_trades = await supervisor.trade_state_repository.get_open_trades()
             tracker_positions = reconcile_public_positions(
                 portfolio.get("positions", []),
                 self.enabled_deployments,
                 orders=portfolio.get("orders", []),
+                known_trades=open_trades,
             )
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
             await supervisor.sync_lifecycle()
@@ -275,10 +279,12 @@ class BhikshaRuntime:
 
         async with sync_lock:
             portfolio = await broker.get_portfolio()
+            open_trades = await supervisor.trade_state_repository.get_open_trades()
             tracker_positions = reconcile_public_positions(
                 portfolio.get("positions", []),
                 self.enabled_deployments,
                 orders=portfolio.get("orders", []),
+                known_trades=open_trades,
             )
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
             await supervisor.sync_lifecycle()

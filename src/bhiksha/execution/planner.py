@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import uuid
 
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
@@ -63,12 +64,32 @@ class ExecutionPlanner:
             to_date=(decision.timestamp + timedelta(days=deployment.execution.dte_max + 1)).date(),
         )
         selection = self.vehicle_resolver.resolve(selection_request, contracts)
+        conflicting_positions = [
+            position
+            for position in self.position_tracker.find_by_option_symbol(selection.option_symbol)
+            if position.deployment_id != deployment.deployment_id
+        ]
+        trade_id = str(uuid.uuid4())
+        if conflicting_positions:
+            return TradePlan(
+                trade_id=trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                direction=decision.direction,
+                option_symbol=selection.option_symbol,
+                quantity=0,
+                estimated_entry_price=selection.estimated_entry_price or 0.0,
+                risk_reasons=["option_contract_already_owned_by_other_deployment"],
+                dry_run=dry_run,
+                order_id=None,
+            )
         quote = await self.order_manager.get_option_quote(selection.option_symbol)
         entry_price = quote.entry_reference_price or selection.estimated_entry_price
         if entry_price is None:
             raise ValueError(f"Selected contract {selection.option_symbol} has no usable price")
         if quote.open_interest is not None and quote.open_interest < deployment.execution.min_open_interest:
             return TradePlan(
+                trade_id=trade_id,
                 deployment_id=deployment.deployment_id,
                 symbol=deployment.symbol,
                 direction=decision.direction,
@@ -85,6 +106,7 @@ class ExecutionPlanner:
             and quote.spread_pct > deployment.execution.max_bid_ask_spread_pct
         ):
             return TradePlan(
+                trade_id=trade_id,
                 deployment_id=deployment.deployment_id,
                 symbol=deployment.symbol,
                 direction=decision.direction,
@@ -100,6 +122,7 @@ class ExecutionPlanner:
         quantity = int(max_trade_premium // (entry_price * 100))
         if quantity <= 0:
             return TradePlan(
+                trade_id=trade_id,
                 deployment_id=deployment.deployment_id,
                 symbol=deployment.symbol,
                 direction=decision.direction,
@@ -124,6 +147,7 @@ class ExecutionPlanner:
 
         if not risk.approved:
             return TradePlan(
+                trade_id=trade_id,
                 deployment_id=deployment.deployment_id,
                 symbol=deployment.symbol,
                 direction=decision.direction,
@@ -139,12 +163,14 @@ class ExecutionPlanner:
             self.position_tracker.open_position(
                 deployment.symbol,
                 deployment.deployment_id,
+                trade_id=trade_id,
                 option_symbol=selection.option_symbol,
                 quantity=quantity,
                 source="dry_run",
                 order_id="DRY_RUN",
             )
             return TradePlan(
+                trade_id=trade_id,
                 deployment_id=deployment.deployment_id,
                 symbol=deployment.symbol,
                 direction=decision.direction,
@@ -160,6 +186,7 @@ class ExecutionPlanner:
             preflight = await self.order_manager.preflight_entry(selection.option_symbol, entry_price, quantity)
         except Exception as exc:
             return TradePlan(
+                trade_id=trade_id,
                 deployment_id=deployment.deployment_id,
                 symbol=deployment.symbol,
                 direction=decision.direction,
@@ -176,17 +203,20 @@ class ExecutionPlanner:
             selection.option_symbol,
             final_limit_price,
             quantity,
+            order_id=trade_id,
         )
         if result.order_id:
             self.position_tracker.open_position(
                 deployment.symbol,
                 deployment.deployment_id,
+                trade_id=trade_id,
                 option_symbol=selection.option_symbol,
                 quantity=quantity,
                 source="live_pending",
                 order_id=result.order_id,
             )
         return TradePlan(
+            trade_id=trade_id,
             deployment_id=deployment.deployment_id,
             symbol=deployment.symbol,
             direction=decision.direction,

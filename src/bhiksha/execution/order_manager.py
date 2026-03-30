@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import math
 import uuid
+import math
+from typing import Any
 
 from bhiksha.execution.brokers.public.adapter import PublicBrokerAdapter
 
@@ -120,14 +121,28 @@ class OrderManager:
             estimated_cost=_maybe_float(response.get("estimatedCost")),
         )
 
-    async def place_entry_order(self, option_symbol: str, limit_price: float, quantity: int) -> OrderResult:
-        payload = self._entry_payload(option_symbol, limit_price, quantity)
+    async def place_entry_order(
+        self,
+        option_symbol: str,
+        limit_price: float,
+        quantity: int,
+        *,
+        order_id: str | None = None,
+    ) -> OrderResult:
+        payload = self._entry_payload(option_symbol, limit_price, quantity, order_id=order_id)
         payload = await self._apply_increment_correction(payload, side="BUY", price_key="limitPrice")
         return await self._submit(payload)
 
-    async def place_stop_loss_order(self, option_symbol: str, stop_price: float, quantity: int) -> OrderResult:
+    async def place_stop_loss_order(
+        self,
+        option_symbol: str,
+        stop_price: float,
+        quantity: int,
+        *,
+        order_id: str | None = None,
+    ) -> OrderResult:
         payload = {
-            "orderId": str(uuid.uuid4()),
+            "orderId": order_id or str(uuid.uuid4()),
             "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
             "orderSide": "SELL",
             "orderType": "STOP",
@@ -139,9 +154,16 @@ class OrderManager:
         payload = await self._apply_increment_correction(payload, side="SELL", price_key="stopPrice")
         return await self._submit(payload)
 
-    async def place_target_order(self, option_symbol: str, limit_price: float, quantity: int) -> OrderResult:
+    async def place_target_order(
+        self,
+        option_symbol: str,
+        limit_price: float,
+        quantity: int,
+        *,
+        order_id: str | None = None,
+    ) -> OrderResult:
         payload = {
-            "orderId": str(uuid.uuid4()),
+            "orderId": order_id or str(uuid.uuid4()),
             "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
             "orderSide": "SELL",
             "orderType": "LIMIT",
@@ -153,10 +175,16 @@ class OrderManager:
         payload = await self._apply_increment_correction(payload, side="SELL", price_key="limitPrice")
         return await self._submit(payload)
 
-    async def place_square_off_order(self, option_symbol: str, quantity: int) -> OrderResult:
+    async def place_square_off_order(
+        self,
+        option_symbol: str,
+        quantity: int,
+        *,
+        order_id: str | None = None,
+    ) -> OrderResult:
         return await self._submit(
             {
-                "orderId": str(uuid.uuid4()),
+                "orderId": order_id or str(uuid.uuid4()),
                 "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
                 "orderSide": "SELL",
                 "orderType": "MARKET",
@@ -234,9 +262,15 @@ class OrderManager:
         return payload
 
     @staticmethod
-    def _entry_payload(option_symbol: str, limit_price: float, quantity: int) -> dict[str, str | dict[str, str]]:
+    def _entry_payload(
+        option_symbol: str,
+        limit_price: float,
+        quantity: int,
+        *,
+        order_id: str | None = None,
+    ) -> dict[str, str | dict[str, str]]:
         return {
-            "orderId": str(uuid.uuid4()),
+            "orderId": order_id or str(uuid.uuid4()),
             "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
             "orderSide": "BUY",
             "orderType": "LIMIT",

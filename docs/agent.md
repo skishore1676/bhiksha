@@ -418,9 +418,40 @@ Open items:
 
 - Broker portfolio synchronization is still serialized before evaluation, so the runtime is not yet fully actorized end to end.
 - Dispatcher work is currently in-memory only; queue depth and task latency are not yet surfaced as operator metrics.
+- Entry and exit evaluation still recompute Newton enrichment separately on the same bar; we should cache and reuse one enriched frame per symbol bar.
 
 Next steps:
 
-1. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
-2. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
-3. Decide whether some low-risk actions, such as quote-only management checks, should bypass the dispatcher in dry-run mode.
+1. Reuse one enriched frame per symbol bar for both exit and entry evaluation.
+2. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
+3. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+
+### 2026-03-30 (Durable Trade Identity And Reconciliation)
+
+Completed:
+
+- Added durable trade sessions in SQLite with local `trade_id` ownership.
+- Threaded `trade_id` through `TradePlan`, `ExitPlan`, and `TrackedPosition`.
+- Changed entry planning so the Public entry `orderId` is the same UUID as the Bhiksha `trade_id`.
+- Updated the execution supervisor to persist trade-session state across pending entry, protected open, target-active, and closed transitions.
+- Updated restart reconciliation to prefer durable known trade ownership over symbol-only mapping.
+- Added ambiguity protection so same-contract multi-deployment ownership is skipped instead of being auto-attached incorrectly.
+- Added tests covering durable known-trade reconciliation and ambiguous same-contract rejection.
+
+Verification:
+
+- `53` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- Existing older live positions that predate the durable trade journal still rely on the old symbol-level fallback until they are cycled through the new runtime.
+- Public account positions are still aggregated by option symbol, so Bhiksha can support multiple strategies on the same underlying only if they do not converge onto the exact same option contract.
+- We still do not persist a full historical order-lineage table; the current implementation stores the active entry/stop/target ownership chain for open trades.
+
+Next steps:
+
+1. Reuse one enriched frame per symbol bar for both exit and entry evaluation.
+2. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
+3. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+4. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
