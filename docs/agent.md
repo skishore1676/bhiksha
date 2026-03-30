@@ -203,3 +203,32 @@ Next steps:
 1. Add broker-aware virtual-target execution flow for Public when a target price is reached.
 2. Port the old-project anticipatory target and pullback-restore ideas into manifest-driven config rather than FSM states.
 3. Add reconciliation and replay tests for target-pending and stop-restore scenarios.
+
+### 2026-03-30 (Public Virtual Target Orchestration)
+
+Completed:
+
+- Added manifest-driven `target_approach_offset_pct` and `target_pullback_restore_progress_pct` exit config fields.
+- Implemented Public virtual-target activation inside `manage_open_position(...)`:
+  the runtime can now arm a target price, cancel the catastrophe stop as price approaches target, and submit the target order.
+- Preserved the older production nuance where Bhiksha may still attempt target submission when Public cancel confirmation is ambiguous.
+- Implemented pullback-based stop restoration:
+  if the target is active and price fades back below the configured progress threshold, Bhiksha cancels the target and restores catastrophe-stop protection.
+- Added unit coverage for virtual target activation, ambiguous stop-cancel fallback, and target-pullback stop restoration.
+
+Verification:
+
+- `32` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- The active QQQ/SPY manifests still keep `use_profit_target: false`; the new orchestration is implemented but not yet enabled in production manifests.
+- Reconciliation still trusts broker state as the main source of truth, so transient broker-lag around just-submitted target orders can still be hardened further.
+- Partial-fill-aware target/stop restoration is still a next step.
+
+Next steps:
+
+1. Decide whether to enable the new target orchestration for any deployment or keep Day 1 as stop-plus-algorithmic-exit only.
+2. Add replay coverage for target activation, target fill, pullback restore, and restart recovery with a target already live.
+3. Harden reconciliation so recently submitted virtual-target transitions survive broker reporting lag more gracefully.

@@ -156,6 +156,13 @@ class ExecutionSupervisor:
             return None
 
         updated = position
+        quote = None
+
+        async def ensure_quote():
+            nonlocal quote
+            if quote is None:
+                quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
+            return quote
         if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None and position.target_order_id is None:
             target_price = _target_price(position.entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
             if self._supports_concurrent_exit_orders():
@@ -195,11 +202,137 @@ class ExecutionSupervisor:
                 updated = _replace_position(updated, target_order_id=None, target_price=target_price)
 
         if (
+            not self._supports_concurrent_exit_orders()
+            and updated.target_price is not None
+            and deployment.exit.target_approach_offset_pct is not None
+            and updated.target_order_id is None
+        ):
+            current_quote = await ensure_quote()
+            reference_price = current_quote.exit_reference_price
+            activation_price = updated.target_price * (1.0 - deployment.exit.target_approach_offset_pct)
+            if reference_price is not None and reference_price >= activation_price:
+                cancel_ok = True
+                cancel_error = None
+                canceled_stop_order_id = updated.stop_order_id
+                if updated.stop_order_id and not dry_run:
+                    cancel_ok, cancel_error = await self.planner.order_manager.cancel_order(updated.stop_order_id)
+                    await self.event_repository.append(
+                        "protection_cancel_attempt",
+                        {
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": updated.symbol,
+                            "option_symbol": updated.option_symbol,
+                            "stop_order_id": updated.stop_order_id,
+                            "canceled": cancel_ok,
+                            "error": cancel_error,
+                            "reason": "virtual_target_activation",
+                        },
+                    )
+                can_submit_target = dry_run or cancel_ok or self._allows_exit_submission_before_cancel_confirmation()
+                if can_submit_target:
+                    target_order_id = "DRY_RUN_TARGET_ACTIVATED"
+                    target_error = cancel_error
+                    if not dry_run:
+                        result = await self.planner.order_manager.place_target_order(
+                            updated.option_symbol,
+                            updated.target_price,
+                            updated.quantity,
+                        )
+                        target_order_id = result.order_id
+                        target_error = result.error or target_error
+                    await self.event_repository.append(
+                        "virtual_target_activation",
+                        {
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": updated.symbol,
+                            "option_symbol": updated.option_symbol,
+                            "reference_price": reference_price,
+                            "activation_price": activation_price,
+                            "target_price": updated.target_price,
+                            "canceled_stop_order_id": canceled_stop_order_id,
+                            "target_order_id": target_order_id,
+                            "target_error": target_error,
+                        },
+                    )
+                    if target_order_id is not None:
+                        updated = _replace_position(
+                            updated,
+                            stop_order_id=None,
+                            target_order_id=target_order_id,
+                        )
+
+        if (
+            not self._supports_concurrent_exit_orders()
+            and updated.target_order_id is not None
+            and updated.target_price is not None
+            and deployment.exit.target_pullback_restore_progress_pct is not None
+        ):
+            current_quote = await ensure_quote()
+            reference_price = current_quote.exit_reference_price
+            restore_threshold = _restore_threshold_price(
+                updated.entry_price,
+                updated.target_price,
+                deployment.exit.target_pullback_restore_progress_pct,
+            )
+            if reference_price is not None and reference_price <= restore_threshold:
+                cancel_ok = True
+                cancel_error = None
+                canceled_target_order_id = updated.target_order_id
+                if updated.target_order_id and not dry_run:
+                    cancel_ok, cancel_error = await self.planner.order_manager.cancel_order(updated.target_order_id)
+                    await self.event_repository.append(
+                        "target_cancel_attempt",
+                        {
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": updated.symbol,
+                            "option_symbol": updated.option_symbol,
+                            "target_order_id": updated.target_order_id,
+                            "canceled": cancel_ok,
+                            "error": cancel_error,
+                            "reason": "virtual_target_pullback_restore",
+                        },
+                    )
+                can_restore_stop = dry_run or cancel_ok or self._allows_exit_submission_before_cancel_confirmation()
+                if can_restore_stop:
+                    restored_stop_price = updated.stop_price or (updated.entry_price * (1.0 - deployment.exit.stop_loss_pct))
+                    stop_order_id = "DRY_RUN_RESTORED_STOP"
+                    stop_error = cancel_error
+                    if not dry_run:
+                        result = await self.planner.order_manager.place_stop_loss_order(
+                            updated.option_symbol,
+                            restored_stop_price,
+                            updated.quantity,
+                        )
+                        stop_order_id = result.order_id
+                        stop_error = result.error or stop_error
+                    await self.event_repository.append(
+                        "virtual_target_pullback_restore",
+                        {
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": updated.symbol,
+                            "option_symbol": updated.option_symbol,
+                            "reference_price": reference_price,
+                            "restore_threshold": restore_threshold,
+                            "canceled_target_order_id": canceled_target_order_id,
+                            "restored_stop_order_id": stop_order_id,
+                            "restored_stop_price": restored_stop_price,
+                            "stop_error": stop_error,
+                        },
+                    )
+                    if stop_order_id is not None:
+                        updated = _replace_position(
+                            updated,
+                            stop_order_id=stop_order_id,
+                            stop_price=restored_stop_price,
+                            target_order_id=None,
+                        )
+
+        if (
             deployment.exit.stop_to_breakeven_after_r_multiple is not None
             and (updated.stop_price is None or updated.stop_price + 1e-9 < updated.entry_price)
         ):
-            quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
-            reference_price = quote.exit_reference_price
+            current_quote = await ensure_quote()
+            reference_price = current_quote.exit_reference_price
             trigger_price = _target_price(
                 updated.entry_price,
                 deployment.exit.stop_loss_pct,
@@ -271,6 +404,9 @@ class ExecutionSupervisor:
 
     def _supports_concurrent_exit_orders(self) -> bool:
         return bool(getattr(self.planner.order_manager, "supports_concurrent_exit_orders", False))
+
+    def _allows_exit_submission_before_cancel_confirmation(self) -> bool:
+        return bool(getattr(self.planner.order_manager, "allows_exit_submission_before_cancel_confirmation", False))
 
     async def handle_exit(
         self,
@@ -502,6 +638,11 @@ def _parse_et_time(value: str) -> time:
 
 def _target_price(entry_price: float, stop_loss_pct: float, r_multiple: float) -> float:
     return entry_price * (1.0 + stop_loss_pct * r_multiple)
+
+
+def _restore_threshold_price(entry_price: float, target_price: float, progress_pct: float) -> float:
+    progress = max(0.0, min(1.0, progress_pct))
+    return entry_price + ((target_price - entry_price) * progress)
 
 
 def _replace_position(position: TrackedPosition, **changes) -> TrackedPosition:

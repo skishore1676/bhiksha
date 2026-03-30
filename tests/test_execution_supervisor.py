@@ -13,6 +13,7 @@ from bhiksha.state.position_tracker import PositionTracker
 
 class StubOrderManager:
     supports_concurrent_exit_orders = False
+    allows_exit_submission_before_cancel_confirmation = True
 
     async def wait_for_fill(self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2):
         return True, {"status": "FILLED"}, None
@@ -56,6 +57,43 @@ class StubPlanner:
 
     async def close(self):
         return None
+
+
+class RecordingOrderManager(StubOrderManager):
+    def __init__(self, *, quote_bid: float = 3.0, cancel_success: bool = True):
+        self.quote_bid = quote_bid
+        self.cancel_success = cancel_success
+        self.calls: list[tuple[str, str | float]] = []
+
+    async def place_stop_loss_order(self, option_symbol: str, stop_price: float, quantity: int):
+        self.calls.append(("place_stop", round(stop_price, 2)))
+        return await super().place_stop_loss_order(option_symbol, stop_price, quantity)
+
+    async def place_target_order(self, option_symbol: str, limit_price: float, quantity: int):
+        self.calls.append(("place_target", round(limit_price, 2)))
+        return await super().place_target_order(option_symbol, limit_price, quantity)
+
+    async def cancel_order(self, order_id: str):
+        self.calls.append(("cancel", order_id))
+        if self.cancel_success:
+            return True, None
+        return False, "cancel_status_unknown"
+
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=self.quote_bid,
+            ask=self.quote_bid + 0.05,
+            last=self.quote_bid + 0.02,
+            open_interest=500,
+            outcome="SUCCESS",
+        )
+
+
+class RecordingPlanner(StubPlanner):
+    def __init__(self, order_manager: RecordingOrderManager):
+        self.order_manager = order_manager
+        self.position_tracker = PositionTracker()
 
 
 def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
@@ -348,3 +386,136 @@ def test_execution_supervisor_promotes_stop_to_breakeven(tmp_path) -> None:
     assert managed is not None
     assert managed.stop_order_id == "STOP123"
     assert managed.stop_price == 2.0
+
+
+def test_execution_supervisor_activates_virtual_target_for_public(tmp_path) -> None:
+    order_manager = RecordingOrderManager(quote_bid=3.30, cancel_success=True)
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_profit_target": True,
+                    "profit_target_multiple": 1.5,
+                    "target_approach_offset_pct": 0.02,
+                }
+            )
+        }
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="broker_sync",
+        stop_order_id="STOP123",
+        stop_price=1.1,
+        target_price=3.35,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+
+    managed = asyncio.run(supervisor.manage_open_position(deployment, position, dry_run=False))
+
+    assert managed is not None
+    assert managed.stop_order_id is None
+    assert managed.target_order_id == "TARGET123"
+    assert ("cancel", "STOP123") in order_manager.calls
+    assert ("place_target", 3.35) in order_manager.calls
+
+
+def test_execution_supervisor_virtual_target_activation_allows_ambiguous_cancel(tmp_path) -> None:
+    order_manager = RecordingOrderManager(quote_bid=3.30, cancel_success=False)
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_profit_target": True,
+                    "profit_target_multiple": 1.5,
+                    "target_approach_offset_pct": 0.02,
+                }
+            )
+        }
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="broker_sync",
+        stop_order_id="STOP123",
+        stop_price=1.1,
+        target_price=3.35,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+
+    managed = asyncio.run(supervisor.manage_open_position(deployment, position, dry_run=False))
+
+    assert managed is not None
+    assert managed.target_order_id == "TARGET123"
+    assert ("cancel", "STOP123") in order_manager.calls
+    assert ("place_target", 3.35) in order_manager.calls
+
+
+def test_execution_supervisor_restores_stop_after_virtual_target_pullback(tmp_path) -> None:
+    order_manager = RecordingOrderManager(quote_bid=3.00, cancel_success=True)
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_profit_target": True,
+                    "profit_target_multiple": 1.5,
+                    "target_pullback_restore_progress_pct": 0.8,
+                }
+            )
+        }
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="broker_sync",
+        stop_order_id=None,
+        stop_price=1.1,
+        target_order_id="TARGET123",
+        target_price=3.35,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+
+    managed = asyncio.run(supervisor.manage_open_position(deployment, position, dry_run=False))
+
+    assert managed is not None
+    assert managed.target_order_id is None
+    assert managed.stop_order_id == "STOP123"
+    assert managed.stop_price == 1.1
+    assert ("cancel", "TARGET123") in order_manager.calls
+    assert ("place_stop", 1.1) in order_manager.calls

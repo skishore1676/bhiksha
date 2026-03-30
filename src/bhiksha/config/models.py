@@ -55,6 +55,8 @@ class ExitSpec(BaseModel):
     use_algorithmic_exit: bool = True
     use_profit_target: bool = False
     profit_target_multiple: float | None = None
+    target_approach_offset_pct: float | None = None
+    target_pullback_restore_progress_pct: float | None = None
     stop_loss_pct: float = 0.45
     stop_to_breakeven_after_r_multiple: float | None = None
     hard_flat_time_et: str = "15:55"

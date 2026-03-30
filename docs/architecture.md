@@ -404,6 +404,8 @@ exit:
   use_algorithmic_exit: true
   use_profit_target: false
   profit_target_multiple: null
+  target_approach_offset_pct: null
+  target_pullback_restore_progress_pct: null
   stop_loss_pct: 0.45
   stop_to_breakeven_after_r_multiple: null
   hard_flat_time_et: "15:55"
@@ -414,6 +416,8 @@ This lets future strategies express:
 - VMA reclaim exits,
 - stage/regime change exits,
 - target-based exits,
+- anticipatory target activation for brokers with one-resting-order constraints,
+- pullback-based stop restoration after target activation,
 - break-even promotion,
 - trailing stop rules,
 - time-based exits.
