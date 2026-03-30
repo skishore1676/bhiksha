@@ -398,3 +398,29 @@ Next steps:
 1. Add per-deployment broker-action summaries such as stop submissions, target activations, and square-offs.
 2. Consider moving broker actions onto a dedicated execution queue if portfolio sync or order submission latency still proves material.
 3. Add lightweight metrics around heartbeat lag, queue depth, and token refresh health.
+
+### 2026-03-30 (Execution Dispatcher)
+
+Completed:
+
+- Added a per-symbol execution dispatcher in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/app/execution_dispatcher.py`.
+- Moved broker-affecting work for entry, exit, hard-flat, and open-position management off the bar-processing path and into dispatcher workers.
+- Added per-symbol dedupe keys so repeated submissions do not stack while a previous action is queued or running.
+- Added dispatcher recovery logging so a failed execution task does not kill the worker for that symbol.
+- Added dispatcher tests for dedupe, symbol independence, and worker recovery.
+
+Verification:
+
+- `51` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- Broker portfolio synchronization is still serialized before evaluation, so the runtime is not yet fully actorized end to end.
+- Dispatcher work is currently in-memory only; queue depth and task latency are not yet surfaced as operator metrics.
+
+Next steps:
+
+1. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
+2. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+3. Decide whether some low-risk actions, such as quote-only management checks, should bypass the dispatcher in dry-run mode.

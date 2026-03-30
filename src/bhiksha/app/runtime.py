@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import polars as pl
 
 from bhiksha.app.event_bus import InMemoryEventBus
+from bhiksha.app.execution_dispatcher import SymbolExecutionDispatcher
 from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.app.token_daemon import PublicTokenRefreshDaemon, SchwabTokenRefreshDaemon
 from bhiksha.config.models import AppConfig, DeploymentManifest, ProviderConfig
@@ -118,6 +119,8 @@ class BhikshaRuntime:
             symbols=symbols,
             provider=self.provider_config.underlying_live_primary,
         )
+        execution_dispatcher = SymbolExecutionDispatcher()
+        execution_dispatcher.start(symbols)
         queue = self.event_bus.subscribe(BarClosedEvent)
         sync_lock = asyncio.Lock()
         symbol_queues = {symbol: asyncio.Queue() for symbol in symbols}
@@ -133,6 +136,7 @@ class BhikshaRuntime:
                     supervisor=supervisor,
                     position_monitor=position_monitor,
                     evaluator=evaluator,
+                    execution_dispatcher=execution_dispatcher,
                     deployments_by_symbol=deployments_by_symbol,
                     deployments_by_id=deployments_by_id,
                     output=output,
@@ -197,6 +201,7 @@ class BhikshaRuntime:
         finally:
             public_token_daemon.stop()
             schwab_token_daemon.stop()
+            await execution_dispatcher.stop()
             await supervisor.close()
             await source.close()
             self.stop()
@@ -213,6 +218,7 @@ class BhikshaRuntime:
         supervisor: ExecutionSupervisor,
         position_monitor: PositionMonitor,
         evaluator: ReplaySignalEvaluator,
+        execution_dispatcher: SymbolExecutionDispatcher,
         deployments_by_symbol: dict[str, list[DeploymentManifest]],
         deployments_by_id: dict[str, DeploymentManifest],
         output: callable,
@@ -230,6 +236,7 @@ class BhikshaRuntime:
                 supervisor=supervisor,
                 position_monitor=position_monitor,
                 evaluator=evaluator,
+                execution_dispatcher=execution_dispatcher,
                 deployments_by_symbol=deployments_by_symbol,
                 deployments_by_id=deployments_by_id,
                 output=output,
@@ -254,6 +261,7 @@ class BhikshaRuntime:
         supervisor: ExecutionSupervisor,
         position_monitor: PositionMonitor,
         evaluator: ReplaySignalEvaluator,
+        execution_dispatcher: SymbolExecutionDispatcher,
         deployments_by_symbol: dict[str, list[DeploymentManifest]],
         deployments_by_id: dict[str, DeploymentManifest],
         output: callable,
@@ -281,14 +289,20 @@ class BhikshaRuntime:
                 )
                 output(f"SYNC positions={joined}")
 
-        closed = await supervisor.close_due_positions(
-            deployments_by_id,
-            now=bar.timestamp,
-            dry_run=not live,
-            symbol=bar.symbol,
+        hard_flat_enqueued = execution_dispatcher.submit(
+            bar.symbol,
+            key=f"hard_flat:{bar.symbol}",
+            runner=self._make_hard_flat_runner(
+                supervisor,
+                deployments_by_id,
+                now=bar.timestamp,
+                live=live,
+                symbol=bar.symbol,
+                output=output,
+            ),
         )
-        for plan in closed:
-            output(f"HARD_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")
+        if hard_flat_enqueued:
+            output(f"EXECUTION_ENQUEUED {bar.symbol} hard_flat_check")
 
         frame = _frame_from_bars(bar.symbol, store.get(bar.symbol))
         for position in list(supervisor.planner.position_tracker.active_positions()):
@@ -297,17 +311,19 @@ class BhikshaRuntime:
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None:
                 continue
-            managed = await supervisor.manage_open_position(
-                deployment,
-                position,
-                dry_run=not live,
+            enqueued = execution_dispatcher.submit(
+                bar.symbol,
+                key=f"manage:{deployment.deployment_id}:{position.option_symbol}",
+                runner=self._make_manage_position_runner(
+                    supervisor,
+                    deployment,
+                    position,
+                    live=live,
+                    output=output,
+                ),
             )
-            if managed is not None and managed != position:
-                output(
-                    f"{deployment.deployment_id}: position_managed "
-                    f"stop={managed.stop_order_id}@{managed.stop_price} "
-                    f"target={managed.target_order_id}@{managed.target_price}"
-                )
+            if enqueued:
+                output(f"{deployment.deployment_id}: manage_enqueued option={position.option_symbol}")
 
         exited_deployments: set[str] = set()
         exit_evaluations = position_monitor.evaluate_symbol(bar.symbol, frame, deployments_by_id)
@@ -317,13 +333,20 @@ class BhikshaRuntime:
                 f"action={evaluation.decision.action} reasons={evaluation.decision.reason}"
             )
             if evaluation.decision.exit:
-                exit_plan = await supervisor.handle_exit(
-                    evaluation.deployment,
-                    evaluation.position,
-                    evaluation.decision,
-                    dry_run=not live,
+                enqueued = execution_dispatcher.submit(
+                    bar.symbol,
+                    key=f"exit:{evaluation.deployment.deployment_id}:{evaluation.position.option_symbol}",
+                    runner=self._make_exit_runner(
+                        supervisor,
+                        evaluation.deployment,
+                        evaluation.position,
+                        evaluation.decision,
+                        live=live,
+                        output=output,
+                    ),
                 )
-                output(f"{evaluation.deployment.deployment_id}: exit_plan={exit_plan}")
+                if enqueued:
+                    output(f"{evaluation.deployment.deployment_id}: exit_enqueued option={evaluation.position.option_symbol}")
                 exited_deployments.add(evaluation.deployment.deployment_id)
 
         for deployment in deployments_by_symbol[bar.symbol]:
@@ -337,8 +360,101 @@ class BhikshaRuntime:
                 f"reasons={decision.reason}"
             )
             if decision.signal:
-                plan = await supervisor.handle_signal(deployment, decision, dry_run=not live)
-                output(f"{deployment.deployment_id}: plan={plan}")
+                enqueued = execution_dispatcher.submit(
+                    bar.symbol,
+                    key=f"entry:{deployment.deployment_id}",
+                    runner=self._make_entry_runner(
+                        supervisor,
+                        deployment,
+                        decision,
+                        live=live,
+                        output=output,
+                    ),
+                )
+                if enqueued:
+                    output(f"{deployment.deployment_id}: entry_enqueued")
+
+    def _make_entry_runner(
+        self,
+        supervisor: ExecutionSupervisor,
+        deployment: DeploymentManifest,
+        decision,
+        *,
+        live: bool,
+        output: callable,
+    ):
+        async def runner() -> None:
+            plan = await supervisor.handle_signal(deployment, decision, dry_run=not live)
+            output(f"{deployment.deployment_id}: plan={plan}")
+
+        return runner
+
+    def _make_exit_runner(
+        self,
+        supervisor: ExecutionSupervisor,
+        deployment: DeploymentManifest,
+        position,
+        decision,
+        *,
+        live: bool,
+        output: callable,
+    ):
+        async def runner() -> None:
+            exit_plan = await supervisor.handle_exit(
+                deployment,
+                position,
+                decision,
+                dry_run=not live,
+            )
+            output(f"{deployment.deployment_id}: exit_plan={exit_plan}")
+
+        return runner
+
+    def _make_manage_position_runner(
+        self,
+        supervisor: ExecutionSupervisor,
+        deployment: DeploymentManifest,
+        position,
+        *,
+        live: bool,
+        output: callable,
+    ):
+        async def runner() -> None:
+            managed = await supervisor.manage_open_position(
+                deployment,
+                position,
+                dry_run=not live,
+            )
+            if managed is not None and managed != position:
+                output(
+                    f"{deployment.deployment_id}: position_managed "
+                    f"stop={managed.stop_order_id}@{managed.stop_price} "
+                    f"target={managed.target_order_id}@{managed.target_price}"
+                )
+
+        return runner
+
+    def _make_hard_flat_runner(
+        self,
+        supervisor: ExecutionSupervisor,
+        deployments_by_id: dict[str, DeploymentManifest],
+        *,
+        now: datetime,
+        live: bool,
+        symbol: str,
+        output: callable,
+    ):
+        async def runner() -> None:
+            closed = await supervisor.close_due_positions(
+                deployments_by_id,
+                now=now,
+                dry_run=not live,
+                symbol=symbol,
+            )
+            for plan in closed:
+                output(f"HARD_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")
+
+        return runner
 
 
 def _frame_from_bars(symbol: str, bars) -> pl.DataFrame:

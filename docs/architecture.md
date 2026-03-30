@@ -220,6 +220,8 @@ Current Bhiksha runtime implementation:
 - A runtime-owned `DataIngestionDaemon` wakes on the closed-bar heartbeat and publishes `BarClosedEvent`.
 - The runtime trading session routes those events onto per-symbol workers.
 - Symbol workers preserve in-symbol ordering while allowing `QQQ`, `SPY`, and future symbols to progress independently.
+- Broker-affecting work is handed off to a per-symbol execution dispatcher so entry, exit, hard-flat, and position-management HTTP does not block bar evaluation.
+- Execution queue keys are deduplicated per symbol so repeated entry or exit attempts are not stacked while an earlier action is already queued or running.
 - Background token daemons refresh Public and Schwab credentials ahead of expiry, with request-path refresh retained only as a fallback.
 
 ### 4. Feature Service
