@@ -12,6 +12,8 @@ from bhiksha.state.position_tracker import PositionTracker
 
 
 class StubOrderManager:
+    supports_concurrent_exit_orders = False
+
     async def wait_for_fill(self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2):
         return True, {"status": "FILLED"}, None
 
@@ -200,10 +202,63 @@ def test_execution_supervisor_handles_algorithmic_exit(tmp_path) -> None:
     assert supervisor.planner.position_tracker.total_open_positions == 0
 
 
-def test_execution_supervisor_places_profit_target_when_enabled(tmp_path) -> None:
+def test_execution_supervisor_arms_virtual_profit_target_when_broker_supports_single_exit_order(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     supervisor = ExecutionSupervisor(
         planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_profit_target": True,
+                    "profit_target_multiple": 1.5,
+                }
+            )
+        }
+    )
+    plan = TradePlan(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert protected.stop_order_id == "STOP123"
+    assert protected.target_order_id is None
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.target_order_id is None
+    assert tracked.target_price == 3.35
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
+    assert [row[0] for row in rows] == ["entry_fill_check", "profit_target_armed", "protective_stop_submission"]
+
+
+def test_execution_supervisor_places_profit_target_when_broker_supports_concurrent_exit_orders(tmp_path) -> None:
+    class ConcurrentExitOrderManager(StubOrderManager):
+        supports_concurrent_exit_orders = True
+
+    class ConcurrentExitPlanner(StubPlanner):
+        def __init__(self):
+            self.order_manager = ConcurrentExitOrderManager()
+            self.position_tracker = PositionTracker()
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=ConcurrentExitPlanner(),
         event_repository=repo,
         app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
     )

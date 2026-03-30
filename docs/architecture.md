@@ -423,6 +423,12 @@ The key design choice is:
 - `risk` controls whether a trade is allowed and what hard guardrails exist,
 - `exit` controls how an open position is managed after entry.
 
+Broker capability note:
+
+- Public should be treated as a `single_resting_exit_order` broker.
+- That means Bhiksha must not rely on broker-side OCO or simultaneous resting stop-plus-target behavior for Public option positions.
+- For Public, the default posture is one broker-side catastrophe stop plus app-managed virtual targets, algorithmic exits, and cancel/replace sequencing.
+
 That separation will matter once we support many strategy families.
 
 ### 12. ExitDecision Contract

@@ -74,6 +74,9 @@ def snap_price(value: float, increment: float, *, side: str) -> float:
 class OrderManager:
     """Minimal Public order manager for Day 1 single-leg options."""
 
+    supports_concurrent_exit_orders = False
+    allows_exit_submission_before_cancel_confirmation = True
+
     def __init__(self, broker: PublicBrokerAdapter | None = None) -> None:
         self.broker = broker or PublicBrokerAdapter()
 

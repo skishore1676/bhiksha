@@ -177,3 +177,29 @@ Next steps:
 1. Decide whether Market Impulse should enable `use_profit_target` in the active deployment manifests or stay stop-plus-algorithmic-exit only.
 2. Add replay cases for target hits, breakeven promotions, and mixed broker-restart recovery.
 3. Add session-summary tooling so operator review is easier after a live run.
+
+### 2026-03-30 (Public Exit Constraint Hardening)
+
+Completed:
+
+- Reviewed the older `public_api_trading_v3` runtime for broker-specific lessons around stop cancellation ambiguity and target orchestration.
+- Kept the reusable ideas but did not port the old FSM directly into Bhiksha.
+- Added an explicit broker capability flag so Public is treated as a `single_resting_exit_order` broker.
+- Changed target handling so Public arms a virtual target price instead of placing a broker-side target while a stop is already live.
+- Preserved the more general path for future brokers that can support concurrent resting stop and target orders.
+
+Verification:
+
+- `29` tests passing.
+- Public-target behavior is now covered in unit tests for both single-exit-order and concurrent-exit-order brokers.
+
+Open items:
+
+- Virtual target hits are still managed conservatively; the more advanced anticipatory target and pullback restore flow from the older project is not ported yet.
+- Partial-fill-aware cancel/replace behavior under Public remains a next hardening step.
+
+Next steps:
+
+1. Add broker-aware virtual-target execution flow for Public when a target price is reached.
+2. Port the old-project anticipatory target and pullback-restore ideas into manifest-driven config rather than FSM states.
+3. Add reconciliation and replay tests for target-pending and stop-restore scenarios.

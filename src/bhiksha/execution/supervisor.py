@@ -89,22 +89,35 @@ class ExecutionSupervisor:
         target_price = None
         if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None:
             target_price = _target_price(plan.estimated_entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
-            target_result = await self.planner.order_manager.place_target_order(
-                plan.option_symbol,
-                target_price,
-                plan.quantity,
-            )
-            target_order_id = target_result.order_id
-            await self.event_repository.append(
-                "profit_target_submission",
-                {
-                    "deployment_id": plan.deployment_id,
-                    "entry_order_id": plan.order_id,
-                    "target_order_id": target_result.order_id,
-                    "target_error": target_result.error,
-                    "target_price": target_price,
-                },
-            )
+            if self._supports_concurrent_exit_orders():
+                target_result = await self.planner.order_manager.place_target_order(
+                    plan.option_symbol,
+                    target_price,
+                    plan.quantity,
+                )
+                target_order_id = target_result.order_id
+                await self.event_repository.append(
+                    "profit_target_submission",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "entry_order_id": plan.order_id,
+                        "target_order_id": target_result.order_id,
+                        "target_error": target_result.error,
+                        "target_price": target_price,
+                    },
+                )
+            else:
+                await self.event_repository.append(
+                    "profit_target_armed",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "entry_order_id": plan.order_id,
+                        "target_order_id": None,
+                        "target_price": target_price,
+                        "mode": "virtual",
+                        "reason": "single_resting_exit_order_broker",
+                    },
+                )
         self.planner.position_tracker.open_position(
             deployment.symbol,
             deployment.deployment_id,
@@ -145,25 +158,41 @@ class ExecutionSupervisor:
         updated = position
         if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None and position.target_order_id is None:
             target_price = _target_price(position.entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
-            target_order_id = "DRY_RUN_TARGET"
-            target_error = None
-            if not dry_run:
-                result = await self.planner.order_manager.place_target_order(position.option_symbol, target_price, position.quantity)
-                target_order_id = result.order_id
-                target_error = result.error
-            await self.event_repository.append(
-                "profit_target_submission",
-                {
-                    "deployment_id": deployment.deployment_id,
-                    "symbol": position.symbol,
-                    "option_symbol": position.option_symbol,
-                    "target_order_id": target_order_id,
-                    "target_error": target_error,
-                    "target_price": target_price,
-                    "source": "position_manager",
-                },
-            )
-            updated = _replace_position(updated, target_order_id=target_order_id, target_price=target_price)
+            if self._supports_concurrent_exit_orders():
+                target_order_id = "DRY_RUN_TARGET"
+                target_error = None
+                if not dry_run:
+                    result = await self.planner.order_manager.place_target_order(position.option_symbol, target_price, position.quantity)
+                    target_order_id = result.order_id
+                    target_error = result.error
+                await self.event_repository.append(
+                    "profit_target_submission",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "target_order_id": target_order_id,
+                        "target_error": target_error,
+                        "target_price": target_price,
+                        "source": "position_manager",
+                    },
+                )
+                updated = _replace_position(updated, target_order_id=target_order_id, target_price=target_price)
+            else:
+                await self.event_repository.append(
+                    "profit_target_armed",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "target_order_id": None,
+                        "target_price": target_price,
+                        "mode": "virtual",
+                        "reason": "single_resting_exit_order_broker",
+                        "source": "position_manager",
+                    },
+                )
+                updated = _replace_position(updated, target_order_id=None, target_price=target_price)
 
         if (
             deployment.exit.stop_to_breakeven_after_r_multiple is not None
@@ -239,6 +268,9 @@ class ExecutionSupervisor:
                 target_price=updated.target_price,
             )
         return updated
+
+    def _supports_concurrent_exit_orders(self) -> bool:
+        return bool(getattr(self.planner.order_manager, "supports_concurrent_exit_orders", False))
 
     async def handle_exit(
         self,
