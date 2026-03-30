@@ -1,0 +1,47 @@
+deployment_id: market_impulse_spy_short_v1
+enabled: true
+symbol: SPY
+
+strategy:
+  key: market_impulse
+  version: 1
+  params:
+    direction: short
+    entry_buffer_minutes: 3
+    entry_window_minutes: 45
+    regime_timeframe: 1h
+    vma_length: 10
+    market_open_hour: 9
+    market_open_minute: 30
+
+execution:
+  profile: single_leg_long_premium_v1
+  option_mapping:
+    long_signal: CALL
+    short_signal: PUT
+  dte_min: 0
+  dte_max: 7
+  target_abs_delta_min: 0.20
+  target_abs_delta_max: 0.40
+  min_open_interest: 100
+  max_bid_ask_spread_pct: 0.20
+
+risk:
+  profile: conservative_day1
+  max_trade_premium_usd: 300
+  hard_flat_time_et: "15:55"
+  stop_loss_pct: 0.45
+
+exit:
+  profile: market_impulse_exit_v1
+  use_algorithmic_exit: true
+  use_profit_target: false
+  profit_target_multiple: null
+  stop_loss_pct: 0.45
+  stop_to_breakeven_after_r_multiple: null
+  hard_flat_time_et: "15:55"
+
+source:
+  origin: mala
+  run_date: "2026-03-28"
+  artifact: "m5_execution_mapping.csv"

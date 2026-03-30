@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+*.egg-info/
+config/public_session.json
+config/public_account.json
+config/schwab_tokens.json

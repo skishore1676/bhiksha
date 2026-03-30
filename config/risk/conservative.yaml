@@ -1,0 +1,8 @@
+profile: conservative_day1
+max_open_positions_total: 2
+max_open_positions_per_symbol: 1
+max_open_positions_per_deployment: 1
+max_trade_premium_usd: 300
+max_daily_drawdown_pct: 2.0
+hard_flat_time_et: "15:55"
+

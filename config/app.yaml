@@ -1,0 +1,10 @@
+app_name: bhiksha
+timezone: America/New_York
+warmup_trading_days: 2
+dry_run: true
+event_bus: in_memory
+sqlite_path: bhiksha.db
+rolling_bar_capacity: 20000
+bar_poll_interval_seconds: 15
+order_fill_poll_seconds: 2
+order_fill_timeout_seconds: 20

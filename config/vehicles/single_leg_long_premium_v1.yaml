@@ -1,0 +1,10 @@
+profile: single_leg_long_premium_v1
+long_signal_contract_type: CALL
+short_signal_contract_type: PUT
+dte_min: 0
+dte_max: 7
+target_abs_delta_min: 0.20
+target_abs_delta_max: 0.40
+min_open_interest: 100
+max_bid_ask_spread_pct: 0.20
+
