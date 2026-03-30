@@ -3,6 +3,8 @@ import sqlite3
 from datetime import UTC, datetime
 
 from bhiksha.config.models import AppConfig
+from bhiksha.app.event_bus import InMemoryEventBus
+from bhiksha.domain.events import TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import ExitDecision, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import PublicQuote
@@ -126,7 +128,42 @@ def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
     assert supervisor.planner.position_tracker.active_positions()[0].stop_order_id == "STOP123"
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
-    assert [row[0] for row in rows] == ["entry_fill_check", "protective_stop_submission"]
+    assert [row[0] for row in rows] == ["entry_fill_check", "lifecycle_transition", "protective_stop_submission"]
+
+
+def test_execution_supervisor_publishes_lifecycle_transition_event(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    bus = InMemoryEventBus()
+    queue = bus.subscribe(TradeLifecycleTransitionEvent)
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        event_bus=bus,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    async def run():
+        await supervisor._protect_live_entry(plan, deployment)
+        return await queue.get()
+
+    event = asyncio.run(run())
+
+    assert event.deployment_id == deployment.deployment_id
+    assert event.new_state == "open_protected"
 
 
 def test_execution_supervisor_blocks_entry_when_lifecycle_is_active(tmp_path) -> None:
@@ -318,7 +355,12 @@ def test_execution_supervisor_arms_virtual_profit_target_when_broker_supports_si
 
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
-    assert [row[0] for row in rows] == ["entry_fill_check", "profit_target_armed", "protective_stop_submission"]
+    assert [row[0] for row in rows] == [
+        "entry_fill_check",
+        "profit_target_armed",
+        "lifecycle_transition",
+        "protective_stop_submission",
+    ]
 
 
 def test_execution_supervisor_places_profit_target_when_broker_supports_concurrent_exit_orders(tmp_path) -> None:

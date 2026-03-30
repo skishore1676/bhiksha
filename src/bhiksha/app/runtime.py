@@ -104,6 +104,7 @@ class BhikshaRuntime:
         supervisor = ExecutionSupervisor(
             event_repository=SQLiteEventRepository(self.app_config.sqlite_path),
             app_config=self.app_config,
+            event_bus=self.event_bus,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker
@@ -124,7 +125,7 @@ class BhikshaRuntime:
                 orders=portfolio.get("orders", []),
             )
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
-            supervisor.sync_lifecycle()
+            await supervisor.sync_lifecycle()
             output(f"SYNC positions={len(tracker_positions)}")
 
             for symbol in symbols:
@@ -208,7 +209,7 @@ class BhikshaRuntime:
             orders=portfolio.get("orders", []),
         )
         supervisor.planner.position_tracker.replace_positions(tracker_positions)
-        supervisor.sync_lifecycle()
+        await supervisor.sync_lifecycle()
         if tracker_positions:
             joined = ",".join(
                 f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"

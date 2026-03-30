@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from bhiksha.domain.models import Bar, ExitDecision, SignalDecision
 
@@ -23,3 +24,15 @@ class SignalEvaluatedEvent:
 @dataclass(slots=True, frozen=True)
 class ExitEvaluatedEvent:
     decision: ExitDecision
+
+
+@dataclass(slots=True, frozen=True)
+class TradeLifecycleTransitionEvent:
+    symbol: str
+    deployment_id: str
+    timestamp: datetime
+    previous_state: str | None
+    new_state: str
+    option_symbol: str | None = None
+    order_id: str | None = None
+    reason: str | None = None

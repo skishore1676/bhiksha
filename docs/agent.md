@@ -318,3 +318,30 @@ Next steps:
 1. Emit typed lifecycle transition events onto the event bus.
 2. Add session-summary and operator-audit reporting on top of the event stream.
 3. Decide whether to collapse `run_session(...)` into a richer async `start(...)` API or keep the current split.
+
+### 2026-03-30 (Lifecycle Events And Session Summary)
+
+Completed:
+
+- Added typed `TradeLifecycleTransitionEvent` publication on lifecycle state changes.
+- Persisted lifecycle transitions into the SQLite event log as `lifecycle_transition` events.
+- Wired the runtime-owned supervisor to publish those lifecycle events on the shared event bus.
+- Added session-summary helpers in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/ops/summary.py`.
+- Added an operator-facing summary command in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/session_summary.py`.
+- Added tests for lifecycle event publication and session summary aggregation.
+
+Verification:
+
+- `44` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- Session summary currently reads from persisted SQLite events, not directly from a live streaming subscriber.
+- Lifecycle transitions are now typed events, but signal and exit evaluation events are not yet consumed by any reporting pipeline.
+
+Next steps:
+
+1. Decide whether to emit signal and exit evaluation events into the same operator-summary layer.
+2. Add richer per-deployment PnL / broker-action summaries once fill and portfolio snapshots are easier to normalize.
+3. Consider promoting `run_session(...)` into the primary async runtime API and keeping CLI tools as thin wrappers only.

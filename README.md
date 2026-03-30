@@ -68,6 +68,12 @@ Live loop:
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --live
 ```
 
+Session summary:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.session_summary
+```
+
 Tests:
 
 ```bash
