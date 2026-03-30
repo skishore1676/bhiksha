@@ -451,9 +451,8 @@ Open items:
 
 Next steps:
 
-1. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
-2. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
-3. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
+1. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+2. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
 
 ### 2026-03-30 (Shared Enriched Frame Reuse)
 
@@ -477,6 +476,31 @@ Open items:
 
 Next steps:
 
-1. Add queue-depth / heartbeat-lag / execution-latency metrics to the operator summary.
-2. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
-3. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
+1. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+2. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
+
+### 2026-03-30 (Runtime Metrics)
+
+Completed:
+
+- Added runtime metric events for heartbeat lag, portfolio sync latency, feature-prep latency, execution queue depth, execution pending count, execution wait latency, execution run latency, and total per-bar processing time.
+- Extended the per-symbol execution dispatcher with queue-depth and pending-count accessors.
+- Extended the operator session summary so it now reports latest and average runtime metrics.
+- Added summary tests covering runtime metric aggregation.
+
+Verification:
+
+- `55` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- The currently running live tmux session was started before this metrics patch, so the new runtime metrics will not appear in `session_summary` until the next restart.
+- Metrics are persisted as event rows, not yet exposed through a live rolling dashboard or alert threshold system.
+- We still need to decide which latency thresholds should trigger an operator warning.
+
+Next steps:
+
+1. Reduce or compartmentalize broker portfolio sync so reconciliation is less of a shared choke point.
+2. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
+3. Add thresholded warnings or alert markers when heartbeat lag / sync latency / execution latency drift beyond acceptable bounds.

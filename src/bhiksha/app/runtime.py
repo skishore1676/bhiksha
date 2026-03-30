@@ -6,6 +6,7 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import time
 
 import polars as pl
 
@@ -271,12 +272,26 @@ class BhikshaRuntime:
         output: callable,
     ) -> None:
         bar = event.bar
+        processing_started_at = time.perf_counter()
         latest = store.latest(bar.symbol)
         if latest is not None and latest.timestamp >= bar.timestamp:
             return
         store.append(bar)
         output(f"BAR {bar.symbol} {bar.timestamp.isoformat()} close={bar.close}")
 
+        expected_heartbeat_at = bar.timestamp + timedelta(minutes=1, seconds=1)
+        heartbeat_lag_ms = max((datetime.now(UTC) - expected_heartbeat_at).total_seconds() * 1000.0, 0.0)
+        await supervisor.event_repository.append(
+            "runtime_metric",
+            {
+                "metric": "heartbeat_lag_ms",
+                "symbol": bar.symbol,
+                "value": round(heartbeat_lag_ms, 3),
+                "unit": "ms",
+            },
+        )
+
+        sync_started_at = time.perf_counter()
         async with sync_lock:
             portfolio = await broker.get_portfolio()
             open_trades = await supervisor.trade_state_repository.get_open_trades()
@@ -294,17 +309,31 @@ class BhikshaRuntime:
                     for position in tracker_positions
                 )
                 output(f"SYNC positions={joined}")
+        await supervisor.event_repository.append(
+            "runtime_metric",
+            {
+                "metric": "portfolio_sync_ms",
+                "symbol": bar.symbol,
+                "value": round((time.perf_counter() - sync_started_at) * 1000.0, 3),
+                "unit": "ms",
+            },
+        )
 
         hard_flat_enqueued = execution_dispatcher.submit(
             bar.symbol,
             key=f"hard_flat:{bar.symbol}",
-            runner=self._make_hard_flat_runner(
+            runner=self._instrument_execution_runner(
+                supervisor,
+                bar.symbol,
+                action="hard_flat",
+                inner=self._make_hard_flat_runner(
                 supervisor,
                 deployments_by_id,
                 now=bar.timestamp,
                 live=live,
                 symbol=bar.symbol,
                 output=output,
+                ),
             ),
         )
         if hard_flat_enqueued:
@@ -320,7 +349,17 @@ class BhikshaRuntime:
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is not None:
                 deployments_for_bar[deployment.deployment_id] = deployment
+        feature_started_at = time.perf_counter()
         enriched_frames = evaluator.prepare_enriched_frames(frame, list(deployments_for_bar.values()))
+        await supervisor.event_repository.append(
+            "runtime_metric",
+            {
+                "metric": "feature_prep_ms",
+                "symbol": bar.symbol,
+                "value": round((time.perf_counter() - feature_started_at) * 1000.0, 3),
+                "unit": "ms",
+            },
+        )
         for position in list(supervisor.planner.position_tracker.active_positions()):
             if position.symbol != bar.symbol:
                 continue
@@ -330,12 +369,17 @@ class BhikshaRuntime:
             enqueued = execution_dispatcher.submit(
                 bar.symbol,
                 key=f"manage:{deployment.deployment_id}:{position.option_symbol}",
-                runner=self._make_manage_position_runner(
+                runner=self._instrument_execution_runner(
+                    supervisor,
+                    bar.symbol,
+                    action="manage",
+                    inner=self._make_manage_position_runner(
                     supervisor,
                     deployment,
                     position,
                     live=live,
                     output=output,
+                    ),
                 ),
             )
             if enqueued:
@@ -357,13 +401,18 @@ class BhikshaRuntime:
                 enqueued = execution_dispatcher.submit(
                     bar.symbol,
                     key=f"exit:{evaluation.deployment.deployment_id}:{evaluation.position.option_symbol}",
-                    runner=self._make_exit_runner(
+                    runner=self._instrument_execution_runner(
+                        supervisor,
+                        bar.symbol,
+                        action="exit",
+                        inner=self._make_exit_runner(
                         supervisor,
                         evaluation.deployment,
                         evaluation.position,
                         evaluation.decision,
                         live=live,
                         output=output,
+                        ),
                     ),
                 )
                 if enqueued:
@@ -388,16 +437,86 @@ class BhikshaRuntime:
                 enqueued = execution_dispatcher.submit(
                     bar.symbol,
                     key=f"entry:{deployment.deployment_id}",
-                    runner=self._make_entry_runner(
+                    runner=self._instrument_execution_runner(
+                        supervisor,
+                        bar.symbol,
+                        action="entry",
+                        inner=self._make_entry_runner(
                         supervisor,
                         deployment,
                         decision,
                         live=live,
                         output=output,
+                        ),
                     ),
                 )
                 if enqueued:
                     output(f"{deployment.deployment_id}: entry_enqueued")
+        await supervisor.event_repository.append(
+            "runtime_metric",
+            {
+                "metric": "execution_queue_depth",
+                "symbol": bar.symbol,
+                "value": execution_dispatcher.queue_depth(bar.symbol),
+                "unit": "count",
+            },
+        )
+        await supervisor.event_repository.append(
+            "runtime_metric",
+            {
+                "metric": "execution_pending_count",
+                "symbol": bar.symbol,
+                "value": execution_dispatcher.pending_count(bar.symbol),
+                "unit": "count",
+            },
+        )
+        await supervisor.event_repository.append(
+            "runtime_metric",
+            {
+                "metric": "processing_ms",
+                "symbol": bar.symbol,
+                "value": round((time.perf_counter() - processing_started_at) * 1000.0, 3),
+                "unit": "ms",
+            },
+        )
+
+    def _instrument_execution_runner(
+        self,
+        supervisor: ExecutionSupervisor,
+        symbol: str,
+        *,
+        action: str,
+        inner,
+    ):
+        queued_at = time.perf_counter()
+
+        async def runner() -> None:
+            started_at = time.perf_counter()
+            await supervisor.event_repository.append(
+                "runtime_metric",
+                {
+                    "metric": "execution_wait_ms",
+                    "symbol": symbol,
+                    "action": action,
+                    "value": round((started_at - queued_at) * 1000.0, 3),
+                    "unit": "ms",
+                },
+            )
+            try:
+                await inner()
+            finally:
+                await supervisor.event_repository.append(
+                    "runtime_metric",
+                    {
+                        "metric": "execution_run_ms",
+                        "symbol": symbol,
+                        "action": action,
+                        "value": round((time.perf_counter() - started_at) * 1000.0, 3),
+                        "unit": "ms",
+                    },
+                )
+
+        return runner
 
     def _make_entry_runner(
         self,

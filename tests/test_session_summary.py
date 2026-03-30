@@ -71,3 +71,46 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
     assert summary.recent_events[-1].detail == "pending_entry->open_protected (entry_filled_open_protected)"
     assert summary.recent_events[2].detail == "signal=True direction=short reasons=time_window_ok"
     assert summary.recent_events[3].detail == "exit=True action=square_off reasons=vma_reclaim_exit"
+
+
+def test_session_summary_aggregates_runtime_metrics(tmp_path) -> None:
+    db_path = tmp_path / "events.db"
+    repo = SQLiteEventRepository(str(db_path))
+
+    async def seed():
+        await repo.append(
+            "runtime_metric",
+            {
+                "metric": "heartbeat_lag_ms",
+                "symbol": "QQQ",
+                "value": 120.0,
+                "unit": "ms",
+            },
+        )
+        await repo.append(
+            "runtime_metric",
+            {
+                "metric": "heartbeat_lag_ms",
+                "symbol": "QQQ",
+                "value": 180.0,
+                "unit": "ms",
+            },
+        )
+        await repo.append(
+            "runtime_metric",
+            {
+                "metric": "execution_run_ms",
+                "symbol": "QQQ",
+                "action": "manage",
+                "value": 45.5,
+                "unit": "ms",
+            },
+        )
+
+    asyncio.run(seed())
+
+    summary = build_session_summary(str(db_path), recent_limit=3)
+
+    assert summary.runtime_metric_latest["heartbeat_lag_ms:QQQ"] == 180.0
+    assert summary.runtime_metric_average["heartbeat_lag_ms:QQQ"] == 150.0
+    assert summary.runtime_metric_latest["execution_run_ms:QQQ:manage"] == 45.5

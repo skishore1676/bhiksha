@@ -25,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
     print("LIFECYCLE_LAST=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.lifecycle_last_state.items())))
     print("SIGNAL_TRUE_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.signal_true_counts.items())))
     print("EXIT_TRUE_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.exit_true_counts.items())))
+    print("RUNTIME_METRIC_LATEST=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.runtime_metric_latest.items())))
+    print("RUNTIME_METRIC_AVG=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.runtime_metric_average.items())))
     for event in summary.recent_events:
         print(
             "RECENT="

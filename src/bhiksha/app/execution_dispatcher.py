@@ -57,6 +57,13 @@ class SymbolExecutionDispatcher:
         queue.put_nowait(ExecutionTask(symbol=symbol, key=key, runner=runner))
         return True
 
+    def queue_depth(self, symbol: str) -> int:
+        queue = self._queues.get(symbol)
+        return queue.qsize() if queue is not None else 0
+
+    def pending_count(self, symbol: str) -> int:
+        return len(self._pending_keys.get(symbol, set()))
+
     async def _worker(self, symbol: str, queue: asyncio.Queue[ExecutionTask | None]) -> None:
         while True:
             task = await queue.get()
