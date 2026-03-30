@@ -51,6 +51,10 @@ class PublicQuote:
     def entry_reference_price(self) -> float | None:
         return self.ask or self.last or self.bid
 
+    @property
+    def exit_reference_price(self) -> float | None:
+        return self.bid or self.last or self.ask
+
 
 @dataclass(slots=True)
 class PreflightCheck:

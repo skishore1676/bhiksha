@@ -84,19 +84,39 @@ class ExecutionSupervisor:
             return plan
 
         stop_price = plan.estimated_entry_price * (1.0 - deployment.exit.stop_loss_pct)
-        stop_result = await self.planner.order_manager.place_stop_loss_order(
-            plan.option_symbol,
-            stop_price,
-            plan.quantity,
-        )
+        stop_result = await self.planner.order_manager.place_stop_loss_order(plan.option_symbol, stop_price, plan.quantity)
+        target_order_id = None
+        target_price = None
+        if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None:
+            target_price = _target_price(plan.estimated_entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
+            target_result = await self.planner.order_manager.place_target_order(
+                plan.option_symbol,
+                target_price,
+                plan.quantity,
+            )
+            target_order_id = target_result.order_id
+            await self.event_repository.append(
+                "profit_target_submission",
+                {
+                    "deployment_id": plan.deployment_id,
+                    "entry_order_id": plan.order_id,
+                    "target_order_id": target_result.order_id,
+                    "target_error": target_result.error,
+                    "target_price": target_price,
+                },
+            )
         self.planner.position_tracker.open_position(
             deployment.symbol,
             deployment.deployment_id,
             option_symbol=plan.option_symbol,
             quantity=plan.quantity,
+            entry_price=plan.estimated_entry_price,
             source="live_open",
             order_id=plan.order_id,
             stop_order_id=stop_result.order_id,
+            stop_price=stop_price,
+            target_order_id=target_order_id,
+            target_price=target_price,
         )
         await self.event_repository.append(
             "protective_stop_submission",
@@ -108,7 +128,117 @@ class ExecutionSupervisor:
                 "stop_price": stop_price,
             },
         )
-        return replace(plan, stop_order_id=stop_result.order_id)
+        return replace(plan, stop_order_id=stop_result.order_id, target_order_id=target_order_id)
+
+    async def manage_open_position(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        dry_run: bool,
+    ) -> TrackedPosition | None:
+        if position.option_symbol is None or position.quantity <= 0:
+            return None
+        if position.entry_price is None:
+            return None
+
+        updated = position
+        if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None and position.target_order_id is None:
+            target_price = _target_price(position.entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
+            target_order_id = "DRY_RUN_TARGET"
+            target_error = None
+            if not dry_run:
+                result = await self.planner.order_manager.place_target_order(position.option_symbol, target_price, position.quantity)
+                target_order_id = result.order_id
+                target_error = result.error
+            await self.event_repository.append(
+                "profit_target_submission",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "target_order_id": target_order_id,
+                    "target_error": target_error,
+                    "target_price": target_price,
+                    "source": "position_manager",
+                },
+            )
+            updated = _replace_position(updated, target_order_id=target_order_id, target_price=target_price)
+
+        if (
+            deployment.exit.stop_to_breakeven_after_r_multiple is not None
+            and (updated.stop_price is None or updated.stop_price + 1e-9 < updated.entry_price)
+        ):
+            quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
+            reference_price = quote.exit_reference_price
+            trigger_price = _target_price(
+                updated.entry_price,
+                deployment.exit.stop_loss_pct,
+                deployment.exit.stop_to_breakeven_after_r_multiple,
+            )
+            if reference_price is not None and reference_price >= trigger_price:
+                canceled_stop_order_id = updated.stop_order_id
+                cancel_error = None
+                if updated.stop_order_id and not dry_run:
+                    canceled, cancel_error = await self.planner.order_manager.cancel_order(updated.stop_order_id)
+                    if not canceled:
+                        await self.event_repository.append(
+                            "protection_cancel_attempt",
+                            {
+                                "deployment_id": deployment.deployment_id,
+                                "symbol": updated.symbol,
+                                "option_symbol": updated.option_symbol,
+                                "stop_order_id": updated.stop_order_id,
+                                "canceled": canceled,
+                                "error": cancel_error,
+                            },
+                        )
+                        return updated
+                new_stop_order_id = "DRY_RUN_BREAKEVEN_STOP"
+                new_stop_error = cancel_error
+                if not dry_run:
+                    result = await self.planner.order_manager.place_stop_loss_order(
+                        updated.option_symbol,
+                        updated.entry_price,
+                        updated.quantity,
+                    )
+                    new_stop_order_id = result.order_id
+                    new_stop_error = result.error
+                await self.event_repository.append(
+                    "breakeven_stop_promotion",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": updated.symbol,
+                        "option_symbol": updated.option_symbol,
+                        "reference_price": reference_price,
+                        "trigger_price": trigger_price,
+                        "canceled_stop_order_id": canceled_stop_order_id,
+                        "new_stop_order_id": new_stop_order_id,
+                        "new_stop_error": new_stop_error,
+                        "new_stop_price": updated.entry_price,
+                    },
+                )
+                updated = _replace_position(
+                    updated,
+                    stop_order_id=new_stop_order_id,
+                    stop_price=updated.entry_price,
+                )
+
+        if updated != position:
+            self.planner.position_tracker.open_position(
+                updated.symbol,
+                updated.deployment_id,
+                option_symbol=updated.option_symbol,
+                quantity=updated.quantity,
+                entry_price=updated.entry_price,
+                source=updated.source,
+                order_id=updated.order_id,
+                stop_order_id=updated.stop_order_id,
+                stop_price=updated.stop_price,
+                target_order_id=updated.target_order_id,
+                target_price=updated.target_price,
+            )
+        return updated
 
     async def handle_exit(
         self,
@@ -136,6 +266,7 @@ class ExecutionSupervisor:
             return None
 
         canceled_stop_order_id = None
+        canceled_target_order_id = None
         cancel_error = None
         if decision.cancel_protection_orders and position.stop_order_id:
             canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
@@ -152,6 +283,23 @@ class ExecutionSupervisor:
                     "error": cancel_error,
                 },
             )
+        if decision.cancel_protection_orders and position.target_order_id:
+            canceled, target_cancel_error = await self.planner.order_manager.cancel_order(position.target_order_id)
+            if canceled:
+                canceled_target_order_id = position.target_order_id
+            if cancel_error is None:
+                cancel_error = target_cancel_error
+            await self.event_repository.append(
+                "target_cancel_attempt",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "target_order_id": position.target_order_id,
+                    "canceled": canceled,
+                    "error": target_cancel_error,
+                },
+            )
 
         if decision.action != "square_off":
             return ExitPlan(
@@ -163,6 +311,7 @@ class ExecutionSupervisor:
                 reasons=decision.reason,
                 dry_run=dry_run,
                 canceled_stop_order_id=canceled_stop_order_id,
+                canceled_target_order_id=canceled_target_order_id,
                 error=f"unsupported_exit_action:{decision.action}",
             )
 
@@ -193,6 +342,7 @@ class ExecutionSupervisor:
                     reasons=decision.reason,
                     dry_run=False,
                     canceled_stop_order_id=canceled_stop_order_id,
+                    canceled_target_order_id=canceled_target_order_id,
                     error=error,
                 )
 
@@ -211,6 +361,7 @@ class ExecutionSupervisor:
             dry_run=dry_run,
             order_id=order_id,
             canceled_stop_order_id=canceled_stop_order_id,
+            canceled_target_order_id=canceled_target_order_id,
             error=error,
         )
         await self.event_repository.append("exit_plan", asdict(plan))
@@ -245,6 +396,19 @@ class ExecutionSupervisor:
                             "symbol": position.symbol,
                             "option_symbol": position.option_symbol,
                             "stop_order_id": position.stop_order_id,
+                            "canceled": canceled,
+                            "error": cancel_error,
+                        },
+                    )
+                if position.target_order_id:
+                    canceled, cancel_error = await self.planner.order_manager.cancel_order(position.target_order_id)
+                    await self.event_repository.append(
+                        "target_cancel_attempt",
+                        {
+                            "deployment_id": position.deployment_id,
+                            "symbol": position.symbol,
+                            "option_symbol": position.option_symbol,
+                            "target_order_id": position.target_order_id,
                             "canceled": canceled,
                             "error": cancel_error,
                         },
@@ -302,3 +466,11 @@ class ExecutionSupervisor:
 def _parse_et_time(value: str) -> time:
     hour, minute = value.split(":", 1)
     return time(int(hour), int(minute))
+
+
+def _target_price(entry_price: float, stop_loss_pct: float, r_multiple: float) -> float:
+    return entry_price * (1.0 + stop_loss_pct * r_multiple)
+
+
+def _replace_position(position: TrackedPosition, **changes) -> TrackedPosition:
+    return replace(position, **changes)

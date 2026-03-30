@@ -58,3 +58,39 @@ def test_reconcile_public_positions_attaches_open_stop_order() -> None:
 
     assert len(tracked) == 1
     assert tracked[0].stop_order_id == "STOP123"
+
+
+def test_reconcile_public_positions_attaches_entry_and_target_metadata() -> None:
+    deployments = load_deployments("config/deployments")
+    positions = [
+        {
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "quantity": "1.0",
+            "costBasis": {
+                "unitCost": "2.73",
+            },
+        }
+    ]
+    orders = [
+        {
+            "orderId": "TARGET123",
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "type": "LIMIT",
+            "side": "SELL",
+            "status": "NEW",
+            "limitPrice": "3.35",
+        }
+    ]
+
+    tracked = reconcile_public_positions(positions, deployments, orders=orders)
+
+    assert len(tracked) == 1
+    assert tracked[0].entry_price == 2.73
+    assert tracked[0].target_order_id == "TARGET123"
+    assert tracked[0].target_price == 3.35

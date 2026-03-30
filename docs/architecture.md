@@ -835,8 +835,8 @@ Before live trading, Bhiksha should support:
 
 ## Immediate Next Build Steps
 
-1. Add a dedicated `exit` spec to deployment manifests and typed config models.
-2. Split strategy plugins into `evaluate_entry(...)` and `evaluate_exit(...)`.
-3. Build `PositionMonitor`, `ExitPlanner`, and `ProtectionManager` as separate runtime services.
-4. Add broker-safe cancellation and replace flows for stop and target orders.
-5. Add replay and live tests for VMA reclaim exits, hard-flat exits, and restart recovery with an open position.
+1. Decide the Day 1 deployment policy for `use_profit_target` and `stop_to_breakeven_after_r_multiple` in the active manifests.
+2. Add replay cases for target hits, breakeven promotions, and restart recovery with both stop and target orders already live.
+3. Harden cancel/replace flows when a target partially fills or a stop promotion races with a broker-side state change.
+4. Add operator-facing session summaries and post-run reconciliation diagnostics.
+5. Extend the same lifecycle contract to the next non-Market-Impulse strategy plugin.

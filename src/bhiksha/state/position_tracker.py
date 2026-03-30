@@ -12,9 +12,13 @@ class TrackedPosition:
     deployment_id: str
     option_symbol: str | None = None
     quantity: int = 0
+    entry_price: float | None = None
     source: str = "runtime"
     order_id: str | None = None
     stop_order_id: str | None = None
+    stop_price: float | None = None
+    target_order_id: str | None = None
+    target_price: float | None = None
 
 
 class PositionTracker:
@@ -49,9 +53,13 @@ class PositionTracker:
         *,
         option_symbol: str | None = None,
         quantity: int = 0,
+        entry_price: float | None = None,
         source: str = "runtime",
         order_id: str | None = None,
         stop_order_id: str | None = None,
+        stop_price: float | None = None,
+        target_order_id: str | None = None,
+        target_price: float | None = None,
     ) -> None:
         for existing in self._positions:
             if (
@@ -60,9 +68,13 @@ class PositionTracker:
                 and existing.option_symbol == option_symbol
             ):
                 existing.quantity = quantity
+                existing.entry_price = entry_price
                 existing.source = source
                 existing.order_id = order_id
                 existing.stop_order_id = stop_order_id
+                existing.stop_price = stop_price
+                existing.target_order_id = target_order_id
+                existing.target_price = target_price
                 self._rebuild_counters()
                 return
 
@@ -72,9 +84,13 @@ class PositionTracker:
                 deployment_id=deployment_id,
                 option_symbol=option_symbol,
                 quantity=quantity,
+                entry_price=entry_price,
                 source=source,
                 order_id=order_id,
                 stop_order_id=stop_order_id,
+                stop_price=stop_price,
+                target_order_id=target_order_id,
+                target_price=target_price,
             )
         )
         self._rebuild_counters()

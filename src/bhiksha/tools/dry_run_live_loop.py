@@ -115,6 +115,23 @@ async def _run(max_bars: int | None, live: bool) -> None:
             for plan in closed:
                 print(f"HARD_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")
             frame = _frame_from_bars(bar.symbol, store.get(bar.symbol))
+            for position in list(supervisor.planner.position_tracker.active_positions()):
+                if position.symbol != bar.symbol:
+                    continue
+                deployment = deployments_by_id.get(position.deployment_id)
+                if deployment is None:
+                    continue
+                managed = await supervisor.manage_open_position(
+                    deployment,
+                    position,
+                    dry_run=not live,
+                )
+                if managed is not None and managed != position:
+                    print(
+                        f"{deployment.deployment_id}: position_managed "
+                        f"stop={managed.stop_order_id}@{managed.stop_price} "
+                        f"target={managed.target_order_id}@{managed.target_price}"
+                    )
             exited_deployments: set[str] = set()
             exit_evaluations = position_monitor.evaluate_symbol(bar.symbol, frame, deployments_by_id)
             for evaluation in exit_evaluations:

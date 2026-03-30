@@ -56,6 +56,7 @@ class ExitPlan:
     dry_run: bool = True
     order_id: str | None = None
     canceled_stop_order_id: str | None = None
+    canceled_target_order_id: str | None = None
     error: str | None = None
 
 
@@ -127,3 +128,4 @@ class TradePlan:
     dry_run: bool = True
     order_id: str | None = None
     stop_order_id: str | None = None
+    target_order_id: str | None = None

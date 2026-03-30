@@ -150,3 +150,30 @@ Next steps:
 1. Restart the runtime when ready to pick up the new exit-monitoring code.
 2. Implement target-order and profit-lock policies behind the new `exit` config.
 3. Add replay tests that validate full entry-to-exit parity for Market Impulse.
+
+### 2026-03-30 (Target And Breakeven Build)
+
+Completed:
+
+- Extended the execution supervisor to place optional profit-target orders after live fills when enabled by deployment config.
+- Added position metadata for entry price, stop price, target price, and target order ID so open positions can be managed coherently after restart.
+- Extended broker reconciliation to recover both stop and target protection orders from Public broker state.
+- Added open-position maintenance logic to promote the catastrophe stop to breakeven after a configured `R` threshold.
+- Updated the live loop to maintain open positions before evaluating new exits or entries on each completed bar.
+- Added tests for profit-target placement, breakeven stop promotion, and target-order recovery.
+
+Verification:
+
+- `28` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- Profit-target fills are recoverable through reconciliation, but target cancel/replace policies are still basic.
+- Replay coverage still focuses on entry and strategy exits; full entry-to-target lifecycle parity is still a next step.
+
+Next steps:
+
+1. Decide whether Market Impulse should enable `use_profit_target` in the active deployment manifests or stay stop-plus-algorithmic-exit only.
+2. Add replay cases for target hits, breakeven promotions, and mixed broker-restart recovery.
+3. Add session-summary tooling so operator review is easier after a live run.
