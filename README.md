@@ -74,6 +74,14 @@ Session summary:
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.session_summary
 ```
 
+This now reports:
+
+- total event counts
+- per-deployment event counts
+- latest lifecycle state per deployment
+- counts of `signal=True` and `exit=True` decisions
+- recent event details for lifecycle, signal, and exit decisions
+
 Tests:
 
 ```bash

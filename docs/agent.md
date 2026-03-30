@@ -345,3 +345,29 @@ Next steps:
 1. Decide whether to emit signal and exit evaluation events into the same operator-summary layer.
 2. Add richer per-deployment PnL / broker-action summaries once fill and portfolio snapshots are easier to normalize.
 3. Consider promoting `run_session(...)` into the primary async runtime API and keeping CLI tools as thin wrappers only.
+
+### 2026-03-30 (Signal And Exit Reporting Extension)
+
+Completed:
+
+- Published typed `SignalEvaluatedEvent` and `ExitEvaluatedEvent` events on the runtime event bus.
+- Changed signal handling so signal evaluations are persisted even when lifecycle gating blocks entry.
+- Extended the session summary to count positive signal evaluations and positive exit evaluations by deployment.
+- Added richer recent-event details for `signal_decision` and `exit_decision` rows.
+- Added tests for signal-event publication, exit-event publication, and signal/exit-aware session summaries.
+
+Verification:
+
+- `46` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- The session summary still focuses on decisions and lifecycle, not realized/unrealized PnL.
+- Event-bus subscribers are still internal only; there is no external observer or dashboard process yet.
+
+Next steps:
+
+1. Add per-deployment broker-action summaries such as stop submissions, target activations, and square-offs.
+2. Add optional fill and portfolio snapshots so session summaries can speak to realized outcomes, not just decisions.
+3. Consider a lightweight TUI or HTML status page on top of the same summary/event model.

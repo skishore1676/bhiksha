@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 from bhiksha.config.models import AppConfig
 from bhiksha.app.event_bus import InMemoryEventBus
-from bhiksha.domain.events import TradeLifecycleTransitionEvent
+from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import ExitDecision, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import PublicQuote
@@ -166,6 +166,92 @@ def test_execution_supervisor_publishes_lifecycle_transition_event(tmp_path) -> 
     assert event.new_state == "open_protected"
 
 
+def test_execution_supervisor_publishes_signal_event_even_when_lifecycle_blocks(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    bus = InMemoryEventBus()
+    queue = bus.subscribe(SignalEvaluatedEvent)
+    lifecycle_store = TradeLifecycleStore()
+    lifecycle_store.begin_entry(
+        "QQQ",
+        "market_impulse_qqq_short_v1",
+        option_symbol="QQQ260330P00558000",
+        order_id="ENTRY123",
+    )
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        lifecycle_store=lifecycle_store,
+        event_bus=bus,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+    )
+
+    async def run():
+        plan = await supervisor.handle_signal(deployment, decision, dry_run=False)
+        event = await queue.get()
+        return plan, event
+
+    plan, event = asyncio.run(run())
+
+    assert plan is None
+    assert event.decision.deployment_id == deployment.deployment_id
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
+    assert [row[0] for row in rows] == ["signal_decision", "lifecycle_entry_blocked"]
+
+
+def test_execution_supervisor_publishes_exit_event(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    bus = InMemoryEventBus()
+    queue = bus.subscribe(ExitEvaluatedEvent)
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        event_bus=bus,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        source="broker_sync",
+        stop_order_id="STOP123",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=False,
+        action="hold",
+        reason=["regime_still_bearish"],
+    )
+
+    async def run():
+        plan = await supervisor.handle_exit(deployment, position, decision, dry_run=False)
+        event = await queue.get()
+        return plan, event
+
+    plan, event = asyncio.run(run())
+
+    assert plan is None
+    assert event.decision.reason == ["regime_still_bearish"]
+
+
 def test_execution_supervisor_blocks_entry_when_lifecycle_is_active(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     lifecycle_store = TradeLifecycleStore()
@@ -198,7 +284,7 @@ def test_execution_supervisor_blocks_entry_when_lifecycle_is_active(tmp_path) ->
     assert plan is None
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
-    assert [row[0] for row in rows] == ["lifecycle_entry_blocked"]
+    assert [row[0] for row in rows] == ["signal_decision", "lifecycle_entry_blocked"]
 
 
 def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:

@@ -28,6 +28,26 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
             },
         )
         await repo.append(
+            "signal_decision",
+            {
+                "deployment_id": "market_impulse_qqq_short_v1",
+                "symbol": "QQQ",
+                "signal": True,
+                "direction": "short",
+                "reason": ["time_window_ok"],
+            },
+        )
+        await repo.append(
+            "exit_decision",
+            {
+                "deployment_id": "market_impulse_qqq_short_v1",
+                "symbol": "QQQ",
+                "exit": True,
+                "action": "square_off",
+                "reason": ["vma_reclaim_exit"],
+            },
+        )
+        await repo.append(
             "lifecycle_transition",
             {
                 "deployment_id": "market_impulse_qqq_short_v1",
@@ -42,8 +62,12 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
 
     summary = build_session_summary(str(db_path), recent_limit=5)
 
-    assert summary.total_events == 3
+    assert summary.total_events == 5
     assert summary.event_type_counts["lifecycle_transition"] == 2
-    assert summary.deployment_event_counts["market_impulse_qqq_short_v1"] == 3
+    assert summary.deployment_event_counts["market_impulse_qqq_short_v1"] == 5
+    assert summary.signal_true_counts["market_impulse_qqq_short_v1"] == 1
+    assert summary.exit_true_counts["market_impulse_qqq_short_v1"] == 1
     assert summary.lifecycle_last_state["market_impulse_qqq_short_v1"] == "open_protected"
     assert summary.recent_events[-1].detail == "pending_entry->open_protected (entry_filled_open_protected)"
+    assert summary.recent_events[2].detail == "signal=True direction=short reasons=time_window_ok"
+    assert summary.recent_events[3].detail == "exit=True action=square_off reasons=vma_reclaim_exit"

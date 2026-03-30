@@ -23,6 +23,8 @@ def main(argv: list[str] | None = None) -> int:
     print("EVENT_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.event_type_counts.items())))
     print("DEPLOYMENT_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.deployment_event_counts.items())))
     print("LIFECYCLE_LAST=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.lifecycle_last_state.items())))
+    print("SIGNAL_TRUE_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.signal_true_counts.items())))
+    print("EXIT_TRUE_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.exit_true_counts.items())))
     for event in summary.recent_events:
         print(
             "RECENT="

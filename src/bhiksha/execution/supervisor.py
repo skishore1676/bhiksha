@@ -10,7 +10,7 @@ from datetime import UTC
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.config.models import AppConfig
 from bhiksha.config.models import DeploymentManifest
-from bhiksha.domain.events import TradeLifecycleTransitionEvent
+from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan
 from bhiksha.execution.planner import ExecutionPlanner
@@ -47,17 +47,6 @@ class ExecutionSupervisor:
         *,
         dry_run: bool,
         ) -> TradePlan | None:
-        lifecycle = self.lifecycle_store.get(deployment.symbol, deployment.deployment_id)
-        if not self.lifecycle_store.can_submit_entry(deployment.symbol, deployment.deployment_id):
-            await self.event_repository.append(
-                "lifecycle_entry_blocked",
-                {
-                    "deployment_id": deployment.deployment_id,
-                    "symbol": deployment.symbol,
-                    "state": lifecycle.state.value if lifecycle else None,
-                },
-            )
-            return None
         await self.event_repository.append(
             "signal_decision",
             {
@@ -70,6 +59,19 @@ class ExecutionSupervisor:
                 "features": decision.features,
             },
         )
+        if self.event_bus is not None:
+            await self.event_bus.publish(SignalEvaluatedEvent(decision=decision))
+        lifecycle = self.lifecycle_store.get(deployment.symbol, deployment.deployment_id)
+        if not self.lifecycle_store.can_submit_entry(deployment.symbol, deployment.deployment_id):
+            await self.event_repository.append(
+                "lifecycle_entry_blocked",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": deployment.symbol,
+                    "state": lifecycle.state.value if lifecycle else None,
+                },
+            )
+            return None
         plan = await self.planner.plan_entry(deployment, decision, dry_run=dry_run)
         if plan is not None:
             if plan.order_id:
@@ -508,6 +510,8 @@ class ExecutionSupervisor:
                 "quantity": position.quantity,
             },
         )
+        if self.event_bus is not None:
+            await self.event_bus.publish(ExitEvaluatedEvent(decision=decision))
         if not decision.exit or decision.action == "hold" or position.option_symbol is None or position.quantity <= 0:
             return None
         transition = self.lifecycle_store.mark_exit_pending(
