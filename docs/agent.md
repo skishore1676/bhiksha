@@ -232,3 +232,31 @@ Next steps:
 1. Decide whether to enable the new target orchestration for any deployment or keep Day 1 as stop-plus-algorithmic-exit only.
 2. Add replay coverage for target activation, target fill, pullback restore, and restart recovery with a target already live.
 3. Harden reconciliation so recently submitted virtual-target transitions survive broker reporting lag more gracefully.
+
+### 2026-03-30 (Virtual Target Replay Coverage)
+
+Completed:
+
+- Added deterministic lifecycle replay tests for Public virtual-target behavior.
+- Covered the bar-by-bar sequence of:
+  preserve stop before target approach,
+  activate target as price approaches,
+  restore stop after pullback,
+  and restart recovery when a live target is already on the broker.
+- Verified that a reconciled target order does not get duplicated after restart.
+
+Verification:
+
+- `35` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- Target-fill replay is still indirect because the broker fill itself remains mocked at the order-manager boundary.
+- Production manifests still keep virtual-target orchestration disabled until we explicitly choose to enable it.
+
+Next steps:
+
+1. Decide whether to enable the new target policy for `QQQ`, `SPY`, or neither.
+2. If enabling, start with one deployment and conservative quantities.
+3. Add a session-summary/report command so live runs make target/stop transitions easier to audit.
