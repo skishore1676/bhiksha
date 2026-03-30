@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import defaultdict
 from dataclasses import asdict
 from dataclasses import replace
 from datetime import datetime, time
@@ -36,6 +38,8 @@ class ExecutionSupervisor:
         self.app_config = app_config or AppConfig()
         self.lifecycle_store = lifecycle_store or TradeLifecycleStore()
         self.event_bus = event_bus
+        self._entry_lock = asyncio.Lock()
+        self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     async def close(self) -> None:
         await self.planner.close()
@@ -61,40 +65,41 @@ class ExecutionSupervisor:
         )
         if self.event_bus is not None:
             await self.event_bus.publish(SignalEvaluatedEvent(decision=decision))
-        lifecycle = self.lifecycle_store.get(deployment.symbol, deployment.deployment_id)
-        if not self.lifecycle_store.can_submit_entry(deployment.symbol, deployment.deployment_id):
-            await self.event_repository.append(
-                "lifecycle_entry_blocked",
-                {
-                    "deployment_id": deployment.deployment_id,
-                    "symbol": deployment.symbol,
-                    "state": lifecycle.state.value if lifecycle else None,
-                },
-            )
-            return None
-        plan = await self.planner.plan_entry(deployment, decision, dry_run=dry_run)
-        if plan is not None:
-            if plan.order_id:
-                transition = self.lifecycle_store.begin_entry(
-                    deployment.symbol,
-                    deployment.deployment_id,
-                    option_symbol=plan.option_symbol,
-                    order_id=plan.order_id,
+        async with self._entry_lock:
+            lifecycle = self.lifecycle_store.get(deployment.symbol, deployment.deployment_id)
+            if not self.lifecycle_store.can_submit_entry(deployment.symbol, deployment.deployment_id):
+                await self.event_repository.append(
+                    "lifecycle_entry_blocked",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": deployment.symbol,
+                        "state": lifecycle.state.value if lifecycle else None,
+                    },
                 )
-                await self._emit_lifecycle_transition(transition, reason="entry_submitted")
-            if not dry_run and plan.order_id:
-                plan = await self._protect_live_entry(plan, deployment)
-            elif dry_run and plan.order_id:
-                transition = self.lifecycle_store.mark_open(
-                    deployment.symbol,
-                    deployment.deployment_id,
-                    option_symbol=plan.option_symbol,
-                    order_id=plan.order_id,
-                    protected=False,
-                )
-                await self._emit_lifecycle_transition(transition, reason="dry_run_entry_open")
-            await self.event_repository.append("trade_plan", asdict(plan))
-        return plan
+                return None
+            plan = await self.planner.plan_entry(deployment, decision, dry_run=dry_run)
+            if plan is not None:
+                if plan.order_id:
+                    transition = self.lifecycle_store.begin_entry(
+                        deployment.symbol,
+                        deployment.deployment_id,
+                        option_symbol=plan.option_symbol,
+                        order_id=plan.order_id,
+                    )
+                    await self._emit_lifecycle_transition(transition, reason="entry_submitted")
+                if not dry_run and plan.order_id:
+                    plan = await self._protect_live_entry(plan, deployment)
+                elif dry_run and plan.order_id:
+                    transition = self.lifecycle_store.mark_open(
+                        deployment.symbol,
+                        deployment.deployment_id,
+                        option_symbol=plan.option_symbol,
+                        order_id=plan.order_id,
+                        protected=False,
+                    )
+                    await self._emit_lifecycle_transition(transition, reason="dry_run_entry_open")
+                await self.event_repository.append("trade_plan", asdict(plan))
+            return plan
 
     async def _protect_live_entry(self, plan: TradePlan, deployment: DeploymentManifest) -> TradePlan:
         filled, payload, error = await self.planner.order_manager.wait_for_fill(
@@ -201,6 +206,16 @@ class ExecutionSupervisor:
         return replace(plan, stop_order_id=stop_result.order_id, target_order_id=target_order_id)
 
     async def manage_open_position(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        dry_run: bool,
+    ) -> TrackedPosition | None:
+        async with self._symbol_locks[position.symbol]:
+            return await self._manage_open_position_locked(deployment, position, dry_run=dry_run)
+
+    async def _manage_open_position_locked(
         self,
         deployment: DeploymentManifest,
         position: TrackedPosition,
@@ -496,6 +511,17 @@ class ExecutionSupervisor:
         *,
         dry_run: bool,
     ) -> ExitPlan | None:
+        async with self._symbol_locks[position.symbol]:
+            return await self._handle_exit_locked(deployment, position, decision, dry_run=dry_run)
+
+    async def _handle_exit_locked(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        decision: ExitDecision,
+        *,
+        dry_run: bool,
+    ) -> ExitPlan | None:
         await self.event_repository.append(
             "exit_decision",
             {
@@ -632,10 +658,13 @@ class ExecutionSupervisor:
         *,
         now: datetime,
         dry_run: bool,
+        symbol: str | None = None,
     ) -> list[TradePlan]:
         closed: list[TradePlan] = []
         now_et = as_et_time(now)
         for position in self.planner.position_tracker.active_positions():
+            if symbol is not None and position.symbol != symbol:
+                continue
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None or position.option_symbol is None or position.quantity <= 0:
                 continue

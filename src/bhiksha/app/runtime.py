@@ -11,6 +11,7 @@ import polars as pl
 
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.app.replay import ReplaySignalEvaluator
+from bhiksha.app.token_daemon import PublicTokenRefreshDaemon, SchwabTokenRefreshDaemon
 from bhiksha.config.models import AppConfig, DeploymentManifest, ProviderConfig
 from bhiksha.domain.events import BarClosedEvent
 from bhiksha.domain.models import Bar
@@ -109,6 +110,8 @@ class BhikshaRuntime:
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker
         source = self._live_bar_source()
+        public_token_daemon = PublicTokenRefreshDaemon()
+        schwab_token_daemon = SchwabTokenRefreshDaemon()
         daemon = DataIngestionDaemon(
             source,
             self.event_bus,
@@ -116,6 +119,27 @@ class BhikshaRuntime:
             provider=self.provider_config.underlying_live_primary,
         )
         queue = self.event_bus.subscribe(BarClosedEvent)
+        sync_lock = asyncio.Lock()
+        symbol_queues = {symbol: asyncio.Queue() for symbol in symbols}
+        symbol_tasks = [
+            asyncio.create_task(
+                self._symbol_worker(
+                    symbol,
+                    symbol_queues[symbol],
+                    sync_lock=sync_lock,
+                    live=live,
+                    store=store,
+                    broker=broker,
+                    supervisor=supervisor,
+                    position_monitor=position_monitor,
+                    evaluator=evaluator,
+                    deployments_by_symbol=deployments_by_symbol,
+                    deployments_by_id=deployments_by_id,
+                    output=output,
+                )
+            )
+            for symbol in symbols
+        ]
 
         try:
             portfolio = await broker.get_portfolio()
@@ -138,6 +162,8 @@ class BhikshaRuntime:
                 return
 
             output("Waiting for newly closed 1-minute bars...")
+            public_token_task = asyncio.create_task(public_token_daemon.run())
+            schwab_token_task = asyncio.create_task(schwab_token_daemon.run())
             daemon_task = asyncio.create_task(daemon.run(max_bars=max_bars))
             seen = 0
             while True:
@@ -149,29 +175,65 @@ class BhikshaRuntime:
                     if daemon_task.done():
                         break
                     continue
-                await self._handle_bar_event(
-                    event,
-                    live=live,
-                    store=store,
-                    broker=broker,
-                    supervisor=supervisor,
-                    position_monitor=position_monitor,
-                    evaluator=evaluator,
-                    deployments_by_symbol=deployments_by_symbol,
-                    deployments_by_id=deployments_by_id,
-                    output=output,
-                )
+                await symbol_queues[event.symbol].put(event)
                 seen += 1
                 if max_bars is not None and seen >= max_bars:
                     daemon.stop()
                     break
             daemon.stop()
+            for queue_ in symbol_queues.values():
+                await queue_.put(None)
+            public_token_daemon.stop()
+            schwab_token_daemon.stop()
             with suppress(asyncio.CancelledError):
                 await daemon_task
+            with suppress(asyncio.CancelledError):
+                await public_token_task
+            with suppress(asyncio.CancelledError):
+                await schwab_token_task
+            for task in symbol_tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
         finally:
+            public_token_daemon.stop()
+            schwab_token_daemon.stop()
             await supervisor.close()
             await source.close()
             self.stop()
+
+    async def _symbol_worker(
+        self,
+        symbol: str,
+        queue: asyncio.Queue,
+        *,
+        sync_lock: asyncio.Lock,
+        live: bool,
+        store: RollingBarStore,
+        broker,
+        supervisor: ExecutionSupervisor,
+        position_monitor: PositionMonitor,
+        evaluator: ReplaySignalEvaluator,
+        deployments_by_symbol: dict[str, list[DeploymentManifest]],
+        deployments_by_id: dict[str, DeploymentManifest],
+        output: callable,
+    ) -> None:
+        while True:
+            event = await queue.get()
+            if event is None:
+                return
+            await self._handle_bar_event(
+                event,
+                sync_lock=sync_lock,
+                live=live,
+                store=store,
+                broker=broker,
+                supervisor=supervisor,
+                position_monitor=position_monitor,
+                evaluator=evaluator,
+                deployments_by_symbol=deployments_by_symbol,
+                deployments_by_id=deployments_by_id,
+                output=output,
+            )
 
     def _live_bar_source(self):
         provider = self.provider_config.underlying_live_primary
@@ -185,6 +247,7 @@ class BhikshaRuntime:
         self,
         event: BarClosedEvent,
         *,
+        sync_lock: asyncio.Lock,
         live: bool,
         store: RollingBarStore,
         broker,
@@ -202,25 +265,27 @@ class BhikshaRuntime:
         store.append(bar)
         output(f"BAR {bar.symbol} {bar.timestamp.isoformat()} close={bar.close}")
 
-        portfolio = await broker.get_portfolio()
-        tracker_positions = reconcile_public_positions(
-            portfolio.get("positions", []),
-            self.enabled_deployments,
-            orders=portfolio.get("orders", []),
-        )
-        supervisor.planner.position_tracker.replace_positions(tracker_positions)
-        await supervisor.sync_lifecycle()
-        if tracker_positions:
-            joined = ",".join(
-                f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
-                for position in tracker_positions
+        async with sync_lock:
+            portfolio = await broker.get_portfolio()
+            tracker_positions = reconcile_public_positions(
+                portfolio.get("positions", []),
+                self.enabled_deployments,
+                orders=portfolio.get("orders", []),
             )
-            output(f"SYNC positions={joined}")
+            supervisor.planner.position_tracker.replace_positions(tracker_positions)
+            await supervisor.sync_lifecycle()
+            if tracker_positions:
+                joined = ",".join(
+                    f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
+                    for position in tracker_positions
+                )
+                output(f"SYNC positions={joined}")
 
         closed = await supervisor.close_due_positions(
             deployments_by_id,
             now=bar.timestamp,
             dry_run=not live,
+            symbol=bar.symbol,
         )
         for plan in closed:
             output(f"HARD_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")

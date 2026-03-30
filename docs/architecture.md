@@ -218,7 +218,9 @@ Current Bhiksha runtime implementation:
 
 - Day 1 uses an in-process event bus backed by `asyncio.Queue`.
 - A runtime-owned `DataIngestionDaemon` wakes on the closed-bar heartbeat and publishes `BarClosedEvent`.
-- The runtime trading session consumes those events and performs reconciliation, feature enrichment, strategy evaluation, and execution handling.
+- The runtime trading session routes those events onto per-symbol workers.
+- Symbol workers preserve in-symbol ordering while allowing `QQQ`, `SPY`, and future symbols to progress independently.
+- Background token daemons refresh Public and Schwab credentials ahead of expiry, with request-path refresh retained only as a fallback.
 
 ### 4. Feature Service
 

@@ -371,3 +371,30 @@ Next steps:
 1. Add per-deployment broker-action summaries such as stop submissions, target activations, and square-offs.
 2. Add optional fill and portfolio snapshots so session summaries can speak to realized outcomes, not just decisions.
 3. Consider a lightweight TUI or HTML status page on top of the same summary/event model.
+
+### 2026-03-30 (Per-Symbol Workers And Token Daemons)
+
+Completed:
+
+- Changed the runtime session path to dispatch `BarClosedEvent` objects onto per-symbol worker queues so symbol processing can proceed independently.
+- Added an entry gate plus symbol-scoped lifecycle locks in the execution supervisor to reduce cross-symbol blocking while still protecting total-entry sequencing.
+- Scoped hard-flat handling to the current symbol inside the worker path to avoid duplicate close attempts across parallel workers.
+- Added background Public and Schwab token refresh daemons in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/app/token_daemon.py`.
+- Kept the existing lazy token-refresh path in place as an emergency fallback, while background refresh becomes the normal path.
+- Added timing tests for both token daemons.
+
+Verification:
+
+- `48` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- Broker portfolio synchronization is still serialized, so a slow portfolio call can still delay worker progress even though order negotiation no longer has to block all symbols.
+- Execution is not yet split into a dedicated broker-action queue, so the current concurrency model is improved but not the final actor-style design.
+
+Next steps:
+
+1. Add per-deployment broker-action summaries such as stop submissions, target activations, and square-offs.
+2. Consider moving broker actions onto a dedicated execution queue if portfolio sync or order submission latency still proves material.
+3. Add lightweight metrics around heartbeat lag, queue depth, and token refresh health.
