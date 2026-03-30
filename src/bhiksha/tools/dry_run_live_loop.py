@@ -71,6 +71,7 @@ async def _run(max_bars: int | None, live: bool) -> None:
         orders=portfolio.get("orders", []),
     )
     supervisor.planner.position_tracker.replace_positions(tracker_positions)
+    supervisor.sync_lifecycle()
     print(f"SYNC positions={len(tracker_positions)}")
 
     for symbol in symbols:
@@ -100,6 +101,7 @@ async def _run(max_bars: int | None, live: bool) -> None:
                 orders=portfolio.get("orders", []),
             )
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
+            supervisor.sync_lifecycle()
             if tracker_positions:
                 joined = ",".join(
                     f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"

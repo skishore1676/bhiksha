@@ -79,6 +79,7 @@ class OrderManager:
 
     def __init__(self, broker: PublicBrokerAdapter | None = None) -> None:
         self.broker = broker or PublicBrokerAdapter()
+        self._price_increments: dict[str, float] = {}
 
     async def close(self) -> None:
         await self.broker.close()
@@ -110,6 +111,7 @@ class OrderManager:
         response = await self.broker.preflight_single_leg(payload)
         increment = _maybe_float((response.get("priceIncrement") or {}).get("currentIncrement"))
         if increment:
+            self._price_increments[normalize_option_symbol(option_symbol)] = increment
             payload["limitPrice"] = f"{snap_price(limit_price, increment, side='BUY'):.2f}"
         return PreflightCheck(
             payload=payload,
@@ -119,35 +121,37 @@ class OrderManager:
         )
 
     async def place_entry_order(self, option_symbol: str, limit_price: float, quantity: int) -> OrderResult:
-        return await self._submit(self._entry_payload(option_symbol, limit_price, quantity))
+        payload = self._entry_payload(option_symbol, limit_price, quantity)
+        payload = await self._apply_increment_correction(payload, side="BUY", price_key="limitPrice")
+        return await self._submit(payload)
 
     async def place_stop_loss_order(self, option_symbol: str, stop_price: float, quantity: int) -> OrderResult:
-        return await self._submit(
-            {
-                "orderId": str(uuid.uuid4()),
-                "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
-                "orderSide": "SELL",
-                "orderType": "STOP",
-                "expiration": {"timeInForce": "DAY"},
-                "quantity": str(int(quantity)),
-                "openCloseIndicator": "CLOSE",
-                "stopPrice": f"{round_price(stop_price):.2f}",
-            }
-        )
+        payload = {
+            "orderId": str(uuid.uuid4()),
+            "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
+            "orderSide": "SELL",
+            "orderType": "STOP",
+            "expiration": {"timeInForce": "DAY"},
+            "quantity": str(int(quantity)),
+            "openCloseIndicator": "CLOSE",
+            "stopPrice": f"{round_price(stop_price):.2f}",
+        }
+        payload = await self._apply_increment_correction(payload, side="SELL", price_key="stopPrice")
+        return await self._submit(payload)
 
     async def place_target_order(self, option_symbol: str, limit_price: float, quantity: int) -> OrderResult:
-        return await self._submit(
-            {
-                "orderId": str(uuid.uuid4()),
-                "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
-                "orderSide": "SELL",
-                "orderType": "LIMIT",
-                "expiration": {"timeInForce": "DAY"},
-                "quantity": str(int(quantity)),
-                "openCloseIndicator": "CLOSE",
-                "limitPrice": f"{round_price(limit_price):.2f}",
-            }
-        )
+        payload = {
+            "orderId": str(uuid.uuid4()),
+            "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
+            "orderSide": "SELL",
+            "orderType": "LIMIT",
+            "expiration": {"timeInForce": "DAY"},
+            "quantity": str(int(quantity)),
+            "openCloseIndicator": "CLOSE",
+            "limitPrice": f"{round_price(limit_price):.2f}",
+        }
+        payload = await self._apply_increment_correction(payload, side="SELL", price_key="limitPrice")
+        return await self._submit(payload)
 
     async def place_square_off_order(self, option_symbol: str, quantity: int) -> OrderResult:
         return await self._submit(
@@ -205,6 +209,29 @@ class OrderManager:
             return OrderResult(order_id=str(order_id) if order_id else None, error=None if order_id else "missing_order_id")
         except Exception as exc:
             return OrderResult(order_id=None, error=str(exc))
+
+    async def _apply_increment_correction(
+        self,
+        payload: dict[str, Any],
+        *,
+        side: str,
+        price_key: str,
+    ) -> dict[str, Any]:
+        if price_key not in payload:
+            return payload
+        symbol = normalize_option_symbol(str((payload.get("instrument") or {}).get("symbol", "")))
+        increment = self._price_increments.get(symbol)
+        if increment is None:
+            try:
+                response = await self.broker.preflight_single_leg(payload)
+            except Exception:
+                response = {}
+            increment = _maybe_float((response.get("priceIncrement") or {}).get("currentIncrement"))
+            if increment:
+                self._price_increments[symbol] = increment
+        if increment:
+            payload[price_key] = f"{snap_price(float(payload[price_key]), increment, side=side):.2f}"
+        return payload
 
     @staticmethod
     def _entry_payload(option_symbol: str, limit_price: float, quantity: int) -> dict[str, str | dict[str, str]]:

@@ -260,3 +260,29 @@ Next steps:
 1. Decide whether to enable the new target policy for `QQQ`, `SPY`, or neither.
 2. If enabling, start with one deployment and conservative quantities.
 3. Add a session-summary/report command so live runs make target/stop transitions easier to audit.
+
+### 2026-03-30 (Execution Hardening And Minimal Lifecycle Store)
+
+Completed:
+
+- Added a minimal `TradeLifecycleStore` in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/state/lifecycle.py`.
+- Wired the execution supervisor to block duplicate entries when a deployment is already in an active lifecycle state.
+- Synced lifecycle state from broker-reconciled positions so restart behavior is explicit rather than inferred only from position counts.
+- Added exit-side increment correction in `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/execution/order_manager.py` so stop and target orders can snap to broker-supported increments using cached or preflight-derived tick sizes.
+- Added tests for lifecycle gating, reconciliation-to-lifecycle sync, and exit-side price snapping.
+
+Verification:
+
+- `39` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- The true `DataIngestionDaemon` and runtime-owned heartbeat loop are still not implemented; the current polling loop remains CLI-driven.
+- Lifecycle is intentionally minimal and does not yet publish transitions onto an internal event bus.
+
+Next steps:
+
+1. Build the in-memory `EventBus`.
+2. Promote the current polling loop into a runtime-owned `DataIngestionDaemon`.
+3. Publish `BarClosedEvent` and lifecycle transition events from the daemon/runtime path.

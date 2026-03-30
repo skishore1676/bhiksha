@@ -13,6 +13,7 @@ from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradeP
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository
+from bhiksha.state.lifecycle import TradeLifecycleStore
 from bhiksha.state.position_tracker import TrackedPosition
 
 
@@ -24,10 +25,12 @@ class ExecutionSupervisor:
         planner: ExecutionPlanner | None = None,
         event_repository: EventRepository | None = None,
         app_config: AppConfig | None = None,
+        lifecycle_store: TradeLifecycleStore | None = None,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
         self.app_config = app_config or AppConfig()
+        self.lifecycle_store = lifecycle_store or TradeLifecycleStore()
 
     async def close(self) -> None:
         await self.planner.close()
@@ -38,7 +41,18 @@ class ExecutionSupervisor:
         decision: SignalDecision,
         *,
         dry_run: bool,
-    ) -> TradePlan | None:
+        ) -> TradePlan | None:
+        lifecycle = self.lifecycle_store.get(deployment.symbol, deployment.deployment_id)
+        if not self.lifecycle_store.can_submit_entry(deployment.symbol, deployment.deployment_id):
+            await self.event_repository.append(
+                "lifecycle_entry_blocked",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": deployment.symbol,
+                    "state": lifecycle.state.value if lifecycle else None,
+                },
+            )
+            return None
         await self.event_repository.append(
             "signal_decision",
             {
@@ -53,8 +67,23 @@ class ExecutionSupervisor:
         )
         plan = await self.planner.plan_entry(deployment, decision, dry_run=dry_run)
         if plan is not None:
+            if plan.order_id:
+                self.lifecycle_store.begin_entry(
+                    deployment.symbol,
+                    deployment.deployment_id,
+                    option_symbol=plan.option_symbol,
+                    order_id=plan.order_id,
+                )
             if not dry_run and plan.order_id:
                 plan = await self._protect_live_entry(plan, deployment)
+            elif dry_run and plan.order_id:
+                self.lifecycle_store.mark_open(
+                    deployment.symbol,
+                    deployment.deployment_id,
+                    option_symbol=plan.option_symbol,
+                    order_id=plan.order_id,
+                    protected=False,
+                )
             await self.event_repository.append("trade_plan", asdict(plan))
         return plan
 
@@ -81,6 +110,7 @@ class ExecutionSupervisor:
                 option_symbol=plan.option_symbol,
                 order_id=plan.order_id,
             )
+            self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
             return plan
 
         stop_price = plan.estimated_entry_price * (1.0 - deployment.exit.stop_loss_pct)
@@ -131,6 +161,21 @@ class ExecutionSupervisor:
             target_order_id=target_order_id,
             target_price=target_price,
         )
+        if target_order_id:
+            self.lifecycle_store.mark_target_active(
+                deployment.symbol,
+                deployment.deployment_id,
+                option_symbol=plan.option_symbol,
+                order_id=target_order_id,
+            )
+        else:
+            self.lifecycle_store.mark_open(
+                deployment.symbol,
+                deployment.deployment_id,
+                option_symbol=plan.option_symbol,
+                order_id=stop_result.order_id or plan.order_id,
+                protected=bool(stop_result.order_id),
+            )
         await self.event_repository.append(
             "protective_stop_submission",
             {
@@ -260,6 +305,12 @@ class ExecutionSupervisor:
                             stop_order_id=None,
                             target_order_id=target_order_id,
                         )
+                        self.lifecycle_store.mark_target_active(
+                            updated.symbol,
+                            updated.deployment_id,
+                            option_symbol=updated.option_symbol,
+                            order_id=target_order_id,
+                        )
 
         if (
             not self._supports_concurrent_exit_orders()
@@ -326,6 +377,13 @@ class ExecutionSupervisor:
                             stop_price=restored_stop_price,
                             target_order_id=None,
                         )
+                        self.lifecycle_store.mark_open(
+                            updated.symbol,
+                            updated.deployment_id,
+                            option_symbol=updated.option_symbol,
+                            order_id=stop_order_id,
+                            protected=True,
+                        )
 
         if (
             deployment.exit.stop_to_breakeven_after_r_multiple is not None
@@ -384,6 +442,13 @@ class ExecutionSupervisor:
                     updated,
                     stop_order_id=new_stop_order_id,
                     stop_price=updated.entry_price,
+                )
+                self.lifecycle_store.mark_open(
+                    updated.symbol,
+                    updated.deployment_id,
+                    option_symbol=updated.option_symbol,
+                    order_id=new_stop_order_id,
+                    protected=True,
                 )
 
         if updated != position:
@@ -519,6 +584,7 @@ class ExecutionSupervisor:
             position.deployment_id,
             option_symbol=position.option_symbol,
         )
+        self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
         plan = ExitPlan(
             deployment_id=deployment.deployment_id,
             symbol=position.symbol,
@@ -605,6 +671,7 @@ class ExecutionSupervisor:
                 position.deployment_id,
                 option_symbol=position.option_symbol,
             )
+            self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
             trade_plan = TradePlan(
                 deployment_id=position.deployment_id,
                 symbol=position.symbol,
@@ -629,6 +696,9 @@ class ExecutionSupervisor:
             )
             closed.append(trade_plan)
         return closed
+
+    def sync_lifecycle(self) -> None:
+        self.lifecycle_store.sync_from_positions(self.planner.position_tracker.active_positions())
 
 
 def _parse_et_time(value: str) -> time:
