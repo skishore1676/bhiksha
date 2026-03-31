@@ -2,10 +2,11 @@
 
 Bhiksha is a live execution runtime for strategy deployments proposed by `mala`.
 
-Day 1 scope:
+Current live scope:
 
 - `QQQ` Market Impulse short deployment
 - `SPY` Market Impulse short deployment
+- `TSLA` Jerk Pivot Momentum short deployment in shadow-only mode
 - single-leg long puts
 - live underlying bars from Schwab
 - execution through Public
@@ -33,12 +34,14 @@ Day 1 scope:
 - Runtime entrypoint: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/trade_session.py`
 - Continuous loop: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/dry_run_live_loop.py`
 - Market Impulse strategy: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/strategy/market_impulse.py`
+- Jerk Pivot strategy: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/strategy/jerk_pivot_momentum.py`
 - Execution planner: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/execution/planner.py`
 - Order manager: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/execution/order_manager.py`
 - Execution supervisor: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/execution/supervisor.py`
 - Public broker adapter: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/execution/brokers/public/adapter.py`
 - Schwab bar adapter: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/market_data/adapters/schwab.py`
 - Deployment manifests:
+  - `/Users/suman/kg_env/projects/bhiksha/config/deployments/jerk_pivot_momentum_tsla_short_v1.yaml`
   - `/Users/suman/kg_env/projects/bhiksha/config/deployments/market_impulse_qqq_short_v1.yaml`
   - `/Users/suman/kg_env/projects/bhiksha/config/deployments/market_impulse_spy_short_v1.yaml`
 
@@ -68,6 +71,10 @@ Live loop:
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --live
 ```
 
+Note:
+
+- deployments with `execution.shadow_only: true` still evaluate live bars and emit simulated plans during `--live`, but they do not send orders or create tracked positions.
+
 Session summary:
 
 ```bash
@@ -90,6 +97,13 @@ PYTHONPATH=src .venv/bin/pytest -q
 
 ## Day-1 Notes
 
-- Live orders are still unproven in production because we have intentionally not sent one yet.
+- Market Impulse deployments can trade normally under `--live`.
+- The TSLA Jerk Pivot deployment is enabled for live market observation, but still runs in shadow-only mode.
 - Quotes and preflight are already validated against Public.
 - Restart safety is broker-sync based: existing Public option positions are re-imported on startup and each completed bar.
+- Compact research-style execution inputs such as `dte: "7-21"`, `delta_target: "0.35-0.55"`, and `entry_window_et: "09:45-14:30"` now normalize directly into the Bhiksha manifest model.
+
+Verification:
+
+- `62` tests passing.
+- `python3 -m compileall src tests` passes cleanly.

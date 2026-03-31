@@ -139,7 +139,8 @@ async def _run(symbol: str, quantity: int, live: bool, confirm_live: str | None)
         if not filled:
             return 1
 
-        stop_price = submit_price * (1.0 - deployment.risk.stop_loss_pct)
+        stop_loss_pct = deployment.exit.stop_loss_pct or deployment.risk.stop_loss_pct
+        stop_price = submit_price * (1.0 - stop_loss_pct)
         stop_result = await order_manager.place_stop_loss_order(selection.option_symbol, stop_price, quantity)
         await repo.append(
             "manual_trade_stop_submission",

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import time, timedelta
 import uuid
 
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import OrderManager, OrderResult
 from bhiksha.integrations.schwab.chain import SchwabOptionChainService
+from bhiksha.market_data.session import as_et_time
 from bhiksha.options.vehicle_resolver import VehicleResolver
 from bhiksha.risk.governor import RiskGovernor
 from bhiksha.state.position_tracker import PositionTracker
@@ -40,9 +41,23 @@ class ExecutionPlanner:
         decision: SignalDecision,
         *,
         dry_run: bool,
+        simulate_only: bool = False,
     ) -> TradePlan | None:
         if not decision.signal or decision.direction is None:
             return None
+        if not _entry_window_allows(deployment, decision.timestamp):
+            return TradePlan(
+                trade_id=str(uuid.uuid4()),
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                direction=decision.direction,
+                option_symbol="",
+                quantity=0,
+                estimated_entry_price=0.0,
+                risk_reasons=["execution_window_blocked"],
+                dry_run=dry_run,
+                order_id=None,
+            )
 
         selection_request = OptionSelectionRequest(
             deployment_id=deployment.deployment_id,
@@ -160,6 +175,19 @@ class ExecutionPlanner:
             )
 
         if dry_run:
+            if simulate_only:
+                return TradePlan(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol=selection.option_symbol,
+                    quantity=quantity,
+                    estimated_entry_price=entry_price,
+                    risk_reasons=risk.reasons,
+                    dry_run=True,
+                    order_id=None,
+                )
             self.position_tracker.open_position(
                 deployment.symbol,
                 deployment.deployment_id,
@@ -227,3 +255,22 @@ class ExecutionPlanner:
             dry_run=False,
             order_id=result.order_id,
         )
+
+
+def _entry_window_allows(deployment: DeploymentManifest, timestamp) -> bool:
+    start = _parse_optional_et_time(deployment.execution.entry_window_start_et)
+    end = _parse_optional_et_time(deployment.execution.entry_window_end_et)
+    if start is None and end is None:
+        return True
+    current = as_et_time(timestamp)
+    if start is not None and current < start:
+        return False
+    if end is not None and current > end:
+        return False
+    return True
+
+
+def _parse_optional_et_time(value: str | None) -> time | None:
+    if value is None or not value.strip():
+        return None
+    return time.fromisoformat(value)

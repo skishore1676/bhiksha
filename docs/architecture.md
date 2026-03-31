@@ -1,7 +1,7 @@
 # Bhiksha Architecture
 
 Status: Draft v2
-Last updated: 2026-03-30
+Last updated: 2026-03-31
 
 ## Purpose
 
@@ -13,6 +13,11 @@ Day 1 scope is deliberately narrow:
 - evaluate signals from completed 1-minute underlying bars only,
 - trade single-leg options only,
 - keep the runtime modular so future Mala strategies can be deployed without rewriting the engine.
+
+Current extension beyond the original Day 1 scope:
+
+- `TSLA` `jerk_pivot_momentum` is onboarded as a second strategy family,
+- the TSLA deployment currently runs in `shadow_only` mode during live sessions so the runtime can validate real signals and simulated plans without sending live orders.
 
 The design should make it easy to add:
 
@@ -57,6 +62,13 @@ Instead, Bhiksha should consume a deployment manifest that contains:
 - execution profile,
 - risk profile,
 - metadata linking the deployment back to the Mala run or CSV row.
+
+Bhiksha should also tolerate compact research-era aliases when they can be normalized safely.
+Examples now supported in the runtime config model include:
+
+- `dte: "7-21"` -> `dte_min=7`, `dte_max=21`
+- `delta_target: "0.35-0.55"` -> `target_abs_delta_min=0.35`, `target_abs_delta_max=0.55`
+- `entry_window_et: "09:45-14:30"` -> `entry_window_start_et`, `entry_window_end_et`
 
 For now, you are the bridge between Mala output and Bhiksha deployment config.
 Later, Mala can emit the manifest directly.
@@ -178,6 +190,12 @@ Loads and validates:
 - `config/risk/*.yaml` for risk defaults,
 - `config/vehicles/*.yaml` for option selection rules.
 
+Current runtime reality:
+
+- deployment manifests are the source of truth for live behavior,
+- shared `risk` and `vehicle` profile files exist, but are not yet merged automatically at load time,
+- execution config now supports `shadow_only` so a deployment can participate in live market evaluation without broker-side entry.
+
 Config precedence:
 
 `env override > deployment file > shared defaults`
@@ -199,6 +217,7 @@ Each deployment should have a stable `deployment_id`.
 
 Example:
 
+- `jerk_pivot_momentum_tsla_short_v1`
 - `market_impulse_qqq_short_v1`
 - `market_impulse_spy_short_v1`
 
@@ -269,6 +288,35 @@ class StrategyPlugin(Protocol):
         position: "PositionRecord",
     ) -> "ExitDecision": ...
 ```
+
+Current strategy families in Bhiksha:
+
+- `market_impulse`
+- `jerk_pivot_momentum`
+
+The Jerk Pivot plugin uses the shared Newton primitives already available in Bhiksha:
+
+- `velocity_1m`
+- `accel_1m`
+- `jerk_1m`
+- `vpoc_4h`
+- `volume_ma_*`
+
+Its live runtime behavior currently uses:
+
+- strategy-managed entry evaluation,
+- option-premium stop and target handling through the generic execution/exit stack,
+- no separate strategy-managed thesis exit yet.
+
+### 6. Execution Planning
+
+Execution planning should remain strategy-agnostic once a directional signal exists.
+
+Current important refinements:
+
+- signal-session filters and execution-entry windows are modeled separately,
+- `execution.shadow_only` allows live bar evaluation and plan simulation without order submission,
+- the planner can therefore support mixed sessions where some deployments trade live and others only shadow.
 
 For compatibility with Mala-era strategy code, Bhiksha may also support adapters around `generate_signals(df)` style strategies.
 

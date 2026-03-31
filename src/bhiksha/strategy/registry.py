@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from bhiksha.strategy.base import StrategyPlugin
+from bhiksha.strategy.jerk_pivot_momentum import JerkPivotMomentumStrategy
 from bhiksha.strategy.market_impulse import MarketImpulseStrategy
 
 
@@ -24,6 +25,6 @@ class StrategyRegistry:
 
 def default_strategy_registry() -> StrategyRegistry:
     registry = StrategyRegistry()
+    registry.register(JerkPivotMomentumStrategy())
     registry.register(MarketImpulseStrategy())
     return registry
-

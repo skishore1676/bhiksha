@@ -52,6 +52,7 @@ class ExecutionSupervisor:
         decision: SignalDecision,
         *,
         dry_run: bool,
+        simulate_only: bool = False,
         ) -> TradePlan | None:
         await self.event_repository.append(
             "signal_decision",
@@ -79,7 +80,12 @@ class ExecutionSupervisor:
                     },
                 )
                 return None
-            plan = await self.planner.plan_entry(deployment, decision, dry_run=dry_run)
+            plan = await self.planner.plan_entry(
+                deployment,
+                decision,
+                dry_run=dry_run,
+                simulate_only=simulate_only,
+            )
             if plan is not None:
                 if plan.order_id:
                     await self._upsert_trade_record(

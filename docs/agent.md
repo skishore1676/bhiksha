@@ -518,6 +518,28 @@ Notes recorded for follow-up:
   `strategy_plus_underlying_trailing_exit`.
 - We are not yet locking a global target policy because the right choice still depends on comparing realized Bhiksha outcomes to Mala’s holdout expectations.
 
+### 2026-03-30 (Research Backlog: Elastic Band Reversion)
+
+Recorded strategy candidates from Mala-style research intake:
+
+- `elastic_band_reversion` / `IWM` / `short`
+  signal params: `z_score_threshold=2.0`, `z_score_window=240`, `use_directional_mass=true`
+  proposed vehicle: `put_debit_spread`
+  selected ratio: `2.0`
+  proposed execution profile: `debit_spread_tight`
+
+- `elastic_band_reversion` / `NVDA` / `long`
+  signal params: `z_score_threshold=3.0`, `z_score_window=120`, `use_directional_mass=true`
+  proposed vehicle: `call_debit_spread`
+  selected ratio: `1.25`
+  proposed execution profile: `debit_spread_tight`
+
+Decision for now:
+
+- Do not move Bhiksha into spread execution yet.
+- Treat these as strategy-family backlog, not deployable live manifests.
+- If we onboard `elastic_band_reversion` before spread support exists, first translate it into a single-leg execution model and re-check whether the edge still holds under that vehicle change.
+
 ### 2026-03-30 (Background Reconciliation Snapshot)
 
 Completed:
@@ -544,3 +566,61 @@ Next steps:
 1. Decide whether we want to hard-block new entries when another deployment already owns the same underlying, or only when it owns the same exact option contract.
 2. Add thresholded warnings or alert markers when heartbeat lag / sync latency / execution latency drift beyond acceptable bounds.
 3. Decide whether execution-triggered reconciliation should be immediate for all actions or only for broker-mutating actions.
+
+### 2026-03-30 (Strategy Family Onboarding: Jerk Pivot Momentum)
+
+Completed:
+
+- Added a native Bhiksha strategy plugin for `jerk_pivot_momentum` instead of depending on Mala runtime imports.
+- Registered the new strategy family in the default runtime strategy registry.
+- Extended execution config normalization so compact research-style fields can be used for `dte`, `delta_target`, and `entry_window_et`.
+- Added execution-window enforcement in the planner so signal session rules and order-entry windows can differ cleanly.
+- Added a disabled-by-default TSLA short deployment manifest for `jerk_pivot_momentum`.
+- Recorded the supplied TSLA research baseline metrics in deployment source metadata.
+- Updated the manual trade probe to use the exit-domain stop-loss setting as the runtime source of truth.
+- Added regression tests for config loading, jerk-pivot short entry logic, and execution-window blocking.
+
+Verification:
+
+- `61` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- `jerk_pivot_momentum` currently relies on stop/target/hard-flat exits; there is not yet a dedicated strategy-managed thesis exit for this family.
+- The TSLA deployment is intentionally `enabled: false` until we decide it is ready to join the active live universe.
+- Shared risk and vehicle profile files still are not merged into deployment manifests at load time.
+
+Next steps:
+
+1. Decide whether future research intake should stay in normalized Bhiksha manifest form or whether we want first-class top-level aliases like `strategy_family`, `signal_params`, and `vehicle`.
+2. Add at least one replay-style integration test that exercises `jerk_pivot_momentum` through feature enrichment plus planning, not just direct strategy evaluation.
+3. If TSLA is approved for runtime evaluation, flip the deployment to `enabled: true` only after a dry-run session confirms signal cadence and execution-window behavior.
+
+### 2026-03-31 (Live Shadow Deployment: TSLA Jerk Pivot Momentum)
+
+Completed:
+
+- Enabled `jerk_pivot_momentum_tsla_short_v1` in the active deployment set.
+- Added `execution.shadow_only` so a deployment can run on live market data and emit simulated plans without sending broker orders.
+- Wired the runtime entry path so `--live` can mix normal trading deployments with shadow-only deployments in the same session.
+- Kept signal-session gating and execution-entry windows separate for the TSLA deployment.
+- Verified from the live tmux session that startup config now includes all three deployments and that TSLA is loaded with `shadow_only=true`.
+
+Verification:
+
+- `62` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+- Live session on 2026-03-31 is producing fresh TSLA runtime metrics and signal evaluations without queue buildup.
+
+Open items:
+
+- TSLA `jerk_pivot_momentum` still has no dedicated strategy-managed thesis exit.
+- Shared `risk` and `vehicle` profile files are still not automatically merged into live deployment manifests.
+- We have not yet added a replay/integration test that exercises the full jerk-pivot path from enriched bars through runtime planning.
+
+Next steps:
+
+1. Decide when TSLA should graduate from `shadow_only` to broker-live entry.
+2. Add one end-to-end replay case for jerk-pivot feature enrichment plus planning.
+3. Decide whether future research ingestion should gain first-class aliases like `strategy_family`, `signal_params`, and `vehicle`, or remain normalized before commit.

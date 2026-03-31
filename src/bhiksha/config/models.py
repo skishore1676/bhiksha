@@ -2,9 +2,63 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+RangeValueT = TypeVar("RangeValueT", int, float)
+
+
+def _parse_compact_range(
+    data: dict[str, Any],
+    *,
+    field_name: str,
+    minimum_name: str,
+    maximum_name: str,
+    caster: Callable[[str], RangeValueT],
+) -> None:
+    if field_name not in data or minimum_name in data or maximum_name in data:
+        return
+    raw_value = data.pop(field_name)
+    if raw_value is None:
+        return
+    if isinstance(raw_value, (int, float)):
+        value = caster(str(raw_value))
+        data[minimum_name] = value
+        data[maximum_name] = value
+        return
+    if not isinstance(raw_value, str):
+        raise TypeError(f"{field_name} must be a string or number")
+    value = raw_value.strip()
+    if not value:
+        return
+    if "-" in value:
+        start_raw, end_raw = (part.strip() for part in value.split("-", 1))
+        data[minimum_name] = caster(start_raw)
+        data[maximum_name] = caster(end_raw)
+        return
+    parsed = caster(value)
+    data[minimum_name] = parsed
+    data[maximum_name] = parsed
+
+
+def _parse_time_window(data: dict[str, Any], *, field_name: str, start_name: str, end_name: str) -> None:
+    if field_name not in data or start_name in data or end_name in data:
+        return
+    raw_value = data.pop(field_name)
+    if raw_value is None:
+        return
+    if not isinstance(raw_value, str):
+        raise TypeError(f"{field_name} must be a HH:MM-HH:MM string")
+    value = raw_value.strip()
+    if not value:
+        return
+    if "-" not in value:
+        raise ValueError(f"{field_name} must be formatted as HH:MM-HH:MM")
+    start_raw, end_raw = (part.strip() for part in value.split("-", 1))
+    data[start_name] = start_raw
+    data[end_name] = end_raw
 
 
 class AppConfig(BaseModel):
@@ -42,6 +96,37 @@ class ExecutionSpec(BaseModel):
     target_abs_delta_max: float | None = None
     min_open_interest: int = 0
     max_bid_ask_spread_pct: float | None = None
+    entry_window_start_et: str | None = None
+    entry_window_end_et: str | None = None
+    shadow_only: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def expand_compact_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        _parse_compact_range(
+            normalized,
+            field_name="dte",
+            minimum_name="dte_min",
+            maximum_name="dte_max",
+            caster=int,
+        )
+        _parse_compact_range(
+            normalized,
+            field_name="delta_target",
+            minimum_name="target_abs_delta_min",
+            maximum_name="target_abs_delta_max",
+            caster=float,
+        )
+        _parse_time_window(
+            normalized,
+            field_name="entry_window_et",
+            start_name="entry_window_start_et",
+            end_name="entry_window_end_et",
+        )
+        return normalized
 
 
 class RiskSpec(BaseModel):
@@ -67,6 +152,7 @@ class SourceSpec(BaseModel):
     origin: str | None = None
     run_date: str | None = None
     artifact: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class DeploymentManifest(BaseModel):

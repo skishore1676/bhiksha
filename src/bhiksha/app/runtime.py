@@ -649,8 +649,17 @@ class BhikshaRuntime:
         output: callable,
     ):
         async def runner() -> None:
-            plan = await supervisor.handle_signal(deployment, decision, dry_run=not live)
-            output(f"{deployment.deployment_id}: plan={plan}")
+            simulate_only = deployment.execution.shadow_only
+            plan = await supervisor.handle_signal(
+                deployment,
+                decision,
+                dry_run=(not live) or simulate_only,
+                simulate_only=simulate_only,
+            )
+            if simulate_only:
+                output(f"{deployment.deployment_id}: shadow_plan={plan}")
+            else:
+                output(f"{deployment.deployment_id}: plan={plan}")
 
         return runner
 
