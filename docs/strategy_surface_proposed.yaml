@@ -1,0 +1,78 @@
+schema_version: 1
+updated_at: "2026-03-31"
+owner: shared
+scope: >
+  Proposed research surfaces discovered in Mala that are not yet executable in
+  Bhiksha. Only record parameters and capabilities that materially affected a
+  research conclusion.
+purpose: >
+  Bridge discovery and execution expansion. Use this registry when research
+  introduces a meaningful new surface that Bhiksha cannot yet honor.
+
+policy:
+  - Keep only research-validated gaps here; do not list hypothetical ideas.
+  - Every entry must describe the Bhiksha capability gap and the current execution readiness label.
+  - Promote an entry into strategy_surface.yaml only after Bhiksha can execute and replay it.
+
+surface_classes:
+  supported:
+    description: Executable in Bhiksha today and belongs in strategy_surface.yaml.
+  proposed:
+    description: Used in Mala research and materially relevant, but not executable in Bhiksha yet.
+  derived:
+    description: Internal helper fields that should not be treated as first-class knobs.
+
+proposed_shared_parameters:
+  - id: execution_profile.debit_spread_tight
+    class: proposed
+    kind: vehicle_execution
+    status: research_valid_not_executable
+    discovered_via:
+      strategy_family: elastic_band_reversion
+      symbols: [IWM, NVDA]
+    description: >
+      Tight debit-spread execution profile that materially improved M5 outcomes
+      versus the default spread template.
+    required_bhiksha_capabilities:
+      - Multi-leg option vehicle construction
+      - Net-debit spread order planning and reconciliation
+      - Spread-aware stop, target, and hard-flat handling
+    proposed_parameters:
+      - id: execution_profile
+        value: debit_spread_tight
+        type: string
+      - id: long_leg_target_abs_delta_range
+        type: float_range
+        description: Delta range for the purchased leg.
+      - id: short_leg_target_abs_delta_range
+        type: float_range
+        description: Delta range for the sold leg.
+      - id: dte_range
+        type: integer_range
+        description: Shared expiration range used for both spread legs.
+    last_evidence:
+      note: >
+        Elastic Band IWM short and NVDA long became paper-trading candidates
+        under tight debit-spread assumptions, but Bhiksha is still single-leg only.
+      source_doc: /Users/suman/kg_env/projects/mala_v1/docs/first_run_agentic.md
+
+proposed_strategy_families:
+  elastic_band_reversion:
+    class: proposed
+    status: research_valid_partially_executable
+    description: >
+      Mean-reversion family with real holdout survivors in Mala, but the most
+      credible vehicle today depends on spread execution that Bhiksha lacks.
+    strategy_parameters:
+      - id: z_score_threshold
+        type: float
+      - id: z_score_window
+        type: integer
+      - id: use_directional_mass
+        type: boolean
+    required_bhiksha_capabilities:
+      - Support for multi-leg debit spreads
+      - Spread-aware execution stress and live monitoring
+    promotion_rule: >
+      Keep this strategy family in the proposed registry until Bhiksha can
+      express the preferred execution vehicle end to end.

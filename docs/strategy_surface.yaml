@@ -1,17 +1,15 @@
 schema_version: 1
 updated_at: "2026-03-31"
-owner: bhiksha
+owner: shared
+scope: >
+  Strict shared contract for strategy surfaces currently executable in Bhiksha
+  and consumable by Mala research and export workflows. Strategy families that
+  Bhiksha cannot execute yet are intentionally excluded.
 purpose: >
-  Shared research and execution surface between Bhiksha and Mala.
-  This file describes the parameter space Bhiksha can express today,
-  along with the parts that are fully replayable from underlying bars
-  versus the parts that require historical option premium data.
-
-design_notes:
-  - Keep this file as the shared contract for what research may vary and what execution may honor.
-  - Add new fields here when Bhiksha gains new parameterized behavior.
-  - Avoid listing hypothetical knobs that are not implemented in Bhiksha yet.
-  - Treat this as a living surface map, not as a strategy-performance artifact.
+  Enumerates only concrete, implemented, parameterized fields that may vary
+  between research and execution. Derived internal fields and research guidance
+  live in strategy_surface_notes.md. Emerging Mala-only surfaces that Bhiksha
+  does not support yet live in strategy_surface_proposed.yaml.
 
 replay_layers:
   underlying_signal_layer:
@@ -97,10 +95,10 @@ shared_parameters:
       bhiksha_path: risk.hard_flat_time_et
       type: hh:mm
       description: Session cutoff after which Bhiksha force-closes any still-open position.
-    - id: stop_loss_pct
+    - id: risk_stop_loss_pct
       bhiksha_path: risk.stop_loss_pct
       type: float
-      description: Premium-based stop percentage used by the live execution layer.
+      description: Default premium stop percentage supplied by the selected risk profile. Live execution uses this value only when the exit layer does not override it.
 
   exit:
     - id: exit_profile
@@ -130,7 +128,7 @@ shared_parameters:
     - id: exit_stop_loss_pct
       bhiksha_path: exit.stop_loss_pct
       type: float
-      description: Premium-based stop percentage applied by the live exit layer.
+      description: Canonical live premium stop percentage used by active protection orders. This overrides risk.stop_loss_pct when both are present.
     - id: stop_to_breakeven_after_r_multiple
       bhiksha_path: exit.stop_to_breakeven_after_r_multiple
       type: float
@@ -161,11 +159,11 @@ strategy_families:
       - id: vma_length
         bhiksha_path: strategy.params.vma_length
         type: integer
-        description: Length of the VMA used for both entry and strategy exit checks.
+        description: Length of the VMA used for both entry and strategy exit checks. Mala derives the internal feature column name as vma_<length>.
       - id: regime_timeframe
         bhiksha_path: strategy.params.regime_timeframe
         type: string
-        description: Higher-timeframe used to derive the impulse regime feature.
+        description: Higher timeframe used to derive the impulse regime feature. Mala derives the internal feature column name as impulse_regime_<timeframe>.
       - id: entry_buffer_minutes
         bhiksha_path: strategy.params.entry_buffer_minutes
         type: integer
@@ -230,26 +228,3 @@ strategy_families:
         bhiksha_path: strategy.params.session_end
         type: hh:mm
         description: Latest ET time when the strategy may emit a signal.
-
-current_constraints:
-  - Bhiksha supports multiple strategy families through a normalized deployment manifest.
-  - Signal logic is replayable from underlying bars and feature enrichment.
-  - Time exits are replayable from timestamp rules.
-  - Strategy exits are replayable only for families that implement evaluate_exit.
-  - Premium stop loss and premium target logic exist in live execution but are not faithfully replayable without option quote history.
-  - The current live vehicle model is single-leg long premium via option selection constraints.
-
-recommended_mala_search_dimensions:
-  - direction
-  - entry window shape
-  - signal threshold or proximity threshold
-  - smoothing lookback
-  - volume gate on or off
-  - volume threshold
-  - higher timeframe regime choice
-  - vehicle DTE range
-  - vehicle delta range
-  - spread and liquidity filters
-  - hard flat time
-  - strategy exit enabled or disabled
-  - strategy exit strictness
