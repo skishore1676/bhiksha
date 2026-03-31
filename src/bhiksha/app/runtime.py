@@ -16,7 +16,7 @@ from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.app.execution_dispatcher import SymbolExecutionDispatcher
 from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.app.token_daemon import PublicTokenRefreshDaemon, SchwabTokenRefreshDaemon
-from bhiksha.config.models import AppConfig, DeploymentManifest, ProviderConfig
+from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest, ProviderConfig
 from bhiksha.domain.events import BarClosedEvent
 from bhiksha.domain.models import Bar
 from bhiksha.domain.runtime import ProviderHealth, StartupReport
@@ -30,6 +30,7 @@ from bhiksha.market_data.daemon import DataIngestionDaemon
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.market_data.trading_calendar import trading_window_start
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup
+from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.persistence.sqlite import SQLiteEventRepository
 from bhiksha.persistence.sqlite import SQLiteTradeStateRepository
 from bhiksha.state.position_tracker import TrackedPosition
@@ -51,6 +52,7 @@ class BhikshaRuntime:
     app_config: AppConfig
     provider_config: ProviderConfig
     deployments: list[DeploymentManifest]
+    bias_inputs: list[BiasSelection]
     strategy_registry: StrategyRegistry
     started: bool = field(default=False, init=False)
     event_bus: InMemoryEventBus = field(default_factory=InMemoryEventBus, init=False)
@@ -249,6 +251,7 @@ class BhikshaRuntime:
             "app": self.app_config.model_dump(),
             "providers": self.provider_config.model_dump(),
             "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
+            "bias_inputs": [selection.model_dump() for selection in self.bias_inputs],
             "session": {
                 "live": live,
                 "max_bars": max_bars,
@@ -281,21 +284,33 @@ class BhikshaRuntime:
             event = await queue.get()
             if event is None:
                 return
-            await self._handle_bar_event(
-                event,
-                sync_lock=sync_lock,
-                reconciliation_snapshot=reconciliation_snapshot,
-                reconcile_trigger=reconcile_trigger,
-                live=live,
-                store=store,
-                supervisor=supervisor,
-                position_monitor=position_monitor,
-                evaluator=evaluator,
-                execution_dispatcher=execution_dispatcher,
-                deployments_by_symbol=deployments_by_symbol,
-                deployments_by_id=deployments_by_id,
-                output=output,
-            )
+            try:
+                await self._handle_bar_event(
+                    event,
+                    sync_lock=sync_lock,
+                    reconciliation_snapshot=reconciliation_snapshot,
+                    reconcile_trigger=reconcile_trigger,
+                    live=live,
+                    store=store,
+                    supervisor=supervisor,
+                    position_monitor=position_monitor,
+                    evaluator=evaluator,
+                    execution_dispatcher=execution_dispatcher,
+                    deployments_by_symbol=deployments_by_symbol,
+                    deployments_by_id=deployments_by_id,
+                    output=output,
+                )
+            except Exception as exc:
+                await supervisor.event_repository.append(
+                    "runtime_issue",
+                    {
+                        "category": classify_runtime_issue_category(error=str(exc), event_type="symbol_worker"),
+                        "symbol": symbol,
+                        "error": str(exc),
+                        "stage": "symbol_worker",
+                    },
+                )
+                output(f"RUNTIME_ISSUE {symbol} stage=symbol_worker error={exc}")
 
     def _live_bar_source(self):
         provider = self.provider_config.underlying_live_primary
@@ -370,6 +385,7 @@ class BhikshaRuntime:
             runner=self._instrument_execution_runner(
                 supervisor,
                 bar.symbol,
+                deployment_id=None,
                 reconcile_trigger=reconcile_trigger,
                 action="hard_flat",
                 inner=self._make_hard_flat_runner(
@@ -418,6 +434,7 @@ class BhikshaRuntime:
                 runner=self._instrument_execution_runner(
                     supervisor,
                     bar.symbol,
+                    deployment_id=deployment.deployment_id,
                     reconcile_trigger=reconcile_trigger,
                     action="manage",
                     inner=self._make_manage_position_runner(
@@ -452,6 +469,7 @@ class BhikshaRuntime:
                     runner=self._instrument_execution_runner(
                         supervisor,
                         bar.symbol,
+                        deployment_id=evaluation.deployment.deployment_id,
                         reconcile_trigger=reconcile_trigger,
                         action="exit",
                         inner=self._make_exit_runner(
@@ -489,6 +507,7 @@ class BhikshaRuntime:
                     runner=self._instrument_execution_runner(
                         supervisor,
                         bar.symbol,
+                        deployment_id=deployment.deployment_id,
                         reconcile_trigger=reconcile_trigger,
                         action="entry",
                         inner=self._make_entry_runner(
@@ -535,6 +554,7 @@ class BhikshaRuntime:
         supervisor: ExecutionSupervisor,
         symbol: str,
         *,
+        deployment_id: str | None,
         reconcile_trigger: asyncio.Event,
         action: str,
         inner,
@@ -555,6 +575,19 @@ class BhikshaRuntime:
             )
             try:
                 await inner()
+            except Exception as exc:
+                await supervisor.event_repository.append(
+                    "runtime_issue",
+                    {
+                        "category": classify_runtime_issue_category(error=str(exc), event_type=action),
+                        "deployment_id": deployment_id,
+                        "symbol": symbol,
+                        "action": action,
+                        "error": str(exc),
+                        "stage": "execution_runner",
+                    },
+                )
+                output(f"RUNTIME_ISSUE {symbol} action={action} error={exc}")
             finally:
                 reconcile_trigger.set()
                 await supervisor.event_repository.append(
@@ -610,14 +643,28 @@ class BhikshaRuntime:
         reason: str,
     ) -> None:
         sync_started_at = time.perf_counter()
-        portfolio = await broker.get_portfolio()
-        open_trades = await supervisor.trade_state_repository.get_open_trades()
-        tracker_positions = reconcile_public_positions(
-            portfolio.get("positions", []),
-            self.enabled_deployments,
-            orders=portfolio.get("orders", []),
-            known_trades=open_trades,
-        )
+        try:
+            portfolio = await broker.get_portfolio()
+            open_trades = await supervisor.trade_state_repository.get_open_trades()
+            tracker_positions = reconcile_public_positions(
+                portfolio.get("positions", []),
+                self.enabled_deployments,
+                orders=portfolio.get("orders", []),
+                known_trades=open_trades,
+            )
+        except Exception as exc:
+            await supervisor.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": classify_runtime_issue_category(error=str(exc), event_type="reconciliation"),
+                    "symbol": "ALL",
+                    "error": str(exc),
+                    "stage": "reconciliation",
+                    "reason": reason,
+                },
+            )
+            output(f"RUNTIME_ISSUE ALL stage=reconciliation reason={reason} error={exc}")
+            return
         async with sync_lock:
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
             await supervisor.sync_lifecycle()

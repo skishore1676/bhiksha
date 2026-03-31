@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from bhiksha.config.loader import load_deployments
+import pytest
+import yaml
+
+from bhiksha.config.loader import load_bias_inputs, load_deployments
 
 
 def test_load_deployments_from_config_directory() -> None:
@@ -21,3 +24,58 @@ def test_load_deployments_from_config_directory() -> None:
     assert tsla.execution.entry_window_start_et == "09:45"
     assert tsla.execution.entry_window_end_et == "14:30"
     assert tsla.source.metadata["holdout_mean_exp_r"] == 0.8397
+
+
+def test_load_deployments_recurses_and_rejects_duplicate_ids(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    generated = root / "generated"
+    generated.mkdir(parents=True)
+    _write_manifest(root / "manual.yaml", "manual_qqq")
+    _write_manifest(generated / "generated.yaml", "generated_qqq")
+
+    deployments = load_deployments(root)
+    assert {deployment.deployment_id for deployment in deployments} == {"generated_qqq", "manual_qqq"}
+
+    _write_manifest(generated / "duplicate.yaml", "manual_qqq")
+    with pytest.raises(ValueError, match="Duplicate deployment_id"):
+        load_deployments(root)
+
+
+def test_load_bias_inputs_returns_empty_list_when_file_missing(tmp_path: Path) -> None:
+    assert load_bias_inputs(tmp_path / "missing.yaml") == []
+
+
+def _write_manifest(path: Path, deployment_id: str) -> None:
+    payload = {
+        "deployment_id": deployment_id,
+        "enabled": True,
+        "symbol": "QQQ",
+        "strategy": {"key": "market_impulse", "version": 1, "params": {"direction": "short"}},
+        "execution": {
+            "profile": "single_leg_long_premium_v1",
+            "option_mapping": {"long_signal": "CALL", "short_signal": "PUT"},
+            "dte_min": 0,
+            "dte_max": 7,
+            "target_abs_delta_min": 0.2,
+            "target_abs_delta_max": 0.4,
+            "min_open_interest": 100,
+            "max_bid_ask_spread_pct": 0.2,
+        },
+        "risk": {
+            "profile": "conservative_day1",
+            "max_trade_premium_usd": 300,
+            "hard_flat_time_et": "15:55",
+            "stop_loss_pct": 0.45,
+        },
+        "exit": {
+            "profile": "market_impulse_exit_v1",
+            "use_algorithmic_exit": True,
+            "use_profit_target": False,
+            "profit_target_multiple": None,
+            "stop_loss_pct": 0.45,
+            "stop_to_breakeven_after_r_multiple": None,
+            "hard_flat_time_et": "15:55",
+        },
+        "source": {"origin": "test", "run_date": "2026-03-31", "artifact": "test.csv"},
+    }
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

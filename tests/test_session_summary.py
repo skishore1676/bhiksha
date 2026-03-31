@@ -106,6 +106,15 @@ def test_session_summary_aggregates_runtime_metrics(tmp_path) -> None:
                 "unit": "ms",
             },
         )
+        await repo.append(
+            "runtime_issue",
+            {
+                "category": "order",
+                "symbol": "QQQ",
+                "action": "entry",
+                "error": "preflight failed",
+            },
+        )
 
     asyncio.run(seed())
 
@@ -114,3 +123,4 @@ def test_session_summary_aggregates_runtime_metrics(tmp_path) -> None:
     assert summary.runtime_metric_latest["heartbeat_lag_ms:QQQ"] == 180.0
     assert summary.runtime_metric_average["heartbeat_lag_ms:QQQ"] == 150.0
     assert summary.runtime_metric_latest["execution_run_ms:QQQ:manage"] == 45.5
+    assert summary.runtime_issue_counts["order"] == 1

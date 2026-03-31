@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -73,6 +73,10 @@ class AppConfig(BaseModel):
     reconciliation_interval_seconds: int = 15
     order_fill_poll_seconds: int = 2
     order_fill_timeout_seconds: int = 20
+    generated_deployments_dir: str = "config/deployments/generated"
+    bias_inputs_path: str = "config/bias_inputs.yaml"
+    playbook_artifacts_dir: str = "artifacts/playbook"
+    observation_reports_dir: str = "artifacts/observations"
 
 
 class ProviderConfig(BaseModel):
@@ -186,3 +190,33 @@ class ConservativeRiskProfile(BaseModel):
     max_trade_premium_usd: float = 300.0
     max_daily_drawdown_pct: float = 2.0
     hard_flat_time_et: str = "15:55"
+
+
+class BiasSelection(BaseModel):
+    allowed_bias_templates: ClassVar[set[str]] = {
+        "bullish_trend_intraday",
+        "bullish_mean_reversion_intraday",
+        "bearish_trend_intraday",
+        "bearish_mean_reversion_intraday",
+    }
+
+    symbol: str
+    bias_template: str
+    horizon: str = "intraday"
+    enabled: bool = True
+    max_active_candidates: int = 1
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "BiasSelection":
+        self.symbol = self.symbol.upper()
+        if self.bias_template not in self.allowed_bias_templates:
+            raise ValueError(f"Unsupported bias_template: {self.bias_template}")
+        if self.horizon != "intraday":
+            raise ValueError(f"Unsupported horizon: {self.horizon}")
+        if self.max_active_candidates < 1:
+            raise ValueError("max_active_candidates must be >= 1")
+        return self
+
+
+class BiasConfig(BaseModel):
+    selections: list[BiasSelection] = Field(default_factory=list)

@@ -26,6 +26,7 @@ class SessionSummary:
     lifecycle_last_state: dict[str, str] = field(default_factory=dict)
     signal_true_counts: dict[str, int] = field(default_factory=dict)
     exit_true_counts: dict[str, int] = field(default_factory=dict)
+    runtime_issue_counts: dict[str, int] = field(default_factory=dict)
     runtime_metric_latest: dict[str, float] = field(default_factory=dict)
     runtime_metric_average: dict[str, float] = field(default_factory=dict)
     recent_events: list[RecentEvent] = field(default_factory=list)
@@ -46,6 +47,7 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
     lifecycle_last_state: dict[str, str] = {}
     signal_true_counts: Counter[str] = Counter()
     exit_true_counts: Counter[str] = Counter()
+    runtime_issue_counts: Counter[str] = Counter()
     runtime_metric_values: defaultdict[str, list[float]] = defaultdict(list)
     runtime_metric_latest: dict[str, float] = {}
     recent: list[RecentEvent] = []
@@ -65,6 +67,9 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
             signal_true_counts[deployment_id] += 1
         if event_type == "exit_decision" and deployment_id and bool(payload.get("exit")):
             exit_true_counts[deployment_id] += 1
+        if event_type == "runtime_issue":
+            category = _maybe_str(payload.get("category")) or "exception"
+            runtime_issue_counts[category] += 1
         if event_type == "runtime_metric":
             metric_name = _runtime_metric_name(payload)
             metric_value = _maybe_float(payload.get("value"))
@@ -88,6 +93,7 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
         lifecycle_last_state=lifecycle_last_state,
         signal_true_counts=dict(signal_true_counts),
         exit_true_counts=dict(exit_true_counts),
+        runtime_issue_counts=dict(runtime_issue_counts),
         runtime_metric_latest=runtime_metric_latest,
         runtime_metric_average={
             key: round(sum(values) / len(values), 3) for key, values in runtime_metric_values.items() if values

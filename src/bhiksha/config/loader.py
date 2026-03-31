@@ -8,7 +8,7 @@ from typing import TypeVar
 import yaml
 from pydantic import BaseModel
 
-from bhiksha.config.models import AppConfig, DeploymentManifest, ProviderConfig
+from bhiksha.config.models import AppConfig, BiasConfig, BiasSelection, DeploymentManifest, ProviderConfig
 
 ConfigModelT = TypeVar("ConfigModelT", bound=BaseModel)
 
@@ -35,8 +35,24 @@ def load_provider_config(path: str | Path) -> ProviderConfig:
 
 def load_deployments(path: str | Path) -> list[DeploymentManifest]:
     root = Path(path)
+    if not root.exists():
+        return []
     manifests: list[DeploymentManifest] = []
-    for file_path in sorted(root.glob("*.yaml")):
-        manifests.append(_load_model(file_path, DeploymentManifest))
+    seen_ids: dict[str, Path] = {}
+    for file_path in sorted(root.rglob("*.yaml")):
+        manifest = _load_model(file_path, DeploymentManifest)
+        previous = seen_ids.get(manifest.deployment_id)
+        if previous is not None:
+            raise ValueError(
+                f"Duplicate deployment_id {manifest.deployment_id!r} in {previous} and {file_path}"
+            )
+        seen_ids[manifest.deployment_id] = file_path
+        manifests.append(manifest)
     return manifests
 
+
+def load_bias_inputs(path: str | Path) -> list[BiasSelection]:
+    resolved = Path(path)
+    if not resolved.exists():
+        return []
+    return _load_model(resolved, BiasConfig).selections
