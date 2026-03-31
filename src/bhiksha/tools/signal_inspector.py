@@ -8,6 +8,7 @@ import csv
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -16,6 +17,8 @@ from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.market_data.session import ET, ensure_utc
 from bhiksha.market_data.trading_calendar import trading_window_start
+
+CT = ZoneInfo("America/Chicago")
 
 
 async def _run(
@@ -41,7 +44,7 @@ async def _run(
         frame = _frame_from_bars(bars)
         enriched = evaluator.prepare_enriched_frames(frame, [deployment])[deployment.deployment_id]
         start_index = _start_index_for_window(enriched["timestamp"].to_list(), window_start)
-        decisions = evaluator.scan_entry_history_on_enriched(
+        indexed_decisions = evaluator.scan_entry_history_with_index_on_enriched(
             deployment,
             enriched,
             start_at=start_index,
@@ -49,19 +52,26 @@ async def _run(
         )
         print(
             f"DEPLOYMENT={deployment.deployment_id} SYMBOL={deployment.symbol} "
-            f"WINDOW_START_UTC={window_start.isoformat()} TRADING_DAYS={trading_days} BARS={enriched.height} "
-            f"MATCHES={len(decisions)}"
+            f"BARS={enriched.height} MATCHES={len(indexed_decisions)}"
         )
-        if not decisions:
+        if not indexed_decisions:
             continue
-        for decision in decisions:
-            print(_format_decision(decision, show_features=show_features))
+        for index, decision in indexed_decisions:
+            row = enriched.row(index, named=True)
+            print(
+                _format_decision(
+                    decision,
+                    bar_open=row.get("open"),
+                    bar_close=row.get("close"),
+                    show_features=show_features,
+                )
+            )
             csv_rows.append(
                 _decision_to_csv_row(
                     decision,
+                    bar_open=row.get("open"),
+                    bar_close=row.get("close"),
                     show_features=show_features,
-                    window_start=window_start,
-                    trading_days=trading_days,
                 )
             )
 
@@ -102,16 +112,25 @@ def _start_index_for_window(timestamps: list[datetime], window_start: datetime) 
     return len(timestamps)
 
 
-def _format_decision(decision, *, show_features: bool) -> str:
+def _central_fields(timestamp: datetime) -> tuple[str, str]:
+    timestamp_ct = ensure_utc(timestamp).astimezone(CT)
+    return timestamp_ct.strftime("%Y-%m-%d"), timestamp_ct.strftime("%I:%M:%S %p %Z")
+
+
+def _format_decision(decision, *, bar_open: float | None, bar_close: float | None, show_features: bool) -> str:
     timestamp_utc = ensure_utc(decision.timestamp)
     timestamp_et = timestamp_utc.astimezone(ET)
+    date_ct, time_ct = _central_fields(timestamp_utc)
     payload = {
         "timestamp_et": timestamp_et.isoformat(),
-        "timestamp_utc": timestamp_utc.isoformat(),
+        "date_ct": date_ct,
+        "time_ct": time_ct,
         "deployment_id": decision.deployment_id,
         "symbol": decision.symbol,
         "signal": decision.signal,
         "direction": decision.direction.value if decision.direction else None,
+        "entry_bar_open": bar_open,
+        "entry_bar_close": bar_close,
         "reason": decision.reason,
     }
     if show_features:
@@ -119,19 +138,27 @@ def _format_decision(decision, *, show_features: bool) -> str:
     return json.dumps(payload, default=str, sort_keys=True)
 
 
-def _decision_to_csv_row(decision, *, show_features: bool, window_start: datetime, trading_days: int) -> dict[str, str]:
+def _decision_to_csv_row(
+    decision,
+    *,
+    bar_open: float | None,
+    bar_close: float | None,
+    show_features: bool,
+) -> dict[str, str]:
     timestamp_utc = ensure_utc(decision.timestamp)
     timestamp_et = timestamp_utc.astimezone(ET)
+    date_ct, time_ct = _central_fields(timestamp_utc)
     row = {
         "deployment_id": decision.deployment_id,
         "symbol": decision.symbol,
         "timestamp_et": timestamp_et.isoformat(),
-        "timestamp_utc": timestamp_utc.isoformat(),
+        "date_ct": date_ct,
+        "time_ct": time_ct,
         "signal": str(decision.signal),
         "direction": decision.direction.value if decision.direction else "",
+        "entry_bar_open": "" if bar_open is None else str(bar_open),
+        "entry_bar_close": "" if bar_close is None else str(bar_close),
         "reason_json": json.dumps(decision.reason),
-        "window_start_utc": window_start.isoformat(),
-        "trading_days": str(trading_days),
     }
     if show_features:
         row["features_json"] = json.dumps(decision.features, default=str, sort_keys=True)
@@ -144,12 +171,13 @@ def _write_csv(path: Path, rows: list[dict[str, str]], *, show_features: bool) -
         "deployment_id",
         "symbol",
         "timestamp_et",
-        "timestamp_utc",
+        "date_ct",
+        "time_ct",
         "signal",
         "direction",
+        "entry_bar_open",
+        "entry_bar_close",
         "reason_json",
-        "window_start_utc",
-        "trading_days",
     ]
     if show_features:
         fieldnames.append("features_json")

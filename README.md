@@ -95,6 +95,11 @@ PYTHONPATH=src .venv/bin/python -m bhiksha.tools.signal_inspector \
   --trading-days 3 \
   --csv artifacts/signal_inspector/tsla_last_3_trading_days.csv
 ```
+For all deployements:
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.signal_inspector \
+  --trading-days 3 \
+  --csv artifacts/signal_inspector/all_enabled_last_3_trading_days.csv
+
 
 This now reports:
 

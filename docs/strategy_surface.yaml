@@ -1,0 +1,255 @@
+schema_version: 1
+updated_at: "2026-03-31"
+owner: bhiksha
+purpose: >
+  Shared research and execution surface between Bhiksha and Mala.
+  This file describes the parameter space Bhiksha can express today,
+  along with the parts that are fully replayable from underlying bars
+  versus the parts that require historical option premium data.
+
+design_notes:
+  - Keep this file as the shared contract for what research may vary and what execution may honor.
+  - Add new fields here when Bhiksha gains new parameterized behavior.
+  - Avoid listing hypothetical knobs that are not implemented in Bhiksha yet.
+  - Treat this as a living surface map, not as a strategy-performance artifact.
+
+replay_layers:
+  underlying_signal_layer:
+    description: Entry logic, strategy exits, and time exits derived from underlying bars and enriched features.
+    replayable_without_option_history: true
+  vehicle_feasibility_layer:
+    description: Contract selection and entry feasibility constraints such as DTE, delta, open interest, spread, and budget.
+    replayable_without_option_history: true
+    notes:
+      - Depends on available historical chain or current chain assumptions in the replay workflow.
+  premium_pnl_layer:
+    description: Premium stop loss, premium target, and true option PnL path after entry.
+    replayable_without_option_history: false
+    notes:
+      - Requires historical option quote data for the selected contract.
+
+shared_parameters:
+  signal_entry:
+    - id: direction
+      bhiksha_path: strategy.params.direction
+      type: enum
+      allowed_values: [long, short, both]
+      description: Restricts a strategy to long-only, short-only, or both sides if omitted.
+
+  vehicle_execution:
+    - id: execution_profile
+      bhiksha_path: execution.profile
+      type: string
+      description: Selects how Bhiksha maps an underlying signal into an option vehicle.
+    - id: long_signal_contract_type
+      bhiksha_path: execution.option_mapping.long_signal
+      type: enum
+      allowed_values: [CALL, PUT]
+      description: Contract type Bhiksha buys when a long underlying signal fires.
+    - id: short_signal_contract_type
+      bhiksha_path: execution.option_mapping.short_signal
+      type: enum
+      allowed_values: [CALL, PUT]
+      description: Contract type Bhiksha buys when a short underlying signal fires.
+    - id: dte_min
+      bhiksha_path: execution.dte_min
+      type: integer
+      description: Minimum days-to-expiration allowed when selecting an option contract.
+    - id: dte_max
+      bhiksha_path: execution.dte_max
+      type: integer
+      description: Maximum days-to-expiration allowed when selecting an option contract.
+    - id: target_abs_delta_min
+      bhiksha_path: execution.target_abs_delta_min
+      type: float
+      description: Minimum absolute delta allowed for the selected option contract.
+    - id: target_abs_delta_max
+      bhiksha_path: execution.target_abs_delta_max
+      type: float
+      description: Maximum absolute delta allowed for the selected option contract.
+    - id: min_open_interest
+      bhiksha_path: execution.min_open_interest
+      type: integer
+      description: Rejects option contracts whose open interest is below this threshold.
+    - id: max_bid_ask_spread_pct
+      bhiksha_path: execution.max_bid_ask_spread_pct
+      type: float
+      description: Rejects option contracts whose quoted spread exceeds this percentage.
+    - id: entry_window_start_et
+      bhiksha_path: execution.entry_window_start_et
+      type: hh:mm
+      description: Earliest ET timestamp when a valid signal may be turned into an entry plan.
+    - id: entry_window_end_et
+      bhiksha_path: execution.entry_window_end_et
+      type: hh:mm
+      description: Latest ET timestamp when a valid signal may be turned into an entry plan.
+    - id: shadow_only
+      bhiksha_path: execution.shadow_only
+      type: boolean
+      description: Runs the deployment live for evaluation while preventing real order submission.
+
+  risk:
+    - id: max_trade_premium_usd
+      bhiksha_path: risk.max_trade_premium_usd
+      type: float
+      description: Caps premium budget per trade and determines maximum quantity.
+    - id: hard_flat_time_et
+      bhiksha_path: risk.hard_flat_time_et
+      type: hh:mm
+      description: Session cutoff after which Bhiksha force-closes any still-open position.
+    - id: stop_loss_pct
+      bhiksha_path: risk.stop_loss_pct
+      type: float
+      description: Premium-based stop percentage used by the live execution layer.
+
+  exit:
+    - id: exit_profile
+      bhiksha_path: exit.profile
+      type: string
+      description: Labels the exit style and groups related exit behavior.
+    - id: use_algorithmic_exit
+      bhiksha_path: exit.use_algorithmic_exit
+      type: boolean
+      description: Enables strategy-managed exit logic based on underlying bars and features.
+    - id: use_profit_target
+      bhiksha_path: exit.use_profit_target
+      type: boolean
+      description: Enables a live premium-based profit target for the option position.
+    - id: profit_target_multiple
+      bhiksha_path: exit.profit_target_multiple
+      type: float
+      description: Defines the premium target in R-multiple terms relative to stop loss.
+    - id: target_approach_offset_pct
+      bhiksha_path: exit.target_approach_offset_pct
+      type: float
+      description: Allows target logic to arm before the full target price is touched.
+    - id: target_pullback_restore_progress_pct
+      bhiksha_path: exit.target_pullback_restore_progress_pct
+      type: float
+      description: Restores stop protection after target progress retraces past this threshold.
+    - id: exit_stop_loss_pct
+      bhiksha_path: exit.stop_loss_pct
+      type: float
+      description: Premium-based stop percentage applied by the live exit layer.
+    - id: stop_to_breakeven_after_r_multiple
+      bhiksha_path: exit.stop_to_breakeven_after_r_multiple
+      type: float
+      description: Reserved hook for moving stop to breakeven after a specified R threshold.
+    - id: exit_hard_flat_time_et
+      bhiksha_path: exit.hard_flat_time_et
+      type: hh:mm
+      description: Exit-layer override for the session hard-flat time.
+
+strategy_families:
+  market_impulse:
+    summary: >
+      Cross-and-reclaim strategy that aligns a lower-timeframe reclaim of VMA
+      with a higher-timeframe impulse regime.
+    replayable_entry: true
+    replayable_strategy_exit: true
+    entry_logic:
+      long: Bullish regime, low touches or crosses below VMA, and close finishes back above VMA inside the entry window.
+      short: Bearish regime, high touches or crosses above VMA, and close finishes back below VMA inside the entry window.
+    exit_logic:
+      long:
+        - Close below VMA exits the trade.
+        - Bearish regime flip exits the trade.
+      short:
+        - Close above VMA exits the trade.
+        - Bullish regime flip exits the trade.
+    parameters:
+      - id: vma_length
+        bhiksha_path: strategy.params.vma_length
+        type: integer
+        description: Length of the VMA used for both entry and strategy exit checks.
+      - id: regime_timeframe
+        bhiksha_path: strategy.params.regime_timeframe
+        type: string
+        description: Higher-timeframe used to derive the impulse regime feature.
+      - id: entry_buffer_minutes
+        bhiksha_path: strategy.params.entry_buffer_minutes
+        type: integer
+        description: Minutes after the market open before entry signals are allowed.
+      - id: entry_window_minutes
+        bhiksha_path: strategy.params.entry_window_minutes
+        type: integer
+        description: Minutes after the market open during which Market Impulse may signal.
+      - id: market_open_hour
+        bhiksha_path: strategy.params.market_open_hour
+        type: integer
+        description: Hour component of the market-open anchor used to build the strategy window.
+      - id: market_open_minute
+        bhiksha_path: strategy.params.market_open_minute
+        type: integer
+        description: Minute component of the market-open anchor used to build the strategy window.
+
+  jerk_pivot_momentum:
+    summary: >
+      VPOC-centered momentum strategy that looks for aligned velocity,
+      acceleration, and jerk inflection near the 4-hour VPOC.
+    replayable_entry: true
+    replayable_strategy_exit: false
+    entry_logic:
+      long: Price is near and above VPOC, velocity and acceleration are positive, and smoothed jerk crosses from negative to positive.
+      short: Price is near and below VPOC, velocity and acceleration are negative, and smoothed jerk crosses from positive to negative.
+    exit_logic:
+      long:
+        - No strategy-managed exit is currently implemented in Bhiksha.
+      short:
+        - No strategy-managed exit is currently implemented in Bhiksha.
+    parameters:
+      - id: vpoc_proximity_pct
+        bhiksha_path: strategy.params.vpoc_proximity_pct
+        type: float
+        description: Maximum normalized distance from 4-hour VPOC allowed for a valid setup.
+      - id: jerk_lookback
+        bhiksha_path: strategy.params.jerk_lookback
+        type: integer
+        description: Rolling window used to smooth jerk before evaluating the directional crossover.
+      - id: volume_ma_period
+        bhiksha_path: strategy.params.volume_ma_period
+        type: integer
+        description: Lookback period for the moving average used by the volume gate.
+      - id: volume_multiplier
+        bhiksha_path: strategy.params.volume_multiplier
+        type: float
+        description: Minimum multiple of current volume relative to volume average required to pass the gate.
+      - id: use_volume_filter
+        bhiksha_path: strategy.params.use_volume_filter
+        type: boolean
+        description: Enables or disables the volume threshold gate.
+      - id: use_time_filter
+        bhiksha_path: strategy.params.use_time_filter
+        type: boolean
+        description: Enables or disables the strategy-local session time filter.
+      - id: session_start
+        bhiksha_path: strategy.params.session_start
+        type: hh:mm
+        description: Earliest ET time when the strategy may emit a signal.
+      - id: session_end
+        bhiksha_path: strategy.params.session_end
+        type: hh:mm
+        description: Latest ET time when the strategy may emit a signal.
+
+current_constraints:
+  - Bhiksha supports multiple strategy families through a normalized deployment manifest.
+  - Signal logic is replayable from underlying bars and feature enrichment.
+  - Time exits are replayable from timestamp rules.
+  - Strategy exits are replayable only for families that implement evaluate_exit.
+  - Premium stop loss and premium target logic exist in live execution but are not faithfully replayable without option quote history.
+  - The current live vehicle model is single-leg long premium via option selection constraints.
+
+recommended_mala_search_dimensions:
+  - direction
+  - entry window shape
+  - signal threshold or proximity threshold
+  - smoothing lookback
+  - volume gate on or off
+  - volume threshold
+  - higher timeframe regime choice
+  - vehicle DTE range
+  - vehicle delta range
+  - spread and liquidity filters
+  - hard flat time
+  - strategy exit enabled or disabled
+  - strategy exit strictness
