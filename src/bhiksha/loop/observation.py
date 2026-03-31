@@ -80,17 +80,20 @@ async def _deployment_packet(
     provider: str | None,
     include_replay: bool,
 ) -> dict[str, Any]:
+    startup_snapshot, startup_created_at = _latest_startup_snapshot(events, deployment.deployment_id)
     relevant_events = [
         event
         for event in events
         if event["payload"].get("deployment_id") == deployment.deployment_id
+        and _event_at_or_after(event, startup_created_at)
     ]
     symbol_events = [
         event
         for event in events
-        if event["payload"].get("deployment_id") is None and event["payload"].get("symbol") == deployment.symbol
+        if event["payload"].get("deployment_id") is None
+        and event["payload"].get("symbol") == deployment.symbol
+        and _event_at_or_after(event, startup_created_at)
     ]
-    startup_snapshot = _latest_startup_snapshot(events, deployment.deployment_id)
     signal_events = [event for event in relevant_events if event["event_type"] == "signal_decision"]
     trade_plan_events = [event for event in relevant_events if event["event_type"] == "trade_plan"]
     exit_plan_events = [event for event in relevant_events if event["event_type"] == "exit_plan"]
@@ -174,11 +177,7 @@ async def _replay_summary(
     )
     enriched = evaluator.prepare_enriched_frames(frame, [deployment])[deployment.deployment_id]
     window_start = trading_window_start(datetime.now(UTC), trading_days)
-    start_index = 0
-    for index, timestamp in enumerate(enriched["timestamp"].to_list()):
-        if ensure_utc(timestamp) >= window_start:
-            start_index = index
-            break
+    start_index = _start_index_for_window(enriched["timestamp"].to_list(), window_start)
     trades = evaluator.scan_trade_history_on_enriched(deployment, enriched, start_at=start_index)
     exit_categories = Counter(trade.exit_category for trade in trades)
     return {
@@ -214,14 +213,27 @@ def _load_events(db_path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _latest_startup_snapshot(events: list[dict[str, Any]], deployment_id: str) -> dict[str, Any]:
+def _event_at_or_after(event: dict[str, Any], cutoff_created_at: str | None) -> bool:
+    if cutoff_created_at is None:
+        return True
+    return str(event["created_at"]) >= cutoff_created_at
+
+
+def _start_index_for_window(timestamps: list[datetime], window_start: datetime) -> int:
+    for index, timestamp in enumerate(timestamps):
+        if ensure_utc(timestamp) >= window_start:
+            return index
+    return len(timestamps)
+
+
+def _latest_startup_snapshot(events: list[dict[str, Any]], deployment_id: str) -> tuple[dict[str, Any], str | None]:
     for event in reversed(events):
         if event["event_type"] != "startup_config":
             continue
         deployments = event["payload"].get("deployments") or []
         if any(str(item.get("deployment_id")) == deployment_id for item in deployments if isinstance(item, dict)):
-            return event["payload"]
-    return {}
+            return event["payload"], str(event["created_at"])
+    return {}, None
 
 
 def _packet_markdown(packet: dict[str, Any]) -> str:

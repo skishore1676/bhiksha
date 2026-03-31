@@ -82,10 +82,6 @@ def refresh_generated_deployments(
     manual_candidates = _dedupe_candidates(manual_candidates)
 
     generated_deployments: list[dict[str, Any]] = []
-    generated_dir.mkdir(parents=True, exist_ok=True)
-    for file_path in sorted(generated_dir.glob("*.yaml")):
-        file_path.unlink()
-
     human_ids = _human_managed_deployment_ids(config_root / "deployments")
     blocked_generation = any(
         issue.startswith(prefix)
@@ -95,6 +91,9 @@ def refresh_generated_deployments(
     if blocked_generation:
         issues.append("generated_deployments_skipped")
     else:
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        for file_path in sorted(generated_dir.glob("*.yaml")):
+            file_path.unlink()
         for candidate in selected_candidates:
             manifest = _build_generated_manifest(candidate)
             deployment_id = str(manifest["deployment_id"])

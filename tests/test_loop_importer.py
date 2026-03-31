@@ -195,6 +195,37 @@ def test_refresh_generated_deployments_reports_empty_bias_selection(tmp_path: Pa
     assert list((config_root / "deployments" / "generated").glob("*.yaml")) == []
 
 
+def test_refresh_generated_deployments_preserves_existing_generated_manifests_when_blocked(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    generated_root = config_root / "deployments" / "generated"
+    generated_root.mkdir(parents=True)
+    existing_path = generated_root / "existing.yaml"
+    _write_manifest(existing_path, "existing_shadow")
+    (config_root / "bias_inputs.yaml").write_text("selections: []\n", encoding="utf-8")
+
+    now = datetime.now(UTC).isoformat()
+    candidates_path = tmp_path / "deployment_candidates.json"
+    playbook_path = tmp_path / "playbook_catalog.json"
+    candidates_path.write_text(
+        json.dumps({"schema_version": 1, "generated_at": now, "candidates": []}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    playbook_path.write_text(
+        json.dumps({"schema_version": 1, "generated_at": now, "contexts": {}}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    report = refresh_generated_deployments(
+        config_root=config_root,
+        deployment_candidates_path=candidates_path,
+        playbook_catalog_path=playbook_path,
+    )
+
+    assert report.safe_for_live_review is False
+    assert "generated_deployments_skipped" in report.issues
+    assert existing_path.exists()
+
+
 def _candidate_payload(
     *,
     candidate_id: str,
