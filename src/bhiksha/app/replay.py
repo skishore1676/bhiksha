@@ -66,6 +66,27 @@ class ReplaySignalEvaluator:
         enriched = self.prepare_enriched_frames(frame, [deployment])[deployment.deployment_id]
         return self.evaluate_entry_on_enriched(deployment, enriched)
 
+    def scan_entry_history_on_enriched(
+        self,
+        deployment: DeploymentManifest,
+        enriched: pl.DataFrame,
+        *,
+        start_at: int = 0,
+        signals_only: bool = True,
+    ) -> list[SignalDecision]:
+        strategy = self.strategy_registry.get(deployment.strategy.key)
+        decisions: list[SignalDecision] = []
+        for index in range(max(start_at, 0), enriched.height):
+            decision = strategy.evaluate_entry(
+                enriched.head(index + 1),
+                deployment.deployment_id,
+                deployment.strategy.params,
+            )
+            if signals_only and not decision.signal:
+                continue
+            decisions.append(decision)
+        return decisions
+
     def evaluate_exit(
         self,
         deployment: DeploymentManifest,

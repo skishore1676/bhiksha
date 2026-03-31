@@ -195,6 +195,7 @@ Current runtime reality:
 - deployment manifests are the source of truth for live behavior,
 - shared `risk` and `vehicle` profile files exist, but are not yet merged automatically at load time,
 - execution config now supports `shadow_only` so a deployment can participate in live market evaluation without broker-side entry.
+- replay and inspection tooling should use NYSE trading-day windows rather than naive calendar-day lookbacks.
 
 Config precedence:
 
@@ -269,6 +270,21 @@ Important implementation choice:
 
 This is acceptable because Day 1 symbol count is tiny.
 
+### 4.5 Trading Calendar
+
+Bhiksha now includes a first-class NYSE trading-calendar helper for session-aware tooling.
+
+Use cases that should rely on it:
+
+- warm-start and historical replay windows,
+- operator tooling such as signal inspection,
+- any future reporting that says "last N trading days".
+
+Use cases that do not need it:
+
+- per-bar live strategy evaluation after the closed bar is already available,
+- strategy time gates that operate directly on each bar's ET timestamp.
+
 ### 5. Strategy Plugin Layer
 
 Each strategy plugin should be pure and deterministic.
@@ -317,6 +333,7 @@ Current important refinements:
 - signal-session filters and execution-entry windows are modeled separately,
 - `execution.shadow_only` allows live bar evaluation and plan simulation without order submission,
 - the planner can therefore support mixed sessions where some deployments trade live and others only shadow.
+- operator tooling can export historical signal hits to CSV for chart review, using the same strategy plugins and trading-calendar-aware warm-start windows as the runtime.
 
 For compatibility with Mala-era strategy code, Bhiksha may also support adapters around `generate_signals(df)` style strategies.
 

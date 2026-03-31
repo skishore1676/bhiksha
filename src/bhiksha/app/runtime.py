@@ -28,6 +28,7 @@ from bhiksha.market_data.adapters.polygon import PolygonBarSource
 from bhiksha.market_data.adapters.schwab import SchwabBarSource
 from bhiksha.market_data.daemon import DataIngestionDaemon
 from bhiksha.market_data.feature_service import FeatureService
+from bhiksha.market_data.trading_calendar import trading_window_start
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup
 from bhiksha.persistence.sqlite import SQLiteEventRepository
 from bhiksha.persistence.sqlite import SQLiteTradeStateRepository
@@ -85,7 +86,7 @@ class BhikshaRuntime:
         """Warm start bars for a symbol using the configured provider."""
         provider = provider or self.provider_config.underlying_live_primary
         end = datetime.now(UTC)
-        start = end - timedelta(days=self.app_config.warmup_trading_days + 3)
+        start = trading_window_start(end, self.app_config.warmup_trading_days + 3)
 
         if provider == "schwab":
             source = SchwabBarSource()

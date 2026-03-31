@@ -49,3 +49,28 @@ def test_replay_evaluator_reuses_enrichment_for_same_feature_set() -> None:
 
     assert set(enriched) == {qqq.deployment_id, sibling.deployment_id}
     assert len(service.calls) == 1
+
+
+def test_replay_evaluator_can_scan_historical_signals_on_enriched_frame() -> None:
+    deployments = load_deployments("config/deployments")
+    tsla = next(d for d in deployments if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1")
+    evaluator = ReplaySignalEvaluator(FeatureService(), default_strategy_registry())
+    frame = pl.DataFrame(
+        {
+            "symbol": ["TSLA"] * 11,
+            "timestamp": [datetime(2026, 3, 30, 15, 0, 0).replace(minute=minute) for minute in range(11)],
+            "close": [100.05] * 10 + [99.90],
+            "velocity_1m": [0.05] * 10 + [-0.20],
+            "accel_1m": [0.02] * 10 + [-0.10],
+            "jerk_1m": [1.0] * 10 + [-20.0],
+            "vpoc_4h": [100.0] * 11,
+            "volume": [1400.0] * 10 + [1500.0],
+            "volume_ma_20": [1000.0] * 11,
+        }
+    )
+
+    decisions = evaluator.scan_entry_history_on_enriched(tsla, frame)
+
+    assert len(decisions) == 1
+    assert decisions[0].signal is True
+    assert decisions[0].direction.value == "short"

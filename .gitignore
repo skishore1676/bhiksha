@@ -13,3 +13,4 @@ __pycache__/
 config/public_session.json
 config/public_account.json
 config/schwab_tokens.json
+artifacts/signal_inspector/

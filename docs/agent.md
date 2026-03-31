@@ -624,3 +624,31 @@ Next steps:
 1. Decide when TSLA should graduate from `shadow_only` to broker-live entry.
 2. Add one end-to-end replay case for jerk-pivot feature enrichment plus planning.
 3. Decide whether future research ingestion should gain first-class aliases like `strategy_family`, `signal_params`, and `vehicle`, or remain normalized before commit.
+
+### 2026-03-31 (Trading-Day Signal Inspector)
+
+Completed:
+
+- Added a first-class NYSE trading-calendar utility under `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/market_data/trading_calendar.py`.
+- Switched warm-start lookbacks from naive calendar-day windows to trading-day-aware windows.
+- Added `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/signal_inspector.py` for replay-style historical signal inspection against live Bhiksha strategy code.
+- Updated the signal inspector to use `--trading-days` instead of calendar-day lookbacks.
+- Added optional CSV export from the signal inspector for chart-review workflows.
+- Added gitignore coverage for `artifacts/signal_inspector/`.
+- Verified that trading-day-aware inspection changed the TSLA result materially: the previous calendar-day scan missed valid 2026-03-27 jerk-pivot signals.
+
+Verification:
+
+- `66` tests passing.
+- `python3 -m compileall src tests` passes cleanly.
+
+Open items:
+
+- Signal inspector currently exports one flat CSV file; we may later want grouped output by trading date or per-deployment automatic file naming.
+- The live tmux session must be restarted to pick up any code changes; the running process still uses the code that was loaded at launch.
+
+Next steps:
+
+1. Restart the live tmux session when ready so the trading-calendar warm-start path is active in the runtime process too.
+2. Add a richer replay report mode if chart review starts needing grouped candles, not just trigger timestamps.
+3. Decide whether signal-inspector CSV output should become part of a more formal `reports/` or `artifacts/` operator workflow.

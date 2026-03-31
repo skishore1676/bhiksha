@@ -81,6 +81,21 @@ Session summary:
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.session_summary
 ```
 
+Signal inspector:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.signal_inspector --trading-days 3
+```
+
+Signal inspector with CSV export:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.signal_inspector \
+  --deployment-id jerk_pivot_momentum_tsla_short_v1 \
+  --trading-days 3 \
+  --csv artifacts/signal_inspector/tsla_last_3_trading_days.csv
+```
+
 This now reports:
 
 - total event counts
@@ -102,8 +117,10 @@ PYTHONPATH=src .venv/bin/pytest -q
 - Quotes and preflight are already validated against Public.
 - Restart safety is broker-sync based: existing Public option positions are re-imported on startup and each completed bar.
 - Compact research-style execution inputs such as `dte: "7-21"`, `delta_target: "0.35-0.55"`, and `entry_window_et: "09:45-14:30"` now normalize directly into the Bhiksha manifest model.
+- Historical signal inspection now uses NYSE trading-day lookbacks rather than naive calendar-day windows.
+- Optional signal-inspector CSV exports are intended to live under `artifacts/signal_inspector/`, which is gitignored.
 
 Verification:
 
-- `62` tests passing.
+- `66` tests passing.
 - `python3 -m compileall src tests` passes cleanly.
