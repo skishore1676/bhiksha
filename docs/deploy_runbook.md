@@ -1,12 +1,21 @@
 # Bhiksha Deploy Runbook
 
-This runbook is for the first live session on Monday, 2026-03-30.
+This runbook covers the current operator loop for Bhiksha with Mala playbook
+imports and the intraday emergency control.
 
 ## Pre-Market Checklist
 
 1. Confirm `.env` is present and current.
 2. Confirm Schwab OAuth tokens exist in `/Users/suman/kg_env/projects/bhiksha/config/schwab_tokens.json`.
-3. Run provider health:
+3. Confirm `config/bias_inputs.yaml` reflects the day's operator view.
+4. If you need an emergency fail-safe armed but inactive, confirm:
+
+```yaml
+emergency:
+  halt_and_flatten: false
+```
+
+5. Run provider health:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.healthcheck
@@ -18,7 +27,22 @@ Expected:
 - `POLYGON=True`
 - `SCHWAB=True`
 
-4. Run a warm-start dry run:
+6. Import the latest Mala playbook bundle before open:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
+  --deployment-candidates <path>/deployment_candidates.json \
+  --playbook-catalog <path>/playbook_catalog.json
+```
+
+Expected:
+
+- schema-v2 contracts validate cleanly
+- supported candidates become generated shadow manifests
+- proposed candidates only appear on the manual research board
+- `safe_for_live_review` is `true` if the selected supported set is clean
+
+7. Run a warm-start dry run:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --max-bars 0
@@ -64,6 +88,27 @@ Live behavior:
 - syncs broker positions on every bar so restarts do not double-enter
 - submits a hard-flat close order at the configured ET cutoff
 
+## Intraday Emergency Control
+
+If your macro read is invalidated intraday, set:
+
+```yaml
+emergency:
+  halt_and_flatten: true
+```
+
+in `config/bias_inputs.yaml`.
+
+Current runtime behavior:
+
+- Bhiksha reloads the emergency flag during the session
+- new entries are skipped while the flag is on
+- open Bhiksha-managed positions are flattened
+- pending live entry orders are canceled instead of being treated as open positions
+
+To return to normal routing on a later session, set the flag back to `false`
+before startup or before the next import cycle.
+
 ## Day-1 Guardrails
 
 - Deployments: `market_impulse_qqq_short_v1`, `market_impulse_spy_short_v1`
@@ -78,3 +123,6 @@ Live behavior:
 - The runtime is single-process and SQLite-backed.
 - The order log is durable, but advanced resume logic is still broker-sync based rather than full event replay.
 - Protective stops are submitted after fill; if a stop fills externally, the next portfolio sync clears the tracked position.
+- The importer currently materializes supported candidates only; proposed
+  playbook winners remain on the manual research board until Bhiksha execution
+  capability expands.

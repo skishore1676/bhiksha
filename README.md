@@ -11,6 +11,8 @@ Current live scope:
 - live underlying bars from Schwab
 - execution through Public
 - config-driven deployments and conservative risk defaults
+- schema-v2 playbook import from Mala nightly regime-matrix exports
+- intraday emergency `halt_and_flatten` operator control
 
 ## Start Here
 
@@ -81,6 +83,28 @@ Session summary:
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.session_summary
 ```
 
+Playbook import:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
+  --deployment-candidates <path>/deployment_candidates.json \
+  --playbook-catalog <path>/playbook_catalog.json
+```
+
+This command now expects Mala schema-v2 contracts:
+
+- `deployment_candidates.json` with `contract_name=deployment_candidates`
+- `playbook_catalog.json` with `contract_name=playbook_catalog`
+
+It validates the contract version and playbook matrix shape before generating
+shadow manifests under `config/deployments/generated/`.
+
+Observation report:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.observation_report --skip-replay
+```
+
 Signal inspector:
 
 ```bash
@@ -119,6 +143,10 @@ PYTHONPATH=src .venv/bin/pytest -q
 
 - Market Impulse deployments can trade normally under `--live`.
 - The TSLA Jerk Pivot deployment is enabled for live market observation, but still runs in shadow-only mode.
+- Generated playbook deployments remain `shadow_only` in the current loop.
+- `config/bias_inputs.yaml` now supports:
+  - daily bias selections used by `import_playbook`
+  - `emergency.halt_and_flatten: true` to stop new entries and flatten Bhiksha-managed positions intraday
 - Quotes and preflight are already validated against Public.
 - Restart safety is broker-sync based: existing Public option positions are re-imported on startup and each completed bar.
 - Compact research-style execution inputs such as `dte: "7-21"`, `delta_target: "0.35-0.55"`, and `entry_window_et: "09:45-14:30"` now normalize directly into the Bhiksha manifest model.
@@ -127,5 +155,5 @@ PYTHONPATH=src .venv/bin/pytest -q
 
 Verification:
 
-- `66` tests passing.
+- `85` tests passing.
 - `python3 -m compileall src tests` passes cleanly.
