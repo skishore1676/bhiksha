@@ -51,8 +51,12 @@ def load_deployments(path: str | Path) -> list[DeploymentManifest]:
     return manifests
 
 
-def load_bias_inputs(path: str | Path) -> list[BiasSelection]:
+def load_bias_config(path: str | Path) -> BiasConfig:
     resolved = Path(path)
     if not resolved.exists():
-        return []
-    return _load_model(resolved, BiasConfig).selections
+        return BiasConfig()
+    return _load_model(resolved, BiasConfig)
+
+
+def load_bias_inputs(path: str | Path) -> list[BiasSelection]:
+    return load_bias_config(path).selections

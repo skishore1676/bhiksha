@@ -365,6 +365,77 @@ def test_execution_supervisor_hard_flats_due_positions(tmp_path) -> None:
     assert supervisor.planner.position_tracker.total_open_positions == 0
 
 
+def test_execution_supervisor_halt_and_flattens_positions(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RecordingOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE123",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        source="broker_sync",
+        stop_order_id="STOP123",
+        target_order_id="TARGET123",
+    )
+
+    closed = asyncio.run(
+        supervisor.halt_and_flatten_positions(
+            {deployment.deployment_id: deployment},
+            dry_run=False,
+        )
+    )
+
+    assert len(closed) == 1
+    assert closed[0].risk_reasons == ["halt_and_flatten_triggered"]
+    assert closed[0].order_id == "CLOSE123"
+    assert supervisor.planner.position_tracker.total_open_positions == 0
+    assert ("cancel", "STOP123") in order_manager.calls
+    assert ("cancel", "TARGET123") in order_manager.calls
+
+
+def test_execution_supervisor_halt_and_flattens_pending_entries_by_canceling_them(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RecordingOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE124",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        source="live_pending",
+        order_id="ENTRY999",
+    )
+
+    closed = asyncio.run(
+        supervisor.halt_and_flatten_positions(
+            {deployment.deployment_id: deployment},
+            dry_run=False,
+        )
+    )
+
+    assert len(closed) == 1
+    assert closed[0].order_id == "ENTRY999"
+    assert supervisor.planner.position_tracker.total_open_positions == 0
+    assert ("cancel", "ENTRY999") in order_manager.calls
+
+
 def test_execution_supervisor_handles_algorithmic_exit(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     supervisor = ExecutionSupervisor(

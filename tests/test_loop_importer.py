@@ -4,8 +4,14 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
+from bhiksha.loop.contracts import (
+    DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+    LOOP_ARTIFACT_SCHEMA_VERSION,
+    PLAYBOOK_CATALOG_CONTRACT_NAME,
+)
 from bhiksha.loop.importer import refresh_generated_deployments
 
 
@@ -69,7 +75,8 @@ def test_refresh_generated_deployments_writes_shadow_manifests_and_manual_board(
     candidates_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "contract_name": DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
                 "generated_at": now,
                 "candidates": [market_candidate, elastic_candidate],
             },
@@ -81,13 +88,16 @@ def test_refresh_generated_deployments_writes_shadow_manifests_and_manual_board(
     playbook_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "contract_name": PLAYBOOK_CATALOG_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
                 "generated_at": now,
                 "contexts": {
                     "QQQ|bearish_trend_intraday|intraday": {
                         "symbol": "QQQ",
                         "bias_template": "bearish_trend_intraday",
                         "horizon": "intraday",
+                        "coverage_status": "researched_with_survivors",
+                        "covered_by_strategy_families": ["market_impulse"],
                         "supported_candidates": [
                             {
                                 "candidate_id": "market_candidate",
@@ -101,6 +111,8 @@ def test_refresh_generated_deployments_writes_shadow_manifests_and_manual_board(
                         "symbol": "NVDA",
                         "bias_template": "bullish_mean_reversion_intraday",
                         "horizon": "intraday",
+                        "coverage_status": "researched_with_survivors",
+                        "covered_by_strategy_families": ["elastic_band_reversion"],
                         "supported_candidates": [],
                         "proposed_candidates": [
                             {
@@ -149,7 +161,8 @@ def test_refresh_generated_deployments_reports_empty_bias_selection(tmp_path: Pa
     candidates_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "contract_name": DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
                 "generated_at": now,
                 "candidates": [
                     _candidate_payload(
@@ -172,7 +185,8 @@ def test_refresh_generated_deployments_reports_empty_bias_selection(tmp_path: Pa
     playbook_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "contract_name": PLAYBOOK_CATALOG_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
                 "generated_at": now,
                 "contexts": {},
             },
@@ -207,11 +221,29 @@ def test_refresh_generated_deployments_preserves_existing_generated_manifests_wh
     candidates_path = tmp_path / "deployment_candidates.json"
     playbook_path = tmp_path / "playbook_catalog.json"
     candidates_path.write_text(
-        json.dumps({"schema_version": 1, "generated_at": now, "candidates": []}, indent=2, sort_keys=True),
+        json.dumps(
+            {
+                "contract_name": DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
+                "generated_at": now,
+                "candidates": [],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     playbook_path.write_text(
-        json.dumps({"schema_version": 1, "generated_at": now, "contexts": {}}, indent=2, sort_keys=True),
+        json.dumps(
+            {
+                "contract_name": PLAYBOOK_CATALOG_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
+                "generated_at": now,
+                "contexts": {},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
@@ -224,6 +256,99 @@ def test_refresh_generated_deployments_preserves_existing_generated_manifests_wh
     assert report.safe_for_live_review is False
     assert "generated_deployments_skipped" in report.issues
     assert existing_path.exists()
+
+
+def test_refresh_generated_deployments_rejects_wrong_contract_version(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    (config_root / "deployments").mkdir(parents=True)
+    (config_root / "bias_inputs.yaml").write_text("selections: []\n", encoding="utf-8")
+    now = datetime.now(UTC).isoformat()
+    candidates_path = tmp_path / "deployment_candidates.json"
+    playbook_path = tmp_path / "playbook_catalog.json"
+    candidates_path.write_text(
+        json.dumps(
+            {
+                "contract_name": DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+                "schema_version": 1,
+                "generated_at": now,
+                "candidates": [],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    playbook_path.write_text(
+        json.dumps(
+            {
+                "contract_name": PLAYBOOK_CATALOG_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
+                "generated_at": now,
+                "contexts": {},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported schema_version"):
+        refresh_generated_deployments(
+            config_root=config_root,
+            deployment_candidates_path=candidates_path,
+            playbook_catalog_path=playbook_path,
+        )
+
+
+def test_refresh_generated_deployments_rejects_invalid_matrix_context(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    (config_root / "deployments").mkdir(parents=True)
+    (config_root / "bias_inputs.yaml").write_text("selections: []\n", encoding="utf-8")
+    now = datetime.now(UTC).isoformat()
+    candidates_path = tmp_path / "deployment_candidates.json"
+    playbook_path = tmp_path / "playbook_catalog.json"
+    candidates_path.write_text(
+        json.dumps(
+            {
+                "contract_name": DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
+                "generated_at": now,
+                "candidates": [],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    playbook_path.write_text(
+        json.dumps(
+            {
+                "contract_name": PLAYBOOK_CATALOG_CONTRACT_NAME,
+                "schema_version": LOOP_ARTIFACT_SCHEMA_VERSION,
+                "generated_at": now,
+                "contexts": {
+                    "QQQ|bearish_trend_intraday|intraday": {
+                        "symbol": "QQQ",
+                        "bias_template": "bearish_trend_intraday",
+                        "horizon": "intraday",
+                        "coverage_status": "unknown",
+                        "supported_candidates": [],
+                        "proposed_candidates": [],
+                    }
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid coverage_status"):
+        refresh_generated_deployments(
+            config_root=config_root,
+            deployment_candidates_path=candidates_path,
+            playbook_catalog_path=playbook_path,
+        )
 
 
 def _candidate_payload(

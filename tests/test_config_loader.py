@@ -45,6 +45,32 @@ def test_load_bias_inputs_returns_empty_list_when_file_missing(tmp_path: Path) -
     assert load_bias_inputs(tmp_path / "missing.yaml") == []
 
 
+def test_load_bias_inputs_accepts_reserved_emergency_controls(tmp_path: Path) -> None:
+    path = tmp_path / "bias_inputs.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "emergency": {"halt_and_flatten": True},
+                "selections": [
+                    {
+                        "symbol": "iwm",
+                        "bias_template": "bullish_trend_intraday",
+                        "horizon": "intraday",
+                        "enabled": True,
+                        "max_active_candidates": 1,
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    selections = load_bias_inputs(path)
+    assert len(selections) == 1
+    assert selections[0].symbol == "IWM"
+
+
 def _write_manifest(path: Path, deployment_id: str) -> None:
     payload = {
         "deployment_id": deployment_id,

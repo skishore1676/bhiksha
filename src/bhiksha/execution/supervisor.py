@@ -828,6 +828,181 @@ class ExecutionSupervisor:
             closed.append(trade_plan)
         return closed
 
+    async def halt_and_flatten_positions(
+        self,
+        deployments_by_id: dict[str, DeploymentManifest],
+        *,
+        dry_run: bool,
+        symbol: str | None = None,
+    ) -> list[TradePlan]:
+        closed: list[TradePlan] = []
+        for position in self.planner.position_tracker.active_positions():
+            if symbol is not None and position.symbol != symbol:
+                continue
+            deployment = deployments_by_id.get(position.deployment_id)
+            if deployment is None or position.option_symbol is None or position.quantity <= 0:
+                continue
+
+            order_id = "DRY_RUN_EMERGENCY_FLAT"
+            error = None
+            canceled_stop_order_id = None
+            canceled_target_order_id = None
+            if position.source == "live_pending" and position.order_id:
+                canceled, cancel_error = await self.planner.order_manager.cancel_order(position.order_id)
+                await self.event_repository.append(
+                    "entry_cancel_attempt",
+                    {
+                        "deployment_id": position.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "entry_order_id": position.order_id,
+                        "canceled": canceled,
+                        "error": cancel_error,
+                        "reason": "halt_and_flatten",
+                    },
+                )
+                if not canceled:
+                    await self.event_repository.append(
+                        "halt_and_flatten_failure",
+                        {
+                            "deployment_id": position.deployment_id,
+                            "symbol": position.symbol,
+                            "option_symbol": position.option_symbol,
+                            "quantity": position.quantity,
+                            "error": cancel_error,
+                            "reason": "pending_entry_cancel_failed",
+                        },
+                    )
+                    continue
+                order_id = position.order_id
+                error = cancel_error
+                self.planner.position_tracker.close_position(
+                    position.symbol,
+                    position.deployment_id,
+                    option_symbol=position.option_symbol,
+                )
+                if position.trade_id is not None:
+                    await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
+                transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
+                await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_pending_entry_canceled")
+                trade_plan = TradePlan(
+                    trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+                    deployment_id=position.deployment_id,
+                    symbol=position.symbol,
+                    direction=SignalDirection(str(deployment.strategy.params.get("direction", "short")).lower()),
+                    option_symbol=position.option_symbol,
+                    quantity=position.quantity,
+                    estimated_entry_price=0.0,
+                    risk_reasons=["halt_and_flatten_triggered"],
+                    dry_run=dry_run,
+                    order_id=order_id,
+                )
+                await self.event_repository.append(
+                    "halt_and_flatten_submission",
+                    {
+                        "deployment_id": position.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "quantity": position.quantity,
+                        "order_id": order_id,
+                        "error": error,
+                        "mode": "pending_entry_cancel",
+                    },
+                )
+                closed.append(trade_plan)
+                continue
+            if position.stop_order_id:
+                canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
+                if canceled:
+                    canceled_stop_order_id = position.stop_order_id
+                await self.event_repository.append(
+                    "protection_cancel_attempt",
+                    {
+                        "deployment_id": position.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "stop_order_id": position.stop_order_id,
+                        "canceled": canceled,
+                        "error": cancel_error,
+                        "reason": "halt_and_flatten",
+                    },
+                )
+                error = cancel_error
+            if position.target_order_id:
+                canceled, cancel_error = await self.planner.order_manager.cancel_order(position.target_order_id)
+                if canceled:
+                    canceled_target_order_id = position.target_order_id
+                await self.event_repository.append(
+                    "target_cancel_attempt",
+                    {
+                        "deployment_id": position.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "target_order_id": position.target_order_id,
+                        "canceled": canceled,
+                        "error": cancel_error,
+                        "reason": "halt_and_flatten",
+                    },
+                )
+                if error is None:
+                    error = cancel_error
+            if not dry_run:
+                result = await self.planner.order_manager.place_square_off_order(
+                    position.option_symbol,
+                    position.quantity,
+                )
+                order_id = result.order_id
+                error = result.error or error
+                if result.order_id is None:
+                    await self.event_repository.append(
+                        "halt_and_flatten_failure",
+                        {
+                            "deployment_id": position.deployment_id,
+                            "symbol": position.symbol,
+                            "option_symbol": position.option_symbol,
+                            "quantity": position.quantity,
+                            "error": error,
+                        },
+                    )
+                    continue
+
+            self.planner.position_tracker.close_position(
+                position.symbol,
+                position.deployment_id,
+                option_symbol=position.option_symbol,
+            )
+            if position.trade_id is not None:
+                await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
+            transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
+            await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_closed")
+            trade_plan = TradePlan(
+                trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+                deployment_id=position.deployment_id,
+                symbol=position.symbol,
+                direction=SignalDirection(str(deployment.strategy.params.get("direction", "short")).lower()),
+                option_symbol=position.option_symbol,
+                quantity=position.quantity,
+                estimated_entry_price=0.0,
+                risk_reasons=["halt_and_flatten_triggered"],
+                dry_run=dry_run,
+                order_id=order_id,
+            )
+            await self.event_repository.append(
+                "halt_and_flatten_submission",
+                {
+                    "deployment_id": position.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "quantity": position.quantity,
+                    "order_id": order_id,
+                    "error": error,
+                    "canceled_stop_order_id": canceled_stop_order_id,
+                    "canceled_target_order_id": canceled_target_order_id,
+                },
+            )
+            closed.append(trade_plan)
+        return closed
+
     async def sync_lifecycle(self) -> None:
         transitions = self.lifecycle_store.sync_from_positions(self.planner.position_tracker.active_positions())
         for transition in transitions:

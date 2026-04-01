@@ -12,6 +12,12 @@ import yaml
 
 from bhiksha.config.loader import load_app_config, load_bias_inputs
 from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest
+from bhiksha.loop.contracts import (
+    ALLOWED_PLAYBOOK_COVERAGE_STATUSES,
+    DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+    PLAYBOOK_CATALOG_CONTRACT_NAME,
+    validate_contract_metadata,
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,6 +45,15 @@ def refresh_generated_deployments(
 
     candidates_payload = _load_json(Path(deployment_candidates_path))
     playbook_payload = _load_json(Path(playbook_catalog_path))
+    validate_contract_metadata(
+        candidates_payload,
+        expected_contract_name=DEPLOYMENT_CANDIDATES_CONTRACT_NAME,
+    )
+    validate_contract_metadata(
+        playbook_payload,
+        expected_contract_name=PLAYBOOK_CATALOG_CONTRACT_NAME,
+    )
+    _validate_playbook_contexts(playbook_payload.get("contexts", {}))
     bias_inputs = load_bias_inputs(bias_inputs_path or (repo_root / app_config.bias_inputs_path))
 
     issues: list[str] = []
@@ -60,6 +75,10 @@ def refresh_generated_deployments(
         context = playbook_contexts.get(context_key)
         if not isinstance(context, dict):
             issues.append(f"missing_playbook_context:{context_key}")
+            continue
+        coverage_status = str(context.get("coverage_status"))
+        if coverage_status == "not_covered_by_enabled_family":
+            issues.append(f"playbook_context_uncovered:{context_key}")
             continue
         selected_candidates.extend(
             _select_supported_candidates(
@@ -155,6 +174,24 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object at {path}")
     return payload
+
+
+def _validate_playbook_contexts(contexts: Any) -> None:
+    if not isinstance(contexts, dict):
+        raise ValueError("playbook contexts must be a JSON object")
+    for key, context in contexts.items():
+        if not isinstance(context, dict):
+            raise ValueError(f"Playbook context {key!r} must be an object")
+        coverage_status = context.get("coverage_status")
+        if coverage_status not in ALLOWED_PLAYBOOK_COVERAGE_STATUSES:
+            raise ValueError(
+                f"Playbook context {key!r} has invalid coverage_status {coverage_status!r}"
+            )
+        covered_families = context.get("covered_by_strategy_families")
+        if not isinstance(covered_families, list):
+            raise ValueError(
+                f"Playbook context {key!r} must include covered_by_strategy_families"
+            )
 
 
 def _staleness_issues(payload: dict[str, Any], label: str, max_export_age_hours: int) -> list[str]:

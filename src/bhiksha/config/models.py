@@ -218,5 +218,10 @@ class BiasSelection(BaseModel):
         return self
 
 
+class EmergencyBiasControl(BaseModel):
+    halt_and_flatten: bool = False
+
+
 class BiasConfig(BaseModel):
+    emergency: EmergencyBiasControl = Field(default_factory=EmergencyBiasControl)
     selections: list[BiasSelection] = Field(default_factory=list)

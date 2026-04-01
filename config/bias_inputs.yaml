@@ -1,7 +1,9 @@
+emergency:
+  halt_and_flatten: false
+
 selections: []
 
 #bullish_trend_intraday
 #bullish_mean_reversion_intraday
 #bearish_trend_intraday
 #bearish_mean_reversion_intraday
-

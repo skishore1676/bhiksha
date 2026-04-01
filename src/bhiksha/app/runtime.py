@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+from pathlib import Path
 import time
 
 import polars as pl
@@ -16,6 +17,7 @@ from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.app.execution_dispatcher import SymbolExecutionDispatcher
 from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.app.token_daemon import PublicTokenRefreshDaemon, SchwabTokenRefreshDaemon
+from bhiksha.config.loader import load_bias_config
 from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest, ProviderConfig
 from bhiksha.domain.events import BarClosedEvent
 from bhiksha.domain.models import Bar
@@ -54,6 +56,8 @@ class BhikshaRuntime:
     deployments: list[DeploymentManifest]
     bias_inputs: list[BiasSelection]
     strategy_registry: StrategyRegistry
+    bias_inputs_path: Path | None = None
+    halt_and_flatten: bool = False
     started: bool = field(default=False, init=False)
     event_bus: InMemoryEventBus = field(default_factory=InMemoryEventBus, init=False)
 
@@ -252,6 +256,9 @@ class BhikshaRuntime:
             "providers": self.provider_config.model_dump(),
             "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
             "bias_inputs": [selection.model_dump() for selection in self.bias_inputs],
+            "emergency_controls": {
+                "halt_and_flatten": self.halt_and_flatten,
+            },
             "session": {
                 "live": live,
                 "max_bars": max_bars,
@@ -357,6 +364,10 @@ class BhikshaRuntime:
             },
         )
 
+        emergency_changed = await self._refresh_intraday_bias_controls(supervisor=supervisor, output=output)
+        if emergency_changed or self.halt_and_flatten:
+            output(f"EMERGENCY_STATE halt_and_flatten={self.halt_and_flatten}")
+
         async with sync_lock:
             tracker_positions = list(reconciliation_snapshot.positions)
             last_synced_at = reconciliation_snapshot.last_synced_at
@@ -378,6 +389,38 @@ class BhikshaRuntime:
                 for position in tracker_positions
             )
             output(f"SYNC positions={joined}")
+
+        if self.halt_and_flatten:
+            emergency_enqueued = execution_dispatcher.submit(
+                bar.symbol,
+                key=f"emergency_flat:{bar.symbol}",
+                runner=self._instrument_execution_runner(
+                    supervisor,
+                    bar.symbol,
+                    deployment_id=None,
+                    reconcile_trigger=reconcile_trigger,
+                    action="emergency_flat",
+                    inner=self._make_emergency_flat_runner(
+                        supervisor,
+                        deployments_by_id,
+                        live=live,
+                        symbol=bar.symbol,
+                        output=output,
+                    ),
+                ),
+            )
+            if emergency_enqueued:
+                output(f"EXECUTION_ENQUEUED {bar.symbol} emergency_flat")
+            await supervisor.event_repository.append(
+                "runtime_metric",
+                {
+                    "metric": "processing_ms",
+                    "symbol": bar.symbol,
+                    "value": round((time.perf_counter() - processing_started_at) * 1000.0, 3),
+                    "unit": "ms",
+                },
+            )
+            return
 
         hard_flat_enqueued = execution_dispatcher.submit(
             bar.symbol,
@@ -603,6 +646,40 @@ class BhikshaRuntime:
 
         return runner
 
+    async def _refresh_intraday_bias_controls(
+        self,
+        *,
+        supervisor: ExecutionSupervisor,
+        output: callable,
+    ) -> bool:
+        if self.bias_inputs_path is None:
+            return False
+        try:
+            bias_config = load_bias_config(self.bias_inputs_path)
+        except Exception as exc:
+            await supervisor.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": classify_runtime_issue_category(error=str(exc), event_type="bias_inputs"),
+                    "symbol": "ALL",
+                    "error": str(exc),
+                    "stage": "bias_reload",
+                },
+            )
+            output(f"RUNTIME_ISSUE ALL stage=bias_reload error={exc}")
+            return False
+        changed = bias_config.emergency.halt_and_flatten != self.halt_and_flatten
+        self.halt_and_flatten = bias_config.emergency.halt_and_flatten
+        if changed:
+            await supervisor.event_repository.append(
+                "emergency_control_update",
+                {
+                    "halt_and_flatten": self.halt_and_flatten,
+                    "source": str(self.bias_inputs_path),
+                },
+            )
+        return changed
+
     async def _reconciliation_loop(
         self,
         *,
@@ -775,6 +852,26 @@ class BhikshaRuntime:
             )
             for plan in closed:
                 output(f"HARD_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")
+
+        return runner
+
+    def _make_emergency_flat_runner(
+        self,
+        supervisor: ExecutionSupervisor,
+        deployments_by_id: dict[str, DeploymentManifest],
+        *,
+        live: bool,
+        symbol: str,
+        output: callable,
+    ):
+        async def runner() -> None:
+            closed = await supervisor.halt_and_flatten_positions(
+                deployments_by_id,
+                dry_run=not live,
+                symbol=symbol,
+            )
+            for plan in closed:
+                output(f"EMERGENCY_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")
 
         return runner
 
