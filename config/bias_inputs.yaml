@@ -1,7 +1,18 @@
 emergency:
   halt_and_flatten: false
 
-selections: []
+selections:
+  - symbol: IWM
+    bias_template: bullish_mean_reversion_intraday
+    horizon: intraday
+    enabled: true
+    max_active_candidates: 1
+
+  - symbol: TSLA
+    bias_template: bearish_trend_intraday
+    horizon: intraday
+    enabled: true
+    max_active_candidates: 2
 
 #bullish_trend_intraday
 #bullish_mean_reversion_intraday

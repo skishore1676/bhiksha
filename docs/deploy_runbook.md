@@ -7,7 +7,8 @@ imports and the intraday emergency control.
 
 1. Confirm `.env` is present and current.
 2. Confirm Schwab OAuth tokens exist in `/Users/suman/kg_env/projects/bhiksha/config/schwab_tokens.json`.
-3. Confirm `config/bias_inputs.yaml` reflects the day's operator view.
+3. Confirm `config/bias_inputs.yaml` reflects the day's emergency controls and any importer-era fallbacks.
+   In the Bionic loop, the daily symbol/thesis intent now comes from Mala's `Bionic_Loop` sheet and published generated deployments.
 4. If you need an emergency fail-safe armed but inactive, confirm:
 
 ```yaml
@@ -27,7 +28,18 @@ Expected:
 - `POLYGON=True`
 - `SCHWAB=True`
 
-6. Import the latest Mala playbook bundle before open:
+6. Publish the latest Mala router output before open.
+
+Preferred path from the Mala repo:
+
+```bash
+./.venv/bin/python scripts/run_bias_playbook_router.py \
+  --playbook-catalog <path>/playbook_catalog.json \
+  --out-dir data/results/bionic_router/<YYYY-MM-DD> \
+  --publish-bhiksha
+```
+
+Fallback importer path if you are using the older deployment-candidates export:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
@@ -38,9 +50,14 @@ PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
 Expected:
 
 - schema-v2 contracts validate cleanly
-- supported candidates become generated shadow manifests
+- supported or routed candidates become generated manifests
 - proposed candidates only appear on the manual research board
 - `safe_for_live_review` is `true` if the selected supported set is clean
+- startup should show `deployment_selection.mode=prefer_generated` so generated deployments override manual deployments on the same symbol
+- for optimized Bionic playbooks, the manifest should also show:
+  - `exit.thesis_exit_anchor: underlying`
+  - `exit.thesis_exit_policy: ...`
+  - `exit.catastrophe_exit_anchor: option_premium`
 
 7. Run a warm-start dry run:
 
@@ -66,7 +83,7 @@ What it does:
 
 - warms 1-minute Schwab bars
 - syncs open Public positions on startup and every new bar
-- evaluates QQQ/SPY deployments on completed bars only
+- evaluates the active deployment set on completed bars only
 - logs plans into SQLite without placing orders
 - hard-flats tracked positions in dry-run mode after the configured ET cutoff
 
@@ -123,6 +140,5 @@ before startup or before the next import cycle.
 - The runtime is single-process and SQLite-backed.
 - The order log is durable, but advanced resume logic is still broker-sync based rather than full event replay.
 - Protective stops are submitted after fill; if a stop fills externally, the next portfolio sync clears the tracked position.
-- The importer currently materializes supported candidates only; proposed
-  playbook winners remain on the manual research board until Bhiksha execution
-  capability expands.
+- Bhiksha currently supports `market_impulse` and `jerk_pivot_momentum` only.
+- `deployment_selection_mode: prefer_generated` suppresses manual deployments on symbols that have enabled generated deployments; this is intentional for the Bionic loop.

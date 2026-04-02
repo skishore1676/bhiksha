@@ -216,6 +216,15 @@ The registry is responsible for answering:
 
 Each deployment should have a stable `deployment_id`.
 
+Current runtime policy:
+
+- Bhiksha can load both hand-managed and Mala-generated deployment manifests.
+- `deployment_selection_mode` controls which set is actually active at runtime.
+- In the Bionic loop, `prefer_generated` is the intended mode: if an enabled generated deployment exists for a symbol, hand-managed deployments on that symbol are skipped for that session.
+- Generated Bionic manifests may now include a split exit contract:
+  - `thesis_exit_*` is anchored to the underlying and comes from Mala research
+  - `catastrophe_exit_*` is anchored to option-premium/runtime safety and is enforced by Bhiksha
+
 Example:
 
 - `jerk_pivot_momentum_tsla_short_v1`

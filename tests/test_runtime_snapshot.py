@@ -16,11 +16,12 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert snapshot["session"] == {"live": False, "max_bars": 5}
     assert snapshot["app"]["app_name"] == "bhiksha"
     assert snapshot["providers"]["execution_broker_primary"] == "public"
-    assert snapshot["bias_inputs"] == []
+    assert {selection["symbol"] for selection in snapshot["bias_inputs"]} >= {"IWM", "TSLA"}
     assert snapshot["emergency_controls"] == {"halt_and_flatten": False}
+    assert snapshot["deployment_selection"]["mode"] == "prefer_generated"
     assert {deployment["deployment_id"] for deployment in snapshot["deployments"]} >= {
+        "market_impulse_spy_short_armed_a98a25d2",
         "market_impulse_qqq_short_v1",
-        "market_impulse_spy_short_v1",
     }
 
 
@@ -146,3 +147,76 @@ def test_runtime_reload_bias_controls_updates_intraday_emergency_flag(tmp_path: 
 
     assert changed is True
     assert runtime.halt_and_flatten is True
+
+
+def test_build_runtime_prefers_generated_deployments_for_same_symbol(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    deployments_root = config_root / "deployments"
+    generated_root = deployments_root / "generated"
+    generated_root.mkdir(parents=True)
+    (config_root / "app.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "app_name": "bhiksha",
+                "deployment_selection_mode": "prefer_generated",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (config_root / "providers.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "underlying_live_primary": "polygon",
+                "underlying_backfill_primary": "polygon",
+                "execution_broker_primary": "public",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_manifest(deployments_root / "manual_spy.yaml", "manual_spy", symbol="SPY")
+    _write_manifest(generated_root / "generated_spy.yaml", "generated_spy", symbol="SPY")
+    _write_manifest(deployments_root / "manual_qqq.yaml", "manual_qqq", symbol="QQQ")
+
+    runtime = build_runtime(config_root)
+
+    assert {deployment.deployment_id for deployment in runtime.deployments} == {"generated_spy", "manual_qqq"}
+    skipped_ids = {entry["deployment_id"] for entry in runtime.deployment_selection["skipped"]}
+    assert skipped_ids == {"manual_spy"}
+
+
+def _write_manifest(path: Path, deployment_id: str, *, symbol: str) -> None:
+    payload = {
+        "deployment_id": deployment_id,
+        "enabled": True,
+        "symbol": symbol,
+        "strategy": {"key": "market_impulse", "version": 1, "params": {"direction": "short"}},
+        "execution": {
+            "profile": "single_leg_long_premium_v1",
+            "option_mapping": {"long_signal": "CALL", "short_signal": "PUT"},
+            "dte_min": 0,
+            "dte_max": 7,
+            "target_abs_delta_min": 0.2,
+            "target_abs_delta_max": 0.4,
+            "min_open_interest": 100,
+            "max_bid_ask_spread_pct": 0.2,
+        },
+        "risk": {
+            "profile": "conservative_day1",
+            "max_trade_premium_usd": 300,
+            "hard_flat_time_et": "15:55",
+            "stop_loss_pct": 0.45,
+        },
+        "exit": {
+            "profile": "market_impulse_exit_v1",
+            "use_algorithmic_exit": True,
+            "use_profit_target": False,
+            "profit_target_multiple": None,
+            "stop_loss_pct": 0.45,
+            "stop_to_breakeven_after_r_multiple": None,
+            "hard_flat_time_et": "15:55",
+        },
+        "source": {"origin": "test", "run_date": "2026-04-01", "artifact": "test.csv"},
+    }
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

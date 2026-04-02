@@ -94,6 +94,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     option_symbol TEXT,
                     quantity INTEGER NOT NULL,
                     entry_price REAL,
+                    underlying_entry_price REAL,
+                    entry_timestamp TEXT,
                     status TEXT NOT NULL,
                     entry_order_id TEXT,
                     stop_order_id TEXT,
@@ -105,6 +107,14 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 )
                 """
             )
+            existing_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(trade_sessions)").fetchall()
+            }
+            if "underlying_entry_price" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN underlying_entry_price REAL")
+            if "entry_timestamp" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN entry_timestamp TEXT")
             conn.commit()
 
     def _upsert_trade_sync(self, record: TradeRecord) -> None:
@@ -113,15 +123,17 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 """
                 INSERT INTO trade_sessions (
                     trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, status,
-                    entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
+                    underlying_entry_price, entry_timestamp, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                     exit_order_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     deployment_id=excluded.deployment_id,
                     symbol=excluded.symbol,
                     option_symbol=excluded.option_symbol,
                     quantity=excluded.quantity,
                     entry_price=excluded.entry_price,
+                    underlying_entry_price=excluded.underlying_entry_price,
+                    entry_timestamp=excluded.entry_timestamp,
                     status=excluded.status,
                     entry_order_id=excluded.entry_order_id,
                     stop_order_id=excluded.stop_order_id,
@@ -138,6 +150,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     record.option_symbol,
                     record.quantity,
                     record.entry_price,
+                    record.underlying_entry_price,
+                    record.entry_timestamp.isoformat() if record.entry_timestamp is not None else None,
                     record.status,
                     record.entry_order_id,
                     record.stop_order_id,
@@ -166,8 +180,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 """
-                SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, status,
-                       entry_order_id, stop_order_id, stop_price, target_order_id, target_price, exit_order_id
+                SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
+                       entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price, exit_order_id
                 FROM trade_sessions
                 WHERE status != 'closed'
                 ORDER BY updated_at DESC
@@ -181,13 +195,15 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 option_symbol=row[3],
                 quantity=row[4],
                 entry_price=row[5],
-                status=row[6],
-                entry_order_id=row[7],
-                stop_order_id=row[8],
-                stop_price=row[9],
-                target_order_id=row[10],
-                target_price=row[11],
-                exit_order_id=row[12],
+                underlying_entry_price=row[6],
+                entry_timestamp=datetime.fromisoformat(row[7]) if row[7] else None,
+                status=row[8],
+                entry_order_id=row[9],
+                stop_order_id=row[10],
+                stop_price=row[11],
+                target_order_id=row[12],
+                target_price=row[13],
+                exit_order_id=row[14],
             )
             for row in rows
         ]

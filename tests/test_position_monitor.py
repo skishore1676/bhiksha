@@ -95,3 +95,109 @@ def test_position_monitor_can_use_supplied_position_snapshot() -> None:
 
     assert len(evaluations) == 1
     assert evaluations[0].decision.exit is True
+
+
+def test_position_monitor_emits_fixed_rr_underlying_exit() -> None:
+    deployment = next(
+        deployment
+        for deployment in load_deployments("config/deployments")
+        if deployment.deployment_id == "market_impulse_qqq_short_v1"
+    ).model_copy(
+        update={
+            "exit": next(
+                deployment
+                for deployment in load_deployments("config/deployments")
+                if deployment.deployment_id == "market_impulse_qqq_short_v1"
+            ).exit.model_copy(
+                update={
+                    "use_algorithmic_exit": False,
+                    "thesis_exit_anchor": "underlying",
+                    "thesis_exit_policy": "fixed_rr_underlying",
+                    "thesis_exit_params": {
+                        "stop_loss_underlying_pct": 0.005,
+                        "take_profit_underlying_r_multiple": 1.5,
+                    },
+                }
+            )
+        }
+    )
+    tracker = PositionTracker()
+    tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        stop_order_id="STOP123",
+        underlying_entry_price=100.0,
+    )
+    monitor = PositionMonitor(
+        ReplaySignalEvaluator(FeatureService(), default_strategy_registry()),
+        tracker,
+    )
+    frame = pl.DataFrame(
+        {
+            "symbol": ["QQQ"],
+            "timestamp": [datetime(2026, 3, 30, 14, 31, 0)],
+            "open": [99.8],
+            "high": [100.1],
+            "low": [99.1],
+            "close": [99.2],
+            "volume": [1200.0],
+        }
+    )
+
+    evaluations = monitor.evaluate_symbol("QQQ", frame, {deployment.deployment_id: deployment})
+
+    assert len(evaluations) == 1
+    assert evaluations[0].decision.exit is True
+    assert evaluations[0].decision.reason == ["thesis_take_profit_underlying"]
+
+
+def test_position_monitor_emits_trailing_vma_underlying_exit() -> None:
+    base = next(
+        deployment
+        for deployment in load_deployments("config/deployments")
+        if deployment.deployment_id == "market_impulse_qqq_short_v1"
+    )
+    deployment = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_algorithmic_exit": False,
+                    "thesis_exit_anchor": "underlying",
+                    "thesis_exit_policy": "trailing_vma_underlying",
+                    "thesis_exit_params": {"vma_col": "vma_10"},
+                }
+            )
+        }
+    )
+    tracker = PositionTracker()
+    tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        stop_order_id="STOP123",
+    )
+    monitor = PositionMonitor(
+        ReplaySignalEvaluator(FeatureService(), default_strategy_registry()),
+        tracker,
+    )
+    frame = pl.DataFrame(
+        {
+            "symbol": ["QQQ"],
+            "timestamp": [datetime(2026, 3, 30, 14, 31, 0)],
+            "open": [99.8],
+            "high": [100.5],
+            "low": [99.7],
+            "close": [100.6],
+            "volume": [1200.0],
+            "vma_10": [100.2],
+        }
+    )
+
+    evaluations = monitor.evaluate_symbol("QQQ", frame, {deployment.deployment_id: deployment})
+
+    assert len(evaluations) == 1
+    assert evaluations[0].decision.exit is True
+    assert evaluations[0].decision.reason == ["thesis_vma_reclaim_underlying"]

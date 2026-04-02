@@ -9,6 +9,7 @@ import polars as pl
 from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.models import ExitDecision
+from bhiksha.execution.thesis_exit import evaluate_underlying_thesis_exit
 from bhiksha.state.position_tracker import PositionTracker, TrackedPosition
 
 
@@ -41,7 +42,14 @@ class PositionMonitor:
             if position.symbol != symbol or position.quantity <= 0:
                 continue
             deployment = deployments_by_id.get(position.deployment_id)
-            if deployment is None or not deployment.exit.use_algorithmic_exit:
+            if deployment is None:
+                continue
+            thesis_decision = evaluate_underlying_thesis_exit(deployment, frame, position)
+            if thesis_decision is not None:
+                if thesis_decision.exit:
+                    evaluations.append(ExitEvaluation(deployment=deployment, position=position, decision=thesis_decision))
+                    continue
+            if not deployment.exit.use_algorithmic_exit:
                 continue
             enriched = (enriched_frames or {}).get(deployment.deployment_id)
             if enriched is not None:

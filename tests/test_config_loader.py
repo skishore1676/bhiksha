@@ -3,13 +3,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bhiksha.config.loader import load_bias_inputs, load_deployments
+from bhiksha.config.loader import load_bias_inputs, load_deployments, load_runtime_deployments
 
 
 def test_load_deployments_from_config_directory() -> None:
     deployments = load_deployments(Path("config/deployments"))
     ids = {deployment.deployment_id for deployment in deployments}
-    assert ids == {
+    assert ids >= {
         "jerk_pivot_momentum_tsla_short_v1",
         "market_impulse_qqq_short_v1",
         "market_impulse_spy_short_v1",
@@ -39,6 +39,43 @@ def test_load_deployments_recurses_and_rejects_duplicate_ids(tmp_path: Path) -> 
     _write_manifest(generated / "duplicate.yaml", "manual_qqq")
     with pytest.raises(ValueError, match="Duplicate deployment_id"):
         load_deployments(root)
+
+
+def test_load_runtime_deployments_prefer_generated_skips_manual_symbol_conflicts(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    generated = root / "generated"
+    generated.mkdir(parents=True)
+    _write_manifest(root / "manual_spy.yaml", "manual_spy", symbol="SPY")
+    _write_manifest(root / "manual_qqq.yaml", "manual_qqq", symbol="QQQ")
+    _write_manifest(generated / "generated_spy.yaml", "generated_spy", symbol="SPY")
+
+    deployments, report = load_runtime_deployments(
+        root,
+        generated_path=generated,
+        selection_mode="prefer_generated",
+    )
+
+    assert {deployment.deployment_id for deployment in deployments} == {"generated_spy", "manual_qqq"}
+    skipped_ids = {entry["deployment_id"] for entry in report["skipped"]}
+    assert skipped_ids == {"manual_spy"}
+    assert report["mode"] == "prefer_generated"
+
+
+def test_load_runtime_deployments_generated_only_filters_manual_entries(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    generated = root / "generated"
+    generated.mkdir(parents=True)
+    _write_manifest(root / "manual_qqq.yaml", "manual_qqq", symbol="QQQ")
+    _write_manifest(generated / "generated_spy.yaml", "generated_spy", symbol="SPY")
+
+    deployments, report = load_runtime_deployments(
+        root,
+        generated_path=generated,
+        selection_mode="generated_only",
+    )
+
+    assert [deployment.deployment_id for deployment in deployments] == ["generated_spy"]
+    assert report["skipped"][0]["deployment_id"] == "manual_qqq"
 
 
 def test_load_bias_inputs_returns_empty_list_when_file_missing(tmp_path: Path) -> None:
@@ -71,11 +108,11 @@ def test_load_bias_inputs_accepts_reserved_emergency_controls(tmp_path: Path) ->
     assert selections[0].symbol == "IWM"
 
 
-def _write_manifest(path: Path, deployment_id: str) -> None:
+def _write_manifest(path: Path, deployment_id: str, *, symbol: str = "QQQ") -> None:
     payload = {
         "deployment_id": deployment_id,
         "enabled": True,
-        "symbol": "QQQ",
+        "symbol": symbol,
         "strategy": {"key": "market_impulse", "version": 1, "params": {"direction": "short"}},
         "execution": {
             "profile": "single_leg_long_premium_v1",

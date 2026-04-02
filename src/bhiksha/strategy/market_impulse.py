@@ -99,6 +99,7 @@ class MarketImpulseStrategy:
             direction=direction,
             reason=reasons,
             features={
+                "close": close,
                 vma_col: vma,
                 regime_col: regime,
             },

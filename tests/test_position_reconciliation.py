@@ -1,10 +1,11 @@
+from bhiksha.app.bootstrap import build_runtime
 from bhiksha.config.loader import load_deployments
 from bhiksha.domain.models import TradeRecord
 from bhiksha.state.reconciliation import reconcile_public_positions
 
 
 def test_reconcile_public_positions_maps_option_positions_to_deployments() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = build_runtime().enabled_deployments
     positions = [
         {
             "instrument": {
@@ -32,7 +33,7 @@ def test_reconcile_public_positions_maps_option_positions_to_deployments() -> No
 
 
 def test_reconcile_public_positions_attaches_open_stop_order() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = build_runtime().enabled_deployments
     positions = [
         {
             "instrument": {
@@ -62,7 +63,7 @@ def test_reconcile_public_positions_attaches_open_stop_order() -> None:
 
 
 def test_reconcile_public_positions_attaches_entry_and_target_metadata() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = build_runtime().enabled_deployments
     positions = [
         {
             "instrument": {

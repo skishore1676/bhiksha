@@ -45,6 +45,7 @@ class ExecutionPlanner:
     ) -> TradePlan | None:
         if not decision.signal or decision.direction is None:
             return None
+        underlying_entry_price = _underlying_entry_price(decision)
         if not _entry_window_allows(deployment, decision.timestamp):
             return TradePlan(
                 trade_id=str(uuid.uuid4()),
@@ -57,6 +58,8 @@ class ExecutionPlanner:
                 risk_reasons=["execution_window_blocked"],
                 dry_run=dry_run,
                 order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
 
         selection_request = OptionSelectionRequest(
@@ -97,6 +100,8 @@ class ExecutionPlanner:
                 risk_reasons=["option_contract_already_owned_by_other_deployment"],
                 dry_run=dry_run,
                 order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
         quote = await self.order_manager.get_option_quote(selection.option_symbol)
         entry_price = quote.entry_reference_price or selection.estimated_entry_price
@@ -114,6 +119,8 @@ class ExecutionPlanner:
                 risk_reasons=["public_open_interest_below_minimum"],
                 dry_run=dry_run,
                 order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
         if (
             deployment.execution.max_bid_ask_spread_pct is not None
@@ -131,6 +138,8 @@ class ExecutionPlanner:
                 risk_reasons=["public_spread_above_maximum"],
                 dry_run=dry_run,
                 order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
 
         max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
@@ -147,6 +156,8 @@ class ExecutionPlanner:
                 risk_reasons=["insufficient_budget_for_single_contract"],
                 dry_run=dry_run,
                 order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
         risk_profile = ConservativeRiskProfile(
             profile=deployment.risk.profile,
@@ -172,6 +183,8 @@ class ExecutionPlanner:
                 risk_reasons=risk.reasons,
                 dry_run=dry_run,
                 order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
 
         if dry_run:
@@ -193,10 +206,12 @@ class ExecutionPlanner:
                 deployment.deployment_id,
                 trade_id=trade_id,
                 option_symbol=selection.option_symbol,
-                quantity=quantity,
-                source="dry_run",
-                order_id="DRY_RUN",
-            )
+                    quantity=quantity,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
+                    source="dry_run",
+                    order_id="DRY_RUN",
+                )
             return TradePlan(
                 trade_id=trade_id,
                 deployment_id=deployment.deployment_id,
@@ -208,6 +223,8 @@ class ExecutionPlanner:
                 risk_reasons=risk.reasons,
                 dry_run=True,
                 order_id="DRY_RUN",
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
 
         try:
@@ -224,6 +241,8 @@ class ExecutionPlanner:
                 risk_reasons=[f"public_preflight_failed:{exc}"],
                 dry_run=False,
                 order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
             )
 
         final_limit_price = float(preflight.payload["limitPrice"])
@@ -240,6 +259,8 @@ class ExecutionPlanner:
                 trade_id=trade_id,
                 option_symbol=selection.option_symbol,
                 quantity=quantity,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
                 source="live_pending",
                 order_id=result.order_id,
             )
@@ -254,6 +275,8 @@ class ExecutionPlanner:
             risk_reasons=risk.reasons if result.order_id else [*risk.reasons, result.error or "order_submit_failed"],
             dry_run=False,
             order_id=result.order_id,
+            underlying_entry_price=underlying_entry_price,
+            entry_timestamp=decision.timestamp,
         )
 
 
@@ -268,6 +291,16 @@ def _entry_window_allows(deployment: DeploymentManifest, timestamp) -> bool:
     if end is not None and current > end:
         return False
     return True
+
+
+def _underlying_entry_price(decision: SignalDecision) -> float | None:
+    value = decision.features.get("close")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_optional_et_time(value: str | None) -> time | None:

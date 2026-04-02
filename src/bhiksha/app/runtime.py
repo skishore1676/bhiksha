@@ -58,6 +58,7 @@ class BhikshaRuntime:
     strategy_registry: StrategyRegistry
     bias_inputs_path: Path | None = None
     halt_and_flatten: bool = False
+    deployment_selection: dict = field(default_factory=dict)
     started: bool = field(default=False, init=False)
     event_bus: InMemoryEventBus = field(default_factory=InMemoryEventBus, init=False)
 
@@ -255,6 +256,7 @@ class BhikshaRuntime:
             "app": self.app_config.model_dump(),
             "providers": self.provider_config.model_dump(),
             "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
+            "deployment_selection": self.deployment_selection,
             "bias_inputs": [selection.model_dump() for selection in self.bias_inputs],
             "emergency_controls": {
                 "halt_and_flatten": self.halt_and_flatten,

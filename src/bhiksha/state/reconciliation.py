@@ -78,6 +78,8 @@ def reconcile_public_positions(
                 option_symbol=option_symbol,
                 quantity=quantity,
                 entry_price=entry_price,
+                underlying_entry_price=matched_trade.underlying_entry_price if matched_trade is not None else None,
+                entry_timestamp=matched_trade.entry_timestamp if matched_trade is not None else None,
                 source="broker_sync",
                 order_id=matched_trade.entry_order_id if matched_trade is not None else None,
                 stop_order_id=stop_order.get("order_id") or (matched_trade.stop_order_id if matched_trade is not None else None),

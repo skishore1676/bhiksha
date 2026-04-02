@@ -131,6 +131,8 @@ class TradePlan:
     order_id: str | None = None
     stop_order_id: str | None = None
     target_order_id: str | None = None
+    underlying_entry_price: float | None = None
+    entry_timestamp: datetime | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -141,6 +143,8 @@ class TradeRecord:
     option_symbol: str | None = None
     quantity: int = 0
     entry_price: float | None = None
+    underlying_entry_price: float | None = None
+    entry_timestamp: datetime | None = None
     status: str = "pending_entry"
     entry_order_id: str | None = None
     stop_order_id: str | None = None

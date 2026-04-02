@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, ClassVar, TypeVar
+from typing import Any, ClassVar, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -74,6 +74,7 @@ class AppConfig(BaseModel):
     order_fill_poll_seconds: int = 2
     order_fill_timeout_seconds: int = 20
     generated_deployments_dir: str = "config/deployments/generated"
+    deployment_selection_mode: Literal["all", "manual_only", "generated_only", "prefer_generated"] = "all"
     bias_inputs_path: str = "config/bias_inputs.yaml"
     playbook_artifacts_dir: str = "artifacts/playbook"
     observation_reports_dir: str = "artifacts/observations"
@@ -150,6 +151,11 @@ class ExitSpec(BaseModel):
     stop_loss_pct: float = 0.45
     stop_to_breakeven_after_r_multiple: float | None = None
     hard_flat_time_et: str = "15:55"
+    thesis_exit_anchor: str | None = None
+    thesis_exit_policy: str | None = None
+    thesis_exit_params: dict[str, Any] = Field(default_factory=dict)
+    catastrophe_exit_anchor: str | None = "option_premium"
+    catastrophe_exit_params: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceSpec(BaseModel):
@@ -168,6 +174,8 @@ class DeploymentManifest(BaseModel):
     risk: RiskSpec
     exit: ExitSpec = Field(default_factory=ExitSpec)
     source: SourceSpec = Field(default_factory=SourceSpec)
+    config_path: str | None = Field(default=None, exclude=True)
+    source_kind: Literal["manual", "generated"] | None = Field(default=None, exclude=True)
 
 
 class VehicleProfile(BaseModel):

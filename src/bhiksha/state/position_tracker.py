@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(slots=True)
@@ -14,6 +15,8 @@ class TrackedPosition:
     option_symbol: str | None = None
     quantity: int = 0
     entry_price: float | None = None
+    underlying_entry_price: float | None = None
+    entry_timestamp: datetime | None = None
     source: str = "runtime"
     order_id: str | None = None
     stop_order_id: str | None = None
@@ -59,6 +62,8 @@ class PositionTracker:
         option_symbol: str | None = None,
         quantity: int = 0,
         entry_price: float | None = None,
+        underlying_entry_price: float | None = None,
+        entry_timestamp: datetime | None = None,
         source: str = "runtime",
         order_id: str | None = None,
         stop_order_id: str | None = None,
@@ -76,6 +81,8 @@ class PositionTracker:
                 existing.trade_id = trade_id
                 existing.quantity = quantity
                 existing.entry_price = entry_price
+                existing.underlying_entry_price = underlying_entry_price
+                existing.entry_timestamp = entry_timestamp
                 existing.source = source
                 existing.order_id = order_id
                 existing.stop_order_id = stop_order_id
@@ -93,6 +100,8 @@ class PositionTracker:
                 option_symbol=option_symbol,
                 quantity=quantity,
                 entry_price=entry_price,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=entry_timestamp,
                 source=source,
                 order_id=order_id,
                 stop_order_id=stop_order_id,

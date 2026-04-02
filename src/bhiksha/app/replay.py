@@ -9,6 +9,7 @@ import polars as pl
 
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.models import ExitDecision, SignalDecision
+from bhiksha.execution.thesis_exit import evaluate_underlying_thesis_exit
 from bhiksha.market_data.session import as_et_time
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.state.position_tracker import TrackedPosition
@@ -159,6 +160,8 @@ class ReplaySignalEvaluator:
                     symbol=deployment.symbol,
                     deployment_id=deployment.deployment_id,
                     option_symbol="REPLAY_OPTION_PLACEHOLDER",
+                    underlying_entry_price=_replay_underlying_entry_price(entry),
+                    entry_timestamp=entry.timestamp,
                 )
                 continue
 
@@ -171,6 +174,25 @@ class ReplaySignalEvaluator:
                         exit_index=index,
                         exit_decision=time_exit,
                         exit_category="time_exit",
+                    )
+                )
+                active_trade = None
+                active_position = None
+                continue
+
+            thesis_decision = (
+                evaluate_underlying_thesis_exit(deployment, frame_slice, active_position)
+                if active_position is not None
+                else None
+            )
+            if thesis_decision is not None and thesis_decision.exit:
+                trades.append(
+                    ReplayTrade(
+                        entry_index=active_trade.entry_index,
+                        entry_decision=active_trade.entry_decision,
+                        exit_index=index,
+                        exit_decision=thesis_decision,
+                        exit_category="thesis_exit",
                     )
                 )
                 active_trade = None
@@ -224,3 +246,13 @@ def _hard_flat_exit_decision(
         reason=["hard_flat_time_reached"],
         cancel_protection_orders=True,
     )
+
+
+def _replay_underlying_entry_price(decision: SignalDecision) -> float | None:
+    value = decision.features.get("close")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
