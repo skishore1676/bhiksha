@@ -109,6 +109,37 @@ Live behavior:
 - syncs broker positions on every bar so restarts do not double-enter
 - submits a hard-flat close order at the configured ET cutoff
 
+## Post-Close Review
+
+Use the same session payload to review what actually happened without mixing the
+result with legacy deployment folders.
+
+Compact event summary:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.session_summary \
+  --session-payload artifacts/playbook/active_session.json
+```
+
+Per-deployment observation packets:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.observation_report \
+  --session-payload artifacts/playbook/active_session.json \
+  --skip-replay
+```
+
+What these now show in Bionic mode:
+
+- session id and session mode
+- deployment origin: `mala_playbook` vs `operator_manual`
+- authorization mode and whether the deployment was live-authorized
+- signal counts, trade-plan counts, exit counts, lifecycle state
+- blocked-entry reasons and runtime issues
+
+Use the replay-enabled observation report only when you specifically want a
+heavier historical reconstruction pass after the close.
+
 ## Intraday Emergency Control
 
 If your macro read is invalidated intraday, set:
