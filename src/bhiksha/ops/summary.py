@@ -29,6 +29,8 @@ class SessionSummary:
     runtime_issue_counts: dict[str, int] = field(default_factory=dict)
     runtime_metric_latest: dict[str, float] = field(default_factory=dict)
     runtime_metric_average: dict[str, float] = field(default_factory=dict)
+    latest_startup_created_at: str | None = None
+    latest_startup_snapshot: dict = field(default_factory=dict)
     recent_events: list[RecentEvent] = field(default_factory=list)
 
 
@@ -50,6 +52,8 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
     runtime_issue_counts: Counter[str] = Counter()
     runtime_metric_values: defaultdict[str, list[float]] = defaultdict(list)
     runtime_metric_latest: dict[str, float] = {}
+    latest_startup_created_at: str | None = None
+    latest_startup_snapshot: dict = {}
     recent: list[RecentEvent] = []
 
     for created_at, event_type, payload_text in rows:
@@ -70,6 +74,9 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
         if event_type == "runtime_issue":
             category = _maybe_str(payload.get("category")) or "exception"
             runtime_issue_counts[category] += 1
+        if event_type == "startup_config":
+            latest_startup_created_at = created_at
+            latest_startup_snapshot = payload
         if event_type == "runtime_metric":
             metric_name = _runtime_metric_name(payload)
             metric_value = _maybe_float(payload.get("value"))
@@ -98,6 +105,8 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
         runtime_metric_average={
             key: round(sum(values) / len(values), 3) for key, values in runtime_metric_values.items() if values
         },
+        latest_startup_created_at=latest_startup_created_at,
+        latest_startup_snapshot=latest_startup_snapshot,
         recent_events=recent[-recent_limit:],
     )
 

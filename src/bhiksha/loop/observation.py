@@ -1,4 +1,4 @@
-"""Post-close observation reports for automated shadow deployments."""
+"""Post-close observation reports for enabled deployments."""
 
 from __future__ import annotations
 
@@ -28,8 +28,9 @@ async def write_observation_reports(
     provider: str | None = None,
     output_dir: str | Path | None = None,
     include_replay: bool = True,
+    session_payload_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    runtime = build_runtime(config_root)
+    runtime = build_runtime(config_root, session_payload_path=session_payload_path)
     repo_root = Path(config_root).parent
     resolved_db_path = Path(db_path) if db_path is not None else Path(runtime.app_config.sqlite_path)
     if not resolved_db_path.is_absolute():
@@ -40,14 +41,10 @@ async def write_observation_reports(
     events = _load_events(resolved_db_path)
     summary = build_session_summary(str(resolved_db_path), recent_limit=50)
     evaluator = ReplaySignalEvaluator(FeatureService(), runtime.strategy_registry)
-    automated_deployments = [
-        deployment
-        for deployment in runtime.enabled_deployments
-        if deployment.source.metadata.get("automation_lane") == "automated_shadow"
-    ]
+    reportable_deployments = list(runtime.enabled_deployments)
 
     packets: list[dict[str, Any]] = []
-    for deployment in automated_deployments:
+    for deployment in reportable_deployments:
         packet = await _deployment_packet(
             runtime=runtime,
             evaluator=evaluator,
@@ -97,6 +94,7 @@ async def _deployment_packet(
     signal_events = [event for event in relevant_events if event["event_type"] == "signal_decision"]
     trade_plan_events = [event for event in relevant_events if event["event_type"] == "trade_plan"]
     exit_plan_events = [event for event in relevant_events if event["event_type"] == "exit_plan"]
+    exit_decision_events = [event for event in relevant_events if event["event_type"] == "exit_decision"]
     lifecycle_blocked_events = [event for event in relevant_events if event["event_type"] == "lifecycle_entry_blocked"]
     runtime_issue_events = [
         event
@@ -114,6 +112,14 @@ async def _deployment_packet(
     for event in runtime_issue_events:
         category = str(event["payload"].get("category", "exception"))
         runtime_issue_counts[category] += 1
+    signal_reason_counts = Counter()
+    for event in signal_events:
+        for reason in event["payload"].get("reason") or []:
+            signal_reason_counts[str(reason)] += 1
+    exit_reason_counts = Counter()
+    for event in exit_decision_events:
+        for reason in event["payload"].get("reason") or []:
+            exit_reason_counts[str(reason)] += 1
 
     replay = await _replay_summary(
         runtime=runtime,
@@ -124,11 +130,25 @@ async def _deployment_packet(
         include_replay=include_replay,
     )
     signal_true_count = sum(1 for event in signal_events if bool(event["payload"].get("signal")))
+    exit_true_count = sum(1 for event in exit_decision_events if bool(event["payload"].get("exit")))
+    startup_deployment = _deployment_from_startup_snapshot(startup_snapshot, deployment.deployment_id)
+    startup_selection = startup_snapshot.get("deployment_selection") or {}
+    startup_session = startup_snapshot.get("session") or {}
+    source_metadata = deployment.source.metadata or {}
     packet = {
         "deployment_id": deployment.deployment_id,
         "candidate_id": deployment.source.metadata.get("candidate_id"),
+        "playbook_id": source_metadata.get("playbook_id"),
+        "trade_id": source_metadata.get("trade_id"),
         "symbol": deployment.symbol,
         "strategy_key": deployment.strategy.key,
+        "source_origin": deployment.source.origin,
+        "source_artifact": deployment.source.artifact,
+        "authorization_mode": source_metadata.get("authorization_mode"),
+        "session_mode": startup_selection.get("mode"),
+        "session_id": startup_selection.get("session_id"),
+        "live_requested": startup_session.get("live"),
+        "shadow_only": deployment.execution.shadow_only,
         "bias_template": deployment.source.metadata.get("bias_template"),
         "horizon": deployment.source.metadata.get("horizon"),
         "startup_config_fingerprint": startup_snapshot.get("config_fingerprint"),
@@ -136,9 +156,14 @@ async def _deployment_packet(
         "signal_true_count": signal_true_count,
         "trade_plan_count": len(trade_plan_events),
         "exit_plan_count": len(exit_plan_events),
+        "exit_decision_count": len(exit_decision_events),
+        "exit_true_count": exit_true_count,
         "latest_lifecycle_state": session_summary.lifecycle_last_state.get(deployment.deployment_id),
         "blocked_entry_reasons": dict(blocked_entry_reasons),
+        "signal_reason_counts": dict(signal_reason_counts),
+        "exit_reason_counts": dict(exit_reason_counts),
         "runtime_issue_counts": dict(runtime_issue_counts),
+        "startup_deployment": startup_deployment,
         "replay": replay,
         "safe_for_live_review": bool(startup_snapshot.get("config_fingerprint"))
         and signal_true_count > 0
@@ -236,16 +261,41 @@ def _latest_startup_snapshot(events: list[dict[str, Any]], deployment_id: str) -
     return {}, None
 
 
+def _deployment_from_startup_snapshot(startup_snapshot: dict[str, Any], deployment_id: str) -> dict[str, Any] | None:
+    for item in startup_snapshot.get("deployments") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("deployment_id")) == deployment_id:
+            return item
+    return None
+
+
 def _packet_markdown(packet: dict[str, Any]) -> str:
     lines = [
         f"# {packet['deployment_id']}",
         "",
+        f"- source_origin: `{packet['source_origin']}`",
+        f"- authorization_mode: `{packet['authorization_mode']}`",
+        f"- session_mode: `{packet['session_mode']}`",
+        f"- session_id: `{packet['session_id']}`",
+        f"- live_requested: `{packet['live_requested']}`",
+        f"- shadow_only: `{packet['shadow_only']}`",
         f"- safe_for_live_review: `{packet['safe_for_live_review']}`",
         f"- startup_config_fingerprint: `{packet['startup_config_fingerprint']}`",
         f"- signal_true_count: `{packet['signal_true_count']}`",
         f"- trade_plan_count: `{packet['trade_plan_count']}`",
         f"- exit_plan_count: `{packet['exit_plan_count']}`",
+        f"- exit_true_count: `{packet['exit_true_count']}`",
+        f"- latest_lifecycle_state: `{packet['latest_lifecycle_state']}`",
     ]
+    if packet["signal_reason_counts"]:
+        lines.extend(["", "## Signal Reasons"])
+        for reason, count in sorted(packet["signal_reason_counts"].items()):
+            lines.append(f"- `{reason}`: `{count}`")
+    if packet["exit_reason_counts"]:
+        lines.extend(["", "## Exit Reasons"])
+        for reason, count in sorted(packet["exit_reason_counts"].items()):
+            lines.append(f"- `{reason}`: `{count}`")
     if packet["blocked_entry_reasons"]:
         lines.extend(["", "## Blocked Entry Reasons"])
         for reason, count in sorted(packet["blocked_entry_reasons"].items()):
@@ -274,6 +324,11 @@ async def _main_async(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", default=None, help="Override warm-start provider for replay")
     parser.add_argument("--output-dir", default=None, help="Output directory for observation packets")
     parser.add_argument("--skip-replay", action="store_true", help="Skip the replay step and use event history only")
+    parser.add_argument(
+        "--session-payload",
+        default=None,
+        help="Optional active_session.json path. When supplied, observation reports target that session-payload lane.",
+    )
     args = parser.parse_args(argv)
 
     packets = await write_observation_reports(
@@ -283,6 +338,7 @@ async def _main_async(argv: list[str] | None = None) -> int:
         provider=args.provider,
         output_dir=args.output_dir,
         include_replay=not args.skip_replay,
+        session_payload_path=args.session_payload,
     )
     print(json.dumps({"reports": packets}, indent=2, sort_keys=True))
     return 0 if all(packet["safe_for_live_review"] for packet in packets) and packets else 2

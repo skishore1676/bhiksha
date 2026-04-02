@@ -124,3 +124,44 @@ def test_session_summary_aggregates_runtime_metrics(tmp_path) -> None:
     assert summary.runtime_metric_average["heartbeat_lag_ms:QQQ"] == 150.0
     assert summary.runtime_metric_latest["execution_run_ms:QQQ:manage"] == 45.5
     assert summary.runtime_issue_counts["order"] == 1
+
+
+def test_session_summary_keeps_latest_startup_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "events.db"
+    repo = SQLiteEventRepository(str(db_path))
+
+    async def seed():
+        await repo.append(
+            "startup_config",
+            {
+                "config_fingerprint": "fingerprint123",
+                "deployment_selection": {
+                    "mode": "session_payload",
+                    "session_id": "active_session_2026-04-02",
+                },
+                "session": {"live": True, "max_bars": None},
+                "deployments": [
+                    {
+                        "deployment_id": "manual_trigger_spy_short_abc",
+                        "symbol": "SPY",
+                        "strategy": {"key": "manual_trigger"},
+                        "execution": {"shadow_only": False},
+                        "source": {
+                            "origin": "operator_manual",
+                            "metadata": {
+                                "authorization_mode": "live",
+                                "trade_id": "manual-1",
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+    asyncio.run(seed())
+
+    summary = build_session_summary(str(db_path), recent_limit=3)
+
+    assert summary.latest_startup_created_at is not None
+    assert summary.latest_startup_snapshot["deployment_selection"]["mode"] == "session_payload"
+    assert summary.latest_startup_snapshot["session"]["live"] is True

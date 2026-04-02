@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.ops.summary import build_session_summary
@@ -12,14 +13,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Print a summary of Bhiksha session events")
     parser.add_argument("--db-path", default=None, help="Override SQLite event database path")
     parser.add_argument("--recent", type=int, default=10, help="How many recent events to print")
+    parser.add_argument(
+        "--session-payload",
+        default=None,
+        help="Optional active_session.json path. Used to resolve the same runtime lane that produced the events.",
+    )
     args = parser.parse_args(argv)
 
-    runtime = build_runtime()
+    runtime = build_runtime(session_payload_path=args.session_payload)
     db_path = args.db_path or runtime.app_config.sqlite_path
     summary = build_session_summary(db_path, recent_limit=args.recent)
+    startup = summary.latest_startup_snapshot or {}
+    deployment_selection = startup.get("deployment_selection") or {}
+    session = startup.get("session") or {}
 
     print(f"DB_PATH={db_path}")
     print(f"TOTAL_EVENTS={summary.total_events}")
+    if summary.latest_startup_created_at:
+        print(f"LATEST_STARTUP_AT={summary.latest_startup_created_at}")
+    if deployment_selection:
+        print(f"STARTUP_MODE={deployment_selection.get('mode', '')}")
+        print(f"STARTUP_SESSION_ID={deployment_selection.get('session_id', '')}")
+    if session:
+        print(f"LIVE_REQUESTED={session.get('live', False)}")
     print("EVENT_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.event_type_counts.items())))
     print("DEPLOYMENT_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.deployment_event_counts.items())))
     print("LIFECYCLE_LAST=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.lifecycle_last_state.items())))
@@ -28,6 +44,28 @@ def main(argv: list[str] | None = None) -> int:
     print("RUNTIME_ISSUE_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.runtime_issue_counts.items())))
     print("RUNTIME_METRIC_LATEST=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.runtime_metric_latest.items())))
     print("RUNTIME_METRIC_AVG=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.runtime_metric_average.items())))
+    for deployment in startup.get("deployments") or []:
+        if not isinstance(deployment, dict):
+            continue
+        source = deployment.get("source") or {}
+        metadata = source.get("metadata") or {}
+        execution = deployment.get("execution") or {}
+        print(
+            "DEPLOYMENT="
+            + json.dumps(
+                {
+                    "deployment_id": deployment.get("deployment_id"),
+                    "symbol": deployment.get("symbol"),
+                    "strategy_key": (deployment.get("strategy") or {}).get("key"),
+                    "origin": source.get("origin"),
+                    "authorization_mode": metadata.get("authorization_mode"),
+                    "playbook_id": metadata.get("playbook_id"),
+                    "trade_id": metadata.get("trade_id"),
+                    "shadow_only": execution.get("shadow_only"),
+                },
+                sort_keys=True,
+            )
+        )
     for event in summary.recent_events:
         print(
             "RECENT="
