@@ -8,6 +8,7 @@ from bhiksha.strategy.elastic_band_reversion import ElasticBandReversionStrategy
 from bhiksha.strategy.base import StrategyPlugin
 from bhiksha.strategy.jerk_pivot_momentum import JerkPivotMomentumStrategy
 from bhiksha.strategy.market_impulse import MarketImpulseStrategy
+from bhiksha.strategy.opening_drive_classifier import OpeningDriveClassifierStrategy
 
 
 @dataclass(slots=True)
@@ -29,4 +30,5 @@ def default_strategy_registry() -> StrategyRegistry:
     registry.register(ElasticBandReversionStrategy())
     registry.register(JerkPivotMomentumStrategy())
     registry.register(MarketImpulseStrategy())
+    registry.register(OpeningDriveClassifierStrategy())
     return registry
