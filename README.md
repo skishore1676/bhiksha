@@ -15,7 +15,8 @@ Current live scope:
 
 - Architecture: `/Users/suman/kg_env/projects/bhiksha/docs/architecture.md`
 - Session log: `/Users/suman/kg_env/projects/bhiksha/docs/agent.md`
-- Deploy runbook: `/Users/suman/kg_env/projects/bhiksha/docs/deploy_runbook.md`
+- Canonical operator checklist: `/Users/suman/kg_env/projects/mala_v1/docs/bionic_loop_checklist.md`
+- Bhiksha redirect runbook: `/Users/suman/kg_env/projects/bhiksha/docs/deploy_runbook.md`
 
 ## Repo Layout
 
