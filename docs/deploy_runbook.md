@@ -28,19 +28,37 @@ Expected:
 - `POLYGON=True`
 - `SCHWAB=True`
 
-6. Compile and publish the latest Mala active session before open.
+6. Prepare and publish the latest active session before open.
 
-Preferred path from the Mala repo:
+Canonical path from the Bhiksha repo:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session prepare
+```
+
+That wrapper:
+
+- calls Mala's `compile_active_session.py`
+- reads `Bionic_Loop` and `entry_v1`
+- compiles and publishes one authoritative `active_session.json`
+- runs provider health
+- runs a warm-start check with `--max-bars 0`
+
+If you want it to start the live session immediately after the pre-open checks:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session prepare --start-live
+```
+
+Legacy direct compile path from the Mala repo:
 
 ```bash
 ./.venv/bin/python scripts/compile_active_session.py \
-  --playbook-catalog <path>/playbook_catalog.json \
   --out-dir data/results/active_session/<YYYY-MM-DD> \
-  --manual-google-sheet-id <entry_v1_sheet_id> \
   --publish-bhiksha
 ```
 
-Fallback importer path if you are using the older deployment-candidates export:
+Legacy importer path if you are using the older deployment-candidates export:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
@@ -48,7 +66,7 @@ PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
   --playbook-catalog <path>/playbook_catalog.json
 ```
 
-Expected:
+Expected in the canonical path:
 
 - one `active_session.json` is published into `artifacts/playbook/active_session.json`
 - each deployment in the file is tagged as either `mala_playbook` or `operator_manual`
@@ -58,7 +76,7 @@ Expected:
   - `exit.thesis_exit_policy: ...`
   - `exit.catastrophe_exit_anchor: option_premium`
 
-7. Run a warm-start dry run:
+7. If you did not use the wrapper, run a warm-start dry run:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session \
@@ -140,6 +158,20 @@ What these now show in Bionic mode:
 Use the replay-enabled observation report only when you specifically want a
 heavier historical reconstruction pass after the close.
 
+Canonical post-close wrapper:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session review
+```
+
+That writes a feedback bundle locally under:
+
+- `artifacts/playbook/session_feedback/<session_id>/`
+
+and mirrors it back into Mala under:
+
+- `../mala_v1/data/live_feedback/<session_id>/`
+
 ## Intraday Emergency Control
 
 If your macro read is invalidated intraday, set:
@@ -177,3 +209,4 @@ before startup or before the next import cycle.
 - Protective stops are submitted after fill; if a stop fills externally, the next portfolio sync clears the tracked position.
 - Bhiksha now supports `market_impulse`, `jerk_pivot_momentum`, `elastic_band_reversion`, `opening_drive_classifier`, and `manual_trigger`.
 - In `--session-payload` mode, Bhiksha ignores `config/deployments/` entirely; the session file is the sole authority.
+- `import_playbook` and generated deployment YAMLs remain legacy support paths, not the primary Bionic control plane.

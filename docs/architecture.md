@@ -77,6 +77,9 @@ Examples now supported in the runtime config model include:
 - `entry_window_et: "09:45-14:30"` -> `entry_window_start_et`, `entry_window_end_et`
 
 In the Bionic loop, Mala now emits that file directly as `active_session.json`.
+The canonical operator entrypoint is Bhiksha's wrapper command
+`python -m bhiksha.tools.bionic_session prepare`, which calls Mala's compiler
+and then boots Bhiksha from the resulting session payload.
 
 ### 2. Strategy Code Lives In Bhiksha; Mala Supplies Parameters And Recommendations
 
@@ -232,6 +235,10 @@ Current runtime policy:
 - deployment origins are explicit:
   - `mala_playbook`
   - `operator_manual`
+- the canonical operator surface is:
+  - pre-open: `bhiksha.tools.bionic_session prepare`
+  - live run: `bhiksha.tools.bionic_session run --live`
+  - post-close: `bhiksha.tools.bionic_session review`
 
 Example:
 
