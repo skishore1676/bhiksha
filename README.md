@@ -1,17 +1,14 @@
 # Bhiksha
 
-Bhiksha is a live execution runtime for strategy deployments proposed by `mala`.
+Bhiksha is the live execution runtime for session payloads compiled from `mala`.
 
 Current live scope:
 
-- `QQQ` Market Impulse short deployment
-- `SPY` Market Impulse short deployment
-- `TSLA` Jerk Pivot Momentum short deployment in shadow-only mode
-- single-leg long puts
+- live sessions loaded from one authoritative `active_session.json`
+- `market_impulse`, `jerk_pivot_momentum`, `elastic_band_reversion`, `opening_drive_classifier`, and `manual_trigger`
+- single-leg options execution through Public
 - live underlying bars from Schwab
-- execution through Public
-- config-driven deployments and conservative risk defaults
-- schema-v2 playbook import from Mala nightly regime-matrix exports
+- underlying-anchored thesis exits plus option catastrophe protection
 - intraday emergency `halt_and_flatten` operator control
 
 ## Start Here
@@ -33,6 +30,7 @@ Current live scope:
 
 ## Most Important Files
 
+- Canonical operator entrypoint: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/bionic_session.py`
 - Runtime entrypoint: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/trade_session.py`
 - Continuous loop: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/tools/dry_run_live_loop.py`
 - Market Impulse strategy: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/strategy/market_impulse.py`
@@ -42,14 +40,17 @@ Current live scope:
 - Execution supervisor: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/execution/supervisor.py`
 - Public broker adapter: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/execution/brokers/public/adapter.py`
 - Schwab bar adapter: `/Users/suman/kg_env/projects/bhiksha/src/bhiksha/market_data/adapters/schwab.py`
-- Deployment manifests:
-  - `/Users/suman/kg_env/projects/bhiksha/config/deployments/jerk_pivot_momentum_tsla_short_v1.yaml`
-  - `/Users/suman/kg_env/projects/bhiksha/config/deployments/market_impulse_qqq_short_v1.yaml`
-  - `/Users/suman/kg_env/projects/bhiksha/config/deployments/market_impulse_spy_short_v1.yaml`
+- Session payload artifact: `/Users/suman/kg_env/projects/bhiksha/artifacts/playbook/active_session.json`
 
 ## Commands
 
-Health:
+Pre-open prepare:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session prepare
+```
+
+Health only:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.healthcheck
@@ -58,19 +59,19 @@ PYTHONPATH=src .venv/bin/python -m bhiksha.tools.healthcheck
 Warm-start smoke test:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --max-bars 0
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session run --max-bars 0
 ```
 
 Dry-run live loop:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session run
 ```
 
 Live loop:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --live
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session run --live
 ```
 
 Note:
@@ -83,26 +84,25 @@ Session summary:
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.session_summary
 ```
 
-Playbook import:
+Legacy importer:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
-  --deployment-candidates <path>/deployment_candidates.json \
-  --playbook-catalog <path>/playbook_catalog.json
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook ...
 ```
 
-This command now expects Mala schema-v2 contracts:
-
-- `deployment_candidates.json` with `contract_name=deployment_candidates`
-- `playbook_catalog.json` with `contract_name=playbook_catalog`
-
-It validates the contract version and playbook matrix shape before generating
-shadow manifests under `config/deployments/generated/`.
+This remains for older generated-manifest workflows only. In the Bionic loop,
+the canonical authority is `active_session.json`, not generated deployment YAMLs.
 
 Observation report:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bhiksha.tools.observation_report --skip-replay
+```
+
+Canonical post-close review:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session review
 ```
 
 Signal inspector:
@@ -139,13 +139,10 @@ Tests:
 PYTHONPATH=src .venv/bin/pytest -q
 ```
 
-## Day-1 Notes
+## Operating Notes
 
-- Market Impulse deployments can trade normally under `--live`.
-- The TSLA Jerk Pivot deployment is enabled for live market observation, but still runs in shadow-only mode.
-- Generated playbook deployments remain `shadow_only` in the current loop.
-- `config/bias_inputs.yaml` now supports:
-  - daily bias selections used by `import_playbook`
+- In Bionic mode, Bhiksha executes only the deployments present in `active_session.json`.
+- `config/bias_inputs.yaml` still supports:
   - `emergency.halt_and_flatten: true` to stop new entries and flatten Bhiksha-managed positions intraday
 - Quotes and preflight are already validated against Public.
 - Restart safety is broker-sync based: existing Public option positions are re-imported on startup and each completed bar.
@@ -155,5 +152,5 @@ PYTHONPATH=src .venv/bin/pytest -q
 
 Verification:
 
-- `85` tests passing.
+- `105` tests passing.
 - `python3 -m compileall src tests` passes cleanly.
