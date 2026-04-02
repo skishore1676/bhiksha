@@ -175,7 +175,19 @@ class DeploymentManifest(BaseModel):
     exit: ExitSpec = Field(default_factory=ExitSpec)
     source: SourceSpec = Field(default_factory=SourceSpec)
     config_path: str | None = Field(default=None, exclude=True)
-    source_kind: Literal["manual", "generated"] | None = Field(default=None, exclude=True)
+    source_kind: Literal["manual", "generated", "session"] | None = Field(default=None, exclude=True)
+
+
+class SessionPayload(BaseModel):
+    contract_name: str = "active_session"
+    schema_version: int = 1
+    session_id: str
+    session_date: str | None = None
+    generated_at: str | None = None
+    source: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    suppressed: list[dict[str, Any]] = Field(default_factory=list)
+    deployments: list[DeploymentManifest] = Field(default_factory=list)
 
 
 class VehicleProfile(BaseModel):

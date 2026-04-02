@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bhiksha.config.loader import load_bias_inputs, load_deployments, load_runtime_deployments
+import json
+
+from bhiksha.config.loader import load_bias_inputs, load_deployments, load_runtime_deployments, load_session_payload
 
 
 def test_load_deployments_from_config_directory() -> None:
@@ -108,8 +110,36 @@ def test_load_bias_inputs_accepts_reserved_emergency_controls(tmp_path: Path) ->
     assert selections[0].symbol == "IWM"
 
 
+def test_load_session_payload_rejects_duplicate_symbols(tmp_path: Path) -> None:
+    payload_path = tmp_path / "active_session.json"
+    payload_path.write_text(
+        json.dumps(
+            {
+                "contract_name": "active_session",
+                "schema_version": 1,
+                "session_id": "active_session_2026-04-01",
+                "deployments": [
+                    _manifest_dict("manual_spy", symbol="SPY"),
+                    _manifest_dict("playbook_spy", symbol="SPY"),
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate symbol"):
+        load_session_payload(payload_path)
+
+
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str = "QQQ") -> None:
-    payload = {
+    payload = _manifest_dict(deployment_id, symbol=symbol)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _manifest_dict(deployment_id: str, *, symbol: str = "QQQ") -> dict:
+    return {
         "deployment_id": deployment_id,
         "enabled": True,
         "symbol": symbol,
@@ -141,4 +171,3 @@ def _write_manifest(path: Path, deployment_id: str, *, symbol: str = "QQQ") -> N
         },
         "source": {"origin": "test", "run_date": "2026-03-31", "artifact": "test.csv"},
     }
-    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

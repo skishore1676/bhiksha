@@ -8,7 +8,7 @@ imports and the intraday emergency control.
 1. Confirm `.env` is present and current.
 2. Confirm Schwab OAuth tokens exist in `/Users/suman/kg_env/projects/bhiksha/config/schwab_tokens.json`.
 3. Confirm `config/bias_inputs.yaml` reflects the day's emergency controls and any importer-era fallbacks.
-   In the Bionic loop, the daily symbol/thesis intent now comes from Mala's `Bionic_Loop` sheet and published generated deployments.
+   In the Bionic loop, the daily symbol/thesis intent now comes from Mala's compiled `active_session.json`.
 4. If you need an emergency fail-safe armed but inactive, confirm:
 
 ```yaml
@@ -28,14 +28,15 @@ Expected:
 - `POLYGON=True`
 - `SCHWAB=True`
 
-6. Publish the latest Mala router output before open.
+6. Compile and publish the latest Mala active session before open.
 
 Preferred path from the Mala repo:
 
 ```bash
-./.venv/bin/python scripts/run_bias_playbook_router.py \
+./.venv/bin/python scripts/compile_active_session.py \
   --playbook-catalog <path>/playbook_catalog.json \
-  --out-dir data/results/bionic_router/<YYYY-MM-DD> \
+  --out-dir data/results/active_session/<YYYY-MM-DD> \
+  --manual-google-sheet-id <entry_v1_sheet_id> \
   --publish-bhiksha
 ```
 
@@ -49,12 +50,10 @@ PYTHONPATH=src .venv/bin/python -m bhiksha.tools.import_playbook \
 
 Expected:
 
-- schema-v2 contracts validate cleanly
-- supported or routed candidates become generated manifests
-- proposed candidates only appear on the manual research board
-- `safe_for_live_review` is `true` if the selected supported set is clean
-- startup should show `deployment_selection.mode=prefer_generated` so generated deployments override manual deployments on the same symbol
-- for optimized Bionic playbooks, the manifest should also show:
+- one `active_session.json` is published into `artifacts/playbook/active_session.json`
+- each deployment in the file is tagged as either `mala_playbook` or `operator_manual`
+- manual entries suppress playbook entries on the same symbol
+- optimized Bionic playbooks still carry:
   - `exit.thesis_exit_anchor: underlying`
   - `exit.thesis_exit_policy: ...`
   - `exit.catastrophe_exit_anchor: option_premium`
@@ -62,7 +61,9 @@ Expected:
 7. Run a warm-start dry run:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --max-bars 0
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session \
+  --session-payload artifacts/playbook/active_session.json \
+  --max-bars 0
 ```
 
 Expected:
@@ -76,7 +77,8 @@ Expected:
 Use this first if you want to watch signals without sending orders:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session \
+  --session-payload artifacts/playbook/active_session.json
 ```
 
 What it does:
@@ -92,7 +94,9 @@ What it does:
 Use only after the dry-run session looks healthy:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --live
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session \
+  --session-payload artifacts/playbook/active_session.json \
+  --live
 ```
 
 Live behavior:
@@ -128,7 +132,7 @@ before startup or before the next import cycle.
 
 ## Day-1 Guardrails
 
-- Deployments: `market_impulse_qqq_short_v1`, `market_impulse_spy_short_v1`
+- Deployments come only from `active_session.json` in session-payload mode.
 - Vehicle: single-leg long puts for short signals
 - DTE: `0-7`
 - Budget per trade: `$300`
@@ -140,5 +144,5 @@ before startup or before the next import cycle.
 - The runtime is single-process and SQLite-backed.
 - The order log is durable, but advanced resume logic is still broker-sync based rather than full event replay.
 - Protective stops are submitted after fill; if a stop fills externally, the next portfolio sync clears the tracked position.
-- Bhiksha currently supports `market_impulse` and `jerk_pivot_momentum` only.
-- `deployment_selection_mode: prefer_generated` suppresses manual deployments on symbols that have enabled generated deployments; this is intentional for the Bionic loop.
+- Bhiksha now supports `market_impulse`, `jerk_pivot_momentum`, `elastic_band_reversion`, `opening_drive_classifier`, and `manual_trigger`.
+- In `--session-payload` mode, Bhiksha ignores `config/deployments/` entirely; the session file is the sole authority.

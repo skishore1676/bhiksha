@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import yaml
@@ -186,8 +187,70 @@ def test_build_runtime_prefers_generated_deployments_for_same_symbol(tmp_path: P
     assert skipped_ids == {"manual_spy"}
 
 
+def test_build_runtime_uses_session_payload_as_sole_authority(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    deployments_root = config_root / "deployments"
+    deployments_root.mkdir(parents=True)
+    (config_root / "app.yaml").write_text(
+        yaml.safe_dump({"app_name": "bhiksha"}, sort_keys=False),
+        encoding="utf-8",
+    )
+    (config_root / "providers.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "underlying_live_primary": "polygon",
+                "underlying_backfill_primary": "polygon",
+                "execution_broker_primary": "public",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_manifest(deployments_root / "manual_spy.yaml", "manual_spy", symbol="SPY")
+    session_payload_path = tmp_path / "active_session.json"
+    session_payload_path.write_text(
+        json.dumps(
+            {
+                "contract_name": "active_session",
+                "schema_version": 1,
+                "session_id": "active_session_2026-04-01",
+                "generated_at": "2026-04-01T12:00:00+00:00",
+                "deployments": [
+                    {
+                        **_manifest_payload("session_iwm", symbol="IWM"),
+                        "strategy": {
+                            "key": "manual_trigger",
+                            "version": 1,
+                            "params": {
+                                "direction": "long",
+                                "trigger_price": 210.0,
+                                "trigger_direction": "ABOVE",
+                            },
+                        },
+                    }
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    runtime = build_runtime(config_root, session_payload_path=session_payload_path)
+
+    assert [deployment.deployment_id for deployment in runtime.deployments] == ["session_iwm"]
+    assert runtime.deployment_selection["mode"] == "session_payload"
+    assert runtime.session_payload is not None
+    assert runtime.session_payload["session_id"] == "active_session_2026-04-01"
+
+
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str) -> None:
-    payload = {
+    payload = _manifest_payload(deployment_id, symbol=symbol)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _manifest_payload(deployment_id: str, *, symbol: str) -> dict:
+    return {
         "deployment_id": deployment_id,
         "enabled": True,
         "symbol": symbol,
@@ -219,4 +282,3 @@ def _write_manifest(path: Path, deployment_id: str, *, symbol: str) -> None:
         },
         "source": {"origin": "test", "run_date": "2026-04-01", "artifact": "test.csv"},
     }
-    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

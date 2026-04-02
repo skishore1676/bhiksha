@@ -1,7 +1,7 @@
 # Bhiksha Architecture
 
 Status: Draft v2
-Last updated: 2026-03-31
+Last updated: 2026-04-01
 
 ## Purpose
 
@@ -49,11 +49,17 @@ We want:
 
 ## Core Decisions
 
-### 1. Research And Execution Should Meet Through A Deployment Manifest
+### 1. Research And Execution Should Meet Through A Session Payload
 
 Bhiksha should not depend on Mala internals at runtime.
 
-Instead, Bhiksha should consume a deployment manifest that contains:
+Instead, Bhiksha should consume one authoritative session payload that contains:
+
+- session metadata,
+- one deployment manifest per active symbol,
+- provenance for each deployment origin.
+
+Each deployment manifest still contains:
 
 - strategy family identifier,
 - strategy parameters,
@@ -70,8 +76,7 @@ Examples now supported in the runtime config model include:
 - `delta_target: "0.35-0.55"` -> `target_abs_delta_min=0.35`, `target_abs_delta_max=0.55`
 - `entry_window_et: "09:45-14:30"` -> `entry_window_start_et`, `entry_window_end_et`
 
-For now, you are the bridge between Mala output and Bhiksha deployment config.
-Later, Mala can emit the manifest directly.
+In the Bionic loop, Mala now emits that file directly as `active_session.json`.
 
 ### 2. Strategy Code Lives In Bhiksha; Mala Supplies Parameters And Recommendations
 
@@ -218,18 +223,22 @@ Each deployment should have a stable `deployment_id`.
 
 Current runtime policy:
 
-- Bhiksha can load both hand-managed and Mala-generated deployment manifests.
-- `deployment_selection_mode` controls which set is actually active at runtime.
-- In the Bionic loop, `prefer_generated` is the intended mode: if an enabled generated deployment exists for a symbol, hand-managed deployments on that symbol are skipped for that session.
-- Generated Bionic manifests may now include a split exit contract:
+- legacy/manual mode can still load `config/deployments/*.yaml`
+- Bionic mode should start Bhiksha with `--session-payload <active_session.json>`
+- in session-payload mode, Bhiksha ignores `config/deployments/` entirely
+- session payload deployments may now include a split exit contract:
   - `thesis_exit_*` is anchored to the underlying and comes from Mala research
   - `catastrophe_exit_*` is anchored to option-premium/runtime safety and is enforced by Bhiksha
+- deployment origins are explicit:
+  - `mala_playbook`
+  - `operator_manual`
 
 Example:
 
 - `jerk_pivot_momentum_tsla_short_v1`
 - `market_impulse_qqq_short_v1`
 - `market_impulse_spy_short_v1`
+- `manual_trigger_iwm_long_<hash>`
 
 ### 3. Underlying Market Data Service
 
