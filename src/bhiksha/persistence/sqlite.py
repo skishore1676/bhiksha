@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import TradeRecord
 from bhiksha.persistence.repository import EventRepository
 from bhiksha.persistence.repository import TradeStateRepository
@@ -103,6 +104,9 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     target_order_id TEXT,
                     target_price REAL,
                     exit_order_id TEXT,
+                    exit_limit_price REAL,
+                    exit_submitted_at TEXT,
+                    exit_mode TEXT,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -115,6 +119,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN underlying_entry_price REAL")
             if "entry_timestamp" not in existing_columns:
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN entry_timestamp TEXT")
+            if "exit_limit_price" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_limit_price REAL")
+            if "exit_submitted_at" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_submitted_at TEXT")
+            if "exit_mode" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_mode TEXT")
             conn.commit()
 
     def _upsert_trade_sync(self, record: TradeRecord) -> None:
@@ -124,8 +134,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 INSERT INTO trade_sessions (
                     trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, status,
                     underlying_entry_price, entry_timestamp, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
-                    exit_order_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     deployment_id=excluded.deployment_id,
                     symbol=excluded.symbol,
@@ -141,6 +151,9 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     target_order_id=excluded.target_order_id,
                     target_price=excluded.target_price,
                     exit_order_id=excluded.exit_order_id,
+                    exit_limit_price=excluded.exit_limit_price,
+                    exit_submitted_at=excluded.exit_submitted_at,
+                    exit_mode=excluded.exit_mode,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -159,6 +172,9 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     record.target_order_id,
                     record.target_price,
                     record.exit_order_id,
+                    record.exit_limit_price,
+                    record.exit_submitted_at.isoformat() if record.exit_submitted_at is not None else None,
+                    record.exit_mode.value if record.exit_mode is not None else None,
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -181,7 +197,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             rows = conn.execute(
                 """
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
-                       entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price, exit_order_id
+                       entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
+                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode
                 FROM trade_sessions
                 WHERE status != 'closed'
                 ORDER BY updated_at DESC
@@ -204,6 +221,9 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 target_order_id=row[12],
                 target_price=row[13],
                 exit_order_id=row[14],
+                exit_limit_price=row[15],
+                exit_submitted_at=datetime.fromisoformat(row[16]) if row[16] else None,
+                exit_mode=ExitMode(row[17]) if row[17] else None,
             )
             for row in rows
         ]

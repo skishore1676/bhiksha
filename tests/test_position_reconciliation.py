@@ -1,5 +1,6 @@
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.config.loader import load_deployments
+from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import TradeRecord
 from bhiksha.state.reconciliation import reconcile_public_positions
 
@@ -141,6 +142,56 @@ def test_reconcile_public_positions_prefers_known_trade_identity_over_symbol_mat
     assert len(tracked) == 1
     assert tracked[0].deployment_id == "market_impulse_qqq_short_v2"
     assert tracked[0].trade_id == "TRADE123"
+
+
+def test_reconcile_public_positions_maps_live_limit_as_exit_when_trade_is_exit_pending() -> None:
+    deployments = build_runtime().enabled_deployments
+    positions = [
+        {
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "quantity": "1.0",
+            "costBasis": {
+                "unitCost": "2.73",
+            },
+        }
+    ]
+    orders = [
+        {
+            "orderId": "EXIT123",
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "type": "LIMIT",
+            "side": "SELL",
+            "status": "NEW",
+            "limitPrice": "2.70",
+        }
+    ]
+    known_trades = [
+        TradeRecord(
+            trade_id="TRADE123",
+            deployment_id="market_impulse_qqq_short_v1",
+            symbol="QQQ",
+            option_symbol="QQQ260401P00556000",
+            quantity=1,
+            status="exit_pending",
+            entry_order_id="ENTRY123",
+            exit_order_id="EXIT123",
+            exit_limit_price=2.70,
+            exit_mode=ExitMode.STRATEGY,
+        )
+    ]
+
+    tracked = reconcile_public_positions(positions, deployments, orders=orders, known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].exit_order_id == "EXIT123"
+    assert tracked[0].exit_limit_price == 2.70
+    assert tracked[0].target_order_id is None
 
 
 def test_reconcile_public_positions_skips_ambiguous_same_contract_trade_identity() -> None:

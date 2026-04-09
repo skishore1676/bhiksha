@@ -96,6 +96,8 @@ async def _deployment_packet(
     exit_plan_events = [event for event in relevant_events if event["event_type"] == "exit_plan"]
     exit_decision_events = [event for event in relevant_events if event["event_type"] == "exit_decision"]
     lifecycle_blocked_events = [event for event in relevant_events if event["event_type"] == "lifecycle_entry_blocked"]
+    pending_exit_events = [event for event in relevant_events if event["event_type"] == "exit_pending_status"]
+    ambiguous_cancel_events = [event for event in relevant_events if event["event_type"] == "ambiguous_cancel"]
     runtime_issue_events = [
         event
         for event in relevant_events + symbol_events
@@ -159,6 +161,9 @@ async def _deployment_packet(
         "exit_decision_count": len(exit_decision_events),
         "exit_true_count": exit_true_count,
         "latest_lifecycle_state": session_summary.lifecycle_last_state.get(deployment.deployment_id),
+        "pending_exit_count": session_summary.pending_exit_counts.get(deployment.deployment_id, 0),
+        "ambiguous_cancel_count": session_summary.ambiguous_cancel_counts.get(deployment.deployment_id, 0),
+        "exit_pending_status_count": len(pending_exit_events),
         "blocked_entry_reasons": dict(blocked_entry_reasons),
         "signal_reason_counts": dict(signal_reason_counts),
         "exit_reason_counts": dict(exit_reason_counts),
@@ -286,6 +291,8 @@ def _packet_markdown(packet: dict[str, Any]) -> str:
         f"- trade_plan_count: `{packet['trade_plan_count']}`",
         f"- exit_plan_count: `{packet['exit_plan_count']}`",
         f"- exit_true_count: `{packet['exit_true_count']}`",
+        f"- pending_exit_count: `{packet['pending_exit_count']}`",
+        f"- ambiguous_cancel_count: `{packet['ambiguous_cancel_count']}`",
         f"- latest_lifecycle_state: `{packet['latest_lifecycle_state']}`",
     ]
     if packet["signal_reason_counts"]:

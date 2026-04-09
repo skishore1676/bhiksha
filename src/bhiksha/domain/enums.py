@@ -10,6 +10,12 @@ class SignalDirection(str, Enum):
     SHORT = "short"
 
 
+class ExitMode(str, Enum):
+    STRATEGY = "strategy"
+    HARD_FLAT = "hard_flat"
+    EMERGENCY = "emergency"
+
+
 class PositionState(str, Enum):
     FLAT = "flat"
     ENTRY_PENDING = "entry_pending"
@@ -29,4 +35,3 @@ class OrderState(str, Enum):
     CANCELED = "canceled"
     REJECTED = "rejected"
     EXPIRED = "expired"
-

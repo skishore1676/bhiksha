@@ -52,9 +52,29 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
             {
                 "deployment_id": "market_impulse_qqq_short_v1",
                 "symbol": "QQQ",
-                "previous_state": "pending_entry",
+                "previous_state": "open_protected",
+                "new_state": "exit_pending",
+                "reason": "exit_submitted",
+            },
+        )
+        await repo.append(
+            "ambiguous_cancel",
+            {
+                "deployment_id": "market_impulse_qqq_short_v1",
+                "symbol": "QQQ",
+                "order_id": "STOP123",
+                "kind": "stop",
+                "reason": "strategy_exit",
+            },
+        )
+        await repo.append(
+            "lifecycle_transition",
+            {
+                "deployment_id": "market_impulse_qqq_short_v1",
+                "symbol": "QQQ",
+                "previous_state": "exit_pending",
                 "new_state": "open_protected",
-                "reason": "entry_filled_open_protected",
+                "reason": "broker_reconciliation_sync",
             },
         )
 
@@ -62,15 +82,18 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
 
     summary = build_session_summary(str(db_path), recent_limit=5)
 
-    assert summary.total_events == 5
-    assert summary.event_type_counts["lifecycle_transition"] == 2
-    assert summary.deployment_event_counts["market_impulse_qqq_short_v1"] == 5
+    assert summary.total_events == 7
+    assert summary.event_type_counts["lifecycle_transition"] == 3
+    assert summary.deployment_event_counts["market_impulse_qqq_short_v1"] == 7
     assert summary.signal_true_counts["market_impulse_qqq_short_v1"] == 1
     assert summary.exit_true_counts["market_impulse_qqq_short_v1"] == 1
+    assert summary.pending_exit_counts["market_impulse_qqq_short_v1"] == 1
+    assert summary.ambiguous_cancel_counts["market_impulse_qqq_short_v1"] == 1
     assert summary.lifecycle_last_state["market_impulse_qqq_short_v1"] == "open_protected"
-    assert summary.recent_events[-1].detail == "pending_entry->open_protected (entry_filled_open_protected)"
-    assert summary.recent_events[2].detail == "signal=True direction=short reasons=time_window_ok"
-    assert summary.recent_events[3].detail == "exit=True action=square_off reasons=vma_reclaim_exit"
+    assert summary.recent_events[-1].detail == "exit_pending->open_protected (broker_reconciliation_sync)"
+    recent_details = [event.detail for event in summary.recent_events]
+    assert "signal=True direction=short reasons=time_window_ok" in recent_details
+    assert "exit=True action=square_off reasons=vma_reclaim_exit" in recent_details
 
 
 def test_session_summary_aggregates_runtime_metrics(tmp_path) -> None:

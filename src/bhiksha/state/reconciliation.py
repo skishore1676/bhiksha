@@ -25,14 +25,14 @@ def reconcile_public_positions(
     deployments_by_symbol: dict[str, list[DeploymentManifest]] = {}
     for deployment in deployments:
         deployments_by_symbol.setdefault(deployment.symbol, []).append(deployment)
-    stop_orders_by_symbol, target_orders_by_symbol = _index_open_exit_orders(orders or [])
+    stop_orders_by_symbol, limit_orders_by_symbol = _index_open_exit_orders(orders or [])
     known_trades = list(known_trades or [])
     trades_by_option_symbol: dict[str, list[TradeRecord]] = {}
     trades_by_order_id: dict[str, TradeRecord] = {}
     for trade in known_trades:
         if trade.option_symbol:
             trades_by_option_symbol.setdefault(trade.option_symbol, []).append(trade)
-        for order_id in (trade.entry_order_id, trade.stop_order_id, trade.target_order_id):
+        for order_id in (trade.entry_order_id, trade.stop_order_id, trade.target_order_id, trade.exit_order_id):
             if order_id:
                 trades_by_order_id[order_id] = trade
     tracked: list[TrackedPosition] = []
@@ -44,11 +44,11 @@ def reconcile_public_positions(
         option_symbol = normalize_option_symbol(str(instrument.get("symbol", "")))
         symbol = _parse_option_root(option_symbol)
         stop_order = stop_orders_by_symbol.get(option_symbol) or {}
-        target_order = target_orders_by_symbol.get(option_symbol) or {}
+        limit_order = limit_orders_by_symbol.get(option_symbol) or {}
         matched_trade = _resolve_trade(
             option_symbol,
             stop_order_id=stop_order.get("order_id"),
-            target_order_id=target_order.get("order_id"),
+            exit_or_target_order_id=limit_order.get("order_id"),
             trades_by_option_symbol=trades_by_option_symbol,
             trades_by_order_id=trades_by_order_id,
         )
@@ -70,6 +70,12 @@ def reconcile_public_positions(
         quantity = int(float(position.get("quantity", "0") or 0))
         if quantity <= 0:
             continue
+        exit_order: dict[str, float | str] = {}
+        target_order: dict[str, float | str] = {}
+        if matched_trade is not None and matched_trade.status == "exit_pending":
+            exit_order = limit_order
+        else:
+            target_order = limit_order
         tracked.append(
             TrackedPosition(
                 symbol=symbol,
@@ -86,6 +92,10 @@ def reconcile_public_positions(
                 stop_price=stop_order.get("price") or (matched_trade.stop_price if matched_trade is not None else None),
                 target_order_id=target_order.get("order_id") or (matched_trade.target_order_id if matched_trade is not None else None),
                 target_price=target_order.get("price") or (matched_trade.target_price if matched_trade is not None else None),
+                exit_order_id=exit_order.get("order_id") or (matched_trade.exit_order_id if matched_trade is not None else None),
+                exit_limit_price=exit_order.get("price") or (matched_trade.exit_limit_price if matched_trade is not None else None),
+                exit_submitted_at=matched_trade.exit_submitted_at if matched_trade is not None else None,
+                exit_mode=matched_trade.exit_mode if matched_trade is not None and matched_trade.status == "exit_pending" else None,
             )
         )
     return tracked
@@ -95,11 +105,11 @@ def _resolve_trade(
     option_symbol: str,
     *,
     stop_order_id: str | None,
-    target_order_id: str | None,
+    exit_or_target_order_id: str | None,
     trades_by_option_symbol: dict[str, list[TradeRecord]],
     trades_by_order_id: dict[str, TradeRecord],
 ) -> TradeRecord | None:
-    for order_id in (stop_order_id, target_order_id):
+    for order_id in (stop_order_id, exit_or_target_order_id):
         if order_id and order_id in trades_by_order_id:
             return trades_by_order_id[order_id]
     option_trades = trades_by_option_symbol.get(option_symbol, [])
@@ -115,7 +125,7 @@ def _parse_option_root(option_symbol: str) -> str:
 
 def _index_open_exit_orders(orders: Iterable[dict]) -> tuple[dict[str, dict[str, float | str]], dict[str, dict[str, float | str]]]:
     stop_indexed: dict[str, dict[str, float | str]] = {}
-    target_indexed: dict[str, dict[str, float | str]] = {}
+    limit_indexed: dict[str, dict[str, float | str]] = {}
     for order in orders:
         instrument = order.get("instrument", {}) or {}
         if instrument.get("type") != "OPTION":
@@ -136,11 +146,11 @@ def _index_open_exit_orders(orders: Iterable[dict]) -> tuple[dict[str, dict[str,
                 "price": _maybe_float(order.get("stopPrice")),
             }
         elif order_type == "LIMIT":
-            target_indexed[symbol] = {
+            limit_indexed[symbol] = {
                 "order_id": str(order_id),
                 "price": _maybe_float(order.get("limitPrice")),
             }
-    return stop_indexed, target_indexed
+    return stop_indexed, limit_indexed
 
 
 def _parse_entry_price(position: dict) -> float | None:

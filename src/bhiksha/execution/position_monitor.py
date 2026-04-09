@@ -41,6 +41,8 @@ class PositionMonitor:
         for position in active_positions:
             if position.symbol != symbol or position.quantity <= 0:
                 continue
+            if position.exit_mode is not None or position.exit_order_id is not None:
+                continue
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None:
                 continue

@@ -197,6 +197,14 @@ class BhikshaRuntime:
             output("Waiting for newly closed 1-minute bars...")
             public_token_task = asyncio.create_task(public_token_daemon.run())
             schwab_token_task = asyncio.create_task(schwab_token_daemon.run())
+            pending_exit_task = asyncio.create_task(
+                self._pending_exit_loop(
+                    supervisor=supervisor,
+                    deployments_by_id=deployments_by_id,
+                    reconcile_trigger=reconcile_trigger,
+                    stop_event=stop_event,
+                )
+            )
             reconciliation_task = asyncio.create_task(
                 self._reconciliation_loop(
                     broker=broker,
@@ -237,6 +245,8 @@ class BhikshaRuntime:
                 await public_token_task
             with suppress(asyncio.CancelledError):
                 await schwab_token_task
+            with suppress(asyncio.CancelledError):
+                await pending_exit_task
             with suppress(asyncio.CancelledError):
                 await reconciliation_task
             for task in symbol_tasks:
@@ -712,6 +722,26 @@ class BhikshaRuntime:
                 output=output,
                 reason="periodic",
             )
+
+    async def _pending_exit_loop(
+        self,
+        *,
+        supervisor: ExecutionSupervisor,
+        deployments_by_id: dict[str, DeploymentManifest],
+        reconcile_trigger: asyncio.Event,
+        stop_event: asyncio.Event,
+    ) -> None:
+        interval = max(self.app_config.order_fill_poll_seconds, 1)
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            if stop_event.is_set():
+                return
+            plans = await supervisor.manage_pending_exits(deployments_by_id)
+            if plans:
+                reconcile_trigger.set()
 
     async def _refresh_reconciliation(
         self,

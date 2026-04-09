@@ -6,14 +6,14 @@ import asyncio
 from collections import defaultdict
 from dataclasses import asdict
 from dataclasses import replace
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from datetime import UTC
 
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.config.models import AppConfig
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
-from bhiksha.domain.enums import SignalDirection
+from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.market_data.session import as_et_time
@@ -284,6 +284,8 @@ class ExecutionSupervisor:
             return None
         if position.entry_price is None:
             return None
+        if position.exit_mode is not None or position.exit_order_id is not None:
+            return position
 
         updated = position
         quote = None
@@ -555,6 +557,11 @@ class ExecutionSupervisor:
                 stop_price=updated.stop_price,
                 target_order_id=updated.target_order_id,
                 target_price=updated.target_price,
+                exit_order_id=updated.exit_order_id,
+                exit_limit_price=updated.exit_limit_price,
+                exit_submitted_at=updated.exit_submitted_at,
+                exit_mode=updated.exit_mode,
+                exit_reprice_count=updated.exit_reprice_count,
             )
             if updated.trade_id is not None and updated.option_symbol is not None:
                 await self._upsert_trade_record(
@@ -567,12 +574,16 @@ class ExecutionSupervisor:
                         entry_price=updated.entry_price,
                         underlying_entry_price=updated.underlying_entry_price,
                         entry_timestamp=updated.entry_timestamp,
-                        status="target_active" if updated.target_order_id else "open_protected",
+                        status=_tracked_trade_status(updated),
                         entry_order_id=updated.order_id,
                         stop_order_id=updated.stop_order_id,
                         stop_price=updated.stop_price,
                         target_order_id=updated.target_order_id,
                         target_price=updated.target_price,
+                        exit_order_id=updated.exit_order_id,
+                        exit_limit_price=updated.exit_limit_price,
+                        exit_submitted_at=updated.exit_submitted_at,
+                        exit_mode=updated.exit_mode,
                     )
                 )
         return updated
@@ -620,50 +631,6 @@ class ExecutionSupervisor:
             await self.event_bus.publish(ExitEvaluatedEvent(decision=decision))
         if not decision.exit or decision.action == "hold" or position.option_symbol is None or position.quantity <= 0:
             return None
-        transition = self.lifecycle_store.mark_exit_pending(
-            position.symbol,
-            position.deployment_id,
-            option_symbol=position.option_symbol,
-            order_id=position.order_id,
-        )
-        await self._emit_lifecycle_transition(transition, reason="exit_submitted")
-
-        canceled_stop_order_id = None
-        canceled_target_order_id = None
-        cancel_error = None
-        if decision.cancel_protection_orders and position.stop_order_id:
-            canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
-            if canceled:
-                canceled_stop_order_id = position.stop_order_id
-            await self.event_repository.append(
-                "protection_cancel_attempt",
-                {
-                    "deployment_id": deployment.deployment_id,
-                    "symbol": position.symbol,
-                    "option_symbol": position.option_symbol,
-                    "stop_order_id": position.stop_order_id,
-                    "canceled": canceled,
-                    "error": cancel_error,
-                },
-            )
-        if decision.cancel_protection_orders and position.target_order_id:
-            canceled, target_cancel_error = await self.planner.order_manager.cancel_order(position.target_order_id)
-            if canceled:
-                canceled_target_order_id = position.target_order_id
-            if cancel_error is None:
-                cancel_error = target_cancel_error
-            await self.event_repository.append(
-                "target_cancel_attempt",
-                {
-                    "deployment_id": deployment.deployment_id,
-                    "symbol": position.symbol,
-                    "option_symbol": position.option_symbol,
-                    "target_order_id": position.target_order_id,
-                    "canceled": canceled,
-                    "error": target_cancel_error,
-                },
-            )
-
         if decision.action != "square_off":
             return ExitPlan(
                 trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
@@ -674,68 +641,510 @@ class ExecutionSupervisor:
                 action=decision.action,
                 reasons=decision.reason,
                 dry_run=dry_run,
-                canceled_stop_order_id=canceled_stop_order_id,
-                canceled_target_order_id=canceled_target_order_id,
+                canceled_stop_order_id=None,
+                canceled_target_order_id=None,
                 error=f"unsupported_exit_action:{decision.action}",
             )
 
-        order_id = "DRY_RUN_EXIT"
-        error = cancel_error
-        if not dry_run:
-            result = await self.planner.order_manager.place_square_off_order(position.option_symbol, position.quantity)
-            order_id = result.order_id
-            error = result.error or error
-            if result.order_id is None:
+        if position.exit_mode is not None or position.exit_order_id is not None:
+            await self.event_repository.append(
+                "exit_pending_status",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "exit_order_id": position.exit_order_id,
+                    "status": "already_pending",
+                    "exit_mode": position.exit_mode.value if position.exit_mode is not None else None,
+                },
+            )
+            return None
+
+        updated_position = position
+        canceled_stop_order_id = None
+        canceled_target_order_id = None
+        cancel_error = None
+        if decision.cancel_protection_orders:
+            (
+                updated_position,
+                canceled_stop_order_id,
+                canceled_target_order_id,
+                cancel_error,
+            ) = await self._cancel_exit_protection(
+                deployment,
+                updated_position,
+                dry_run=dry_run,
+                reason="strategy_exit",
+            )
+
+        if dry_run:
+            self.planner.position_tracker.close_position(
+                updated_position.symbol,
+                updated_position.deployment_id,
+                option_symbol=updated_position.option_symbol,
+            )
+            if updated_position.trade_id is not None:
+                await self.trade_state_repository.mark_closed(updated_position.trade_id, exit_order_id="DRY_RUN_EXIT")
+            transition = self.lifecycle_store.mark_closed(updated_position.symbol, updated_position.deployment_id)
+            await self._emit_lifecycle_transition(transition, reason="exit_closed")
+            plan = ExitPlan(
+                trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
+                deployment_id=deployment.deployment_id,
+                symbol=updated_position.symbol,
+                option_symbol=updated_position.option_symbol,
+                quantity=updated_position.quantity,
+                action=decision.action,
+                reasons=decision.reason,
+                dry_run=True,
+                order_id="DRY_RUN_EXIT",
+                canceled_stop_order_id=canceled_stop_order_id,
+                canceled_target_order_id=canceled_target_order_id,
+                error=cancel_error,
+            )
+            await self.event_repository.append("exit_plan", asdict(plan))
+            return plan
+
+        updated_position, plan = await self._submit_exit_request(
+            deployment,
+            updated_position,
+            exit_mode=ExitMode.STRATEGY,
+            reason="exit_submitted",
+            event_type="exit_submission",
+            canceled_stop_order_id=canceled_stop_order_id,
+            canceled_target_order_id=canceled_target_order_id,
+            inherited_error=cancel_error,
+        )
+        await self.event_repository.append("exit_plan", asdict(plan))
+        return plan
+
+    async def _submit_exit_request(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        exit_mode: ExitMode,
+        reason: str,
+        event_type: str,
+        canceled_stop_order_id: str | None = None,
+        canceled_target_order_id: str | None = None,
+        inherited_error: str | None = None,
+        force_market: bool = False,
+        submitted_at: datetime | None = None,
+        increment_reprice: bool = False,
+    ) -> tuple[TrackedPosition, ExitPlan]:
+        if position.option_symbol is None:
+            raise ValueError("Cannot submit exit without option_symbol")
+        submitted_at = submitted_at or datetime.now(UTC)
+        order_id: str | None = None
+        limit_price: float | None = None
+        error = inherited_error
+        order_type = "MARKET" if exit_mode == ExitMode.EMERGENCY or force_market else "LIMIT"
+
+        if exit_mode != ExitMode.EMERGENCY and not force_market:
+            try:
+                quote = await self.planner.order_manager.get_option_quote(position.option_symbol)
+            except Exception as exc:
+                quote = None
+                error = inherited_error or str(exc)
+            limit_price = quote.exit_reference_price if quote is not None else None
+            if limit_price is None:
+                if exit_mode == ExitMode.STRATEGY:
+                    order_type = "WAIT"
+                else:
+                    order_type = "MARKET"
+        if order_type == "MARKET":
+            if force_market and exit_mode != ExitMode.EMERGENCY:
                 await self.event_repository.append(
-                    "exit_submission_failure",
+                    "exit_market_fallback",
                     {
                         "deployment_id": deployment.deployment_id,
                         "symbol": position.symbol,
                         "option_symbol": position.option_symbol,
-                        "quantity": position.quantity,
-                        "action": decision.action,
-                        "error": error,
+                        "exit_mode": exit_mode.value,
+                        "reason": reason,
                     },
                 )
-                return ExitPlan(
-                    trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
-                    deployment_id=deployment.deployment_id,
-                    symbol=position.symbol,
-                    option_symbol=position.option_symbol,
-                    quantity=position.quantity,
-                    action=decision.action,
-                    reasons=decision.reason,
-                    dry_run=False,
-                    canceled_stop_order_id=canceled_stop_order_id,
-                    canceled_target_order_id=canceled_target_order_id,
-                    error=error,
-                )
+            result = await self.planner.order_manager.place_close_order(
+                position.option_symbol,
+                position.quantity,
+                exit_mode=exit_mode,
+            )
+            order_id = result.order_id
+            error = result.error or error
+            limit_price = None
+        elif order_type == "LIMIT" and limit_price is not None:
+            result = await self.planner.order_manager.place_close_order(
+                position.option_symbol,
+                position.quantity,
+                exit_mode=exit_mode,
+                limit_price=limit_price,
+            )
+            order_id = result.order_id
+            error = result.error or error
+        if order_type != "WAIT" and order_id is None:
+            await self.event_repository.append(
+                "exit_submission_failure",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "quantity": position.quantity,
+                    "exit_mode": exit_mode.value,
+                    "order_type": order_type,
+                    "error": error,
+                },
+            )
 
-        self.planner.position_tracker.close_position(
-            position.symbol,
-            position.deployment_id,
-            option_symbol=position.option_symbol,
+        updated = _replace_position(
+            position,
+            exit_order_id=order_id,
+            exit_limit_price=limit_price,
+            exit_submitted_at=submitted_at,
+            exit_mode=exit_mode,
+            exit_reprice_count=position.exit_reprice_count + (1 if increment_reprice else 0),
         )
-        if position.trade_id is not None:
-            await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
-        transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
-        await self._emit_lifecycle_transition(transition, reason="exit_closed")
+        self.planner.position_tracker.open_position(
+            updated.symbol,
+            updated.deployment_id,
+            trade_id=updated.trade_id,
+            option_symbol=updated.option_symbol,
+            quantity=updated.quantity,
+            entry_price=updated.entry_price,
+            underlying_entry_price=updated.underlying_entry_price,
+            entry_timestamp=updated.entry_timestamp,
+            source=updated.source,
+            order_id=updated.order_id,
+            stop_order_id=updated.stop_order_id,
+            stop_price=updated.stop_price,
+            target_order_id=updated.target_order_id,
+            target_price=updated.target_price,
+            exit_order_id=updated.exit_order_id,
+            exit_limit_price=updated.exit_limit_price,
+            exit_submitted_at=updated.exit_submitted_at,
+            exit_mode=updated.exit_mode,
+            exit_reprice_count=updated.exit_reprice_count,
+        )
+        transition = self.lifecycle_store.mark_exit_pending(
+            updated.symbol,
+            updated.deployment_id,
+            option_symbol=updated.option_symbol,
+            order_id=updated.exit_order_id or updated.order_id,
+        )
+        await self._emit_lifecycle_transition(transition, reason=reason)
+        if updated.trade_id is not None and updated.option_symbol is not None:
+            await self._upsert_trade_record(
+                TradeRecord(
+                    trade_id=updated.trade_id,
+                    deployment_id=updated.deployment_id,
+                    symbol=updated.symbol,
+                    option_symbol=updated.option_symbol,
+                    quantity=updated.quantity,
+                    entry_price=updated.entry_price,
+                    underlying_entry_price=updated.underlying_entry_price,
+                    entry_timestamp=updated.entry_timestamp,
+                    status="exit_pending",
+                    entry_order_id=updated.order_id,
+                    stop_order_id=updated.stop_order_id,
+                    stop_price=updated.stop_price,
+                    target_order_id=updated.target_order_id,
+                    target_price=updated.target_price,
+                    exit_order_id=updated.exit_order_id,
+                    exit_limit_price=updated.exit_limit_price,
+                    exit_submitted_at=updated.exit_submitted_at,
+                    exit_mode=updated.exit_mode,
+                )
+            )
+        await self.event_repository.append(
+            event_type,
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": updated.symbol,
+                "option_symbol": updated.option_symbol,
+                "quantity": updated.quantity,
+                "exit_mode": exit_mode.value,
+                "order_id": updated.exit_order_id,
+                "order_type": order_type,
+                "limit_price": updated.exit_limit_price,
+                "error": error,
+                "exit_submitted_at": updated.exit_submitted_at.isoformat() if updated.exit_submitted_at is not None else None,
+            },
+        )
         plan = ExitPlan(
-            trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
-            deployment_id=deployment.deployment_id,
-            symbol=position.symbol,
-            option_symbol=position.option_symbol,
-            quantity=position.quantity,
-            action=decision.action,
-            reasons=decision.reason,
-            dry_run=dry_run,
-            order_id=order_id,
+            trade_id=updated.trade_id or updated.order_id or "UNKNOWN_TRADE",
+            deployment_id=updated.deployment_id,
+            symbol=updated.symbol,
+            option_symbol=updated.option_symbol,
+            quantity=updated.quantity,
+            action="square_off",
+            reasons=[reason],
+            dry_run=False,
+            order_id=updated.exit_order_id,
             canceled_stop_order_id=canceled_stop_order_id,
             canceled_target_order_id=canceled_target_order_id,
             error=error,
         )
-        await self.event_repository.append("exit_plan", asdict(plan))
-        return plan
+        return updated, plan
+
+    async def _cancel_exit_protection(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        dry_run: bool,
+        reason: str,
+    ) -> tuple[TrackedPosition, str | None, str | None, str | None]:
+        updated = position
+        canceled_stop_order_id = None
+        canceled_target_order_id = None
+        first_error = None
+        if position.stop_order_id:
+            canceled = True
+            cancel_error = None
+            if not dry_run:
+                canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
+            if canceled:
+                canceled_stop_order_id = position.stop_order_id
+                updated = _replace_position(updated, stop_order_id=None)
+            elif self._allows_exit_submission_before_cancel_confirmation():
+                await self.event_repository.append(
+                    "ambiguous_cancel",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "order_id": position.stop_order_id,
+                        "kind": "stop",
+                        "reason": reason,
+                        "error": cancel_error,
+                    },
+                )
+            await self.event_repository.append(
+                "protection_cancel_attempt",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "stop_order_id": position.stop_order_id,
+                    "canceled": canceled,
+                    "error": cancel_error,
+                    "reason": reason,
+                },
+            )
+            first_error = cancel_error
+        if position.target_order_id:
+            canceled = True
+            cancel_error = None
+            if not dry_run:
+                canceled, cancel_error = await self.planner.order_manager.cancel_order(position.target_order_id)
+            if canceled:
+                canceled_target_order_id = position.target_order_id
+                updated = _replace_position(updated, target_order_id=None)
+            elif self._allows_exit_submission_before_cancel_confirmation():
+                await self.event_repository.append(
+                    "ambiguous_cancel",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "order_id": position.target_order_id,
+                        "kind": "target",
+                        "reason": reason,
+                        "error": cancel_error,
+                    },
+                )
+            await self.event_repository.append(
+                "target_cancel_attempt",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "target_order_id": position.target_order_id,
+                    "canceled": canceled,
+                    "error": cancel_error,
+                    "reason": reason,
+                },
+            )
+            if first_error is None:
+                first_error = cancel_error
+        return updated, canceled_stop_order_id, canceled_target_order_id, first_error
+
+    async def manage_pending_exits(
+        self,
+        deployments_by_id: dict[str, DeploymentManifest],
+        *,
+        now: datetime | None = None,
+    ) -> list[ExitPlan]:
+        plans: list[ExitPlan] = []
+        current_now = now or datetime.now(UTC)
+        for position in list(self.planner.position_tracker.active_positions()):
+            if position.exit_mode is None and position.exit_order_id is None and position.exit_submitted_at is None:
+                continue
+            deployment = deployments_by_id.get(position.deployment_id)
+            if deployment is None:
+                continue
+            async with self._symbol_locks[position.symbol]:
+                plan = await self._manage_pending_exit_locked(deployment, position, now=current_now)
+            if plan is not None:
+                plans.append(plan)
+        return plans
+
+    async def _manage_pending_exit_locked(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        now: datetime,
+    ) -> ExitPlan | None:
+        if position.option_symbol is None or position.quantity <= 0 or position.exit_mode is None:
+            return None
+        status = None
+        payload = None
+        error = None
+        if position.exit_order_id:
+            status, payload, error = await self.planner.order_manager.get_order_status(position.exit_order_id)
+        await self.event_repository.append(
+            "exit_pending_status",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": position.symbol,
+                "option_symbol": position.option_symbol,
+                "exit_order_id": position.exit_order_id,
+                "status": status,
+                "error": error,
+                "exit_mode": position.exit_mode.value,
+            },
+        )
+        normalized = (status or "").upper()
+        if normalized == "FILLED":
+            self.planner.position_tracker.close_position(
+                position.symbol,
+                position.deployment_id,
+                option_symbol=position.option_symbol,
+            )
+            if position.trade_id is not None:
+                await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=position.exit_order_id)
+            transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
+            await self._emit_lifecycle_transition(transition, reason="exit_closed")
+            plan = ExitPlan(
+                trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+                deployment_id=deployment.deployment_id,
+                symbol=position.symbol,
+                option_symbol=position.option_symbol,
+                quantity=position.quantity,
+                action="square_off",
+                reasons=["exit_filled"],
+                dry_run=False,
+                order_id=position.exit_order_id,
+            )
+            await self.event_repository.append("exit_plan", asdict(plan))
+            return plan
+        if error and position.exit_order_id is not None:
+            await self.event_repository.append(
+                "ambiguous_cancel",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "order_id": position.exit_order_id,
+                    "kind": "exit_status",
+                    "reason": "status_unavailable",
+                    "error": error,
+                },
+            )
+            return None
+        if normalized in {"REJECTED", "CANCELED", "EXPIRED"} or position.exit_order_id is None:
+            _, plan = await self._submit_exit_request(
+                deployment,
+                position,
+                exit_mode=position.exit_mode,
+                reason="exit_resubmitted",
+                event_type="exit_resubmitted",
+                inherited_error=error,
+                submitted_at=position.exit_submitted_at,
+                force_market=position.exit_mode == ExitMode.EMERGENCY,
+            )
+            return plan
+        if normalized in {"NEW", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}:
+            if position.exit_mode == ExitMode.STRATEGY:
+                try:
+                    quote = await self.planner.order_manager.get_option_quote(position.option_symbol)
+                except Exception:
+                    quote = None
+                next_price = quote.exit_reference_price if quote is not None else None
+                if next_price is not None and _material_exit_price_change(position.exit_limit_price, next_price):
+                    replaced_position, _, _, cancel_error = await self._cancel_exit_protection(
+                        deployment,
+                        position,
+                        dry_run=False,
+                        reason="exit_reprice",
+                    )
+                    if position.exit_order_id:
+                        canceled, replace_cancel_error = await self.planner.order_manager.cancel_order(position.exit_order_id)
+                        if not canceled and self._allows_exit_submission_before_cancel_confirmation():
+                            await self.event_repository.append(
+                                "ambiguous_cancel",
+                                {
+                                    "deployment_id": deployment.deployment_id,
+                                    "symbol": position.symbol,
+                                    "option_symbol": position.option_symbol,
+                                    "order_id": position.exit_order_id,
+                                    "kind": "exit",
+                                    "reason": "exit_reprice",
+                                    "error": replace_cancel_error,
+                                },
+                            )
+                        if cancel_error is None:
+                            cancel_error = replace_cancel_error
+                    _, plan = await self._submit_exit_request(
+                        deployment,
+                        replaced_position,
+                        exit_mode=ExitMode.STRATEGY,
+                        reason="exit_reprice",
+                        event_type="exit_reprice",
+                        inherited_error=cancel_error,
+                        submitted_at=position.exit_submitted_at,
+                    )
+                    return plan
+            if position.exit_mode == ExitMode.HARD_FLAT:
+                if position.exit_reprice_count == 0:
+                    if position.exit_order_id:
+                        canceled, cancel_error = await self.planner.order_manager.cancel_order(position.exit_order_id)
+                        if not canceled and self._allows_exit_submission_before_cancel_confirmation():
+                            await self.event_repository.append(
+                                "ambiguous_cancel",
+                                {
+                                    "deployment_id": deployment.deployment_id,
+                                    "symbol": position.symbol,
+                                    "option_symbol": position.option_symbol,
+                                    "order_id": position.exit_order_id,
+                                    "kind": "exit",
+                                    "reason": "hard_flat_reprice",
+                                    "error": cancel_error,
+                                },
+                            )
+                    _, plan = await self._submit_exit_request(
+                        deployment,
+                        position,
+                        exit_mode=ExitMode.HARD_FLAT,
+                        reason="hard_flat_reprice",
+                        event_type="exit_reprice",
+                        inherited_error=cancel_error if 'cancel_error' in locals() else None,
+                        submitted_at=position.exit_submitted_at,
+                        increment_reprice=True,
+                    )
+                    return plan
+                if _hard_flat_market_fallback_due(position.exit_submitted_at, now, deployment):
+                    _, plan = await self._submit_exit_request(
+                        deployment,
+                        position,
+                        exit_mode=ExitMode.HARD_FLAT,
+                        reason="hard_flat_market_fallback",
+                        event_type="exit_resubmitted",
+                        submitted_at=position.exit_submitted_at,
+                        force_market=True,
+                    )
+                    return plan
+        return None
 
     async def close_due_positions(
         self,
@@ -753,67 +1162,43 @@ class ExecutionSupervisor:
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None or position.option_symbol is None or position.quantity <= 0:
                 continue
+            if position.exit_mode is not None or position.exit_order_id is not None:
+                continue
             hard_flat_time = _parse_et_time(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
             if now_et < hard_flat_time:
                 continue
 
             order_id = "DRY_RUN_CLOSE"
             error = None
-            if not dry_run:
-                if position.stop_order_id:
-                    canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
-                    await self.event_repository.append(
-                        "protection_cancel_attempt",
-                        {
-                            "deployment_id": position.deployment_id,
-                            "symbol": position.symbol,
-                            "option_symbol": position.option_symbol,
-                            "stop_order_id": position.stop_order_id,
-                            "canceled": canceled,
-                            "error": cancel_error,
-                        },
-                    )
-                if position.target_order_id:
-                    canceled, cancel_error = await self.planner.order_manager.cancel_order(position.target_order_id)
-                    await self.event_repository.append(
-                        "target_cancel_attempt",
-                        {
-                            "deployment_id": position.deployment_id,
-                            "symbol": position.symbol,
-                            "option_symbol": position.option_symbol,
-                            "target_order_id": position.target_order_id,
-                            "canceled": canceled,
-                            "error": cancel_error,
-                        },
-                    )
-                result = await self.planner.order_manager.place_square_off_order(
-                    position.option_symbol,
-                    position.quantity,
+            if dry_run:
+                self.planner.position_tracker.close_position(
+                    position.symbol,
+                    position.deployment_id,
+                    option_symbol=position.option_symbol,
                 )
-                order_id = result.order_id
-                error = result.error
-                if result.order_id is None:
-                    await self.event_repository.append(
-                        "hard_flat_failure",
-                        {
-                            "deployment_id": position.deployment_id,
-                            "symbol": position.symbol,
-                            "option_symbol": position.option_symbol,
-                            "quantity": position.quantity,
-                            "error": error,
-                        },
-                    )
-                    continue
-
-            self.planner.position_tracker.close_position(
-                position.symbol,
-                position.deployment_id,
-                option_symbol=position.option_symbol,
-            )
-            if position.trade_id is not None:
-                await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
-            transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
-            await self._emit_lifecycle_transition(transition, reason="hard_flat_closed")
+                if position.trade_id is not None:
+                    await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
+                transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
+                await self._emit_lifecycle_transition(transition, reason="hard_flat_closed")
+            else:
+                updated_position, canceled_stop_order_id, canceled_target_order_id, cancel_error = await self._cancel_exit_protection(
+                    deployment,
+                    position,
+                    dry_run=False,
+                    reason="hard_flat",
+                )
+                updated_position, exit_plan = await self._submit_exit_request(
+                    deployment,
+                    updated_position,
+                    exit_mode=ExitMode.HARD_FLAT,
+                    reason="hard_flat_submitted",
+                    event_type="exit_submission",
+                    canceled_stop_order_id=canceled_stop_order_id,
+                    canceled_target_order_id=canceled_target_order_id,
+                    inherited_error=cancel_error,
+                )
+                order_id = exit_plan.order_id
+                error = exit_plan.error
             trade_plan = TradePlan(
                 trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
                 deployment_id=position.deployment_id,
@@ -853,6 +1238,8 @@ class ExecutionSupervisor:
                 continue
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None or position.option_symbol is None or position.quantity <= 0:
+                continue
+            if position.exit_mode is not None or position.exit_order_id is not None:
                 continue
 
             order_id = "DRY_RUN_EMERGENCY_FLAT"
@@ -923,70 +1310,36 @@ class ExecutionSupervisor:
                 )
                 closed.append(trade_plan)
                 continue
-            if position.stop_order_id:
-                canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
-                if canceled:
-                    canceled_stop_order_id = position.stop_order_id
-                await self.event_repository.append(
-                    "protection_cancel_attempt",
-                    {
-                        "deployment_id": position.deployment_id,
-                        "symbol": position.symbol,
-                        "option_symbol": position.option_symbol,
-                        "stop_order_id": position.stop_order_id,
-                        "canceled": canceled,
-                        "error": cancel_error,
-                        "reason": "halt_and_flatten",
-                    },
+            if dry_run:
+                self.planner.position_tracker.close_position(
+                    position.symbol,
+                    position.deployment_id,
+                    option_symbol=position.option_symbol,
                 )
-                error = cancel_error
-            if position.target_order_id:
-                canceled, cancel_error = await self.planner.order_manager.cancel_order(position.target_order_id)
-                if canceled:
-                    canceled_target_order_id = position.target_order_id
-                await self.event_repository.append(
-                    "target_cancel_attempt",
-                    {
-                        "deployment_id": position.deployment_id,
-                        "symbol": position.symbol,
-                        "option_symbol": position.option_symbol,
-                        "target_order_id": position.target_order_id,
-                        "canceled": canceled,
-                        "error": cancel_error,
-                        "reason": "halt_and_flatten",
-                    },
+                if position.trade_id is not None:
+                    await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
+                transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
+                await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_closed")
+            else:
+                updated_position, canceled_stop_order_id, canceled_target_order_id, cancel_error = await self._cancel_exit_protection(
+                    deployment,
+                    position,
+                    dry_run=False,
+                    reason="halt_and_flatten",
                 )
-                if error is None:
-                    error = cancel_error
-            if not dry_run:
-                result = await self.planner.order_manager.place_square_off_order(
-                    position.option_symbol,
-                    position.quantity,
+                updated_position, exit_plan = await self._submit_exit_request(
+                    deployment,
+                    updated_position,
+                    exit_mode=ExitMode.EMERGENCY,
+                    reason="halt_and_flatten_submitted",
+                    event_type="exit_submission",
+                    canceled_stop_order_id=canceled_stop_order_id,
+                    canceled_target_order_id=canceled_target_order_id,
+                    inherited_error=cancel_error,
+                    force_market=True,
                 )
-                order_id = result.order_id
-                error = result.error or error
-                if result.order_id is None:
-                    await self.event_repository.append(
-                        "halt_and_flatten_failure",
-                        {
-                            "deployment_id": position.deployment_id,
-                            "symbol": position.symbol,
-                            "option_symbol": position.option_symbol,
-                            "quantity": position.quantity,
-                            "error": error,
-                        },
-                    )
-                    continue
-
-            self.planner.position_tracker.close_position(
-                position.symbol,
-                position.deployment_id,
-                option_symbol=position.option_symbol,
-            )
-            if position.trade_id is not None:
-                await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
-            transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
-            await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_closed")
+                order_id = exit_plan.order_id
+                error = exit_plan.error
             trade_plan = TradePlan(
                 trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
                 deployment_id=position.deployment_id,
@@ -1019,6 +1372,16 @@ class ExecutionSupervisor:
         transitions = self.lifecycle_store.sync_from_positions(self.planner.position_tracker.active_positions())
         for transition in transitions:
             await self._emit_lifecycle_transition(transition, reason="broker_reconciliation_sync")
+        active_trade_ids = {
+            position.trade_id
+            for position in self.planner.position_tracker.active_positions()
+            if position.trade_id is not None
+        }
+        for trade in await self.trade_state_repository.get_open_trades():
+            if trade.status == "pending_entry":
+                continue
+            if trade.trade_id not in active_trade_ids:
+                await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
         for position in self.planner.position_tracker.active_positions():
             if position.trade_id is None or position.option_symbol is None:
                 continue
@@ -1032,12 +1395,16 @@ class ExecutionSupervisor:
                     entry_price=position.entry_price,
                     underlying_entry_price=position.underlying_entry_price,
                     entry_timestamp=position.entry_timestamp,
-                    status="target_active" if position.target_order_id else "open_protected",
+                    status=_tracked_trade_status(position),
                     entry_order_id=position.order_id,
                     stop_order_id=position.stop_order_id,
                     stop_price=position.stop_price,
                     target_order_id=position.target_order_id,
                     target_price=position.target_price,
+                    exit_order_id=position.exit_order_id,
+                    exit_limit_price=position.exit_limit_price,
+                    exit_submitted_at=position.exit_submitted_at,
+                    exit_mode=position.exit_mode,
                 )
             )
 
@@ -1090,6 +1457,37 @@ def _target_price(entry_price: float, stop_loss_pct: float, r_multiple: float) -
 def _restore_threshold_price(entry_price: float, target_price: float, progress_pct: float) -> float:
     progress = max(0.0, min(1.0, progress_pct))
     return entry_price + ((target_price - entry_price) * progress)
+
+
+def _tracked_trade_status(position: TrackedPosition) -> str:
+    if position.exit_mode is not None or position.exit_order_id is not None or position.exit_submitted_at is not None:
+        return "exit_pending"
+    if position.target_order_id:
+        return "target_active"
+    return "open_protected" if position.stop_order_id else "open_unprotected"
+
+
+def _hard_flat_market_fallback_due(
+    exit_submitted_at: datetime | None,
+    now: datetime,
+    deployment: DeploymentManifest,
+) -> bool:
+    if exit_submitted_at is None:
+        return False
+    if now >= exit_submitted_at + timedelta(seconds=10):
+        return True
+    hard_flat_time = _parse_et_time(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
+    now_seconds = as_et_time(now).hour * 3600 + as_et_time(now).minute * 60 + as_et_time(now).second
+    hard_flat_seconds = hard_flat_time.hour * 3600 + hard_flat_time.minute * 60 + 30
+    return now_seconds >= hard_flat_seconds
+
+
+def _material_exit_price_change(previous_price: float | None, next_price: float | None) -> bool:
+    if next_price is None:
+        return False
+    if previous_price is None:
+        return True
+    return round(previous_price, 2) != round(next_price, 2)
 
 
 def _replace_position(position: TrackedPosition, **changes) -> TrackedPosition:

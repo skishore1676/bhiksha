@@ -143,7 +143,14 @@ class TradeLifecycleStore:
         for position in positions:
             key = (position.symbol, position.deployment_id)
             active_keys.add(key)
-            if position.target_order_id:
+            if position.exit_mode is not None or position.exit_order_id is not None:
+                transition = self.mark_exit_pending(
+                    position.symbol,
+                    position.deployment_id,
+                    option_symbol=position.option_symbol,
+                    order_id=position.exit_order_id or position.order_id,
+                )
+            elif position.target_order_id:
                 transition = self.mark_target_active(
                     position.symbol,
                     position.deployment_id,

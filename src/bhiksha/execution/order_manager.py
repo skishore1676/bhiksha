@@ -8,6 +8,7 @@ import uuid
 import math
 from typing import Any
 
+from bhiksha.domain.enums import ExitMode
 from bhiksha.execution.brokers.public.adapter import PublicBrokerAdapter
 
 
@@ -182,6 +183,35 @@ class OrderManager:
         *,
         order_id: str | None = None,
     ) -> OrderResult:
+        return await self.place_close_order(
+            option_symbol,
+            quantity,
+            exit_mode=ExitMode.EMERGENCY,
+            order_id=order_id,
+        )
+
+    async def place_close_order(
+        self,
+        option_symbol: str,
+        quantity: int,
+        *,
+        exit_mode: ExitMode,
+        limit_price: float | None = None,
+        order_id: str | None = None,
+    ) -> OrderResult:
+        if exit_mode != ExitMode.EMERGENCY and limit_price is not None:
+            payload = {
+                "orderId": order_id or str(uuid.uuid4()),
+                "instrument": {"symbol": normalize_option_symbol(option_symbol), "type": "OPTION"},
+                "orderSide": "SELL",
+                "orderType": "LIMIT",
+                "expiration": {"timeInForce": "DAY"},
+                "quantity": str(int(quantity)),
+                "openCloseIndicator": "CLOSE",
+                "limitPrice": f"{round_price(limit_price):.2f}",
+            }
+            payload = await self._apply_increment_correction(payload, side="SELL", price_key="limitPrice")
+            return await self._submit(payload)
         return await self._submit(
             {
                 "orderId": order_id or str(uuid.uuid4()),

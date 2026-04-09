@@ -6,6 +6,8 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
+from bhiksha.domain.enums import ExitMode
+
 
 @dataclass(slots=True)
 class TrackedPosition:
@@ -23,6 +25,11 @@ class TrackedPosition:
     stop_price: float | None = None
     target_order_id: str | None = None
     target_price: float | None = None
+    exit_order_id: str | None = None
+    exit_limit_price: float | None = None
+    exit_submitted_at: datetime | None = None
+    exit_mode: ExitMode | None = None
+    exit_reprice_count: int = 0
 
 
 class PositionTracker:
@@ -70,6 +77,11 @@ class PositionTracker:
         stop_price: float | None = None,
         target_order_id: str | None = None,
         target_price: float | None = None,
+        exit_order_id: str | None = None,
+        exit_limit_price: float | None = None,
+        exit_submitted_at: datetime | None = None,
+        exit_mode: ExitMode | None = None,
+        exit_reprice_count: int = 0,
     ) -> None:
         for existing in self._positions:
             if (
@@ -89,6 +101,11 @@ class PositionTracker:
                 existing.stop_price = stop_price
                 existing.target_order_id = target_order_id
                 existing.target_price = target_price
+                existing.exit_order_id = exit_order_id
+                existing.exit_limit_price = exit_limit_price
+                existing.exit_submitted_at = exit_submitted_at
+                existing.exit_mode = exit_mode
+                existing.exit_reprice_count = exit_reprice_count
                 self._rebuild_counters()
                 return
 
@@ -108,6 +125,11 @@ class PositionTracker:
                 stop_price=stop_price,
                 target_order_id=target_order_id,
                 target_price=target_price,
+                exit_order_id=exit_order_id,
+                exit_limit_price=exit_limit_price,
+                exit_submitted_at=exit_submitted_at,
+                exit_mode=exit_mode,
+                exit_reprice_count=exit_reprice_count,
             )
         )
         self._rebuild_counters()

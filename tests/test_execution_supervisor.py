@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from bhiksha.config.models import AppConfig
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
-from bhiksha.domain.enums import SignalDirection
+from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
@@ -33,6 +33,9 @@ class StubOrderManager:
             error = None
         return Result()
 
+    async def place_close_order(self, option_symbol: str, quantity: int, *, exit_mode: ExitMode, limit_price: float | None = None):
+        return await self.place_square_off_order(option_symbol, quantity)
+
     async def place_target_order(self, option_symbol: str, limit_price: float, quantity: int):
         class Result:
             order_id = "TARGET123"
@@ -41,6 +44,9 @@ class StubOrderManager:
 
     async def cancel_order(self, order_id: str):
         return True, None
+
+    async def get_order_status(self, order_id: str):
+        return "FILLED", {"status": "FILLED"}, None
 
     async def get_option_quote(self, option_symbol: str):
         return PublicQuote(
@@ -75,6 +81,12 @@ class RecordingOrderManager(StubOrderManager):
     async def place_target_order(self, option_symbol: str, limit_price: float, quantity: int):
         self.calls.append(("place_target", round(limit_price, 2)))
         return await super().place_target_order(option_symbol, limit_price, quantity)
+
+    async def place_close_order(self, option_symbol: str, quantity: int, *, exit_mode: ExitMode, limit_price: float | None = None):
+        self.calls.append(
+            ("place_close_market" if limit_price is None else "place_close_limit", exit_mode.value if limit_price is None else round(limit_price, 2))
+        )
+        return await super().place_close_order(option_symbol, quantity, exit_mode=exit_mode, limit_price=limit_price)
 
     async def cancel_order(self, order_id: str):
         self.calls.append(("cancel", order_id))
@@ -362,7 +374,9 @@ def test_execution_supervisor_hard_flats_due_positions(tmp_path) -> None:
 
     assert len(closed) == 1
     assert closed[0].order_id == "CLOSE123"
-    assert supervisor.planner.position_tracker.total_open_positions == 0
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.exit_order_id == "CLOSE123"
+    assert tracked.exit_mode == ExitMode.HARD_FLAT
 
 
 def test_execution_supervisor_halt_and_flattens_positions(tmp_path) -> None:
@@ -397,9 +411,12 @@ def test_execution_supervisor_halt_and_flattens_positions(tmp_path) -> None:
     assert len(closed) == 1
     assert closed[0].risk_reasons == ["halt_and_flatten_triggered"]
     assert closed[0].order_id == "CLOSE123"
-    assert supervisor.planner.position_tracker.total_open_positions == 0
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.exit_order_id == "CLOSE123"
+    assert tracked.exit_mode == ExitMode.EMERGENCY
     assert ("cancel", "STOP123") in order_manager.calls
     assert ("cancel", "TARGET123") in order_manager.calls
+    assert ("place_close_market", "emergency") in order_manager.calls
 
 
 def test_execution_supervisor_halt_and_flattens_pending_entries_by_canceling_them(tmp_path) -> None:
@@ -470,6 +487,46 @@ def test_execution_supervisor_handles_algorithmic_exit(tmp_path) -> None:
     assert plan is not None
     assert plan.order_id == "CLOSE123"
     assert plan.canceled_stop_order_id == "STOP123"
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.exit_order_id == "CLOSE123"
+    assert tracked.exit_mode == ExitMode.STRATEGY
+
+
+def test_execution_supervisor_closes_filled_pending_exit(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE123",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        source="broker_sync",
+        stop_order_id="STOP123",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["vma_reclaim_exit"],
+        cancel_protection_orders=True,
+    )
+
+    asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    assert len(plans) == 1
+    assert plans[0].order_id == "CLOSE123"
     assert supervisor.planner.position_tracker.total_open_positions == 0
 
 

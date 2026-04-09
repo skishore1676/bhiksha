@@ -26,6 +26,8 @@ class SessionSummary:
     lifecycle_last_state: dict[str, str] = field(default_factory=dict)
     signal_true_counts: dict[str, int] = field(default_factory=dict)
     exit_true_counts: dict[str, int] = field(default_factory=dict)
+    pending_exit_counts: dict[str, int] = field(default_factory=dict)
+    ambiguous_cancel_counts: dict[str, int] = field(default_factory=dict)
     runtime_issue_counts: dict[str, int] = field(default_factory=dict)
     runtime_metric_latest: dict[str, float] = field(default_factory=dict)
     runtime_metric_average: dict[str, float] = field(default_factory=dict)
@@ -49,6 +51,8 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
     lifecycle_last_state: dict[str, str] = {}
     signal_true_counts: Counter[str] = Counter()
     exit_true_counts: Counter[str] = Counter()
+    pending_exit_counts: Counter[str] = Counter()
+    ambiguous_cancel_counts: Counter[str] = Counter()
     runtime_issue_counts: Counter[str] = Counter()
     runtime_metric_values: defaultdict[str, list[float]] = defaultdict(list)
     runtime_metric_latest: dict[str, float] = {}
@@ -67,10 +71,14 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
             new_state = _maybe_str(payload.get("new_state"))
             if new_state:
                 lifecycle_last_state[deployment_id] = new_state
+                if new_state == "exit_pending":
+                    pending_exit_counts[deployment_id] += 1
         if event_type == "signal_decision" and deployment_id and bool(payload.get("signal")):
             signal_true_counts[deployment_id] += 1
         if event_type == "exit_decision" and deployment_id and bool(payload.get("exit")):
             exit_true_counts[deployment_id] += 1
+        if event_type == "ambiguous_cancel" and deployment_id:
+            ambiguous_cancel_counts[deployment_id] += 1
         if event_type == "runtime_issue":
             category = _maybe_str(payload.get("category")) or "exception"
             runtime_issue_counts[category] += 1
@@ -100,6 +108,8 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
         lifecycle_last_state=lifecycle_last_state,
         signal_true_counts=dict(signal_true_counts),
         exit_true_counts=dict(exit_true_counts),
+        pending_exit_counts=dict(pending_exit_counts),
+        ambiguous_cancel_counts=dict(ambiguous_cancel_counts),
         runtime_issue_counts=dict(runtime_issue_counts),
         runtime_metric_latest=runtime_metric_latest,
         runtime_metric_average={

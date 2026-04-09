@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from bhiksha.domain.enums import SignalDirection
+from bhiksha.domain.enums import ExitMode, SignalDirection
 
 
 @dataclass(slots=True, frozen=True)
@@ -152,3 +152,6 @@ class TradeRecord:
     target_order_id: str | None = None
     target_price: float | None = None
     exit_order_id: str | None = None
+    exit_limit_price: float | None = None
+    exit_submitted_at: datetime | None = None
+    exit_mode: ExitMode | None = None
