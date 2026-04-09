@@ -13,6 +13,8 @@ __pycache__/
 config/public_session.json
 config/public_account.json
 config/schwab_tokens.json
+config/google-credentials.json
+.claude/
 artifacts/signal_inspector/
 artifacts/playbook/
 artifacts/observations/

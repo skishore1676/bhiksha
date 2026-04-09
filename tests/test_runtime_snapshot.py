@@ -17,6 +17,10 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert snapshot["session"] == {"live": False, "max_bars": 5}
     assert snapshot["app"]["app_name"] == "bhiksha"
     assert snapshot["providers"]["execution_broker_primary"] == "public"
+    assert {entry["strategy_id"] for entry in snapshot["strategy_catalog"]} >= {
+        "market_impulse_qqq_short_v1",
+        "market_impulse_spy_short_v1",
+    }
     assert {selection["symbol"] for selection in snapshot["bias_inputs"]} >= {"IWM", "TSLA"}
     assert snapshot["emergency_controls"] == {"halt_and_flatten": False}
     assert snapshot["deployment_selection"]["mode"] == "prefer_generated"
@@ -187,7 +191,7 @@ def test_build_runtime_prefers_generated_deployments_for_same_symbol(tmp_path: P
     assert skipped_ids == {"manual_spy"}
 
 
-def test_build_runtime_uses_session_payload_as_sole_authority(tmp_path: Path) -> None:
+def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> None:
     config_root = tmp_path / "config"
     deployments_root = config_root / "deployments"
     deployments_root.mkdir(parents=True)
@@ -207,13 +211,13 @@ def test_build_runtime_uses_session_payload_as_sole_authority(tmp_path: Path) ->
         encoding="utf-8",
     )
     _write_manifest(deployments_root / "manual_spy.yaml", "manual_spy", symbol="SPY")
-    session_payload_path = tmp_path / "active_session.json"
-    session_payload_path.write_text(
+    active_plan_path = tmp_path / "active_plan.json"
+    active_plan_path.write_text(
         json.dumps(
             {
-                "contract_name": "active_session",
+                "contract_name": "active_plan",
                 "schema_version": 1,
-                "session_id": "active_session_2026-04-01",
+                "active_plan_id": "active_plan_2026-04-01",
                 "generated_at": "2026-04-01T12:00:00+00:00",
                 "deployments": [
                     {
@@ -236,12 +240,12 @@ def test_build_runtime_uses_session_payload_as_sole_authority(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    runtime = build_runtime(config_root, session_payload_path=session_payload_path)
+    runtime = build_runtime(config_root, active_plan_path=active_plan_path)
 
     assert [deployment.deployment_id for deployment in runtime.deployments] == ["session_iwm"]
-    assert runtime.deployment_selection["mode"] == "session_payload"
-    assert runtime.session_payload is not None
-    assert runtime.session_payload["session_id"] == "active_session_2026-04-01"
+    assert runtime.deployment_selection["mode"] == "active_plan"
+    assert runtime.active_plan is not None
+    assert runtime.active_plan["active_plan_id"] == "active_plan_2026-04-01"
 
 
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str) -> None:

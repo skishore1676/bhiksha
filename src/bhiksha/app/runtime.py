@@ -18,7 +18,7 @@ from bhiksha.app.execution_dispatcher import SymbolExecutionDispatcher
 from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.app.token_daemon import PublicTokenRefreshDaemon, SchwabTokenRefreshDaemon
 from bhiksha.config.loader import load_bias_config
-from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest, ProviderConfig
+from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest, ProviderConfig, StrategyCatalogEntry
 from bhiksha.domain.events import BarClosedEvent
 from bhiksha.domain.models import Bar
 from bhiksha.domain.runtime import ProviderHealth, StartupReport
@@ -56,10 +56,11 @@ class BhikshaRuntime:
     deployments: list[DeploymentManifest]
     bias_inputs: list[BiasSelection]
     strategy_registry: StrategyRegistry
+    strategy_catalog: list[StrategyCatalogEntry]
     bias_inputs_path: Path | None = None
     halt_and_flatten: bool = False
     deployment_selection: dict = field(default_factory=dict)
-    session_payload: dict | None = None
+    active_plan: dict | None = None
     started: bool = field(default=False, init=False)
     event_bus: InMemoryEventBus = field(default_factory=InMemoryEventBus, init=False)
 
@@ -268,7 +269,18 @@ class BhikshaRuntime:
             "providers": self.provider_config.model_dump(),
             "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
             "deployment_selection": self.deployment_selection,
-            "session_payload": self.session_payload,
+            "active_plan": self.active_plan,
+            "strategy_catalog": [
+                {
+                    "strategy_id": entry.strategy_id,
+                    "symbol": entry.symbol,
+                    "strategy_key": entry.strategy.key,
+                    "approval_status": entry.approval_status,
+                    "enabled": entry.enabled,
+                    "tags": list(entry.tags),
+                }
+                for entry in self.strategy_catalog
+            ],
             "bias_inputs": [selection.model_dump() for selection in self.bias_inputs],
             "emergency_controls": {
                 "halt_and_flatten": self.halt_and_flatten,

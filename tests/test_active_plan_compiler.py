@@ -1,0 +1,737 @@
+from __future__ import annotations
+
+import csv
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from bhiksha.active_plan.compiler import (
+    compile_active_plan_from_google_sheets,
+    compile_active_plan_from_sheet,
+    sync_google_strategy_catalog,
+)
+from bhiksha.config.loader import load_active_plan
+from bhiksha.tools.compile_active_plan import main as compile_active_plan_main
+
+
+def test_compile_active_plan_from_csv_supports_strategy_and_manual_same_symbol(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_jerk.yaml", strategy_id="spy_jerk_pivot_short_v1", symbol="SPY")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_jerk_live_today",
+                "row_type": "strategy",
+                "strategy_id": "spy_jerk_pivot_short_v1",
+                "authorization_mode": "live",
+                "max_trade_premium_usd": "200",
+                "entry_window_start_et": "09:40",
+                "notes": "primary opening lane",
+                "execution_overrides": json.dumps({"dte_min": 1, "dte_max": 5}),
+            },
+            {
+                "row_id": "spy_breakout_manual",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "after_time_et": "09:35",
+                "profit_target_multiple": "2.0",
+                "stop_loss_pct": "0.35",
+            },
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-04-09",
+        trading_date="2026-04-09",
+        source_name="test_sheet",
+    )
+
+    assert compiled.plan.active_plan_id == "active_plan_2026-04-09"
+    assert compiled.plan.summary["deployment_count"] == 2
+    assert compiled.plan.summary["symbols"] == ["SPY"]
+    assert [deployment.deployment_id for deployment in compiled.plan.deployments] == [
+        "spy_jerk_live_today",
+        "spy_breakout_manual",
+    ]
+
+    strategy = compiled.plan.deployments[0]
+    assert strategy.execution.shadow_only is False
+    assert strategy.execution.dte_min == 1
+    assert strategy.execution.dte_max == 5
+    assert strategy.execution.entry_window_start_et == "09:40"
+    assert strategy.risk.max_trade_premium_usd == 200
+    assert strategy.source.origin == "active_sheet_strategy"
+    assert strategy.source.metadata["strategy_id"] == "spy_jerk_pivot_short_v1"
+
+    manual = compiled.plan.deployments[1]
+    assert manual.strategy.key == "manual_trigger"
+    assert manual.execution.shadow_only is True
+    assert manual.strategy.params["after_time_et"] == "09:35"
+    assert manual.exit.use_profit_target is True
+    assert manual.exit.profit_target_multiple == 2.0
+    assert manual.exit.stop_loss_pct == 0.35
+    assert manual.source.metadata["manual_setup_type"] == "manual_trigger"
+
+
+def test_compile_active_plan_suppresses_unknown_strategy_id(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    sheet_path = tmp_path / "sheet.json"
+    sheet_path.write_text(
+        json.dumps(
+            [
+                {
+                    "row_id": "unknown_strategy_lane",
+                    "row_type": "strategy",
+                    "strategy_id": "missing_strategy",
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-04-09",
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "Unknown strategy_id" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_cli_writes_active_plan_json(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "qqq_impulse.yaml", strategy_id="qqq_market_impulse_short_v1", symbol="QQQ")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "qqq_impulse_shadow",
+                "row_type": "strategy",
+                "strategy_id": "qqq_market_impulse_short_v1",
+                "authorization_mode": "shadow",
+            }
+        ],
+    )
+    output_path = tmp_path / "artifacts" / "playbook" / "active_plan.json"
+
+    exit_code = compile_active_plan_main(
+        [
+            "--sheet",
+            str(sheet_path),
+            "--strategy-catalog",
+            str(catalog_root),
+            "--out",
+            str(output_path),
+            "--active-plan-id",
+            "active_plan_2026-04-09",
+            "--trading-date",
+            "2026-04-09",
+        ]
+    )
+
+    assert exit_code == 0
+    plan = load_active_plan(output_path)
+    assert plan.active_plan_id == "active_plan_2026-04-09"
+    assert [deployment.deployment_id for deployment in plan.deployments] == ["qqq_impulse_shadow"]
+
+
+def test_compile_active_plan_accepts_operator_friendly_alias_columns(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_impulse.yaml", strategy_id="market_impulse_spy_short_v1", symbol="SPY")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "id": "spy_strategy_lane",
+                "type": "strategy",
+                "mode": "live",
+                "strategy": "market_impulse_spy_short_v1",
+                "max_premium": "180",
+                "start": "09:40",
+                "end": "10:30",
+            },
+            {
+                "id": "spy_breakout_lane",
+                "type": "manual",
+                "setup": "breakout",
+                "mode": "shadow",
+                "symbol": "spy",
+                "direction": "long",
+                "trigger": "603.25",
+                "trigger_when": "ABOVE",
+                "after": "09:35",
+                "target_r": "2.5",
+                "stop_pct": "0.30",
+                "flat_time": "15:50",
+            },
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-04-10",
+        trading_date="2026-04-10",
+    )
+
+    strategy = compiled.plan.deployments[0]
+    assert strategy.deployment_id == "spy_strategy_lane"
+    assert strategy.execution.shadow_only is False
+    assert strategy.execution.entry_window_start_et == "09:40"
+    assert strategy.execution.entry_window_end_et == "10:30"
+    assert strategy.risk.max_trade_premium_usd == 180
+
+    manual = compiled.plan.deployments[1]
+    assert manual.deployment_id == "spy_breakout_lane"
+    assert manual.symbol == "SPY"
+    assert manual.execution.shadow_only is True
+    assert manual.strategy.params["trigger_price"] == 603.25
+    assert manual.strategy.params["after_time_et"] == "09:35"
+    assert manual.exit.profit_target_multiple == 2.5
+    assert manual.exit.hard_flat_time_et == "15:50"
+    assert manual.source.metadata["manual_setup_type"] == "breakout"
+
+
+def test_compile_active_plan_normalizes_loose_sheet_times(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_impulse.yaml", strategy_id="market_impulse_spy_short_v1", symbol="SPY")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "id": "spy_strategy_lane",
+                "type": "strategy",
+                "mode": "shadow",
+                "strategy": "market_impulse_spy_short_v1",
+                "start": "9:30",
+                "end": "10:05",
+            },
+            {
+                "id": "spy_breakout_lane",
+                "type": "manual",
+                "setup": "breakout",
+                "mode": "shadow",
+                "symbol": "SPY",
+                "direction": "long",
+                "trigger": "603.25",
+                "trigger_when": "ABOVE",
+                "after": "9:35",
+                "flat_time": "15:05",
+            },
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-04-10",
+        trading_date="2026-04-10",
+    )
+
+    strategy = compiled.plan.deployments[0]
+    manual = compiled.plan.deployments[1]
+    assert strategy.execution.entry_window_start_et == "09:30"
+    assert strategy.execution.entry_window_end_et == "10:05"
+    assert manual.strategy.params["after_time_et"] == "09:35"
+    assert manual.exit.hard_flat_time_et == "15:05"
+
+
+def test_compile_active_plan_suppresses_invalid_rows_but_keeps_valid_rows(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_impulse.yaml", strategy_id="market_impulse_spy_short_v1", symbol="SPY")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "id": "spy_strategy_lane",
+                "type": "strategy",
+                "mode": "shadow",
+                "strategy": "market_impulse_spy_short_v1",
+            },
+            {
+                "id": "bad_manual_lane",
+                "type": "manual",
+                "setup": "reversion",
+                "mode": "shadow",
+                "symbol": "TSLA",
+                "direction": "short",
+                "trigger": "250",
+                "trigger_when": "BELOW",
+            },
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-04-10",
+    )
+
+    assert [deployment.deployment_id for deployment in compiled.plan.deployments] == ["spy_strategy_lane"]
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert compiled.plan.suppressed[0]["row_id"] == "bad_manual_lane"
+    assert compiled.plan.suppressed[0]["sheet_name"] == "sheet.csv"
+    assert "manual_setup_type=manual_trigger or breakout" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_tabs(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_impulse.yaml", strategy_id="market_impulse_spy_short_v1", symbol="SPY")
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="strategy catalog",
+        rows=[
+            {
+                "catalog_key": "market_impulse_spy_short_v1",
+                "playbook_id": "pb_spy_01",
+                "symbol": "SPY",
+                "strategy_key": "market_impulse",
+                "strategy_family": "impulse",
+                "bionic_ready": "TRUE",
+                "expectancy": "1.42",
+                "confidence": "0.67",
+                "thesis_exit_policy": "market_impulse_reclaim",
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategies",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "mode": "live",
+                "strategy": "market_impulse_spy_short_v1",
+                "max_premium": "180",
+                "start": "09:40",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="manual_entry",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "mode": "shadow",
+                "strategy": "breakout",
+                "symbol": "SPY",
+                "direction": "long",
+                "trigger": "603.25",
+                "trigger_when": "ABOVE",
+                "after": "09:35",
+                "end_in_days": "1",
+                "notes": "opening breakout",
+                "id": "spy_breakout_lane",
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="strategy catalog",
+        strategy_sheet_name="active_strategies",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-04-11",
+        trading_date="2026-04-11",
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.active_plan_id == "active_plan_2026-04-11"
+    assert compiled.plan.source["spreadsheet_id"] == "spreadsheet123"
+    assert compiled.plan.source["catalog_sheet_name"] == "strategy catalog"
+    assert compiled.plan.source["strategy_sheet_name"] == "active_strategies"
+    assert compiled.plan.source["manual_sheet_name"] == "manual_entry"
+    assert [deployment.deployment_id for deployment in compiled.plan.deployments] == [
+        "strategy_market_impulse_spy_short_v1_live_row_2",
+        "spy_breakout_lane",
+    ]
+    strategy = compiled.plan.deployments[0]
+    manual = compiled.plan.deployments[1]
+    assert strategy.source.metadata["row_index"] == 2
+    assert strategy.source.metadata["catalog_key"] == "market_impulse_spy_short_v1"
+    assert strategy.source.metadata["playbook_id"] == "pb_spy_01"
+    assert strategy.source.metadata["expectancy"] == 1.42
+    assert manual.source.metadata["row_index"] == 2
+    assert manual.execution.dte_max == 1
+    assert manual.source.metadata["manual_setup_type"] == "breakout"
+    assert manual.source.metadata["notes"] == "opening breakout"
+
+
+def test_compile_active_plan_from_google_sheets_suppresses_non_ready_catalog_rows(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_impulse.yaml", strategy_id="market_impulse_spy_short_v1", symbol="SPY")
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="strategy catalog",
+        rows=[
+            {
+                "catalog_key": "market_impulse_spy_short_v1",
+                "symbol": "SPY",
+                "strategy_key": "market_impulse",
+                "bionic_ready": "FALSE",
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategies",
+        rows=[{"strategy": "market_impulse_spy_short_v1"}],
+    )
+    manual_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="manual_entry",
+        rows=[],
+    )
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="strategy catalog",
+        strategy_sheet_name="active_strategies",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "not bionic_ready" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="strategy catalog",
+        rows=[
+            {
+                "catalog_key": "market_impulse_spy_short_19383a3c9faf",
+                "playbook_id": "market_impulse_spy_short_17d4462c5932",
+                "symbol": "SPY",
+                "bias_template": "bearish_trend_intraday",
+                "strategy_key": "market_impulse",
+                "strategy_family": "market_impulse",
+                "direction": "short",
+                "lifecycle_status": "active",
+                "bionic_ready": "TRUE",
+                "last_validated_date": "2026-04-01",
+                "thesis_exit_policy": "fixed_rr_underlying",
+                "playbook_summary_json": json.dumps(
+                    {
+                        "entry_params": {
+                            "direction": "short",
+                            "entry_buffer_minutes": 3,
+                            "entry_window_minutes": 45,
+                            "regime_timeframe": "1h",
+                        },
+                        "vehicle_mapping": {
+                            "profile": "single_leg_long_premium_v1",
+                            "option_mapping": {"long_signal": "CALL", "short_signal": "PUT"},
+                            "dte_min": 0,
+                            "dte_max": 7,
+                            "target_abs_delta_min": 0.2,
+                            "target_abs_delta_max": 0.4,
+                        },
+                        "catastrophe_exit_params": {
+                            "hard_flat_time_et": "15:55",
+                            "stop_loss_pct": 0.45,
+                            "use_profit_target": False,
+                        },
+                        "thesis_exit_params": {
+                            "stop_loss_underlying_pct": 0.0035,
+                            "take_profit_underlying_r_multiple": 1.5,
+                        },
+                    }
+                ),
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[{"enabled": "TRUE", "mode": "live", "strategy": "market_impulse_spy_short_19383a3c9faf"}],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="strategy catalog",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    generated_path = catalog_root / "google_promoted" / "market_impulse_spy_short_19383a3c9faf.yaml"
+    assert generated_path.exists()
+    generated_payload = yaml.safe_load(generated_path.read_text(encoding="utf-8"))
+    assert generated_payload["strategy_id"] == "market_impulse_spy_short_19383a3c9faf"
+    assert generated_payload["strategy"]["key"] == "market_impulse"
+    assert generated_payload["exit"]["thesis_exit_policy"] == "fixed_rr_underlying"
+    assert compiled.plan.deployments[0].deployment_id == "strategy_market_impulse_spy_short_19383a3c9faf_live_row_2"
+    assert compiled.plan.deployments[0].strategy.key == "market_impulse"
+
+
+def test_sync_google_strategy_catalog_only_writes_active_bionic_ready_supported_rows(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    (catalog_root / "manual.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "strategy_id": "manual_preserved",
+                "enabled": True,
+                "symbol": "SPY",
+                "strategy": {"key": "market_impulse", "version": 1, "params": {"direction": "short"}},
+                "execution": {"profile": "single_leg_long_premium_v1"},
+                "risk": {"profile": "conservative_day1"},
+                "exit": {"profile": "strategy_exit_v1"},
+                "source": {"origin": "manual"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    written = sync_google_strategy_catalog(
+        strategy_catalog_path=catalog_root,
+        google_strategy_catalog=[
+            _catalog_sheet_row(
+                catalog_key="eligible_market_impulse",
+                symbol="SPY",
+                strategy_key="market_impulse",
+                lifecycle_status="active",
+                bionic_ready=True,
+            ),
+            _catalog_sheet_row(
+                catalog_key="not_ready",
+                symbol="SPY",
+                strategy_key="market_impulse",
+                lifecycle_status="active",
+                bionic_ready=False,
+            ),
+            _catalog_sheet_row(
+                catalog_key="retired",
+                symbol="SPY",
+                strategy_key="market_impulse",
+                lifecycle_status="retired",
+                bionic_ready=True,
+            ),
+            _catalog_sheet_row(
+                catalog_key="unsupported",
+                symbol="SPY",
+                strategy_key="not_in_registry",
+                lifecycle_status="active",
+                bionic_ready=True,
+            ),
+        ],
+    )
+
+    assert [path.name for path in written] == ["eligible_market_impulse.yaml"]
+    assert (catalog_root / "google_promoted" / "eligible_market_impulse.yaml").exists()
+    assert not (catalog_root / "google_promoted" / "not_ready.yaml").exists()
+    assert not (catalog_root / "google_promoted" / "retired.yaml").exists()
+    assert not (catalog_root / "google_promoted" / "unsupported.yaml").exists()
+
+
+def test_compile_active_plan_cli_supports_google_sheets_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "qqq_impulse.yaml", strategy_id="qqq_market_impulse_short_v1", symbol="QQQ")
+    output_path = tmp_path / "artifacts" / "playbook" / "active_plan.json"
+
+    def _fake_compile(**kwargs):
+        return compile_active_plan_from_google_sheets(
+            spreadsheet_id="spreadsheet123",
+            credentials_path=tmp_path / "credentials.json",
+            catalog_sheet_name="strategy catalog",
+            strategy_sheet_name="active_strategies",
+            manual_sheet_name="manual_entry",
+            strategy_catalog_path=kwargs["strategy_catalog_path"],
+            active_plan_id=kwargs["active_plan_id"],
+            trading_date=kwargs["trading_date"],
+            catalog_client=_FakeSheetClient(
+                spreadsheet_id="spreadsheet123",
+                sheet_name="strategy catalog",
+                rows=[
+                    {
+                        "catalog_key": "qqq_market_impulse_short_v1",
+                        "symbol": "QQQ",
+                        "strategy_key": "market_impulse",
+                        "bionic_ready": "TRUE",
+                    }
+                ],
+            ),
+            strategy_client=_FakeSheetClient(
+                spreadsheet_id="spreadsheet123",
+                sheet_name="active_strategies",
+                rows=[{"strategy": "qqq_market_impulse_short_v1"}],
+            ),
+            manual_client=_FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[]),
+        )
+
+    monkeypatch.setattr("bhiksha.tools.compile_active_plan.compile_active_plan_from_google_sheets", _fake_compile)
+
+    exit_code = compile_active_plan_main(
+        [
+            "--google-sheet-id",
+            "spreadsheet123",
+            "--credentials-path",
+            str(tmp_path / "credentials.json"),
+            "--catalog-sheet-name",
+            "strategy catalog",
+            "--strategy-catalog",
+            str(catalog_root),
+            "--out",
+            str(output_path),
+            "--active-plan-id",
+            "active_plan_2026-04-11",
+            "--trading-date",
+            "2026-04-11",
+        ]
+    )
+
+    assert exit_code == 0
+    plan = load_active_plan(output_path)
+    assert plan.active_plan_id == "active_plan_2026-04-11"
+    assert [deployment.deployment_id for deployment in plan.deployments] == ["strategy_qqq_market_impulse_short_v1_shadow_row_2"]
+
+
+def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_catalog_entry(path: Path, *, strategy_id: str, symbol: str) -> None:
+    payload = {
+        "strategy_id": strategy_id,
+        "enabled": True,
+        "symbol": symbol,
+        "strategy": {
+            "key": "jerk_pivot_momentum" if "jerk" in strategy_id else "market_impulse",
+            "version": 1,
+            "params": {"direction": "short"},
+        },
+        "execution": {
+            "profile": "single_leg_long_premium_v1",
+            "shadow_only": True,
+            "option_mapping": {"long_signal": "CALL", "short_signal": "PUT"},
+            "dte_min": 0,
+            "dte_max": 7,
+            "target_abs_delta_min": 0.2,
+            "target_abs_delta_max": 0.4,
+            "min_open_interest": 100,
+            "max_bid_ask_spread_pct": 0.2,
+        },
+        "risk": {
+            "profile": "conservative_day1",
+            "max_trade_premium_usd": 300,
+            "hard_flat_time_et": "15:55",
+            "stop_loss_pct": 0.45,
+        },
+        "exit": {
+            "profile": "strategy_exit_v1",
+            "use_algorithmic_exit": True,
+            "use_profit_target": False,
+            "profit_target_multiple": None,
+            "stop_loss_pct": 0.45,
+            "stop_to_breakeven_after_r_multiple": None,
+            "hard_flat_time_et": "15:55",
+        },
+        "source": {"origin": "test_catalog", "run_date": "2026-04-08", "artifact": "research.md"},
+        "approval_status": "approved",
+        "tags": ["test"],
+    }
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+class _FakeSheetClient:
+    def __init__(self, *, spreadsheet_id: str, sheet_name: str, rows: list[dict[str, str]]) -> None:
+        self.spreadsheet_id = spreadsheet_id
+        self.sheet_name = sheet_name
+        self._rows = rows
+
+    def read_rows(self, *, range_suffix: str = "A1:Z2000") -> list[dict[str, str]]:
+        del range_suffix
+        return [
+            {
+                **row,
+                "row_index": index,
+            }
+            for index, row in enumerate(self._rows, start=2)
+        ]
+
+
+def _catalog_sheet_row(**overrides):
+    payload = {
+        "catalog_key": "market_impulse_spy_short_19383a3c9faf",
+        "playbook_id": "playbook_123",
+        "symbol": "SPY",
+        "bias_template": "bearish_trend_intraday",
+        "strategy_key": "market_impulse",
+        "strategy_family": "market_impulse",
+        "direction": "short",
+        "lifecycle_status": "active",
+        "bionic_ready": True,
+        "playbook_summary_json": {
+            "entry_params": {"direction": "short"},
+            "vehicle_mapping": {"profile": "single_leg_long_premium_v1"},
+            "catastrophe_exit_params": {"hard_flat_time_et": "15:55", "stop_loss_pct": 0.45},
+        },
+    }
+    payload.update(overrides)
+    from bhiksha.active_plan.compiler import StrategyCatalogSheetRow
+
+    return StrategyCatalogSheetRow.model_validate(payload)

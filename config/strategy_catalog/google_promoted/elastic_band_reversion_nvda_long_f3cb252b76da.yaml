@@ -1,0 +1,98 @@
+strategy_id: elastic_band_reversion_nvda_long_f3cb252b76da
+enabled: true
+symbol: NVDA
+strategy:
+  key: elastic_band_reversion
+  version: 1
+  params:
+    direction: long
+    use_directional_mass: true
+    z_score_threshold: 3.0
+    z_score_window: 120
+execution:
+  profile: single_leg_long_premium_v1
+  shadow_only: true
+  option_mapping: &id001
+    long_signal: CALL
+    short_signal: PUT
+  dte_min: 7
+  dte_max: 21
+  target_abs_delta_min: null
+  target_abs_delta_max: null
+  min_open_interest: 100
+  max_bid_ask_spread_pct: 0.2
+risk:
+  profile: elastic_band_reversion_risk_v1
+  max_trade_premium_usd: 300.0
+  hard_flat_time_et: '15:55'
+  stop_loss_pct: 0.35
+exit:
+  profile: elastic_band_reversion_exit_v1
+  use_algorithmic_exit: false
+  use_profit_target: false
+  profit_target_multiple: null
+  stop_loss_pct: 0.35
+  stop_to_breakeven_after_r_multiple: null
+  hard_flat_time_et: '15:55'
+  thesis_exit_policy: fixed_rr_underlying
+  thesis_exit_params:
+    stop_loss_underlying_pct: 0.0035
+    take_profit_underlying_r_multiple: 1.0
+  catastrophe_exit_params:
+    hard_flat_time_et: '15:55'
+    profit_target_multiple: null
+    stop_loss_pct: 0.35
+    stop_to_breakeven_after_r_multiple: null
+    use_profit_target: false
+source:
+  origin: google_strategy_catalog
+  run_date: '2026-04-02'
+  artifact: elastic_band_reversion_nvda_long_7c09e91c3430
+  metadata:
+    catalog_key: elastic_band_reversion_nvda_long_f3cb252b76da
+    playbook_id: elastic_band_reversion_nvda_long_7c09e91c3430
+    bias_template: bullish_mean_reversion_intraday
+    strategy_key: elastic_band_reversion
+    strategy_family: elastic_band_reversion
+    direction: long
+    lifecycle_status: active
+    bionic_ready: true
+    first_validated_date: '2026-04-02'
+    last_validated_date: '2026-04-02'
+    validation_count: 1
+    expectancy: 0.1521
+    signal_count: 42
+    execution_robustness: 0.60275
+    thesis_exit_policy: fixed_rr_underlying
+    playbook_summary:
+      bhiksha_compatibility:
+        bionic_ready: true
+        has_optimized_thesis_exit: true
+        required_capabilities: []
+        supported: true
+      catastrophe_exit_params:
+        hard_flat_time_et: '15:55'
+        profit_target_multiple: null
+        stop_loss_pct: 0.35
+        stop_to_breakeven_after_r_multiple: null
+        use_profit_target: false
+      entry_params:
+        direction: long
+        use_directional_mass: true
+        z_score_threshold: 3.0
+        z_score_window: 120
+      thesis_exit_params:
+        stop_loss_underlying_pct: 0.0035
+        take_profit_underlying_r_multiple: 1.0
+      vehicle_mapping:
+        dte_max: 21
+        dte_min: 7
+        option_mapping: *id001
+        profile: single_leg_long_premium_v1
+    catalog_row_index: 2
+approval_status: approved
+tags:
+- google_promoted
+- elastic_band_reversion
+- long
+- bullish_mean_reversion_intraday

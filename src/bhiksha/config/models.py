@@ -74,6 +74,7 @@ class AppConfig(BaseModel):
     order_fill_poll_seconds: int = 2
     order_fill_timeout_seconds: int = 20
     generated_deployments_dir: str = "config/deployments/generated"
+    strategy_catalog_dir: str = "config/strategy_catalog"
     deployment_selection_mode: Literal["all", "manual_only", "generated_only", "prefer_generated"] = "all"
     bias_inputs_path: str = "config/bias_inputs.yaml"
     playbook_artifacts_dir: str = "artifacts/playbook"
@@ -175,19 +176,33 @@ class DeploymentManifest(BaseModel):
     exit: ExitSpec = Field(default_factory=ExitSpec)
     source: SourceSpec = Field(default_factory=SourceSpec)
     config_path: str | None = Field(default=None, exclude=True)
-    source_kind: Literal["manual", "generated", "session"] | None = Field(default=None, exclude=True)
+    source_kind: Literal["manual", "generated", "active_plan"] | None = Field(default=None, exclude=True)
 
 
-class SessionPayload(BaseModel):
-    contract_name: str = "active_session"
+class ActivePlan(BaseModel):
+    contract_name: str = "active_plan"
     schema_version: int = 1
-    session_id: str
-    session_date: str | None = None
+    active_plan_id: str
+    trading_date: str | None = None
     generated_at: str | None = None
     source: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     suppressed: list[dict[str, Any]] = Field(default_factory=list)
     deployments: list[DeploymentManifest] = Field(default_factory=list)
+
+
+class StrategyCatalogEntry(BaseModel):
+    strategy_id: str
+    enabled: bool = True
+    symbol: str
+    strategy: StrategySpec
+    execution: ExecutionSpec
+    risk: RiskSpec
+    exit: ExitSpec = Field(default_factory=ExitSpec)
+    source: SourceSpec = Field(default_factory=SourceSpec)
+    approval_status: Literal["draft", "approved", "retired"] = "approved"
+    tags: list[str] = Field(default_factory=list)
+    config_path: str | None = Field(default=None, exclude=True)
 
 
 class VehicleProfile(BaseModel):

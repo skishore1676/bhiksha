@@ -11,12 +11,13 @@ from pydantic import BaseModel
 import json
 
 from bhiksha.config.models import (
+    ActivePlan,
     AppConfig,
     BiasConfig,
     BiasSelection,
     DeploymentManifest,
     ProviderConfig,
-    SessionPayload,
+    StrategyCatalogEntry,
 )
 
 ConfigModelT = TypeVar("ConfigModelT", bound=BaseModel)
@@ -62,31 +63,42 @@ def load_deployments(path: str | Path) -> list[DeploymentManifest]:
     return manifests
 
 
-def load_session_payload(path: str | Path) -> SessionPayload:
+def load_active_plan(path: str | Path) -> ActivePlan:
     payload_path = Path(path)
     if not payload_path.exists():
         raise FileNotFoundError(payload_path)
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    session = SessionPayload.model_validate(payload)
-    seen_symbols: dict[str, str] = {}
+    plan = ActivePlan.model_validate(payload)
     seen_ids: dict[str, str] = {}
-    for manifest in session.deployments:
-        manifest.source_kind = "session"
+    for manifest in plan.deployments:
+        manifest.source_kind = "active_plan"
         manifest.config_path = str(payload_path.resolve())
-        previous_symbol = seen_symbols.get(manifest.symbol)
-        if previous_symbol is not None:
-            raise ValueError(
-                f"Duplicate symbol {manifest.symbol!r} in session payload deployments "
-                f"{previous_symbol!r} and {manifest.deployment_id!r}"
-            )
         previous_id = seen_ids.get(manifest.deployment_id)
         if previous_id is not None:
             raise ValueError(
-                f"Duplicate deployment_id {manifest.deployment_id!r} in session payload"
+                f"Duplicate deployment_id {manifest.deployment_id!r} in active plan"
             )
-        seen_symbols[manifest.symbol] = manifest.deployment_id
         seen_ids[manifest.deployment_id] = manifest.deployment_id
-    return session
+    return plan
+
+
+def load_strategy_catalog(path: str | Path) -> list[StrategyCatalogEntry]:
+    root = Path(path)
+    if not root.exists():
+        return []
+    catalog: list[StrategyCatalogEntry] = []
+    seen_ids: dict[str, Path] = {}
+    for file_path in sorted(root.rglob("*.yaml")):
+        entry = _load_model(file_path, StrategyCatalogEntry)
+        entry.config_path = str(file_path.resolve())
+        previous = seen_ids.get(entry.strategy_id)
+        if previous is not None:
+            raise ValueError(
+                f"Duplicate strategy_id {entry.strategy_id!r} in {previous} and {file_path}"
+            )
+        seen_ids[entry.strategy_id] = file_path
+        catalog.append(entry)
+    return catalog
 
 
 def load_runtime_deployments(

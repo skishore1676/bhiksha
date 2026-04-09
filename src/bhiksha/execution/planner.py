@@ -13,6 +13,7 @@ from bhiksha.market_data.session import as_et_time
 from bhiksha.options.vehicle_resolver import VehicleResolver
 from bhiksha.risk.governor import RiskGovernor
 from bhiksha.state.position_tracker import PositionTracker
+from bhiksha.time_utils import parse_time_text
 
 
 class ExecutionPlanner:
@@ -306,4 +307,4 @@ def _underlying_entry_price(decision: SignalDecision) -> float | None:
 def _parse_optional_et_time(value: str | None) -> time | None:
     if value is None or not value.strip():
         return None
-    return time.fromisoformat(value)
+    return parse_time_text(value)

@@ -28,9 +28,9 @@ async def write_observation_reports(
     provider: str | None = None,
     output_dir: str | Path | None = None,
     include_replay: bool = True,
-    session_payload_path: str | Path | None = None,
+    active_plan_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    runtime = build_runtime(config_root, session_payload_path=session_payload_path)
+    runtime = build_runtime(config_root, active_plan_path=active_plan_path)
     repo_root = Path(config_root).parent
     resolved_db_path = Path(db_path) if db_path is not None else Path(runtime.app_config.sqlite_path)
     if not resolved_db_path.is_absolute():
@@ -147,8 +147,8 @@ async def _deployment_packet(
         "source_origin": deployment.source.origin,
         "source_artifact": deployment.source.artifact,
         "authorization_mode": source_metadata.get("authorization_mode"),
-        "session_mode": startup_selection.get("mode"),
-        "session_id": startup_selection.get("session_id"),
+        "active_plan_mode": startup_selection.get("mode"),
+        "active_plan_id": startup_selection.get("active_plan_id"),
         "live_requested": startup_session.get("live"),
         "shadow_only": deployment.execution.shadow_only,
         "bias_template": deployment.source.metadata.get("bias_template"),
@@ -281,8 +281,8 @@ def _packet_markdown(packet: dict[str, Any]) -> str:
         "",
         f"- source_origin: `{packet['source_origin']}`",
         f"- authorization_mode: `{packet['authorization_mode']}`",
-        f"- session_mode: `{packet['session_mode']}`",
-        f"- session_id: `{packet['session_id']}`",
+        f"- active_plan_mode: `{packet['active_plan_mode']}`",
+        f"- active_plan_id: `{packet['active_plan_id']}`",
         f"- live_requested: `{packet['live_requested']}`",
         f"- shadow_only: `{packet['shadow_only']}`",
         f"- safe_for_live_review: `{packet['safe_for_live_review']}`",
@@ -332,9 +332,9 @@ async def _main_async(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", default=None, help="Output directory for observation packets")
     parser.add_argument("--skip-replay", action="store_true", help="Skip the replay step and use event history only")
     parser.add_argument(
-        "--session-payload",
+        "--active-plan",
         default=None,
-        help="Optional active_session.json path. When supplied, observation reports target that session-payload lane.",
+        help="Optional active plan JSON path. When supplied, observation reports target that active-plan lane.",
     )
     args = parser.parse_args(argv)
 
@@ -345,7 +345,7 @@ async def _main_async(argv: list[str] | None = None) -> int:
         provider=args.provider,
         output_dir=args.output_dir,
         include_replay=not args.skip_replay,
-        session_payload_path=args.session_payload,
+        active_plan_path=args.active_plan,
     )
     print(json.dumps({"reports": packets}, indent=2, sort_keys=True))
     return 0 if all(packet["safe_for_live_review"] for packet in packets) and packets else 2

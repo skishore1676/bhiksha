@@ -102,3 +102,28 @@ def test_manual_trigger_exit_is_runtime_managed() -> None:
 
     assert decision.exit is False
     assert decision.reason == ["strategy_exit_not_configured"]
+
+
+def test_manual_trigger_accepts_loose_after_time_strings() -> None:
+    strategy = ManualTriggerStrategy()
+    frame = pl.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": [datetime(2026, 4, 1, 14, 29), datetime(2026, 4, 1, 14, 30)],
+            "close": [199.8, 200.1],
+        }
+    )
+
+    decision = strategy.evaluate_entry(
+        frame,
+        "manual_trigger_aapl_long_v1",
+        {
+            "direction": "long",
+            "trigger_price": 200.0,
+            "trigger_direction": "ABOVE",
+            "after_time_et": "9:30",
+        },
+    )
+
+    assert decision.signal is True
+    assert "after_time_et=9:30" in decision.reason

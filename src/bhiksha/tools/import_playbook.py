@@ -1,4 +1,4 @@
-"""Legacy importer for pre-session-payload generated Bhiksha deployments."""
+"""Legacy importer for pre-active-plan generated Bhiksha deployments."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     print(
-        "WARNING: import_playbook is a legacy path. In Bionic mode, prefer Mala's active_session compiler "
-        "and start Bhiksha with --session-payload.",
+        "WARNING: import_playbook is a legacy path. In Bionic mode, prefer Mala's plan compiler "
+        "and start Bhiksha with --active-plan.",
         file=sys.stderr,
     )
 

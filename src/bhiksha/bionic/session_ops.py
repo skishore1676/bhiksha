@@ -1,4 +1,4 @@
-"""Helpers for the canonical Bionic pre-open and post-close workflow."""
+"""Helpers for active-plan prep plus optional Mala interoperability."""
 
 from __future__ import annotations
 
@@ -11,17 +11,15 @@ import subprocess
 import sys
 from typing import Any
 
-from bhiksha.app.bootstrap import build_runtime
-from bhiksha.loop.observation import write_observation_reports
-from bhiksha.ops.summary import SessionSummary, build_session_summary
+from bhiksha.ops.summary import SessionSummary
 
 
 def default_mala_root(repo_root: str | Path) -> Path:
     return (Path(repo_root).resolve().parent / "mala_v1").resolve()
 
 
-def default_session_payload_path(repo_root: str | Path) -> Path:
-    return (Path(repo_root).resolve() / "artifacts" / "playbook" / "active_session.json").resolve()
+def default_active_plan_path(repo_root: str | Path) -> Path:
+    return (Path(repo_root).resolve() / "artifacts" / "playbook" / "active_plan.json").resolve()
 
 
 def default_prepare_out_dir(mala_root: str | Path, *, today: date | None = None) -> Path:
@@ -112,16 +110,16 @@ def session_summary_to_dict(summary: SessionSummary) -> dict[str, Any]:
 def write_feedback_bundle(
     *,
     repo_root: str | Path,
-    session_payload_path: str | Path,
+    active_plan_path: str | Path,
     summary: SessionSummary,
     observation_packets: list[dict[str, Any]],
     export_to_mala_root: str | Path | None = None,
 ) -> Path:
     resolved_repo_root = Path(repo_root).resolve()
-    session_payload = Path(session_payload_path).resolve()
-    session = json.loads(session_payload.read_text(encoding="utf-8"))
-    session_id = str(session.get("session_id") or session_payload.stem)
-    bundle_root = resolved_repo_root / "artifacts" / "playbook" / "session_feedback" / session_id
+    active_plan = Path(active_plan_path).resolve()
+    plan = json.loads(active_plan.read_text(encoding="utf-8"))
+    active_plan_id = str(plan.get("active_plan_id") or active_plan.stem)
+    bundle_root = resolved_repo_root / "artifacts" / "playbook" / "session_feedback" / active_plan_id
     bundle_root.mkdir(parents=True, exist_ok=True)
 
     summary_path = bundle_root / "session_summary.json"
@@ -141,10 +139,10 @@ def write_feedback_bundle(
         json.dumps({"reports": observation_packets}, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    shutil.copy2(session_payload, bundle_root / "active_session.json")
+    shutil.copy2(active_plan, bundle_root / "active_plan.json")
 
     if export_to_mala_root is not None:
-        target = default_feedback_export_dir(export_to_mala_root, session_id)
+        target = default_feedback_export_dir(export_to_mala_root, active_plan_id)
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(bundle_root, target)

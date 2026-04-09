@@ -14,13 +14,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db-path", default=None, help="Override SQLite event database path")
     parser.add_argument("--recent", type=int, default=10, help="How many recent events to print")
     parser.add_argument(
-        "--session-payload",
+        "--active-plan",
         default=None,
-        help="Optional active_session.json path. Used to resolve the same runtime lane that produced the events.",
+        help="Optional active plan JSON path. Used to resolve the same runtime lane that produced the events.",
     )
     args = parser.parse_args(argv)
 
-    runtime = build_runtime(session_payload_path=args.session_payload)
+    runtime = build_runtime(active_plan_path=args.active_plan)
     db_path = args.db_path or runtime.app_config.sqlite_path
     summary = build_session_summary(db_path, recent_limit=args.recent)
     startup = summary.latest_startup_snapshot or {}
@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"LATEST_STARTUP_AT={summary.latest_startup_created_at}")
     if deployment_selection:
         print(f"STARTUP_MODE={deployment_selection.get('mode', '')}")
-        print(f"STARTUP_SESSION_ID={deployment_selection.get('session_id', '')}")
+        print(f"STARTUP_ACTIVE_PLAN_ID={deployment_selection.get('active_plan_id', '')}")
     if session:
         print(f"LIVE_REQUESTED={session.get('live', False)}")
     print("EVENT_COUNTS=" + ",".join(f"{key}:{value}" for key, value in sorted(summary.event_type_counts.items())))

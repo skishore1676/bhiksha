@@ -1,19 +1,95 @@
 # Bhiksha Deploy Runbook
 
-The canonical operator checklist now lives in:
+Bhiksha now runs from a Google Sheets control plane.
 
-- [bionic_loop_checklist.md](/Users/suman/kg_env/projects/mala_v1/docs/bionic_loop_checklist.md)
+The live authority is the compiled active plan at [active_plan.json](/Users/suman/kg_env/projects/bhiksha/artifacts/playbook/active_plan.json). Bhiksha builds that file from your Google Sheet, not from `config/deployments/` and not from a daily Mala compile.
 
-Use that document for the full end-to-end Bionic loop.
+## Control Plane
 
-This file is now only a short redirect so there is one checklist instead of two.
+Use these 3 sheet tabs:
 
-Bhiksha-specific reminders:
+- `Strategy_Catalog`
+  - maintained by Mala or by occasional manual promotion work
+  - rows are promotable when `lifecycle_status=active` and `bionic_ready=true`
+- `active_strategy`
+  - turns approved catalog strategies on or off for the current session
+  - `strategy` should contain the `catalog_key`
+- `manual_entry`
+  - defines operator-authored manual setups like breakout triggers
 
-- pre-open wrapper:
-  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session prepare`
-- live run:
-  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session run --live`
-- post-close review:
-  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.bionic_session review`
-- in `--session-payload` mode, Bhiksha ignores `config/deployments/` and treats `active_session.json` as the sole live authority
+Bhiksha allows multiple same-symbol lanes, so `SPY` can have multiple active strategy rows and manual rows at the same time.
+
+## Time Conventions
+
+Enter sheet times in ET.
+
+- `active_strategy.start`
+  - earliest entry time for that strategy lane
+- `active_strategy.end`
+  - optional latest entry time
+- `manual_entry.after`
+  - earliest trigger activation time
+
+Google Sheets may convert `09:30` to `9:30`. Bhiksha now normalizes that automatically, so both formats are accepted.
+
+## Required Env
+
+These should be present on the server:
+
+- `GOOGLE_SHEET_ID`
+- `GOOGLE_API_CREDENTIALS_PATH`
+- `STRATEGY_CATALOG_SHEET_NAME`
+- `ACTIVE_STRATEGIES_SHEET_NAME`
+- `MANUAL_ENTRY_SHEET_NAME`
+
+Optional:
+
+- `BHIKSHA_ACTIVE_PLAN_PATH`
+  - defaults to [active_plan.json](/Users/suman/kg_env/projects/bhiksha/artifacts/playbook/active_plan.json)
+- `BHIKSHA_STRATEGY_CATALOG_PATH`
+  - defaults to [strategy_catalog](/Users/suman/kg_env/projects/bhiksha/config/strategy_catalog)
+- `BHIKSHA_ACTIVE_PLAN_LOG_DIR`
+  - defaults to [logs](/Users/suman/kg_env/projects/bhiksha/artifacts/playbook/logs)
+- `BHIKSHA_ACTIVE_PLAN_SYNC_MINUTES`
+  - optional polling interval for repeated sync
+
+## Morning Workflow
+
+1. Update the Google Sheet.
+2. Sync the active plan:
+   - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.sync_active_plan`
+3. Dry startup:
+   - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --active-plan artifacts/playbook/active_plan.json --max-bars 0`
+4. Start live only when the plan looks correct:
+   - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.trade_session --active-plan artifacts/playbook/active_plan.json --live`
+
+## Intraday Reload
+
+If you change your mind during the day:
+
+1. update the Google Sheet
+2. rerun `sync_active_plan`
+3. restart Bhiksha against the refreshed active plan
+
+Hot-reloading inside the same runtime is not the primary path yet. The intended operating model is sync plus restart.
+
+## Logging And Bad Rows
+
+Each sync appends a JSON log entry to:
+
+- [active_plan_sync_2026-04-09.jsonl](/Users/suman/kg_env/projects/bhiksha/artifacts/playbook/logs/active_plan_sync_2026-04-09.jsonl)
+
+The dated file records:
+
+- sync status
+- deployment summary
+- suppressed row count
+- suppressed row details with sheet name, row id, row index, and reason
+
+Bad rows no longer fail the whole sync. Bhiksha keeps valid rows, suppresses invalid rows, and records the issue in the sync log.
+
+## Notes
+
+- `config/strategy_catalog/google_promoted/` is generated from eligible `Strategy_Catalog` rows.
+- Manual breakout rows currently compile through the `manual_trigger` runtime path.
+- Post-close review still exports feedback bundles and can optionally copy them back to `mala_v1`.

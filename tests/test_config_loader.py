@@ -2,10 +2,17 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 import json
 
-from bhiksha.config.loader import load_bias_inputs, load_deployments, load_runtime_deployments, load_session_payload
+from bhiksha.config.loader import (
+    load_active_plan,
+    load_bias_inputs,
+    load_deployments,
+    load_runtime_deployments,
+    load_strategy_catalog,
+)
 
 
 def test_load_deployments_from_config_directory() -> None:
@@ -110,14 +117,14 @@ def test_load_bias_inputs_accepts_reserved_emergency_controls(tmp_path: Path) ->
     assert selections[0].symbol == "IWM"
 
 
-def test_load_session_payload_rejects_duplicate_symbols(tmp_path: Path) -> None:
-    payload_path = tmp_path / "active_session.json"
+def test_load_active_plan_allows_duplicate_symbols_but_rejects_duplicate_ids(tmp_path: Path) -> None:
+    payload_path = tmp_path / "active_plan.json"
     payload_path.write_text(
         json.dumps(
             {
-                "contract_name": "active_session",
+                "contract_name": "active_plan",
                 "schema_version": 1,
-                "session_id": "active_session_2026-04-01",
+                "active_plan_id": "active_plan_2026-04-01",
                 "deployments": [
                     _manifest_dict("manual_spy", symbol="SPY"),
                     _manifest_dict("playbook_spy", symbol="SPY"),
@@ -129,8 +136,64 @@ def test_load_session_payload_rejects_duplicate_symbols(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="Duplicate symbol"):
-        load_session_payload(payload_path)
+    plan = load_active_plan(payload_path)
+    assert [deployment.deployment_id for deployment in plan.deployments] == ["manual_spy", "playbook_spy"]
+
+    payload_path.write_text(
+        json.dumps(
+            {
+                "contract_name": "active_plan",
+                "schema_version": 1,
+                "active_plan_id": "active_plan_2026-04-01",
+                "deployments": [
+                    _manifest_dict("manual_spy", symbol="SPY"),
+                    _manifest_dict("manual_spy", symbol="QQQ"),
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate deployment_id"):
+        load_active_plan(payload_path)
+
+
+def test_load_active_plan_rejects_legacy_contracts(tmp_path: Path) -> None:
+    payload_path = tmp_path / "active_session.json"
+    payload_path.write_text(
+        json.dumps(
+            {
+                "contract_name": "active_session",
+                "schema_version": 1,
+                "session_id": "active_session_2026-04-01",
+                "session_date": "2026-04-01",
+                "deployments": [_manifest_dict("legacy_spy", symbol="SPY")],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_active_plan(payload_path)
+
+
+def test_load_strategy_catalog_from_config_directory() -> None:
+    catalog = load_strategy_catalog(Path("config/strategy_catalog"))
+
+    ids = {entry.strategy_id for entry in catalog}
+    assert ids >= {
+        "jerk_pivot_momentum_tsla_short_v1",
+        "market_impulse_qqq_short_v1",
+        "market_impulse_spy_short_v1",
+    }
+    tsla = next(entry for entry in catalog if entry.strategy_id == "jerk_pivot_momentum_tsla_short_v1")
+    assert tsla.approval_status == "approved"
+    assert tsla.execution.target_abs_delta_min == 0.35
+    assert "mala_promoted" in tsla.tags
 
 
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str = "QQQ") -> None:

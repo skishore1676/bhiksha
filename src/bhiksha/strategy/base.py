@@ -10,6 +10,7 @@ import polars as pl
 
 from bhiksha.domain.models import ExitDecision, SignalDecision
 from bhiksha.state.position_tracker import TrackedPosition
+from bhiksha.time_utils import parse_time_text
 
 
 class StrategyPlugin(Protocol):
@@ -33,9 +34,7 @@ class StrategyPlugin(Protocol):
 
 def coerce_time(value: time | str) -> time:
     """Accept either time objects or HH:MM strings."""
-    if isinstance(value, time):
-        return value
-    return time.fromisoformat(value)
+    return parse_time_text(value)
 
 
 class DataFrameStrategyAdapter:

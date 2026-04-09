@@ -159,8 +159,8 @@ def test_session_summary_keeps_latest_startup_snapshot(tmp_path) -> None:
             {
                 "config_fingerprint": "fingerprint123",
                 "deployment_selection": {
-                    "mode": "session_payload",
-                    "session_id": "active_session_2026-04-02",
+                    "mode": "active_plan",
+                    "active_plan_id": "active_plan_2026-04-02",
                 },
                 "session": {"live": True, "max_bars": None},
                 "deployments": [
@@ -186,5 +186,5 @@ def test_session_summary_keeps_latest_startup_snapshot(tmp_path) -> None:
     summary = build_session_summary(str(db_path), recent_limit=3)
 
     assert summary.latest_startup_created_at is not None
-    assert summary.latest_startup_snapshot["deployment_selection"]["mode"] == "session_payload"
+    assert summary.latest_startup_snapshot["deployment_selection"]["mode"] == "active_plan"
     assert summary.latest_startup_snapshot["session"]["live"] is True

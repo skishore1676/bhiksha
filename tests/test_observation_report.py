@@ -303,7 +303,7 @@ def test_observation_report_scopes_counts_to_latest_startup(tmp_path: Path) -> N
     assert packet["safe_for_live_review"] is False
 
 
-def test_observation_report_supports_session_payload_manual_origin(tmp_path: Path) -> None:
+def test_observation_report_supports_active_plan_manual_origin(tmp_path: Path) -> None:
     config_root = tmp_path / "config"
     config_root.mkdir(parents=True)
     (config_root / "app.yaml").write_text(
@@ -329,11 +329,11 @@ def test_observation_report_supports_session_payload_manual_origin(tmp_path: Pat
         encoding="utf-8",
     )
     (config_root / "bias_inputs.yaml").write_text("selections: []\n", encoding="utf-8")
-    session_payload_path = tmp_path / "active_session.json"
-    session_payload = {
-        "contract_name": "active_session",
+    active_plan_path = tmp_path / "active_plan.json"
+    active_plan = {
+        "contract_name": "active_plan",
         "schema_version": 1,
-        "session_id": "active_session_2026-04-02",
+        "active_plan_id": "active_plan_2026-04-02",
         "generated_at": "2026-04-02T12:00:00+00:00",
         "deployments": [
             {
@@ -389,7 +389,7 @@ def test_observation_report_supports_session_payload_manual_origin(tmp_path: Pat
             }
         ],
     }
-    session_payload_path.write_text(json.dumps(session_payload, indent=2), encoding="utf-8")
+    active_plan_path.write_text(json.dumps(active_plan, indent=2), encoding="utf-8")
 
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
 
@@ -399,11 +399,11 @@ def test_observation_report_supports_session_payload_manual_origin(tmp_path: Pat
             {
                 "config_fingerprint": "livefingerprint",
                 "deployment_selection": {
-                    "mode": "session_payload",
-                    "session_id": "active_session_2026-04-02",
+                    "mode": "active_plan",
+                    "active_plan_id": "active_plan_2026-04-02",
                 },
                 "session": {"live": True, "max_bars": None},
-                "deployments": session_payload["deployments"],
+                "deployments": active_plan["deployments"],
             },
         )
         await repo.append(
@@ -453,7 +453,7 @@ def test_observation_report_supports_session_payload_manual_origin(tmp_path: Pat
             db_path=tmp_path / "events.db",
             output_dir=tmp_path / "reports",
             include_replay=False,
-            session_payload_path=session_payload_path,
+            active_plan_path=active_plan_path,
         )
     )
 
@@ -461,8 +461,8 @@ def test_observation_report_supports_session_payload_manual_origin(tmp_path: Pat
     packet = packets[0]
     assert packet["source_origin"] == "operator_manual"
     assert packet["authorization_mode"] == "live"
-    assert packet["session_mode"] == "session_payload"
-    assert packet["session_id"] == "active_session_2026-04-02"
+    assert packet["active_plan_mode"] == "active_plan"
+    assert packet["active_plan_id"] == "active_plan_2026-04-02"
     assert packet["live_requested"] is True
     assert packet["shadow_only"] is False
     assert packet["signal_reason_counts"]["manual_trigger_met"] == 1

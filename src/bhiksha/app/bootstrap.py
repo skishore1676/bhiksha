@@ -8,10 +8,11 @@ from bhiksha.config.environment import load_dotenv
 from bhiksha.app.runtime import BhikshaRuntime
 from bhiksha.config.loader import (
     load_app_config,
+    load_active_plan,
     load_bias_config,
     load_provider_config,
     load_runtime_deployments,
-    load_session_payload,
+    load_strategy_catalog,
 )
 from bhiksha.strategy.registry import StrategyRegistry, default_strategy_registry
 
@@ -19,7 +20,7 @@ from bhiksha.strategy.registry import StrategyRegistry, default_strategy_registr
 def build_runtime(
     config_root: str | Path = "config",
     *,
-    session_payload_path: str | Path | None = None,
+    active_plan_path: str | Path | None = None,
 ) -> BhikshaRuntime:
     """Build a runtime from config files without starting live services yet."""
     load_dotenv()
@@ -27,17 +28,21 @@ def build_runtime(
     repo_root = config_root.parent
     app_config = load_app_config(config_root / "app.yaml")
     provider_config = load_provider_config(config_root / "providers.yaml")
-    session_payload = None
-    if session_payload_path is not None:
-        payload_path = Path(session_payload_path)
+    strategy_catalog_path = Path(app_config.strategy_catalog_dir)
+    if not strategy_catalog_path.is_absolute():
+        strategy_catalog_path = repo_root / strategy_catalog_path
+    strategy_catalog = load_strategy_catalog(strategy_catalog_path)
+    active_plan = None
+    if active_plan_path is not None:
+        payload_path = Path(active_plan_path)
         if not payload_path.is_absolute():
             payload_path = (repo_root / payload_path).resolve()
-        session_payload = load_session_payload(payload_path)
-        deployments = list(session_payload.deployments)
+        active_plan = load_active_plan(payload_path)
+        deployments = list(active_plan.deployments)
         deployment_selection = {
-            "mode": "session_payload",
-            "payload_path": str(payload_path),
-            "session_id": session_payload.session_id,
+            "mode": "active_plan",
+            "active_plan_path": str(payload_path),
+            "active_plan_id": active_plan.active_plan_id,
             "selected": [
                 {
                     "deployment_id": manifest.deployment_id,
@@ -66,9 +71,10 @@ def build_runtime(
         provider_config=provider_config,
         deployments=deployments,
         bias_inputs=bias_config.selections,
+        strategy_catalog=strategy_catalog,
         bias_inputs_path=bias_inputs_path,
         halt_and_flatten=bias_config.emergency.halt_and_flatten,
         strategy_registry=registry,
         deployment_selection=deployment_selection,
-        session_payload=session_payload.model_dump(mode="json") if session_payload is not None else None,
+        active_plan=active_plan.model_dump(mode="json") if active_plan is not None else None,
     )
