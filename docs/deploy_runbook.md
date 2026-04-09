@@ -55,6 +55,21 @@ Optional:
 
 ## Morning Workflow
 
+Preferred one-command flow:
+
+- dry restart:
+  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.server_session restart`
+- live restart:
+  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.server_session restart --live`
+
+That command:
+
+1. syncs the Google Sheet into the active plan
+2. stops any currently running Bhiksha server process
+3. starts Bhiksha again against the refreshed active plan
+
+Manual equivalents if needed:
+
 1. Update the Google Sheet.
 2. Sync the active plan:
    - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.sync_active_plan`
@@ -68,10 +83,22 @@ Optional:
 If you change your mind during the day:
 
 1. update the Google Sheet
-2. rerun `sync_active_plan`
-3. restart Bhiksha against the refreshed active plan
+2. rerun:
+   - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.server_session restart`
+   - or `... restart --live` if you are already in live mode
 
 Hot-reloading inside the same runtime is not the primary path yet. The intended operating model is sync plus restart.
+
+## Server Process Commands
+
+- status:
+  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.server_session status`
+- stop:
+  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.server_session stop`
+- start in dry mode:
+  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.server_session start`
+- start in live mode:
+  - `PYTHONPATH=src .venv/bin/python -m bhiksha.tools.server_session start --live`
 
 ## Logging And Bad Rows
 

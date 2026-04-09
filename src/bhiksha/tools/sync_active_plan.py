@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import os
@@ -11,6 +12,17 @@ import time
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets
 from bhiksha.config.environment import load_dotenv
+
+
+@dataclass(slots=True, frozen=True)
+class SyncActivePlanResult:
+    active_plan_path: Path
+    active_plan_id: str
+    summary: dict[str, object]
+    suppressed: list[dict[str, object]]
+    changed: bool
+    log_path: Path
+    attempt: int
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,43 +72,32 @@ def main(argv: list[str] | None = None) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     for attempt in range(1, iterations + 1):
-        started_at = datetime.now(UTC)
         try:
-            compiled = compile_active_plan_from_google_sheets(
+            result = sync_active_plan_once(
                 spreadsheet_id=args.google_sheet_id,
                 credentials_path=args.credentials_path,
                 catalog_sheet_name=args.catalog_sheet_name,
                 strategy_sheet_name=args.strategy_sheet_name,
                 manual_sheet_name=args.manual_sheet_name,
                 strategy_catalog_path=args.strategy_catalog,
+                output_path=output_path,
+                log_dir=log_dir,
                 active_plan_id=args.active_plan_id,
                 trading_date=args.trading_date,
                 source_name=args.source_name,
-            )
-            payload = json.dumps(compiled.plan.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
-            changed = _write_if_changed(output_path, payload)
-            log_path = _append_sync_log(
-                log_dir=log_dir,
-                started_at=started_at,
-                status="ok",
                 attempt=attempt,
-                output_path=output_path,
-                changed=changed,
-                summary=compiled.plan.summary,
-                suppressed=compiled.plan.suppressed,
-                error=None,
             )
-            print(f"ACTIVE_PLAN={output_path}")
-            print(f"ACTIVE_PLAN_ID={compiled.plan.active_plan_id}")
-            print("SUMMARY=" + json.dumps(compiled.plan.summary, sort_keys=True))
-            print(f"SUPPRESSED_COUNT={len(compiled.plan.suppressed)}")
-            print(f"ACTIVE_PLAN_UPDATED={'1' if changed else '0'}")
-            print(f"SYNC_LOG={log_path}")
+            print(f"ACTIVE_PLAN={result.active_plan_path}")
+            print(f"ACTIVE_PLAN_ID={result.active_plan_id}")
+            print("SUMMARY=" + json.dumps(result.summary, sort_keys=True))
+            print(f"SUPPRESSED_COUNT={len(result.suppressed)}")
+            print(f"ACTIVE_PLAN_UPDATED={'1' if result.changed else '0'}")
+            print(f"SYNC_LOG={result.log_path}")
             print(f"SYNC_ATTEMPT={attempt}")
         except Exception as exc:
             log_path = _append_sync_log(
                 log_dir=log_dir,
-                started_at=started_at,
+                started_at=datetime.now(UTC),
                 status="error",
                 attempt=attempt,
                 output_path=output_path,
@@ -112,6 +113,61 @@ def main(argv: list[str] | None = None) -> int:
             break
         time.sleep(interval_minutes * 60)
     return 0
+
+
+def sync_active_plan_once(
+    *,
+    spreadsheet_id: str,
+    credentials_path: str | Path,
+    catalog_sheet_name: str,
+    strategy_sheet_name: str,
+    manual_sheet_name: str,
+    strategy_catalog_path: str | Path,
+    output_path: str | Path,
+    log_dir: str | Path,
+    active_plan_id: str | None = None,
+    trading_date: str | None = None,
+    source_name: str = "google_sheet_integration",
+    attempt: int = 1,
+) -> SyncActivePlanResult:
+    resolved_output = Path(output_path).resolve()
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    resolved_log_dir = Path(log_dir).resolve()
+    resolved_log_dir.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(UTC)
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id=spreadsheet_id,
+        credentials_path=credentials_path,
+        catalog_sheet_name=catalog_sheet_name,
+        strategy_sheet_name=strategy_sheet_name,
+        manual_sheet_name=manual_sheet_name,
+        strategy_catalog_path=strategy_catalog_path,
+        active_plan_id=active_plan_id,
+        trading_date=trading_date,
+        source_name=source_name,
+    )
+    payload = json.dumps(compiled.plan.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+    changed = _write_if_changed(resolved_output, payload)
+    log_path = _append_sync_log(
+        log_dir=resolved_log_dir,
+        started_at=started_at,
+        status="ok",
+        attempt=attempt,
+        output_path=resolved_output,
+        changed=changed,
+        summary=compiled.plan.summary,
+        suppressed=compiled.plan.suppressed,
+        error=None,
+    )
+    return SyncActivePlanResult(
+        active_plan_path=resolved_output,
+        active_plan_id=compiled.plan.active_plan_id,
+        summary=compiled.plan.summary,
+        suppressed=compiled.plan.suppressed,
+        changed=changed,
+        log_path=log_path,
+        attempt=attempt,
+    )
 
 
 def _write_if_changed(path: Path, payload: str) -> bool:
