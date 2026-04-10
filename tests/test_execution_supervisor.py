@@ -67,6 +67,10 @@ class StubPlanner:
     async def close(self):
         return None
 
+    async def plan_entry(self, *args, **kwargs):
+        del args, kwargs
+        return None
+
 
 class RecordingOrderManager(StubOrderManager):
     def __init__(self, *, quote_bid: float = 3.0, cancel_success: bool = True):
@@ -109,6 +113,35 @@ class RecordingPlanner(StubPlanner):
     def __init__(self, order_manager: RecordingOrderManager):
         self.order_manager = order_manager
         self.position_tracker = PositionTracker()
+
+
+class RecordingManualStatusWriter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def mark_signal_triggered(self, deployment, decision):
+        self.calls.append(("signal_triggered", deployment.deployment_id))
+        return None
+
+    async def mark_entry_blocked(self, deployment, *, event_at, note, trade_id=None):
+        del event_at, note, trade_id
+        self.calls.append(("entry_blocked", deployment.deployment_id))
+        return None
+
+    async def mark_entry_planned(self, deployment, *, plan, mode):
+        del plan, mode
+        self.calls.append(("entry_planned", deployment.deployment_id))
+        return None
+
+    async def mark_exit_submitted(self, deployment, *, plan):
+        del plan
+        self.calls.append(("exit_submitted", deployment.deployment_id))
+        return None
+
+    async def mark_closed(self, deployment, *, trade_id, note, event_at=None):
+        del trade_id, note, event_at
+        self.calls.append(("closed", deployment.deployment_id))
+        return None
 
 
 def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
@@ -299,6 +332,93 @@ def test_execution_supervisor_blocks_entry_when_lifecycle_is_active(tmp_path) ->
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
     assert [row[0] for row in rows] == ["signal_decision", "lifecycle_entry_blocked"]
+
+
+def test_execution_supervisor_updates_manual_sheet_status_for_blocked_entry(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    lifecycle_store = TradeLifecycleStore()
+    lifecycle_store.begin_entry(
+        "QQQ",
+        "market_impulse_qqq_short_v1",
+        option_symbol="QQQ260330P00558000",
+        order_id="ENTRY123",
+    )
+    status_writer = RecordingManualStatusWriter()
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        lifecycle_store=lifecycle_store,
+        manual_status_writer=status_writer,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+    )
+
+    plan = asyncio.run(supervisor.handle_signal(deployment, decision, dry_run=False))
+
+    assert plan is None
+    assert status_writer.calls == [
+        ("signal_triggered", deployment.deployment_id),
+        ("entry_blocked", deployment.deployment_id),
+    ]
+
+
+def test_execution_supervisor_updates_manual_sheet_status_for_planned_entry(tmp_path, monkeypatch) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    status_writer = RecordingManualStatusWriter()
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        manual_status_writer=status_writer,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+    )
+
+    async def _fake_plan_entry(*args, **kwargs):
+        del args, kwargs
+        return TradePlan(
+            trade_id="TRADE123",
+            deployment_id=deployment.deployment_id,
+            symbol="QQQ",
+            direction=SignalDirection.SHORT,
+            option_symbol="QQQ260330P00558000",
+            quantity=1,
+            estimated_entry_price=2.0,
+            risk_reasons=["approved"],
+            dry_run=True,
+            order_id="DRY_RUN",
+            underlying_entry_price=500.0,
+            entry_timestamp=decision.timestamp,
+        )
+
+    monkeypatch.setattr(supervisor.planner, "plan_entry", _fake_plan_entry)
+
+    plan = asyncio.run(supervisor.handle_signal(deployment, decision, dry_run=True))
+
+    assert plan is not None
+    assert status_writer.calls[:2] == [
+        ("signal_triggered", deployment.deployment_id),
+        ("entry_planned", deployment.deployment_id),
+    ]
 
 
 def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:

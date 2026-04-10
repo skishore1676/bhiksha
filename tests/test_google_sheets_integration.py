@@ -102,3 +102,76 @@ def test_google_sheet_client_resolves_nearby_sheet_names(tmp_path: Path) -> None
 
     assert client.sheet_name == "active_strategy"
     assert service.spreadsheets_api.values_api.range == "'active_strategy'!A1:Z2000"
+
+
+def test_google_sheet_client_updates_row_cells_and_extends_headers(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class _Values:
+        def get(self, *, spreadsheetId: str, range: str):
+            captured.setdefault("gets", []).append((spreadsheetId, range))
+            return self
+
+        def batchUpdate(self, *, spreadsheetId: str, body: dict):
+            captured.setdefault("batch_updates", []).append((spreadsheetId, body))
+            return self
+
+        def execute(self):
+            gets = captured.get("gets", [])
+            if len(gets) == 0:
+                return {"sheets": [{"properties": {"title": "manual_entry"}}]}
+            if len(gets) == 1:
+                return {
+                    "values": [
+                        ["", "enabled", "notes"],
+                        ["", "TRUE", "test row"],
+                    ]
+                }
+            return {
+                "values": [
+                    ["", "enabled", "notes", "bhiksha_status", "bhiksha_last_note"],
+                    ["", "TRUE", "test row", "", ""],
+                ]
+            }
+
+    class _Spreadsheets:
+        def get(self, *, spreadsheetId: str, fields: str):
+            captured["metadata"] = (spreadsheetId, fields)
+            return self
+
+        def execute(self):
+            return {"sheets": [{"properties": {"title": "manual_entry"}}]}
+
+        def values(self):
+            return _Values()
+
+    class _Service:
+        def spreadsheets(self):
+            return _Spreadsheets()
+
+    client = GoogleSheetTableClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="manual_entry",
+        credentials_path=tmp_path / "credentials.json",
+        service=_Service(),
+    )
+
+    client.update_row_cells(
+        row_index=2,
+        values={
+            "bhiksha_status": "triggered",
+            "bhiksha_last_note": "trigger met",
+            "enabled": False,
+        },
+    )
+
+    updates = captured["batch_updates"]
+    assert [item[0] for item in updates] == ["spreadsheet123", "spreadsheet123"]
+    header_ranges = [item["range"] for item in updates[0][1]["data"]]
+    cell_ranges = [item["range"] for item in updates[1][1]["data"]]
+    assert updates[0][1]["valueInputOption"] == "USER_ENTERED"
+    assert updates[1][1]["valueInputOption"] == "USER_ENTERED"
+    assert "'manual_entry'!B1:E1" in header_ranges
+    assert "'manual_entry'!D2" in cell_ranges
+    assert "'manual_entry'!E2" in cell_ranges
+    assert "'manual_entry'!B2" in cell_ranges

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import time
 
@@ -24,6 +25,7 @@ from bhiksha.domain.models import Bar
 from bhiksha.domain.runtime import ProviderHealth, StartupReport
 from bhiksha.execution.position_monitor import PositionMonitor
 from bhiksha.execution.supervisor import ExecutionSupervisor
+from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.integrations.schwab.settings import SchwabSettings
 from bhiksha.market_data.bar_store import RollingBarStore
 from bhiksha.market_data.adapters.polygon import PolygonBarSource
@@ -126,11 +128,16 @@ class BhikshaRuntime:
         store = RollingBarStore(max_bars_per_symbol=self.app_config.rolling_bar_capacity)
         evaluator = ReplaySignalEvaluator(FeatureService(), self.strategy_registry)
         event_repository = SQLiteEventRepository(self.app_config.sqlite_path)
+        manual_status_writer = await self._build_manual_status_writer(
+            output=output,
+            event_repository=event_repository,
+        )
         supervisor = ExecutionSupervisor(
             event_repository=event_repository,
             app_config=self.app_config,
             event_bus=self.event_bus,
             trade_state_repository=SQLiteTradeStateRepository(self.app_config.sqlite_path),
+            manual_status_writer=manual_status_writer,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker
@@ -532,6 +539,13 @@ class BhikshaRuntime:
                 f"action={evaluation.decision.action} reasons={evaluation.decision.reason}"
             )
             if evaluation.decision.exit:
+                output(
+                    "EXIT_TRIGGERED "
+                    f"deployment={evaluation.deployment.deployment_id} "
+                    f"symbol={evaluation.deployment.symbol} "
+                    f"option={evaluation.position.option_symbol} "
+                    f"reasons={','.join(evaluation.decision.reason)}"
+                )
                 enqueued = execution_dispatcher.submit(
                     bar.symbol,
                     key=f"exit:{evaluation.deployment.deployment_id}:{evaluation.position.option_symbol}",
@@ -570,6 +584,14 @@ class BhikshaRuntime:
                 f"reasons={decision.reason}"
             )
             if decision.signal:
+                output(
+                    "SIGNAL_TRUE "
+                    f"deployment={deployment.deployment_id} "
+                    f"symbol={deployment.symbol} "
+                    f"direction={decision.direction.value if decision.direction else 'unknown'} "
+                    f"close={bar.close} "
+                    f"reasons={','.join(decision.reason)}"
+                )
                 enqueued = execution_dispatcher.submit(
                     bar.symbol,
                     key=f"entry:{deployment.deployment_id}",
@@ -787,6 +809,7 @@ class BhikshaRuntime:
                 },
             )
             output(f"RUNTIME_ISSUE ALL stage=reconciliation reason={reason} error={exc}")
+            output(f"RECONCILIATION_DEGRADED reason={reason} error={exc}")
             return
         async with sync_lock:
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
@@ -821,12 +844,68 @@ class BhikshaRuntime:
     ):
         async def runner() -> None:
             simulate_only = deployment.execution.shadow_only
-            plan = await supervisor.handle_signal(
-                deployment,
-                decision,
-                dry_run=(not live) or simulate_only,
-                simulate_only=simulate_only,
-            )
+            try:
+                plan = await supervisor.handle_signal(
+                    deployment,
+                    decision,
+                    dry_run=(not live) or simulate_only,
+                    simulate_only=simulate_only,
+                )
+            except Exception as exc:
+                if "No contracts matched the execution profile" in str(exc):
+                    output(
+                        "ENTRY_SELECTOR_EMPTY "
+                        f"deployment={deployment.deployment_id} "
+                        f"symbol={deployment.symbol} "
+                        f"error={exc}"
+                    )
+                else:
+                    output(
+                        "ENTRY_FAILED "
+                        f"deployment={deployment.deployment_id} "
+                        f"symbol={deployment.symbol} "
+                        f"error={exc}"
+                    )
+                if supervisor.manual_status_writer is not None:
+                    error = await supervisor.manual_status_writer.mark_entry_error(
+                        deployment,
+                        event_at=decision.timestamp,
+                        error=str(exc),
+                    )
+                    if error is not None:
+                        await supervisor.event_repository.append(
+                            "sheet_status_writeback_failure",
+                            {
+                                "deployment_id": deployment.deployment_id,
+                                "symbol": deployment.symbol,
+                                "stage": "entry_error",
+                                "error": error,
+                            },
+                        )
+                raise
+            if plan is None:
+                output(f"ENTRY_BLOCKED deployment={deployment.deployment_id} symbol={deployment.symbol} reason=lifecycle")
+                return
+            if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):
+                mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")
+                label = "ENTRY_SUBMITTED" if mode == "live" else "ENTRY_PLANNED"
+                output(
+                    f"{label} "
+                    f"deployment={deployment.deployment_id} "
+                    f"symbol={deployment.symbol} "
+                    f"mode={mode} "
+                    f"option={plan.option_symbol} "
+                    f"qty={plan.quantity} "
+                    f"est={round(plan.estimated_entry_price, 2)} "
+                    f"reasons={','.join(plan.risk_reasons)}"
+                )
+            else:
+                output(
+                    "ENTRY_BLOCKED "
+                    f"deployment={deployment.deployment_id} "
+                    f"symbol={deployment.symbol} "
+                    f"reasons={','.join(plan.risk_reasons)}"
+                )
             if simulate_only:
                 output(f"{deployment.deployment_id}: shadow_plan={plan}")
             else:
@@ -851,6 +930,15 @@ class BhikshaRuntime:
                 decision,
                 dry_run=not live,
             )
+            if exit_plan is not None:
+                output(
+                    "EXIT_SUBMITTED "
+                    f"deployment={deployment.deployment_id} "
+                    f"symbol={deployment.symbol} "
+                    f"option={exit_plan.option_symbol} "
+                    f"order_id={exit_plan.order_id or 'pending'} "
+                    f"reasons={','.join(exit_plan.reasons)}"
+                )
             output(f"{deployment.deployment_id}: exit_plan={exit_plan}")
 
         return runner
@@ -897,6 +985,14 @@ class BhikshaRuntime:
                 symbol=symbol,
             )
             for plan in closed:
+                output(
+                    "EXIT_SUBMITTED "
+                    f"deployment={plan.deployment_id} "
+                    f"symbol={plan.symbol} "
+                    f"option={plan.option_symbol} "
+                    f"order_id={plan.order_id or 'pending'} "
+                    f"reasons={','.join(plan.risk_reasons)}"
+                )
                 output(f"HARD_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")
 
         return runner
@@ -917,9 +1013,53 @@ class BhikshaRuntime:
                 symbol=symbol,
             )
             for plan in closed:
+                output(
+                    "EXIT_SUBMITTED "
+                    f"deployment={plan.deployment_id} "
+                    f"symbol={plan.symbol} "
+                    f"option={plan.option_symbol} "
+                    f"order_id={plan.order_id or 'pending'} "
+                    f"reasons={','.join(plan.risk_reasons)}"
+                )
                 output(f"EMERGENCY_FLAT {plan.deployment_id} option={plan.option_symbol} order_id={plan.order_id}")
 
         return runner
+
+    async def _build_manual_status_writer(
+        self,
+        *,
+        output: callable,
+        event_repository: SQLiteEventRepository,
+    ) -> ManualSheetStatusWriter | None:
+        credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_PATH")
+        if self.active_plan is None or not credentials_path:
+            return None
+        try:
+            writer = await asyncio.to_thread(
+                ManualSheetStatusWriter.from_active_plan,
+                active_plan=self.active_plan,
+                deployments=self.enabled_deployments,
+                credentials_path=credentials_path,
+            )
+        except Exception as exc:
+            await event_repository.append(
+                "sheet_status_writeback_failure",
+                {
+                    "deployment_id": None,
+                    "symbol": "ALL",
+                    "stage": "startup",
+                    "error": str(exc),
+                },
+            )
+            output(f"CONTROL_PLANE_WRITEBACK_DISABLED error={exc}")
+            return None
+        if writer is not None:
+            output(
+                "CONTROL_PLANE_WRITEBACK "
+                f"sheet={writer.client.sheet_name} "
+                f"tracked_rows={len(writer.row_index_by_deployment)}"
+            )
+        return writer
 
 
 def _frame_from_bars(symbol: str, bars) -> pl.DataFrame:

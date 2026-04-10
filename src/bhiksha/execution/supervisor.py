@@ -16,6 +16,7 @@ from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, Trad
 from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
+from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
 from bhiksha.state.lifecycle import LifecycleTransition, TradeLifecycleStore
@@ -33,6 +34,7 @@ class ExecutionSupervisor:
         lifecycle_store: TradeLifecycleStore | None = None,
         event_bus: InMemoryEventBus | None = None,
         trade_state_repository: TradeStateRepository | None = None,
+        manual_status_writer: ManualSheetStatusWriter | None = None,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
@@ -40,6 +42,7 @@ class ExecutionSupervisor:
         self.app_config = app_config or AppConfig()
         self.lifecycle_store = lifecycle_store or TradeLifecycleStore()
         self.event_bus = event_bus
+        self.manual_status_writer = manual_status_writer
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -66,6 +69,14 @@ class ExecutionSupervisor:
                 "features": decision.features,
             },
         )
+        if decision.signal:
+            await self._record_manual_status(
+                deployment,
+                stage="signal_triggered",
+                writer_call=self.manual_status_writer.mark_signal_triggered(deployment, decision)
+                if self.manual_status_writer is not None
+                else None,
+            )
         if self.event_bus is not None:
             await self.event_bus.publish(SignalEvaluatedEvent(decision=decision))
         async with self._entry_lock:
@@ -79,6 +90,17 @@ class ExecutionSupervisor:
                         "state": lifecycle.state.value if lifecycle else None,
                     },
                 )
+                await self._record_manual_status(
+                    deployment,
+                    stage="entry_blocked",
+                    writer_call=self.manual_status_writer.mark_entry_blocked(
+                        deployment,
+                        event_at=decision.timestamp,
+                        note=f"lifecycle_blocked:{lifecycle.state.value if lifecycle else 'unknown'}",
+                    )
+                    if self.manual_status_writer is not None
+                    else None,
+                )
                 return None
             plan = await self.planner.plan_entry(
                 deployment,
@@ -86,6 +108,34 @@ class ExecutionSupervisor:
                 dry_run=dry_run,
                 simulate_only=simulate_only,
             )
+            if plan is not None:
+                if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):
+                    mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")
+                    await self._record_manual_status(
+                        deployment,
+                        stage="entry_planned",
+                        writer_call=self.manual_status_writer.mark_entry_planned(
+                            deployment,
+                            plan=plan,
+                            mode=mode,
+                        )
+                        if self.manual_status_writer is not None
+                        else None,
+                    )
+                else:
+                    note = ",".join(plan.risk_reasons) or "entry_blocked"
+                    await self._record_manual_status(
+                        deployment,
+                        stage="entry_blocked",
+                        writer_call=self.manual_status_writer.mark_entry_blocked(
+                            deployment,
+                            event_at=plan.entry_timestamp or decision.timestamp,
+                            note=note,
+                            trade_id=plan.trade_id,
+                        )
+                        if self.manual_status_writer is not None
+                        else None,
+                    )
             if plan is not None:
                 if plan.order_id:
                     await self._upsert_trade_record(
@@ -702,6 +752,17 @@ class ExecutionSupervisor:
                 error=cancel_error,
             )
             await self.event_repository.append("exit_plan", asdict(plan))
+            await self._record_manual_status(
+                deployment,
+                stage="exit_closed",
+                writer_call=self.manual_status_writer.mark_closed(
+                    deployment,
+                    trade_id=plan.trade_id,
+                    note="dry_run_exit_closed",
+                )
+                if self.manual_status_writer is not None
+                else None,
+            )
             return plan
 
         updated_position, plan = await self._submit_exit_request(
@@ -715,6 +776,16 @@ class ExecutionSupervisor:
             inherited_error=cancel_error,
         )
         await self.event_repository.append("exit_plan", asdict(plan))
+        await self._record_manual_status(
+            deployment,
+            stage="exit_submitted",
+            writer_call=self.manual_status_writer.mark_exit_submitted(
+                deployment,
+                plan=plan,
+            )
+            if self.manual_status_writer is not None
+            else None,
+        )
         return plan
 
     async def _submit_exit_request(
@@ -1037,6 +1108,18 @@ class ExecutionSupervisor:
                 order_id=position.exit_order_id,
             )
             await self.event_repository.append("exit_plan", asdict(plan))
+            await self._record_manual_status(
+                deployment,
+                stage="exit_closed",
+                writer_call=self.manual_status_writer.mark_closed(
+                    deployment,
+                    trade_id=position.trade_id,
+                    note="exit_filled",
+                    event_at=now,
+                )
+                if self.manual_status_writer is not None
+                else None,
+            )
             return plan
         if error and position.exit_order_id is not None:
             await self.event_repository.append(
@@ -1180,6 +1263,18 @@ class ExecutionSupervisor:
                     await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
                 transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
                 await self._emit_lifecycle_transition(transition, reason="hard_flat_closed")
+                await self._record_manual_status(
+                    deployment,
+                    stage="hard_flat_closed",
+                    writer_call=self.manual_status_writer.mark_closed(
+                        deployment,
+                        trade_id=position.trade_id,
+                        note="hard_flat_closed",
+                        event_at=now,
+                    )
+                    if self.manual_status_writer is not None
+                    else None,
+                )
             else:
                 updated_position, canceled_stop_order_id, canceled_target_order_id, cancel_error = await self._cancel_exit_protection(
                     deployment,
@@ -1199,6 +1294,16 @@ class ExecutionSupervisor:
                 )
                 order_id = exit_plan.order_id
                 error = exit_plan.error
+                await self._record_manual_status(
+                    deployment,
+                    stage="hard_flat_submitted",
+                    writer_call=self.manual_status_writer.mark_exit_submitted(
+                        deployment,
+                        plan=exit_plan,
+                    )
+                    if self.manual_status_writer is not None
+                    else None,
+                )
             trade_plan = TradePlan(
                 trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
                 deployment_id=position.deployment_id,
@@ -1320,6 +1425,17 @@ class ExecutionSupervisor:
                     await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
                 transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
                 await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_closed")
+                await self._record_manual_status(
+                    deployment,
+                    stage="halt_and_flatten_closed",
+                    writer_call=self.manual_status_writer.mark_closed(
+                        deployment,
+                        trade_id=position.trade_id,
+                        note="halt_and_flatten_closed",
+                    )
+                    if self.manual_status_writer is not None
+                    else None,
+                )
             else:
                 updated_position, canceled_stop_order_id, canceled_target_order_id, cancel_error = await self._cancel_exit_protection(
                     deployment,
@@ -1340,6 +1456,16 @@ class ExecutionSupervisor:
                 )
                 order_id = exit_plan.order_id
                 error = exit_plan.error
+                await self._record_manual_status(
+                    deployment,
+                    stage="halt_and_flatten_submitted",
+                    writer_call=self.manual_status_writer.mark_exit_submitted(
+                        deployment,
+                        plan=exit_plan,
+                    )
+                    if self.manual_status_writer is not None
+                    else None,
+                )
             trade_plan = TradePlan(
                 trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
                 deployment_id=position.deployment_id,
@@ -1440,6 +1566,28 @@ class ExecutionSupervisor:
                     reason=reason,
                 )
             )
+
+    async def _record_manual_status(
+        self,
+        deployment: DeploymentManifest,
+        *,
+        stage: str,
+        writer_call,
+    ) -> None:
+        if writer_call is None:
+            return
+        error = await writer_call
+        if error is None:
+            return
+        await self.event_repository.append(
+            "sheet_status_writeback_failure",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": deployment.symbol,
+                "stage": stage,
+                "error": error,
+            },
+        )
 
     async def _upsert_trade_record(self, record: TradeRecord) -> None:
         await self.trade_state_repository.upsert_trade(record)

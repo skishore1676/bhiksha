@@ -19,6 +19,17 @@ Use these 3 sheet tabs:
 
 Bhiksha allows multiple same-symbol lanes, so `SPY` can have multiple active strategy rows and manual rows at the same time.
 
+For manual rows, Bhiksha now writes back execution status into the same `manual_entry` tab.
+
+- new status columns are added automatically when needed:
+  - `bhiksha_status`
+  - `bhiksha_last_event_at`
+  - `bhiksha_last_note`
+  - `bhiksha_last_trade_id`
+- when a manual trigger fires, Bhiksha also flips `enabled` to `FALSE`
+  - this makes the row one-shot by default, so yesterday's triggered manual setup does not silently re-arm tomorrow
+  - re-enable the row manually if you want to reuse it
+
 ## Time Conventions
 
 Enter sheet times in ET.
@@ -114,6 +125,17 @@ The dated file records:
 - suppressed row details with sheet name, row id, row index, and reason
 
 Bad rows no longer fail the whole sync. Bhiksha keeps valid rows, suppresses invalid rows, and records the issue in the sync log.
+
+The runtime log now also emits clearer operator-facing lines such as:
+
+- `SIGNAL_TRUE`
+- `ENTRY_PLANNED`
+- `ENTRY_SUBMITTED`
+- `ENTRY_BLOCKED`
+- `ENTRY_SELECTOR_EMPTY`
+- `EXIT_TRIGGERED`
+- `EXIT_SUBMITTED`
+- `RECONCILIATION_DEGRADED`
 
 ## Notes
 
