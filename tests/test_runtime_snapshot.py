@@ -1,10 +1,14 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 
+import httpx
 import yaml
 
 from bhiksha.app.bootstrap import build_runtime
+from bhiksha.app.runtime import ReconciliationSnapshot
+from bhiksha.state.position_tracker import PositionTracker
 
 
 def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments() -> None:
@@ -231,6 +235,10 @@ def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> Non
                                 "trigger_direction": "ABOVE",
                             },
                         },
+                        "exit": {
+                            **_manifest_payload("session_iwm", symbol="IWM")["exit"],
+                            "use_algorithmic_exit": False,
+                        },
                     }
                 ],
             },
@@ -246,6 +254,87 @@ def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> Non
     assert runtime.deployment_selection["mode"] == "active_plan"
     assert runtime.active_plan is not None
     assert runtime.active_plan["active_plan_id"] == "active_plan_2026-04-01"
+
+
+def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
+    runtime = build_runtime()
+    snapshot = ReconciliationSnapshot()
+
+    class StubBroker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_portfolio(self) -> dict:
+            self.calls += 1
+            if self.calls < 3:
+                raise httpx.TimeoutException("timed out")
+            return {
+                "positions": [
+                    {
+                        "instrument": {
+                            "symbol": "QQQ260401P00556000",
+                            "type": "OPTION",
+                        },
+                        "quantity": "1.0",
+                    }
+                ],
+                "orders": [],
+            }
+
+    class StubRepo:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+
+        async def append(self, event_type: str, payload: dict) -> None:
+            self.events.append((event_type, payload))
+
+    class StubTradeStateRepository:
+        async def get_open_trades(self) -> list:
+            return []
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.event_repository = StubRepo()
+            self.trade_state_repository = StubTradeStateRepository()
+            self.planner = type("Planner", (), {"position_tracker": PositionTracker()})()
+            self.sync_calls = 0
+
+        async def sync_lifecycle(self) -> None:
+            self.sync_calls += 1
+
+    broker = StubBroker()
+    supervisor = StubSupervisor()
+
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=broker,
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=lambda _: None,
+            reason="periodic",
+        )
+    )
+
+    assert broker.calls == 3
+    assert snapshot.last_success_at is not None
+    assert snapshot.consecutive_failures == 0
+    assert snapshot.last_error is None
+    assert supervisor.sync_calls == 1
+    assert len(snapshot.positions) == 1
+
+
+def test_runtime_reconciliation_staleness_blocks_live_entries() -> None:
+    runtime = build_runtime()
+    snapshot = ReconciliationSnapshot(
+        last_attempt_at=datetime.now(UTC),
+        last_success_at=datetime.now(UTC) - timedelta(seconds=61),
+        consecutive_failures=2,
+    )
+
+    reason = runtime._reconciliation_live_entry_block_reason(snapshot, now=datetime.now(UTC))
+
+    assert reason == "reconciliation_too_stale"
 
 
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str) -> None:

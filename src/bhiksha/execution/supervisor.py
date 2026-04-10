@@ -6,8 +6,9 @@ import asyncio
 from collections import defaultdict
 from dataclasses import asdict
 from dataclasses import replace
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from datetime import UTC
+import uuid
 
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.config.models import AppConfig
@@ -21,6 +22,7 @@ from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
 from bhiksha.state.lifecycle import LifecycleTransition, TradeLifecycleStore
 from bhiksha.state.position_tracker import TrackedPosition
+from bhiksha.time_utils import parse_time_text
 
 
 class ExecutionSupervisor:
@@ -56,7 +58,8 @@ class ExecutionSupervisor:
         *,
         dry_run: bool,
         simulate_only: bool = False,
-        ) -> TradePlan | None:
+        live_entry_block_reason: str | None = None,
+    ) -> TradePlan | None:
         await self.event_repository.append(
             "signal_decision",
             {
@@ -102,12 +105,28 @@ class ExecutionSupervisor:
                     else None,
                 )
                 return None
-            plan = await self.planner.plan_entry(
-                deployment,
-                decision,
-                dry_run=dry_run,
-                simulate_only=simulate_only,
-            )
+            if decision.signal and decision.direction is not None and live_entry_block_reason and not dry_run and not simulate_only:
+                plan = TradePlan(
+                    trade_id=str(uuid.uuid4()),
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol="",
+                    quantity=0,
+                    estimated_entry_price=0.0,
+                    risk_reasons=[live_entry_block_reason],
+                    dry_run=False,
+                    order_id=None,
+                    underlying_entry_price=_underlying_entry_price(decision),
+                    entry_timestamp=decision.timestamp,
+                )
+            else:
+                plan = await self.planner.plan_entry(
+                    deployment,
+                    decision,
+                    dry_run=dry_run,
+                    simulate_only=simulate_only,
+                )
             if plan is not None:
                 if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):
                     mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")
@@ -1247,7 +1266,7 @@ class ExecutionSupervisor:
                 continue
             if position.exit_mode is not None or position.exit_order_id is not None:
                 continue
-            hard_flat_time = _parse_et_time(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
+            hard_flat_time = parse_time_text(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
             if now_et < hard_flat_time:
                 continue
 
@@ -1593,13 +1612,18 @@ class ExecutionSupervisor:
         await self.trade_state_repository.upsert_trade(record)
 
 
-def _parse_et_time(value: str) -> time:
-    hour, minute = value.split(":", 1)
-    return time(int(hour), int(minute))
-
-
 def _target_price(entry_price: float, stop_loss_pct: float, r_multiple: float) -> float:
     return entry_price * (1.0 + stop_loss_pct * r_multiple)
+
+
+def _underlying_entry_price(decision: SignalDecision) -> float | None:
+    value = decision.features.get("close")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _restore_threshold_price(entry_price: float, target_price: float, progress_pct: float) -> float:
@@ -1624,7 +1648,7 @@ def _hard_flat_market_fallback_due(
         return False
     if now >= exit_submitted_at + timedelta(seconds=10):
         return True
-    hard_flat_time = _parse_et_time(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
+    hard_flat_time = parse_time_text(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
     now_seconds = as_et_time(now).hour * 3600 + as_et_time(now).minute * 60 + as_et_time(now).second
     hard_flat_seconds = hard_flat_time.hour * 3600 + hard_flat_time.minute * 60 + 30
     return now_seconds >= hard_flat_seconds

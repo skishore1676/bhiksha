@@ -7,31 +7,81 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import TradeRecord
-from bhiksha.persistence.repository import EventRepository
-from bhiksha.persistence.repository import TradeStateRepository
+from bhiksha.persistence.repository import EventRepository, TradeStateRepository
+
+ReadResultT = TypeVar("ReadResultT")
+
+
+class SQLiteBackend:
+    """Shared SQLite connection policy plus serialized writes for one DB path."""
+
+    def __init__(self, db_path: str, *, busy_timeout_ms: int = 5000) -> None:
+        self.db_path = db_path
+        self.busy_timeout_ms = busy_timeout_ms
+        self._write_lock = asyncio.Lock()
+        self._db_initialized = False
+        self._db_init_lock = asyncio.Lock()
+
+    async def ensure_db(self) -> None:
+        if self._db_initialized:
+            return
+        async with self._db_init_lock:
+            if self._db_initialized:
+                return
+            await asyncio.to_thread(self._ensure_db_sync)
+            self._db_initialized = True
+
+    async def run_write(self, operation: Callable[..., None], *args) -> None:
+        await self.ensure_db()
+        async with self._write_lock:
+            await asyncio.to_thread(operation, *args)
+
+    async def run_read(self, operation: Callable[..., ReadResultT], *args) -> ReadResultT:
+        await self.ensure_db()
+        return await asyncio.to_thread(operation, *args)
+
+    def connect(self) -> sqlite3.Connection:
+        """Open a connection with the runtime SQLite policy applied."""
+        conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000.0)
+        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _ensure_db_sync(self) -> None:
+        path = Path(self.db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect():
+            pass
 
 
 class SQLiteEventRepository(EventRepository):
     """Append-only event log stored in SQLite."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, backend: SQLiteBackend | None = None) -> None:
         self.db_path = db_path
+        self.backend = backend or SQLiteBackend(db_path)
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def append(self, event_type: str, payload: dict[str, Any]) -> None:
-        if not self._initialized:
-            await asyncio.to_thread(self._init_db)
+        await self._ensure_initialized()
+        await self.backend.run_write(self._append_sync, event_type, payload)
+
+    async def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self.backend.run_write(self._init_db)
             self._initialized = True
-        await asyncio.to_thread(self._append_sync, event_type, payload)
 
     def _init_db(self) -> None:
-        path = Path(self.db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        with self.backend.connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -45,7 +95,7 @@ class SQLiteEventRepository(EventRepository):
             conn.commit()
 
     def _append_sync(self, event_type: str, payload: dict[str, Any]) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self.backend.connect() as conn:
             conn.execute(
                 "INSERT INTO events (created_at, event_type, payload) VALUES (?, ?, ?)",
                 (
@@ -60,32 +110,35 @@ class SQLiteEventRepository(EventRepository):
 class SQLiteTradeStateRepository(TradeStateRepository):
     """SQLite-backed durable trade session store."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, backend: SQLiteBackend | None = None) -> None:
         self.db_path = db_path
+        self.backend = backend or SQLiteBackend(db_path)
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def upsert_trade(self, record: TradeRecord) -> None:
-        if not self._initialized:
-            await asyncio.to_thread(self._init_db)
-            self._initialized = True
-        await asyncio.to_thread(self._upsert_trade_sync, record)
+        await self._ensure_initialized()
+        await self.backend.run_write(self._upsert_trade_sync, record)
 
     async def mark_closed(self, trade_id: str, *, exit_order_id: str | None = None) -> None:
-        if not self._initialized:
-            await asyncio.to_thread(self._init_db)
-            self._initialized = True
-        await asyncio.to_thread(self._mark_closed_sync, trade_id, exit_order_id)
+        await self._ensure_initialized()
+        await self.backend.run_write(self._mark_closed_sync, trade_id, exit_order_id)
 
     async def get_open_trades(self) -> list[TradeRecord]:
-        if not self._initialized:
-            await asyncio.to_thread(self._init_db)
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_open_trades_sync)
+
+    async def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self.backend.run_write(self._init_db)
             self._initialized = True
-        return await asyncio.to_thread(self._get_open_trades_sync)
 
     def _init_db(self) -> None:
-        path = Path(self.db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        with self.backend.connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS trade_sessions (
@@ -128,12 +181,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             conn.commit()
 
     def _upsert_trade_sync(self, record: TradeRecord) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self.backend.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO trade_sessions (
-                    trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, status,
-                    underlying_entry_price, entry_timestamp, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
+                    trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
+                    entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                     exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
@@ -181,7 +234,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             conn.commit()
 
     def _mark_closed_sync(self, trade_id: str, exit_order_id: str | None) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self.backend.connect() as conn:
             conn.execute(
                 """
                 UPDATE trade_sessions
@@ -193,7 +246,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             conn.commit()
 
     def _get_open_trades_sync(self) -> list[TradeRecord]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self.backend.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,

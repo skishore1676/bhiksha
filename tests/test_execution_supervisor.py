@@ -421,6 +421,140 @@ def test_execution_supervisor_updates_manual_sheet_status_for_planned_entry(tmp_
     ]
 
 
+def test_execution_supervisor_blocks_live_entry_when_reconciliation_is_stale(tmp_path, monkeypatch) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    status_writer = RecordingManualStatusWriter()
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        manual_status_writer=status_writer,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 500.0},
+    )
+
+    async def _unexpected_plan_entry(*args, **kwargs):
+        raise AssertionError("planner.plan_entry should not run when reconciliation is stale")
+
+    monkeypatch.setattr(supervisor.planner, "plan_entry", _unexpected_plan_entry)
+
+    plan = asyncio.run(
+        supervisor.handle_signal(
+            deployment,
+            decision,
+            dry_run=False,
+            live_entry_block_reason="reconciliation_too_stale",
+        )
+    )
+
+    assert plan is not None
+    assert plan.quantity == 0
+    assert plan.risk_reasons == ["reconciliation_too_stale"]
+    assert status_writer.calls[:2] == [
+        ("signal_triggered", deployment.deployment_id),
+        ("entry_blocked", deployment.deployment_id),
+    ]
+
+
+def test_execution_supervisor_does_not_apply_stale_gate_to_dry_run_or_shadow_entries(tmp_path, monkeypatch) -> None:
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 500.0},
+    )
+    plans = [
+        TradePlan(
+            trade_id="TRADE-DRY",
+            deployment_id=deployment.deployment_id,
+            symbol="QQQ",
+            direction=SignalDirection.SHORT,
+            option_symbol="QQQ260330P00558000",
+            quantity=1,
+            estimated_entry_price=2.0,
+            risk_reasons=["approved"],
+            dry_run=True,
+            order_id="DRY_RUN",
+            underlying_entry_price=500.0,
+            entry_timestamp=decision.timestamp,
+        ),
+        TradePlan(
+            trade_id="TRADE-SHADOW",
+            deployment_id=deployment.deployment_id,
+            symbol="QQQ",
+            direction=SignalDirection.SHORT,
+            option_symbol="QQQ260330P00558000",
+            quantity=1,
+            estimated_entry_price=2.0,
+            risk_reasons=["approved"],
+            dry_run=True,
+            order_id=None,
+            underlying_entry_price=500.0,
+            entry_timestamp=decision.timestamp,
+        ),
+    ]
+    dry_run_supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=SQLiteEventRepository(str(tmp_path / "dry-run-events.db")),
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    shadow_supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=SQLiteEventRepository(str(tmp_path / "shadow-events.db")),
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+
+    async def _dry_run_plan_entry(*args, **kwargs):
+        del args, kwargs
+        return plans[0]
+
+    async def _shadow_plan_entry(*args, **kwargs):
+        del args, kwargs
+        return plans[1]
+
+    monkeypatch.setattr(dry_run_supervisor.planner, "plan_entry", _dry_run_plan_entry)
+    monkeypatch.setattr(shadow_supervisor.planner, "plan_entry", _shadow_plan_entry)
+
+    dry_run_plan = asyncio.run(
+        dry_run_supervisor.handle_signal(
+            deployment,
+            decision,
+            dry_run=True,
+            live_entry_block_reason="reconciliation_too_stale",
+        )
+    )
+    shadow_plan = asyncio.run(
+        shadow_supervisor.handle_signal(
+            deployment,
+            decision,
+            dry_run=False,
+            simulate_only=True,
+            live_entry_block_reason="reconciliation_too_stale",
+        )
+    )
+
+    assert dry_run_plan is not None
+    assert dry_run_plan.risk_reasons == ["approved"]
+    assert shadow_plan is not None
+    assert shadow_plan.risk_reasons == ["approved"]
+
+
 def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:
     class UnfilledOrderManager(StubOrderManager):
         async def wait_for_fill(self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2):

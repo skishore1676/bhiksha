@@ -683,7 +683,7 @@ def _write_catalog_entry(path: Path, *, strategy_id: str, symbol: str) -> None:
         },
         "exit": {
             "profile": "strategy_exit_v1",
-            "use_algorithmic_exit": True,
+            "use_algorithmic_exit": "jerk" not in strategy_id,
             "use_profit_target": False,
             "profit_target_multiple": None,
             "stop_loss_pct": 0.45,

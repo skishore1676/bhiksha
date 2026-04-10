@@ -196,6 +196,102 @@ def test_load_strategy_catalog_from_config_directory() -> None:
     assert "mala_promoted" in tsla.tags
 
 
+def test_load_deployments_normalizes_time_fields(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_qqq")
+    payload["execution"]["entry_window_start_et"] = "9:45"
+    payload["execution"]["entry_window_end_et"] = "9:55"
+    payload["risk"]["hard_flat_time_et"] = "9:05"
+    payload["exit"]["hard_flat_time_et"] = "9:07"
+    payload["exit"]["catastrophe_exit_params"] = {"hard_flat_time_et": "9:08"}
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    deployments = load_deployments(root)
+
+    assert deployments[0].execution.entry_window_start_et == "09:45"
+    assert deployments[0].execution.entry_window_end_et == "09:55"
+    assert deployments[0].risk.hard_flat_time_et == "09:05"
+    assert deployments[0].exit.hard_flat_time_et == "09:07"
+    assert deployments[0].exit.catastrophe_exit_params["hard_flat_time_et"] == "09:08"
+
+
+def test_load_deployments_rejects_algorithmic_exit_without_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_tsla", symbol="TSLA")
+    payload["strategy"]["key"] = "jerk_pivot_momentum"
+    payload["exit"]["stop_loss_pct"] = 0.0
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="use_algorithmic_exit"):
+        load_deployments(root)
+
+
+def test_load_deployments_accepts_non_native_exit_with_thesis_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_tsla", symbol="TSLA")
+    payload["strategy"]["key"] = "jerk_pivot_momentum"
+    payload["exit"]["thesis_exit_policy"] = "fixed_rr_underlying"
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    deployments = load_deployments(root)
+
+    assert deployments[0].exit.thesis_exit_policy == "fixed_rr_underlying"
+
+
+def test_load_deployments_accepts_non_native_exit_with_profit_target_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_tsla", symbol="TSLA")
+    payload["strategy"]["key"] = "jerk_pivot_momentum"
+    payload["exit"]["use_profit_target"] = True
+    payload["exit"]["profit_target_multiple"] = 1.5
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    deployments = load_deployments(root)
+
+    assert deployments[0].exit.profit_target_multiple == 1.5
+
+
+def test_load_strategy_catalog_rejects_algorithmic_exit_without_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "strategy_catalog"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_tsla", symbol="TSLA")
+    payload["strategy"]["key"] = "jerk_pivot_momentum"
+    payload["exit"]["stop_loss_pct"] = 0.0
+    payload["strategy_id"] = "manual_tsla"
+    payload["approval_status"] = "approved"
+    payload["tags"] = []
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="use_algorithmic_exit"):
+        load_strategy_catalog(root)
+
+
+def test_load_deployments_rejects_invalid_entry_window_time(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_qqq")
+    payload["execution"]["entry_window_start_et"] = "bad-time"
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="Invalid time value"):
+        load_deployments(root)
+
+
+def test_load_deployments_rejects_invalid_hard_flat_time(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_qqq")
+    payload["exit"]["hard_flat_time_et"] = "25:99"
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="Invalid time value"):
+        load_deployments(root)
+
+
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str = "QQQ") -> None:
     payload = _manifest_dict(deployment_id, symbol=symbol)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

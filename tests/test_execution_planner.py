@@ -10,12 +10,23 @@ from bhiksha.state.position_tracker import PositionTracker
 
 
 class StubChainService:
-    def __init__(self, *, symbol: str = "QQQ", option_symbol: str | None = None, dte: int = 0, delta: float = -0.31) -> None:
+    def __init__(
+        self,
+        *,
+        symbol: str = "QQQ",
+        option_symbol: str | None = None,
+        dte: int = 0,
+        delta: float = -0.31,
+        bid: float | None = 3.00,
+        ask: float | None = 2.90,
+    ) -> None:
         self.calls = 0
         self.symbol = symbol
         self.option_symbol = option_symbol or f"{symbol}260330P00558000"
         self.dte = dte
         self.delta = delta
+        self.bid = bid
+        self.ask = ask
 
     async def get_chain(self, symbol: str, **kwargs):
         self.calls += 1
@@ -28,8 +39,8 @@ class StubChainService:
                 dte=self.dte,
                 strike=558.0,
                 delta=self.delta,
-                bid=3.00,
-                ask=2.90,
+                bid=self.bid,
+                ask=self.ask,
                 open_interest=500,
             )
         ]
@@ -65,6 +76,23 @@ class StubOrderManager:
 
     async def close(self):
         return None
+
+
+class QuoteErrorOrderManager(StubOrderManager):
+    async def get_option_quote(self, option_symbol: str):
+        raise RuntimeError(f"quote failed for {option_symbol}")
+
+
+class MissingPriceOrderManager(StubOrderManager):
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=None,
+            ask=None,
+            last=None,
+            open_interest=550,
+            outcome="SUCCESS",
+        )
 
 
 def test_execution_planner_creates_dry_run_trade_plan():
@@ -150,3 +178,67 @@ def test_execution_planner_can_simulate_without_tracking_position() -> None:
     assert plan.order_id is None
     assert plan.quantity > 0
     assert tracker.active_positions() == []
+
+
+def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=QuoteErrorOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.quantity == 0
+    assert plan.option_symbol == "QQQ260330P00558000"
+    assert plan.risk_reasons == ["public_quote_unavailable"]
+
+
+def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None:
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = deployment.model_copy(
+        update={
+            "execution": deployment.execution.model_copy(
+                update={"max_bid_ask_spread_pct": None}
+            )
+        }
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=0,
+            delta=-0.31,
+            bid=None,
+            ask=None,
+        ),
+        order_manager=MissingPriceOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.quantity == 0
+    assert plan.option_symbol == "QQQ260330P00558000"
+    assert plan.risk_reasons == ["public_quote_missing_price"]

@@ -15,6 +15,7 @@ import yaml
 from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
+from bhiksha.strategy.capabilities import NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS
 from bhiksha.strategy.registry import default_strategy_registry
 from bhiksha.time_utils import normalize_time_text
 
@@ -726,7 +727,7 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
         },
         "exit": {
             "profile": f"{strategy_key}_exit_v1" if strategy_key else "catalog_promoted_exit_v1",
-            "use_algorithmic_exit": strategy_key in _ALGORITHMIC_EXIT_STRATEGY_KEYS,
+            "use_algorithmic_exit": strategy_key in NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS,
             "use_profit_target": use_profit_target,
             "profit_target_multiple": profit_target_multiple,
             "stop_loss_pct": stop_loss_pct,
@@ -1129,5 +1130,3 @@ _COLUMN_ALIASES = {
     "exit": "exit_overrides",
     "metadata": "source_metadata",
 }
-
-_ALGORITHMIC_EXIT_STRATEGY_KEYS = {"market_impulse"}

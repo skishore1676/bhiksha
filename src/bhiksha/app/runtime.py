@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import time
 
+import httpx
 import polars as pl
 
 from bhiksha.app.event_bus import InMemoryEventBus
@@ -35,8 +36,7 @@ from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.market_data.trading_calendar import trading_window_start
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup
 from bhiksha.ops.issues import classify_runtime_issue_category
-from bhiksha.persistence.sqlite import SQLiteEventRepository
-from bhiksha.persistence.sqlite import SQLiteTradeStateRepository
+from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
@@ -46,6 +46,10 @@ from bhiksha.strategy.registry import StrategyRegistry
 class ReconciliationSnapshot:
     positions: list[TrackedPosition] = field(default_factory=list)
     last_synced_at: datetime | None = None
+    last_attempt_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_error: str | None = None
+    consecutive_failures: int = 0
     signature: str = ""
 
 
@@ -127,7 +131,8 @@ class BhikshaRuntime:
 
         store = RollingBarStore(max_bars_per_symbol=self.app_config.rolling_bar_capacity)
         evaluator = ReplaySignalEvaluator(FeatureService(), self.strategy_registry)
-        event_repository = SQLiteEventRepository(self.app_config.sqlite_path)
+        sqlite_backend = SQLiteBackend(self.app_config.sqlite_path)
+        event_repository = SQLiteEventRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         manual_status_writer = await self._build_manual_status_writer(
             output=output,
             event_repository=event_repository,
@@ -136,7 +141,7 @@ class BhikshaRuntime:
             event_repository=event_repository,
             app_config=self.app_config,
             event_bus=self.event_bus,
-            trade_state_repository=SQLiteTradeStateRepository(self.app_config.sqlite_path),
+            trade_state_repository=SQLiteTradeStateRepository(self.app_config.sqlite_path, backend=sqlite_backend),
             manual_status_writer=manual_status_writer,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
@@ -403,14 +408,17 @@ class BhikshaRuntime:
 
         async with sync_lock:
             tracker_positions = list(reconciliation_snapshot.positions)
-            last_synced_at = reconciliation_snapshot.last_synced_at
+            last_synced_at = reconciliation_snapshot.last_success_at or reconciliation_snapshot.last_synced_at
+            last_attempt_at = reconciliation_snapshot.last_attempt_at
+            live_entry_block_reason = self._reconciliation_live_entry_block_reason(reconciliation_snapshot)
+        staleness_anchor = last_synced_at or last_attempt_at
         await supervisor.event_repository.append(
             "runtime_metric",
             {
                 "metric": "reconciliation_staleness_ms",
                 "symbol": bar.symbol,
                 "value": round(
-                    max(((datetime.now(UTC) - last_synced_at).total_seconds() * 1000.0), 0.0) if last_synced_at else 0.0,
+                    max(((datetime.now(UTC) - staleness_anchor).total_seconds() * 1000.0), 0.0) if staleness_anchor else 0.0,
                     3,
                 ),
                 "unit": "ms",
@@ -605,6 +613,7 @@ class BhikshaRuntime:
                         supervisor,
                         deployment,
                         decision,
+                        live_entry_block_reason=live_entry_block_reason,
                         live=live,
                         output=output,
                         ),
@@ -788,8 +797,11 @@ class BhikshaRuntime:
         reason: str,
     ) -> None:
         sync_started_at = time.perf_counter()
+        attempt_started_at = datetime.now(UTC)
+        async with sync_lock:
+            reconciliation_snapshot.last_attempt_at = attempt_started_at
         try:
-            portfolio = await broker.get_portfolio()
+            portfolio = await self._fetch_reconciliation_portfolio(broker)
             open_trades = await supervisor.trade_state_repository.get_open_trades()
             tracker_positions = reconcile_public_positions(
                 portfolio.get("positions", []),
@@ -798,6 +810,9 @@ class BhikshaRuntime:
                 known_trades=open_trades,
             )
         except Exception as exc:
+            async with sync_lock:
+                reconciliation_snapshot.last_error = str(exc)
+                reconciliation_snapshot.consecutive_failures += 1
             await supervisor.event_repository.append(
                 "runtime_issue",
                 {
@@ -815,7 +830,10 @@ class BhikshaRuntime:
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
             await supervisor.sync_lifecycle()
             reconciliation_snapshot.positions = list(tracker_positions)
-            reconciliation_snapshot.last_synced_at = datetime.now(UTC)
+            reconciliation_snapshot.last_success_at = datetime.now(UTC)
+            reconciliation_snapshot.last_synced_at = reconciliation_snapshot.last_success_at
+            reconciliation_snapshot.last_error = None
+            reconciliation_snapshot.consecutive_failures = 0
             reconciliation_snapshot.signature = ",".join(
                 f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
                 for position in tracker_positions
@@ -833,12 +851,43 @@ class BhikshaRuntime:
         if reason == "startup" or tracker_positions:
             output(f"SYNC positions={reconciliation_snapshot.signature or len(tracker_positions)}")
 
+    def _reconciliation_live_entry_block_reason(
+        self,
+        reconciliation_snapshot: ReconciliationSnapshot,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        current_time = now or datetime.now(UTC)
+        if reconciliation_snapshot.last_success_at is None:
+            return "reconciliation_unavailable"
+        staleness_seconds = (current_time - reconciliation_snapshot.last_success_at).total_seconds()
+        if staleness_seconds > self.app_config.reconciliation_max_staleness_seconds:
+            return "reconciliation_too_stale"
+        return None
+
+    async def _fetch_reconciliation_portfolio(self, broker) -> dict:
+        delay_seconds = 0.25
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                return await broker.get_portfolio()
+            except Exception as exc:
+                last_error = exc
+                if attempt == 2 or not _is_retryable_reconciliation_error(exc):
+                    raise
+                await asyncio.sleep(delay_seconds)
+                delay_seconds *= 2
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("reconciliation_portfolio_fetch_failed_without_error")
+
     def _make_entry_runner(
         self,
         supervisor: ExecutionSupervisor,
         deployment: DeploymentManifest,
         decision,
         *,
+        live_entry_block_reason: str | None,
         live: bool,
         output: callable,
     ):
@@ -850,6 +899,7 @@ class BhikshaRuntime:
                     decision,
                     dry_run=(not live) or simulate_only,
                     simulate_only=simulate_only,
+                    live_entry_block_reason=live_entry_block_reason,
                 )
             except Exception as exc:
                 if "No contracts matched the execution profile" in str(exc):
@@ -1060,6 +1110,14 @@ class BhikshaRuntime:
                 f"tracked_rows={len(writer.row_index_by_deployment)}"
             )
         return writer
+
+
+def _is_retryable_reconciliation_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TimeoutException | httpx.RequestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return False
 
 
 def _frame_from_bars(symbol: str, bars) -> pl.DataFrame:

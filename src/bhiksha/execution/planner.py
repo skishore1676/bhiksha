@@ -104,10 +104,39 @@ class ExecutionPlanner:
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
             )
-        quote = await self.order_manager.get_option_quote(selection.option_symbol)
+        try:
+            quote = await self.order_manager.get_option_quote(selection.option_symbol)
+        except Exception:
+            return TradePlan(
+                trade_id=trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                direction=decision.direction,
+                option_symbol=selection.option_symbol,
+                quantity=0,
+                estimated_entry_price=selection.estimated_entry_price or 0.0,
+                risk_reasons=["public_quote_unavailable"],
+                dry_run=dry_run,
+                order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
+            )
         entry_price = quote.entry_reference_price or selection.estimated_entry_price
         if entry_price is None:
-            raise ValueError(f"Selected contract {selection.option_symbol} has no usable price")
+            return TradePlan(
+                trade_id=trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                direction=decision.direction,
+                option_symbol=selection.option_symbol,
+                quantity=0,
+                estimated_entry_price=selection.estimated_entry_price or 0.0,
+                risk_reasons=["public_quote_missing_price"],
+                dry_run=dry_run,
+                order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
+            )
         if quote.open_interest is not None and quote.open_interest < deployment.execution.min_open_interest:
             return TradePlan(
                 trade_id=trade_id,

@@ -7,6 +7,9 @@ from typing import Any, ClassVar, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
+from bhiksha.strategy.capabilities import supports_native_algorithmic_exit
+from bhiksha.time_utils import normalize_time_text, parse_time_text
+
 RangeValueT = TypeVar("RangeValueT", int, float)
 
 
@@ -61,6 +64,70 @@ def _parse_time_window(data: dict[str, Any], *, field_name: str, start_name: str
     data[end_name] = end_raw
 
 
+def _normalize_time_field(data: dict[str, Any], field_name: str) -> None:
+    if field_name not in data:
+        return
+    data[field_name] = normalize_time_text(data.get(field_name))
+
+
+def _normalize_nested_time_field(data: dict[str, Any], field_name: str, nested_key: str) -> None:
+    raw_value = data.get(field_name)
+    if not isinstance(raw_value, dict):
+        return
+    normalized = dict(raw_value)
+    normalized[nested_key] = normalize_time_text(normalized.get(nested_key))
+    data[field_name] = normalized
+
+
+def _has_exit_fallback_protection(exit_spec: "ExitSpec") -> bool:
+    return (exit_spec.stop_loss_pct is not None and exit_spec.stop_loss_pct > 0) or bool(exit_spec.thesis_exit_policy) or (
+        exit_spec.use_profit_target and exit_spec.profit_target_multiple is not None
+    )
+
+
+def _validate_exit_safety(
+    *,
+    identifier: str,
+    strategy_key: str,
+    exit_spec: "ExitSpec",
+) -> None:
+    if not exit_spec.use_algorithmic_exit:
+        return
+    if supports_native_algorithmic_exit(strategy_key):
+        return
+    if _has_exit_fallback_protection(exit_spec):
+        return
+    raise ValueError(
+        f"{identifier} enables use_algorithmic_exit for strategy {strategy_key!r}, "
+        "but that strategy has no native exit implementation and no stop/thesis/profit-target fallback"
+    )
+
+
+def _validate_optional_time_field(data: Any, field_name: str) -> None:
+    if not isinstance(data, dict):
+        return
+    raw_value = data.get(field_name)
+    if raw_value is None:
+        return
+    normalized = normalize_time_text(raw_value)
+    if normalized is None:
+        data[field_name] = None
+        return
+    parse_time_text(normalized)
+    data[field_name] = normalized
+
+
+def _validate_nested_optional_time_field(data: Any, field_name: str, nested_key: str) -> None:
+    if not isinstance(data, dict):
+        return
+    nested = data.get(field_name)
+    if not isinstance(nested, dict):
+        return
+    normalized_nested = dict(nested)
+    _validate_optional_time_field(normalized_nested, nested_key)
+    data[field_name] = normalized_nested
+
+
 class AppConfig(BaseModel):
     app_name: str = "bhiksha"
     timezone: str = "America/New_York"
@@ -71,6 +138,7 @@ class AppConfig(BaseModel):
     rolling_bar_capacity: int = 20000
     bar_poll_interval_seconds: int = 15
     reconciliation_interval_seconds: int = 15
+    reconciliation_max_staleness_seconds: int = 60
     order_fill_poll_seconds: int = 2
     order_fill_timeout_seconds: int = 20
     generated_deployments_dir: str = "config/deployments/generated"
@@ -132,6 +200,8 @@ class ExecutionSpec(BaseModel):
             start_name="entry_window_start_et",
             end_name="entry_window_end_et",
         )
+        _validate_optional_time_field(normalized, "entry_window_start_et")
+        _validate_optional_time_field(normalized, "entry_window_end_et")
         return normalized
 
 
@@ -140,6 +210,15 @@ class RiskSpec(BaseModel):
     max_trade_premium_usd: float | None = None
     hard_flat_time_et: str | None = None
     stop_loss_pct: float = 0.45
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_input(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        _validate_optional_time_field(normalized, "hard_flat_time_et")
+        return normalized
 
 
 class ExitSpec(BaseModel):
@@ -157,6 +236,19 @@ class ExitSpec(BaseModel):
     thesis_exit_params: dict[str, Any] = Field(default_factory=dict)
     catastrophe_exit_anchor: str | None = "option_premium"
     catastrophe_exit_params: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_input(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        _validate_optional_time_field(normalized, "hard_flat_time_et")
+        _validate_nested_optional_time_field(normalized, "catastrophe_exit_params", "hard_flat_time_et")
+        thesis_exit_policy = normalized.get("thesis_exit_policy")
+        if isinstance(thesis_exit_policy, str):
+            normalized["thesis_exit_policy"] = thesis_exit_policy.strip() or None
+        return normalized
 
 
 class SourceSpec(BaseModel):
@@ -177,6 +269,15 @@ class DeploymentManifest(BaseModel):
     source: SourceSpec = Field(default_factory=SourceSpec)
     config_path: str | None = Field(default=None, exclude=True)
     source_kind: Literal["manual", "generated", "active_plan"] | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def validate_exit_safety(self) -> "DeploymentManifest":
+        _validate_exit_safety(
+            identifier=f"deployment {self.deployment_id!r}",
+            strategy_key=self.strategy.key,
+            exit_spec=self.exit,
+        )
+        return self
 
 
 class ActivePlan(BaseModel):
@@ -203,6 +304,15 @@ class StrategyCatalogEntry(BaseModel):
     approval_status: Literal["draft", "approved", "retired"] = "approved"
     tags: list[str] = Field(default_factory=list)
     config_path: str | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def validate_exit_safety(self) -> "StrategyCatalogEntry":
+        _validate_exit_safety(
+            identifier=f"strategy catalog entry {self.strategy_id!r}",
+            strategy_key=self.strategy.key,
+            exit_spec=self.exit,
+        )
+        return self
 
 
 class VehicleProfile(BaseModel):
