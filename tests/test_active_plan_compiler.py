@@ -208,8 +208,15 @@ def test_compile_active_plan_accepts_operator_friendly_alias_columns(tmp_path: P
     assert manual.deployment_id == "spy_breakout_lane"
     assert manual.symbol == "SPY"
     assert manual.execution.shadow_only is True
+    assert manual.strategy.key == "manual_breakout"
     assert manual.strategy.params["trigger_price"] == 603.25
     assert manual.strategy.params["after_time_et"] == "09:35"
+    assert manual.execution.dte_max == 5
+    assert manual.execution.target_abs_delta_min == 0.30
+    assert manual.execution.target_abs_delta_max == 0.70
+    assert manual.execution.min_open_interest == 50
+    assert manual.execution.max_bid_ask_spread_pct == 0.25
+    assert manual.exit.stop_loss_pct == 0.30
     assert manual.exit.profit_target_multiple == 2.5
     assert manual.exit.hard_flat_time_et == "15:50"
     assert manual.source.metadata["manual_setup_type"] == "breakout"
@@ -258,6 +265,7 @@ def test_compile_active_plan_normalizes_loose_sheet_times(tmp_path: Path) -> Non
     manual = compiled.plan.deployments[1]
     assert strategy.execution.entry_window_start_et == "09:30"
     assert strategy.execution.entry_window_end_et == "10:05"
+    assert manual.strategy.key == "manual_breakout"
     assert manual.strategy.params["after_time_et"] == "09:35"
     assert manual.exit.hard_flat_time_et == "15:05"
 
@@ -388,7 +396,11 @@ def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_t
     assert strategy.source.metadata["playbook_id"] == "pb_spy_01"
     assert strategy.source.metadata["expectancy"] == 1.42
     assert manual.source.metadata["row_index"] == 2
+    assert manual.strategy.key == "manual_breakout"
     assert manual.execution.dte_max == 1
+    assert manual.exit.stop_loss_pct == 0.35
+    assert manual.exit.profit_target_multiple == 1.25
+    assert manual.exit.hard_flat_time_et == "15:53"
     assert manual.source.metadata["manual_setup_type"] == "breakout"
     assert manual.source.metadata["notes"] == "opening breakout"
 

@@ -55,6 +55,9 @@ class PolygonBarSource(UnderlyingBarSource):
         completed = [bar for bar in bars if bar.timestamp < minute_floor]
         return completed[-1] if completed else None
 
+    async def fetch_live_price(self, symbol: str) -> tuple[float, datetime] | None:
+        return None
+
     @staticmethod
     def _parse_bars(symbol: str, payload: dict[str, Any]) -> list[Bar]:
         bars: list[Bar] = []

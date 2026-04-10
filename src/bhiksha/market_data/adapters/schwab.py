@@ -69,6 +69,29 @@ class SchwabBarSource(UnderlyingBarSource):
         )
         return self._latest_completed_bar(symbol, payload.get("candles", []), now=end)
 
+    async def fetch_live_price(self, symbol: str) -> tuple[float, datetime] | None:
+        payload = await self.client.quote(symbol)
+        quote_payload = payload.get(symbol, {})
+        quote = quote_payload.get("quote", {})
+        regular = quote_payload.get("regular", {})
+        extended = quote_payload.get("extended", {})
+
+        price = _first_float(
+            quote.get("mark"),
+            quote.get("lastPrice"),
+            regular.get("regularMarketLastPrice"),
+            extended.get("lastPrice"),
+        )
+        timestamp_ms = _first_int(
+            quote.get("quoteTime"),
+            quote.get("tradeTime"),
+            regular.get("regularMarketTradeTime"),
+            extended.get("tradeTime"),
+        )
+        if price is None or timestamp_ms is None:
+            return None
+        return price, ensure_utc(datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC))
+
     @staticmethod
     def _bar_from_candle(symbol: str, candle: dict) -> Bar:
         return Bar(
@@ -93,3 +116,25 @@ class SchwabBarSource(UnderlyingBarSource):
         if not completed:
             return None
         return cls._bar_from_candle(symbol, completed[-1])
+
+
+def _first_float(*values: object) -> float | None:
+    for value in values:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric > 0:
+            return numeric
+    return None
+
+
+def _first_int(*values: object) -> int | None:
+    for value in values:
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric > 0:
+            return numeric
+    return None

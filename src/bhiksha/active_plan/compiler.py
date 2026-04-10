@@ -547,7 +547,10 @@ def _compile_row(
 ) -> DeploymentManifest:
     if row.row_type == "strategy":
         return _compile_strategy_row(row, catalog_by_id, google_catalog_by_id or {}, enforce_google_catalog)
-    return _compile_manual_trigger_row(row)
+    manual_setup_type = _normalized_manual_setup_type(row.manual_setup_type)
+    if manual_setup_type == "manual_trigger":
+        return _compile_manual_trigger_row(row)
+    return _compile_manual_breakout_row(row)
 
 
 def _compile_strategy_row(
@@ -640,6 +643,72 @@ def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:
             "use_algorithmic_exit": False,
             "use_profit_target": use_profit_target,
             "profit_target_multiple": row.profit_target_multiple,
+            "stop_loss_pct": stop_loss_pct,
+            "stop_to_breakeven_after_r_multiple": row.stop_to_breakeven_after_r_multiple,
+            "hard_flat_time_et": hard_flat_time_et,
+        },
+        "source": {
+            "origin": "active_sheet_manual",
+            "metadata": {
+                "manual_setup_type": _normalized_manual_setup_type(row.manual_setup_type),
+            },
+        },
+    }
+    if row.after_time_et is not None:
+        payload["strategy"]["params"]["after_time_et"] = row.after_time_et
+    if row.close_by_factor is not None:
+        payload["strategy"]["params"]["close_by_factor"] = row.close_by_factor
+
+    payload["execution"] = _apply_execution_overrides(payload["execution"], row)
+    payload["risk"] = _apply_risk_overrides(payload["risk"], row)
+    payload["exit"] = _apply_exit_overrides(payload["exit"], row)
+    payload["source"] = _merge_source_metadata(payload["source"], row=row, origin="active_sheet_manual")
+    return DeploymentManifest.model_validate(payload)
+
+
+def _compile_manual_breakout_row(row: ActivePlanSheetRow) -> DeploymentManifest:
+    stop_loss_pct = row.stop_loss_pct if row.stop_loss_pct is not None else 0.35
+    hard_flat_time_et = row.hard_flat_time_et or "15:53"
+    profit_target_multiple = row.profit_target_multiple if row.profit_target_multiple is not None else 1.25
+    use_profit_target = row.use_profit_target if row.use_profit_target is not None else True
+
+    payload: dict[str, Any] = {
+        "deployment_id": row.row_id,
+        "enabled": row.enabled,
+        "symbol": row.symbol,
+        "strategy": {
+            "key": "manual_breakout",
+            "version": 1,
+            "params": {
+                "direction": row.direction,
+                "trigger_price": row.trigger_price,
+                "trigger_direction": row.trigger_direction,
+                "vma_length": 10,
+                "vma_timeframe": "5m",
+            },
+        },
+        "execution": {
+            "profile": "single_leg_long_premium_v1",
+            "shadow_only": row.authorization_mode != "live",
+            "option_mapping": {"long_signal": "CALL", "short_signal": "PUT"},
+            "dte_min": 0,
+            "dte_max": row.end_in_days if row.end_in_days is not None else 5,
+            "target_abs_delta_min": 0.30,
+            "target_abs_delta_max": 0.70,
+            "min_open_interest": 50,
+            "max_bid_ask_spread_pct": 0.25,
+        },
+        "risk": {
+            "profile": "manual_breakout_v1",
+            "max_trade_premium_usd": row.max_trade_premium_usd if row.max_trade_premium_usd is not None else 300.0,
+            "hard_flat_time_et": hard_flat_time_et,
+            "stop_loss_pct": stop_loss_pct,
+        },
+        "exit": {
+            "profile": "manual_breakout_exit_v1",
+            "use_algorithmic_exit": True,
+            "use_profit_target": use_profit_target,
+            "profit_target_multiple": profit_target_multiple,
             "stop_loss_pct": stop_loss_pct,
             "stop_to_breakeven_after_r_multiple": row.stop_to_breakeven_after_r_multiple,
             "hard_flat_time_et": hard_flat_time_et,

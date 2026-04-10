@@ -21,3 +21,7 @@ class UnderlyingBarSource(ABC):
     @abstractmethod
     async def fetch_latest_completed_bar(self, symbol: str, *, now: datetime | None = None) -> Bar | None:
         """Fetch the latest completed 1-minute bar for a symbol."""
+
+    async def fetch_live_price(self, symbol: str) -> tuple[float, datetime] | None:
+        """Fetch a best-effort current underlying price for intrabar workflows."""
+        return None

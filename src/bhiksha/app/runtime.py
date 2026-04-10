@@ -41,6 +41,8 @@ from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
 
+MANUAL_INTRABAR_STRATEGY_KEYS = frozenset({"manual_breakout", "manual_trigger"})
+
 
 @dataclass(slots=True)
 class ReconciliationSnapshot:
@@ -124,9 +126,12 @@ class BhikshaRuntime:
         self.start()
         symbols = sorted({deployment.symbol for deployment in self.enabled_deployments})
         deployments_by_symbol = {symbol: [] for symbol in symbols}
+        manual_intrabar_deployments_by_symbol = {symbol: [] for symbol in symbols}
         deployments_by_id = {}
         for deployment in self.enabled_deployments:
             deployments_by_symbol[deployment.symbol].append(deployment)
+            if deployment.strategy.key in MANUAL_INTRABAR_STRATEGY_KEYS:
+                manual_intrabar_deployments_by_symbol[deployment.symbol].append(deployment)
             deployments_by_id[deployment.deployment_id] = deployment
 
         store = RollingBarStore(max_bars_per_symbol=self.app_config.rolling_bar_capacity)
@@ -218,6 +223,22 @@ class BhikshaRuntime:
                     stop_event=stop_event,
                 )
             )
+            manual_intrabar_task = asyncio.create_task(
+                self._manual_intrabar_loop(
+                    source=source,
+                    store=store,
+                    supervisor=supervisor,
+                    evaluator=evaluator,
+                    execution_dispatcher=execution_dispatcher,
+                    deployments_by_symbol=manual_intrabar_deployments_by_symbol,
+                    reconciliation_snapshot=reconciliation_snapshot,
+                    sync_lock=sync_lock,
+                    reconcile_trigger=reconcile_trigger,
+                    stop_event=stop_event,
+                    live=live,
+                    output=output,
+                )
+            )
             reconciliation_task = asyncio.create_task(
                 self._reconciliation_loop(
                     broker=broker,
@@ -260,6 +281,8 @@ class BhikshaRuntime:
                 await schwab_token_task
             with suppress(asyncio.CancelledError):
                 await pending_exit_task
+            with suppress(asyncio.CancelledError):
+                await manual_intrabar_task
             with suppress(asyncio.CancelledError):
                 await reconciliation_task
             for task in symbol_tasks:
@@ -786,6 +809,140 @@ class BhikshaRuntime:
             if plans:
                 reconcile_trigger.set()
 
+    async def _manual_intrabar_loop(
+        self,
+        *,
+        source,
+        store: RollingBarStore,
+        supervisor: ExecutionSupervisor,
+        evaluator: ReplaySignalEvaluator,
+        execution_dispatcher: SymbolExecutionDispatcher,
+        deployments_by_symbol: dict[str, list[DeploymentManifest]],
+        reconciliation_snapshot: ReconciliationSnapshot,
+        sync_lock: asyncio.Lock,
+        reconcile_trigger: asyncio.Event,
+        stop_event: asyncio.Event,
+        live: bool,
+        output: callable,
+    ) -> None:
+        if not any(deployments_by_symbol.values()):
+            return
+        interval = max(self.app_config.bar_poll_interval_seconds, 1)
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            if stop_event.is_set():
+                return
+            for symbol, deployments in deployments_by_symbol.items():
+                if not deployments:
+                    continue
+                snapshot = await source.fetch_live_price(symbol)
+                if snapshot is None:
+                    continue
+                price, snapshot_timestamp = snapshot
+                try:
+                    await self._handle_manual_intrabar_price(
+                        symbol=symbol,
+                        price=price,
+                        snapshot_timestamp=snapshot_timestamp,
+                        store=store,
+                        supervisor=supervisor,
+                        evaluator=evaluator,
+                        execution_dispatcher=execution_dispatcher,
+                        deployments=deployments,
+                        reconciliation_snapshot=reconciliation_snapshot,
+                        sync_lock=sync_lock,
+                        reconcile_trigger=reconcile_trigger,
+                        live=live,
+                        output=output,
+                    )
+                except Exception as exc:
+                    await supervisor.event_repository.append(
+                        "runtime_issue",
+                        {
+                            "category": classify_runtime_issue_category(error=str(exc), event_type="manual_intrabar"),
+                            "symbol": symbol,
+                            "error": str(exc),
+                            "stage": "manual_intrabar",
+                        },
+                    )
+                    output(f"RUNTIME_ISSUE {symbol} stage=manual_intrabar error={exc}")
+
+    async def _handle_manual_intrabar_price(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        snapshot_timestamp: datetime,
+        store: RollingBarStore,
+        supervisor: ExecutionSupervisor,
+        evaluator: ReplaySignalEvaluator,
+        execution_dispatcher: SymbolExecutionDispatcher,
+        deployments: list[DeploymentManifest],
+        reconciliation_snapshot: ReconciliationSnapshot,
+        sync_lock: asyncio.Lock,
+        reconcile_trigger: asyncio.Event,
+        live: bool,
+        output: callable,
+    ) -> None:
+        bars = store.get(symbol)
+        if not bars:
+            return
+        latest_bar = store.latest(symbol)
+        if latest_bar is not None and snapshot_timestamp <= latest_bar.timestamp:
+            return
+        active_deployments = [
+            deployment
+            for deployment in deployments
+            if supervisor.lifecycle_store.can_submit_entry(symbol, deployment.deployment_id)
+        ]
+        if not active_deployments:
+            return
+
+        frame = _frame_with_live_price(symbol, bars, timestamp=snapshot_timestamp, price=price)
+        enriched_frames = evaluator.prepare_enriched_frames(frame, active_deployments)
+        async with sync_lock:
+            live_entry_block_reason = self._reconciliation_live_entry_block_reason(reconciliation_snapshot, now=snapshot_timestamp)
+
+        for deployment in active_deployments:
+            enriched = enriched_frames.get(deployment.deployment_id)
+            if enriched is None:
+                continue
+            decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
+            if not decision.signal:
+                continue
+            output(
+                "INTRABAR_SIGNAL_TRUE "
+                f"deployment={deployment.deployment_id} "
+                f"symbol={deployment.symbol} "
+                f"direction={decision.direction.value if decision.direction else 'unknown'} "
+                f"price={price} "
+                f"reasons={','.join(decision.reason)}"
+            )
+            enqueued = execution_dispatcher.submit(
+                symbol,
+                key=f"entry:{deployment.deployment_id}",
+                runner=self._instrument_execution_runner(
+                    supervisor,
+                    symbol,
+                    deployment_id=deployment.deployment_id,
+                    reconcile_trigger=reconcile_trigger,
+                    action="entry",
+                    inner=self._make_entry_runner(
+                        supervisor,
+                        deployment,
+                        decision,
+                        live_entry_block_reason=live_entry_block_reason,
+                        live=live,
+                        output=output,
+                    ),
+                ),
+            )
+            if enqueued:
+                output(f"{deployment.deployment_id}: intrabar_entry_enqueued")
+
     async def _refresh_reconciliation(
         self,
         *,
@@ -1132,3 +1289,21 @@ def _frame_from_bars(symbol: str, bars) -> pl.DataFrame:
             "volume": [bar.volume for bar in bars],
         }
     )
+
+
+def _frame_with_live_price(symbol: str, bars, *, timestamp: datetime, price: float) -> pl.DataFrame:
+    frame = _frame_from_bars(symbol, bars)
+    synthetic = pl.DataFrame(
+        {
+            "symbol": [symbol],
+            "timestamp": [timestamp],
+            "open": [price],
+            "high": [price],
+            "low": [price],
+            "close": [price],
+            "volume": [0.0],
+        }
+    )
+    if frame.is_empty():
+        return synthetic
+    return pl.concat([frame, synthetic], how="vertical")

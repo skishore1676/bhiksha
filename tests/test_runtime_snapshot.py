@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 
 import httpx
+import polars as pl
 import yaml
 
 from bhiksha.app.bootstrap import build_runtime
-from bhiksha.app.runtime import ReconciliationSnapshot
+from bhiksha.app.runtime import ReconciliationSnapshot, _frame_with_live_price
+from bhiksha.domain.models import Bar
 from bhiksha.state.position_tracker import PositionTracker
 
 
@@ -335,6 +337,32 @@ def test_runtime_reconciliation_staleness_blocks_live_entries() -> None:
     reason = runtime._reconciliation_live_entry_block_reason(snapshot, now=datetime.now(UTC))
 
     assert reason == "reconciliation_too_stale"
+
+
+def test_frame_with_live_price_appends_synthetic_quote_row() -> None:
+    frame = _frame_with_live_price(
+        "AAPL",
+        [
+            Bar(
+                symbol="AAPL",
+                timestamp=datetime(2026, 4, 10, 14, 30, tzinfo=UTC),
+                open=259.0,
+                high=259.2,
+                low=258.9,
+                close=259.1,
+                volume=1000.0,
+            )
+        ],
+        timestamp=datetime(2026, 4, 10, 14, 30, 15, tzinfo=UTC),
+        price=259.5,
+    )
+
+    assert isinstance(frame, pl.DataFrame)
+    assert frame.height == 2
+    latest = frame.tail(1).to_dicts()[0]
+    assert latest["timestamp"] == datetime(2026, 4, 10, 14, 30, 15, tzinfo=UTC)
+    assert latest["close"] == 259.5
+    assert latest["volume"] == 0.0
 
 
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str) -> None:
