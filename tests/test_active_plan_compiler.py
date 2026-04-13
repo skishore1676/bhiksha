@@ -529,7 +529,7 @@ def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(
     assert compiled.plan.deployments[0].strategy.key == "market_impulse"
 
 
-def test_sync_google_strategy_catalog_only_writes_active_bionic_ready_supported_rows(tmp_path: Path) -> None:
+def test_sync_google_strategy_catalog_writes_active_or_candidate_bionic_ready_supported_rows(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
     (catalog_root / "manual.yaml").write_text(
@@ -560,6 +560,14 @@ def test_sync_google_strategy_catalog_only_writes_active_bionic_ready_supported_
                 bionic_ready=True,
             ),
             _catalog_sheet_row(
+                catalog_key="candidate_shadow_market_impulse",
+                symbol="AMD",
+                strategy_key="market_impulse",
+                lifecycle_status="candidate",
+                bionic_ready=True,
+                operator_status_override="shadow",
+            ),
+            _catalog_sheet_row(
                 catalog_key="not_ready",
                 symbol="SPY",
                 strategy_key="market_impulse",
@@ -583,8 +591,12 @@ def test_sync_google_strategy_catalog_only_writes_active_bionic_ready_supported_
         ],
     )
 
-    assert [path.name for path in written] == ["eligible_market_impulse.yaml"]
+    assert [path.name for path in written] == [
+        "eligible_market_impulse.yaml",
+        "candidate_shadow_market_impulse.yaml",
+    ]
     assert (catalog_root / "google_promoted" / "eligible_market_impulse.yaml").exists()
+    assert (catalog_root / "google_promoted" / "candidate_shadow_market_impulse.yaml").exists()
     assert not (catalog_root / "google_promoted" / "not_ready.yaml").exists()
     assert not (catalog_root / "google_promoted" / "retired.yaml").exists()
     assert not (catalog_root / "google_promoted" / "unsupported.yaml").exists()

@@ -905,7 +905,7 @@ def _is_google_catalog_entry_promotable(entry: StrategyCatalogSheetRow, supporte
     strategy_key = str(entry.strategy_key or "").strip()
     return (
         entry.bionic_ready
-        and entry.lifecycle_status == "active"
+        and entry.lifecycle_status in {"active", "candidate"}
         and bool(entry.catalog_key)
         and bool(entry.symbol)
         and strategy_key in supported_keys
