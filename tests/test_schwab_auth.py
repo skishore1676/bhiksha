@@ -1,11 +1,14 @@
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from bhiksha.integrations.schwab.auth import (
     access_token_is_stale,
     build_authorize_url,
     extract_authorization_code,
 )
 from bhiksha.integrations.schwab.settings import SchwabSettings
+from bhiksha.integrations.schwab.token_store import SchwabTokenStoreError, read_tokens
 
 
 def test_build_authorize_url_uses_configured_callback() -> None:
@@ -37,3 +40,14 @@ def test_access_token_staleness_detection() -> None:
     }
     assert access_token_is_stale(payload, buffer_seconds=1800) is True
 
+
+def test_read_tokens_raises_for_invalid_existing_token_file(tmp_path) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    token_file.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(SchwabTokenStoreError, match="Invalid JSON"):
+        read_tokens(token_file)
+
+
+def test_read_tokens_returns_none_for_missing_token_file(tmp_path) -> None:
+    assert read_tokens(tmp_path / "missing_tokens.json") is None
