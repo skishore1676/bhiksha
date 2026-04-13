@@ -253,12 +253,57 @@ class BhikshaRuntime:
             daemon_task = asyncio.create_task(daemon.run(max_bars=max_bars))
             seen = 0
             while True:
-                if daemon_task.done() and queue.empty():
-                    break
+                if daemon_task.done():
+                    daemon_error = _task_exception(daemon_task)
+                    if daemon_error is not None:
+                        await supervisor.event_repository.append(
+                            "runtime_issue",
+                            {
+                                "category": classify_runtime_issue_category(
+                                    error=repr(daemon_error),
+                                    event_type="market_data_daemon",
+                                ),
+                                "symbol": "ALL",
+                                "error": repr(daemon_error),
+                                "error_type": type(daemon_error).__name__,
+                                "stage": "market_data_daemon",
+                            },
+                        )
+                        output(
+                            "RUNTIME_ISSUE ALL "
+                            f"stage=market_data_daemon error_type={type(daemon_error).__name__} "
+                            f"error={daemon_error!r}"
+                        )
+                        raise daemon_error
+                    if queue.empty():
+                        output("MARKET_DATA_DAEMON_STOPPED reason=completed")
+                        break
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     if daemon_task.done():
+                        daemon_error = _task_exception(daemon_task)
+                        if daemon_error is not None:
+                            await supervisor.event_repository.append(
+                                "runtime_issue",
+                                {
+                                    "category": classify_runtime_issue_category(
+                                        error=repr(daemon_error),
+                                        event_type="market_data_daemon",
+                                    ),
+                                    "symbol": "ALL",
+                                    "error": repr(daemon_error),
+                                    "error_type": type(daemon_error).__name__,
+                                    "stage": "market_data_daemon",
+                                },
+                            )
+                            output(
+                                "RUNTIME_ISSUE ALL "
+                                f"stage=market_data_daemon error_type={type(daemon_error).__name__} "
+                                f"error={daemon_error!r}"
+                            )
+                            raise daemon_error
+                        output("MARKET_DATA_DAEMON_STOPPED reason=completed")
                         break
                     continue
                 await symbol_queues[event.symbol].put(event)
@@ -1307,6 +1352,14 @@ def _entry_blocked_extra_details(plan) -> str:
         else:
             values.append(f"{key}={value}")
     return " " + " ".join(values) if values else ""
+
+
+def _task_exception(task: asyncio.Task) -> BaseException | None:
+    if not task.done():
+        return None
+    with suppress(asyncio.CancelledError):
+        return task.exception()
+    return None
 
 
 def _frame_with_live_price(symbol: str, bars, *, timestamp: datetime, price: float) -> pl.DataFrame:

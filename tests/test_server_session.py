@@ -43,6 +43,7 @@ def test_server_session_start_status_stop_round_trip(tmp_path: Path, monkeypatch
     def _fake_popen(command, **kwargs):
         popen_calls.append(command)
         assert kwargs["cwd"] == str(tmp_path.resolve())
+        assert kwargs["env"]["PYTHONUNBUFFERED"] == "1"
         return _FakeProcess()
 
     def _fake_kill(pid: int, sig: int) -> None:
@@ -78,6 +79,7 @@ def test_server_session_start_status_stop_round_trip(tmp_path: Path, monkeypatch
     assert metadata["live"] is True
     assert popen_calls == [[
         "/tmp/python",
+        "-u",
         "-m",
         "bhiksha.tools.trade_session",
         "--active-plan",
@@ -120,6 +122,7 @@ def test_server_session_restart_syncs_stops_and_restarts(tmp_path: Path, monkeyp
 
     def _fake_popen(command, **kwargs):
         started_commands.append(command)
+        assert kwargs["env"]["PYTHONUNBUFFERED"] == "1"
         return _FakeProcess()
 
     def _fake_kill(pid: int, sig: int) -> None:
@@ -158,6 +161,7 @@ def test_server_session_restart_syncs_stops_and_restarts(tmp_path: Path, monkeyp
     assert metadata["pid"] == 22222
     assert started_commands == [[
         "/tmp/python",
+        "-u",
         "-m",
         "bhiksha.tools.trade_session",
         "--active-plan",

@@ -152,12 +152,14 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
     log_path = runtime_log_dir / f"trade_session_{datetime.now(UTC).date().isoformat()}.log"
     repo_root = Path(args.repo_root).resolve()
     active_plan = Path(args.active_plan).resolve()
-    command = [args.python_executable, "-m", "bhiksha.tools.trade_session", "--active-plan", str(active_plan)]
+    command = [args.python_executable, "-u", "-m", "bhiksha.tools.trade_session", "--active-plan", str(active_plan)]
     if args.live:
         command.append("--live")
     if args.max_bars is not None:
         command.extend(["--max-bars", str(args.max_bars)])
 
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     with log_path.open("a", encoding="utf-8") as handle:
         process = subprocess.Popen(  # noqa: S603
             command,
@@ -165,7 +167,7 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
             stdout=handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            env=os.environ.copy(),
+            env=env,
         )
 
     metadata = {
