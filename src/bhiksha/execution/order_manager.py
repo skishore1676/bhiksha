@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import uuid
 import math
+import re
+import uuid
 from typing import Any
+
+import httpx
+from loguru import logger
 
 from bhiksha.domain.enums import ExitMode
 from bhiksha.execution.brokers.public.adapter import PublicBrokerAdapter
+
+DEFAULT_OPTION_TICK_INCREMENT = 0.05
 
 
 def round_price(value: float) -> float:
@@ -82,6 +88,7 @@ class OrderManager:
     def __init__(self, broker: PublicBrokerAdapter | None = None) -> None:
         self.broker = broker or PublicBrokerAdapter()
         self._price_increments: dict[str, float] = {}
+        self._underlying_price_increments: dict[str, float] = {}
 
     async def close(self) -> None:
         await self.broker.close()
@@ -113,7 +120,7 @@ class OrderManager:
         response = await self.broker.preflight_single_leg(payload)
         increment = _maybe_float((response.get("priceIncrement") or {}).get("currentIncrement"))
         if increment:
-            self._price_increments[normalize_option_symbol(option_symbol)] = increment
+            self._cache_price_increment(option_symbol, increment)
             payload["limitPrice"] = f"{snap_price(limit_price, increment, side='BUY'):.2f}"
         return PreflightCheck(
             payload=payload,
@@ -132,7 +139,7 @@ class OrderManager:
     ) -> OrderResult:
         payload = self._entry_payload(option_symbol, limit_price, quantity, order_id=order_id)
         payload = await self._apply_increment_correction(payload, side="BUY", price_key="limitPrice")
-        return await self._submit(payload)
+        return await self._submit_with_increment_retry(payload, side="BUY", price_key="limitPrice")
 
     async def place_stop_loss_order(
         self,
@@ -153,7 +160,7 @@ class OrderManager:
             "stopPrice": f"{round_price(stop_price):.2f}",
         }
         payload = await self._apply_increment_correction(payload, side="SELL", price_key="stopPrice")
-        return await self._submit(payload)
+        return await self._submit_with_increment_retry(payload, side="SELL", price_key="stopPrice")
 
     async def place_target_order(
         self,
@@ -174,7 +181,7 @@ class OrderManager:
             "limitPrice": f"{round_price(limit_price):.2f}",
         }
         payload = await self._apply_increment_correction(payload, side="SELL", price_key="limitPrice")
-        return await self._submit(payload)
+        return await self._submit_with_increment_retry(payload, side="SELL", price_key="limitPrice")
 
     async def place_square_off_order(
         self,
@@ -211,7 +218,7 @@ class OrderManager:
                 "limitPrice": f"{round_price(limit_price):.2f}",
             }
             payload = await self._apply_increment_correction(payload, side="SELL", price_key="limitPrice")
-            return await self._submit(payload)
+            return await self._submit_with_increment_retry(payload, side="SELL", price_key="limitPrice")
         return await self._submit(
             {
                 "orderId": order_id or str(uuid.uuid4()),
@@ -260,13 +267,44 @@ class OrderManager:
             await __import__("asyncio").sleep(poll_seconds)
         return False, last_payload, "fill_timeout"
 
-    async def _submit(self, payload: dict[str, str]) -> OrderResult:
+    async def _submit(self, payload: dict[str, Any]) -> OrderResult:
         try:
             response = await self.broker.place_order(payload)
             order_id = response.get("orderId") or response.get("id")
             return OrderResult(order_id=str(order_id) if order_id else None, error=None if order_id else "missing_order_id")
         except Exception as exc:
-            return OrderResult(order_id=None, error=str(exc))
+            return OrderResult(order_id=None, error=_exception_message(exc))
+
+    async def _submit_with_increment_retry(
+        self,
+        payload: dict[str, Any],
+        *,
+        side: str,
+        price_key: str,
+    ) -> OrderResult:
+        result = await self._submit(payload)
+        if result.order_id or not result.error:
+            return result
+        increment = _extract_price_increment(result.error)
+        if increment is None:
+            return result
+        symbol = normalize_option_symbol(str((payload.get("instrument") or {}).get("symbol", "")))
+        if not symbol:
+            return result
+        self._cache_price_increment(symbol, increment)
+        original_price = float(payload[price_key])
+        corrected_price = snap_price(original_price, increment, side=side)
+        payload[price_key] = f"{corrected_price:.2f}"
+        logger.warning(
+            "ORDER_RETRY_INCREMENT symbol={} side={} price_key={} increment={} original_price={} corrected_price={}",
+            symbol,
+            side,
+            price_key,
+            increment,
+            f"{original_price:.2f}",
+            payload[price_key],
+        )
+        return await self._submit(payload)
 
     async def _apply_increment_correction(
         self,
@@ -278,7 +316,7 @@ class OrderManager:
         if price_key not in payload:
             return payload
         symbol = normalize_option_symbol(str((payload.get("instrument") or {}).get("symbol", "")))
-        increment = self._price_increments.get(symbol)
+        increment = self._lookup_price_increment(symbol)
         if increment is None:
             try:
                 response = await self.broker.preflight_single_leg(payload)
@@ -286,10 +324,40 @@ class OrderManager:
                 response = {}
             increment = _maybe_float((response.get("priceIncrement") or {}).get("currentIncrement"))
             if increment:
-                self._price_increments[symbol] = increment
+                self._cache_price_increment(symbol, increment)
         if increment:
-            payload[price_key] = f"{snap_price(float(payload[price_key]), increment, side=side):.2f}"
+            original_price = float(payload[price_key])
+            corrected_price = snap_price(original_price, increment, side=side)
+            payload[price_key] = f"{corrected_price:.2f}"
+            if corrected_price != round_price(original_price):
+                logger.info(
+                    "ORDER_PRICE_SNAPPED symbol={} side={} price_key={} increment={} original_price={} corrected_price={}",
+                    symbol,
+                    side,
+                    price_key,
+                    increment,
+                    f"{original_price:.2f}",
+                    payload[price_key],
+                )
         return payload
+
+    def _lookup_price_increment(self, option_symbol: str) -> float | None:
+        symbol = normalize_option_symbol(option_symbol)
+        increment = self._price_increments.get(symbol)
+        if increment is not None:
+            return increment
+        underlying = underlying_symbol_from_option(symbol)
+        if underlying is None:
+            return None
+        return self._underlying_price_increments.get(underlying)
+
+    def _cache_price_increment(self, option_symbol: str, increment: float) -> None:
+        symbol = normalize_option_symbol(option_symbol)
+        self._price_increments[symbol] = increment
+        underlying = underlying_symbol_from_option(symbol)
+        if underlying is not None:
+            self._underlying_price_increments[underlying] = increment
+        logger.info("PRICE_INCREMENT_LEARNED symbol={} underlying={} increment={}", symbol, underlying, increment)
 
     @staticmethod
     def _entry_payload(
@@ -327,3 +395,43 @@ def _maybe_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+_PRICE_INCREMENT_RE = re.compile(r"(?:increment|increments)[^\$]*\$(?P<increment>\d+(?:\.\d+)?)", re.IGNORECASE)
+_OCC_UNDERLYING_RE = re.compile(r"^(?P<underlying>[A-Z]+)\d{6}[CP]\d{8}$")
+
+
+def _extract_price_increment(message: str | None) -> float | None:
+    if not message:
+        return None
+    match = _PRICE_INCREMENT_RE.search(message)
+    if match is not None:
+        parsed = _maybe_float(match.group("increment"))
+        if parsed:
+            return parsed
+    lowered = message.lower()
+    if "$" in lowered and "increment" in lowered:
+        return DEFAULT_OPTION_TICK_INCREMENT
+    return None
+
+
+def _exception_message(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            payload = exc.response.json()
+        except Exception:
+            return str(exc)
+        if isinstance(payload, dict):
+            for key in ("message", "error", "detail"):
+                value = payload.get(key)
+                if value:
+                    return str(value)
+    return str(exc)
+
+
+def underlying_symbol_from_option(option_symbol: str) -> str | None:
+    normalized = normalize_option_symbol(option_symbol)
+    match = _OCC_UNDERLYING_RE.fullmatch(normalized)
+    if match is not None:
+        return match.group("underlying")
+    return None
