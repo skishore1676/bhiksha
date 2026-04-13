@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -767,6 +768,28 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
         catastrophe_exit_params.get("stop_to_breakeven_after_r_multiple")
     )
     strategy_key = str(entry.strategy_key or "").strip()
+    execution_payload: dict[str, Any] = {
+        "profile": str(vehicle_mapping.get("profile") or "single_leg_long_premium_v1"),
+        "shadow_only": True,
+        "option_mapping": vehicle_mapping.get("option_mapping") or _option_mapping_from_structure(vehicle_mapping.get("structure")),
+        "min_open_interest": _coerce_int(vehicle_mapping.get("min_open_interest")) or 100,
+        "max_bid_ask_spread_pct": _coerce_float(vehicle_mapping.get("max_bid_ask_spread_pct")) or 0.20,
+    }
+    dte_range = _compact_numeric_range_text(vehicle_mapping.get("dte") or vehicle_mapping.get("dte_target"))
+    if dte_range is not None:
+        execution_payload["dte"] = dte_range
+    else:
+        execution_payload["dte_min"] = _coerce_int(vehicle_mapping.get("dte_min")) or 0
+        execution_payload["dte_max"] = _coerce_int(vehicle_mapping.get("dte_max")) or 7
+    delta_range = _compact_numeric_range_text(vehicle_mapping.get("delta_target") or vehicle_mapping.get("delta_plan"))
+    if delta_range is not None:
+        execution_payload["delta_target"] = delta_range
+    else:
+        execution_payload["target_abs_delta_min"] = _coerce_float(vehicle_mapping.get("target_abs_delta_min"))
+        execution_payload["target_abs_delta_max"] = _coerce_float(vehicle_mapping.get("target_abs_delta_max"))
+    entry_window = vehicle_mapping.get("entry_window_et")
+    if entry_window is not None:
+        execution_payload["entry_window_et"] = entry_window
 
     return {
         "strategy_id": entry.catalog_key,
@@ -777,17 +800,7 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
             "version": 1,
             "params": entry_params,
         },
-        "execution": {
-            "profile": str(vehicle_mapping.get("profile") or "single_leg_long_premium_v1"),
-            "shadow_only": True,
-            "option_mapping": vehicle_mapping.get("option_mapping") or {"long_signal": "CALL", "short_signal": "PUT"},
-            "dte_min": _coerce_int(vehicle_mapping.get("dte_min")) or 0,
-            "dte_max": _coerce_int(vehicle_mapping.get("dte_max")) or 7,
-            "target_abs_delta_min": _coerce_float(vehicle_mapping.get("target_abs_delta_min")),
-            "target_abs_delta_max": _coerce_float(vehicle_mapping.get("target_abs_delta_max")),
-            "min_open_interest": _coerce_int(vehicle_mapping.get("min_open_interest")) or 100,
-            "max_bid_ask_spread_pct": _coerce_float(vehicle_mapping.get("max_bid_ask_spread_pct")) or 0.20,
-        },
+        "execution": execution_payload,
         "risk": {
             "profile": f"{strategy_key}_risk_v1" if strategy_key else "catalog_promoted_v1",
             "max_trade_premium_usd": 300.0,
@@ -824,6 +837,31 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
             if tag
         ],
     }
+
+
+def _option_mapping_from_structure(value: Any) -> dict[str, str]:
+    structure = str(value or "").strip().lower()
+    if structure in {"long_put", "put"}:
+        return {"long_signal": "CALL", "short_signal": "PUT"}
+    if structure in {"long_call", "call"}:
+        return {"long_signal": "CALL", "short_signal": "PUT"}
+    return {"long_signal": "CALL", "short_signal": "PUT"}
+
+
+_COMPACT_NUMERIC_RANGE_RE = re.compile(r"(?P<start>\d+(?:\.\d+)?)(?:\s*-\s*(?P<end>\d+(?:\.\d+)?))?")
+
+
+def _compact_numeric_range_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    match = _COMPACT_NUMERIC_RANGE_RE.search(str(value))
+    if match is None:
+        return None
+    start = match.group("start")
+    end = match.group("end")
+    return f"{start}-{end}" if end is not None else start
 
 
 def _apply_execution_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:

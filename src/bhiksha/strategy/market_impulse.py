@@ -22,14 +22,19 @@ class MarketImpulseStrategy:
     def required_features(self, params: dict[str, Any]) -> set[str]:
         vma_length = int(params.get("vma_length", 10))
         regime_timeframe = str(params.get("regime_timeframe", "1h"))
+        vwma_periods = _coerce_vwma_periods(params.get("vwma_periods"))
+        if vwma_periods is not None:
+            vwma_spec = "_".join(str(period) for period in vwma_periods)
+            impulse_request = f"market_impulse:{regime_timeframe}:vma_{vma_length}:vwma_{vwma_spec}"
+        else:
+            impulse_request = f"market_impulse:{regime_timeframe}:vma_{vma_length}"
         return {
             "timestamp",
             "symbol",
             "close",
             "high",
             "low",
-            f"vma_{vma_length}",
-            f"impulse_regime_{regime_timeframe}",
+            impulse_request,
         }
 
     def evaluate_entry(self, frame: pl.DataFrame, deployment_id: str, params: dict[str, Any]) -> SignalDecision:
@@ -167,3 +172,21 @@ class MarketImpulseStrategy:
                 "position_option_symbol": position.option_symbol,
             },
         )
+
+
+def _coerce_vwma_periods(value: Any) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw_parts = value.replace(",", "_").replace("-", "_").split("_")
+    elif isinstance(value, (list, tuple)):
+        raw_parts = list(value)
+    else:
+        return None
+    try:
+        periods = tuple(int(part) for part in raw_parts if str(part).strip())
+    except (TypeError, ValueError):
+        return None
+    if len(periods) < 3:
+        return None
+    return periods

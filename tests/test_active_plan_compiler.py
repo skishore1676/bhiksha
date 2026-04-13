@@ -529,6 +529,94 @@ def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(
     assert compiled.plan.deployments[0].strategy.key == "market_impulse"
 
 
+def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="strategy catalog",
+        rows=[
+            {
+                "catalog_key": "market-impulse-all-basket-discovery__amd_short",
+                "playbook_id": "market-impulse-all-basket-discovery",
+                "symbol": "AMD",
+                "strategy_key": "market_impulse",
+                "strategy_family": "market_impulse",
+                "direction": "short",
+                "lifecycle_status": "candidate",
+                "bionic_ready": "TRUE",
+                "operator_status_override": "shadow",
+                "playbook_summary_json": json.dumps(
+                    {
+                        "entry_params": {
+                            "entry_buffer_minutes": 5,
+                            "entry_window_minutes": 90,
+                            "regime_timeframe": "1h",
+                            "vwma_periods": [5, 13, 21],
+                        },
+                        "vehicle_mapping": {
+                            "structure": "long_put",
+                            "dte": "7-21",
+                            "delta_plan": "long 0.35-0.55 / short 0.10-0.25",
+                            "entry_window_et": "09:45-14:30",
+                            "risk_rule": "hard stop at -35% premium",
+                        },
+                        "catastrophe_exit_params": {
+                            "hard_flat_time_et": "15:55",
+                            "stop_loss_pct": 0.35,
+                        },
+                        "thesis_exit_params": {
+                            "stop_loss_underlying_pct": 0.0075,
+                            "take_profit_underlying_r_multiple": 2.0,
+                        },
+                    }
+                ),
+                "thesis_exit_policy": "fixed_rr_underlying",
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "mode": "shadow",
+                "strategy": "market-impulse-all-basket-discovery__amd_short",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="strategy catalog",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    deployment = compiled.plan.deployments[0]
+    assert deployment.strategy.params["vwma_periods"] == [5, 13, 21]
+    assert deployment.execution.dte_min == 7
+    assert deployment.execution.dte_max == 21
+    assert deployment.execution.target_abs_delta_min == 0.35
+    assert deployment.execution.target_abs_delta_max == 0.55
+    assert deployment.execution.entry_window_start_et == "09:45"
+    assert deployment.execution.entry_window_end_et == "14:30"
+    assert deployment.risk.stop_loss_pct == 0.35
+    assert deployment.exit.thesis_exit_policy == "fixed_rr_underlying"
+    assert deployment.exit.thesis_exit_params == {
+        "stop_loss_underlying_pct": 0.0075,
+        "take_profit_underlying_r_multiple": 2.0,
+    }
+
+
 def test_sync_google_strategy_catalog_writes_active_or_candidate_bionic_ready_supported_rows(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()

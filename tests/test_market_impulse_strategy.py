@@ -3,6 +3,7 @@ from datetime import datetime
 import polars as pl
 
 from bhiksha.config.loader import load_deployments
+from bhiksha.market_data.newton.engine import PhysicsEngine
 from bhiksha.strategy.market_impulse import MarketImpulseStrategy
 from bhiksha.state.position_tracker import TrackedPosition
 
@@ -30,6 +31,30 @@ def test_market_impulse_short_signal_on_latest_bar() -> None:
 
     assert decision.signal is True
     assert decision.direction.value == "short"
+
+
+def test_market_impulse_required_features_include_custom_vwma_periods() -> None:
+    strategy = MarketImpulseStrategy()
+
+    features = strategy.required_features(
+        {
+            "regime_timeframe": "1h",
+            "vma_length": 10,
+            "vwma_periods": [5, 13, 21],
+        }
+    )
+
+    assert "market_impulse:1h:vma_10:vwma_5_13_21" in features
+
+
+def test_newton_engine_uses_custom_market_impulse_vwma_periods() -> None:
+    engine = PhysicsEngine()
+
+    transforms = engine.transforms_for_features({"market_impulse:1h:vma_10:vwma_5_13_21"})
+
+    assert len(transforms) == 1
+    assert transforms[0].vwma_periods == (5, 13, 21)
+    assert transforms[0].timeframe == "1h"
 
 
 def test_market_impulse_short_exit_on_vma_reclaim() -> None:

@@ -71,6 +71,7 @@ class PhysicsEngine:
 
     def _market_impulse_transforms_for_features(self, required_features: set[str]) -> list[FeatureTransform]:
         requests: dict[str, set[int]] = {}
+        explicit_requests: set[tuple[str, int, tuple[int, ...]]] = set()
         base_requested = False
         base_lengths: set[int] = set()
 
@@ -82,7 +83,18 @@ class PhysicsEngine:
         for feature in required_features:
             spec_match = _MARKET_IMPULSE_SPEC_RE.fullmatch(feature)
             if spec_match:
-                add_request(spec_match.group("timeframe") or "5m")
+                vma_length = spec_match.group("vma_length")
+                vwma_periods = spec_match.group("vwma_periods")
+                if vma_length is not None or vwma_periods is not None:
+                    explicit_requests.add(
+                        (
+                            spec_match.group("timeframe") or "5m",
+                            int(vma_length or self.vma_length),
+                            _parse_vwma_periods(vwma_periods) or self.vwma_periods,
+                        )
+                    )
+                else:
+                    add_request(spec_match.group("timeframe") or "5m")
                 continue
 
             impulse_match = _MARKET_IMPULSE_COLUMN_RE.fullmatch(feature)
@@ -138,6 +150,14 @@ class PhysicsEngine:
                     timeframe=timeframe,
                 )
             )
+        for timeframe, vma_length, vwma_periods in sorted(explicit_requests):
+            transforms.append(
+                MarketImpulseTransform(
+                    vma_length=vma_length,
+                    vwma_periods=vwma_periods,
+                    timeframe=timeframe,
+                )
+            )
         return transforms
 
     def _build_registry(self) -> dict[str, FeatureTransform]:
@@ -185,8 +205,8 @@ class PhysicsEngine:
             spec_match = _MARKET_IMPULSE_SPEC_RE.fullmatch(item)
             if spec_match:
                 return MarketImpulseTransform(
-                    vma_length=self.vma_length,
-                    vwma_periods=self.vwma_periods,
+                    vma_length=int(spec_match.group("vma_length") or self.vma_length),
+                    vwma_periods=_parse_vwma_periods(spec_match.group("vwma_periods")) or self.vwma_periods,
                     timeframe=spec_match.group("timeframe") or "5m",
                 )
             try:
@@ -207,7 +227,24 @@ class PhysicsEngine:
         return result
 
 
-_MARKET_IMPULSE_SPEC_RE = re.compile(r"^market_impulse(?::(?P<timeframe>[^:]+))?$")
+def _parse_vwma_periods(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    try:
+        periods = tuple(int(part) for part in value.split("_") if part)
+    except ValueError:
+        return None
+    if len(periods) < 3:
+        return None
+    return periods
+
+
+_MARKET_IMPULSE_SPEC_RE = re.compile(
+    r"^market_impulse"
+    r"(?::(?P<timeframe>[0-9]+[A-Za-z]+))?"
+    r"(?::vma_(?P<vma_length>\d+))?"
+    r"(?::vwma_(?P<vwma_periods>\d+(?:_\d+)*))?"
+    r"$"
+)
 _MARKET_IMPULSE_COLUMN_RE = re.compile(r"^impulse_(?:regime|stage)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$")
 _MARKET_IMPULSE_VMA_RE = re.compile(r"^vma_(?P<vma_length>\d+)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$")
-
