@@ -173,6 +173,7 @@ class ExecutionPlanner:
             )
 
         max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
+        min_contract_cost = entry_price * 100
         quantity = int(max_trade_premium // (entry_price * 100))
         if quantity <= 0:
             return TradePlan(
@@ -188,6 +189,12 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
+                risk_details={
+                    "reason": "insufficient_budget",
+                    "max_premium": max_trade_premium,
+                    "entry_price": entry_price,
+                    "min_contract_cost": min_contract_cost,
+                },
             )
         risk_profile = ConservativeRiskProfile(
             profile=deployment.risk.profile,

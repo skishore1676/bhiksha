@@ -1107,11 +1107,13 @@ class BhikshaRuntime:
                     f"reasons={','.join(plan.risk_reasons)}"
                 )
             else:
+                extra_details = _entry_blocked_extra_details(plan)
                 output(
                     "ENTRY_BLOCKED "
                     f"deployment={deployment.deployment_id} "
                     f"symbol={deployment.symbol} "
                     f"reasons={','.join(plan.risk_reasons)}"
+                    f"{extra_details}"
                 )
             if simulate_only:
                 output(f"{deployment.deployment_id}: shadow_plan={plan}")
@@ -1289,6 +1291,22 @@ def _frame_from_bars(symbol: str, bars) -> pl.DataFrame:
             "volume": [bar.volume for bar in bars],
         }
     )
+
+
+def _entry_blocked_extra_details(plan) -> str:
+    details = getattr(plan, "risk_details", None) or {}
+    if details.get("reason") != "insufficient_budget":
+        return ""
+    values: list[str] = []
+    for key in ("max_premium", "entry_price", "min_contract_cost"):
+        value = details.get(key)
+        if value is None:
+            continue
+        if isinstance(value, float):
+            values.append(f"{key}={value:.2f}")
+        else:
+            values.append(f"{key}={value}")
+    return " " + " ".join(values) if values else ""
 
 
 def _frame_with_live_price(symbol: str, bars, *, timestamp: datetime, price: float) -> pl.DataFrame:

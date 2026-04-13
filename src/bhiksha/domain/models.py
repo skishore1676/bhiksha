@@ -133,6 +133,7 @@ class TradePlan:
     target_order_id: str | None = None
     underlying_entry_price: float | None = None
     entry_timestamp: datetime | None = None
+    risk_details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)

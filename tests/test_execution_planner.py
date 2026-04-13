@@ -95,6 +95,18 @@ class MissingPriceOrderManager(StubOrderManager):
         )
 
 
+class ExpensiveQuoteOrderManager(StubOrderManager):
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=8.90,
+            ask=9.10,
+            last=9.00,
+            open_interest=550,
+            outcome="SUCCESS",
+        )
+
+
 def test_execution_planner_creates_dry_run_trade_plan():
     deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
     chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
@@ -242,3 +254,33 @@ def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None
     assert plan.quantity == 0
     assert plan.option_symbol == "QQQ260330P00558000"
     assert plan.risk_reasons == ["public_quote_missing_price"]
+
+
+def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> None:
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=ExpensiveQuoteOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=True))
+
+    assert plan is not None
+    assert plan.quantity == 0
+    assert plan.risk_reasons == ["insufficient_budget_for_single_contract"]
+    assert plan.risk_details == {
+        "reason": "insufficient_budget",
+        "max_premium": 300.0,
+        "entry_price": 9.1,
+        "min_contract_cost": 910.0,
+    }
