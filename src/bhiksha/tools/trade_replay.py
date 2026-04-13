@@ -26,9 +26,10 @@ async def _run(
     deployment_ids: list[str],
     trading_days: int,
     provider: str | None,
+    active_plan: str | None,
     csv_path: str | None,
 ) -> None:
-    runtime = build_runtime()
+    runtime = build_runtime(active_plan_path=active_plan)
     evaluator = ReplaySignalEvaluator(FeatureService(), runtime.strategy_registry)
     deployments = _select_deployments(runtime, deployment_ids)
     window_start = trading_window_start(datetime.now(UTC), trading_days)
@@ -244,6 +245,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--trading-days", type=int, default=3, help="How many recent NYSE trading days to inspect")
     parser.add_argument("--provider", default=None, help="Override warm-start provider")
+    parser.add_argument(
+        "--active-plan",
+        default=None,
+        help="Path to an active plan JSON. When supplied, replay ignores config/deployments.",
+    )
     parser.add_argument("--csv", default=None, help="Write replayed trades to a CSV file")
     args = parser.parse_args(argv)
 
@@ -252,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_ids=args.deployment_ids,
             trading_days=args.trading_days,
             provider=args.provider,
+            active_plan=args.active_plan,
             csv_path=args.csv,
         )
     )
