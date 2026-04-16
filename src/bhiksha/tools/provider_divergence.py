@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import csv
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,10 @@ from bhiksha.market_data.trading_calendar import trading_window_start
 CT = ZoneInfo("America/Chicago")
 
 OHLCV = ("open", "high", "low", "close", "volume")
+PRICE_COLUMNS = ("open", "high", "low", "close")
+SESSION_CHOICES = ("all", "regular", "extended")
+REGULAR_OPEN_ET = time(9, 30)
+REGULAR_CLOSE_ET = time(16, 0)
 
 
 async def _fetch_bars(symbol: str, start: datetime, end: datetime):
@@ -62,6 +66,42 @@ def _align(schwab_df: pl.DataFrame, polygon_df: pl.DataFrame) -> tuple[pl.DataFr
     return s_aligned, p_aligned, len(schwab_ts - common_set), len(polygon_ts - common_set)
 
 
+def _is_regular_session(timestamp: datetime) -> bool:
+    timestamp_et = ensure_utc(timestamp).astimezone(ZoneInfo("America/New_York")).time().replace(tzinfo=None)
+    return REGULAR_OPEN_ET <= timestamp_et <= REGULAR_CLOSE_ET
+
+
+def _session_label(timestamp: datetime) -> str:
+    return "regular" if _is_regular_session(timestamp) else "extended"
+
+
+def _session_allowed(timestamp: datetime, session: str) -> bool:
+    if session == "all":
+        return True
+    label = _session_label(timestamp)
+    return label == session
+
+
+def _filter_session(df: pl.DataFrame, session: str) -> pl.DataFrame:
+    if session == "all" or df.is_empty():
+        return df
+    allowed = [_session_allowed(ensure_utc(ts), session) for ts in df["timestamp"].to_list()]
+    return df.filter(pl.Series(allowed))
+
+
+def _session_counts(df: pl.DataFrame, window_start: datetime) -> dict[str, int]:
+    counts = {"all": 0, "regular": 0, "extended": 0}
+    if df.is_empty():
+        return counts
+    for raw_ts in df["timestamp"].to_list():
+        ts = ensure_utc(raw_ts)
+        if ts < window_start:
+            continue
+        counts["all"] += 1
+        counts[_session_label(ts)] += 1
+    return counts
+
+
 def _pct(a: float, b: float) -> float:
     if a == 0 and b == 0:
         return 0.0
@@ -75,6 +115,7 @@ def _diff_row(ts: datetime, s_row: dict, p_row: dict, feature_cols: list[str]) -
         "timestamp": ts.isoformat(),
         "date_ct": ts_ct.strftime("%Y-%m-%d"),
         "time_ct": ts_ct.strftime("%I:%M %p"),
+        "session": _session_label(ts),
     }
     for col in OHLCV:
         sv, pv = s_row[col], p_row[col]
@@ -128,8 +169,10 @@ def _build_diff_rows(
 
 
 def _summarize(rows: list[dict], feature_cols: list[str], pct_tol: float):
-    ohlcv_divergent = 0
+    price_divergent = 0
+    volume_divergent = 0
     feature_divergent = 0
+    max_price_pct = 0.0
     max_close_pct = 0.0
     max_volume_pct = 0.0
     worst_feature = ("", 0.0)
@@ -137,10 +180,13 @@ def _summarize(rows: list[dict], feature_cols: list[str], pct_tol: float):
     for row in rows:
         close_pct = row.get("close_pct") or 0.0
         vol_pct = row.get("volume_pct") or 0.0
+        max_price_pct = max(max_price_pct, *(row.get(f"{c}_pct") or 0.0 for c in PRICE_COLUMNS))
         max_close_pct = max(max_close_pct, close_pct)
         max_volume_pct = max(max_volume_pct, vol_pct)
-        if any((row.get(f"{c}_pct") or 0.0) > pct_tol for c in OHLCV):
-            ohlcv_divergent += 1
+        if any((row.get(f"{c}_pct") or 0.0) > pct_tol for c in PRICE_COLUMNS):
+            price_divergent += 1
+        if vol_pct > pct_tol:
+            volume_divergent += 1
 
         feat_diverged = False
         for col in feature_cols:
@@ -156,8 +202,10 @@ def _summarize(rows: list[dict], feature_cols: list[str], pct_tol: float):
             feature_divergent += 1
 
     return {
-        "ohlcv_divergent": ohlcv_divergent,
+        "price_divergent": price_divergent,
+        "volume_divergent": volume_divergent,
         "feature_divergent": feature_divergent,
+        "max_price_pct": round(max_price_pct, 6),
         "max_close_pct": round(max_close_pct, 6),
         "max_volume_pct": round(max_volume_pct, 6),
         "worst_feature_name": worst_feature[0],
@@ -185,12 +233,14 @@ async def _run(
     pct_tolerance: float,
     csv_path: str | None,
     active_plan: str | None,
+    session: str,
+    max_signal_details: int,
 ) -> None:
     now = datetime.now(UTC)
     window_start = trading_window_start(now, trading_days)
     warmup_start = trading_window_start(now, trading_days + 5)
 
-    print(f"SYMBOL={symbol} WINDOW_START={window_start.date()} TRADING_DAYS={trading_days}")
+    print(f"SYMBOL={symbol} WINDOW_START={window_start.date()} TRADING_DAYS={trading_days} SESSION={session}")
     print("Fetching bars from both providers...")
     schwab_bars, polygon_bars = await _fetch_bars(symbol, warmup_start, now)
     print(f"SCHWAB_BARS={len(schwab_bars)} POLYGON_BARS={len(polygon_bars)}")
@@ -203,23 +253,37 @@ async def _run(
     p_df = _frame_from_bars(polygon_bars)
     s_aligned, p_aligned, s_only, p_only = _align(s_df, p_df)
     print(f"ALIGNED={s_aligned.height} SCHWAB_ONLY={s_only} POLYGON_ONLY={p_only}")
+    full_counts = _session_counts(s_aligned, window_start)
+    print(
+        "ALIGNED_WINDOW_SESSION_COUNTS "
+        f"all={full_counts['all']} regular={full_counts['regular']} extended={full_counts['extended']}"
+    )
 
     if s_aligned.height == 0:
         print("ERROR: no overlapping bars between providers")
         return
 
+    s_scoped = _filter_session(s_aligned, session)
+    p_scoped = _filter_session(p_aligned, session)
+    if s_scoped.is_empty() or p_scoped.is_empty():
+        print(f"ERROR: no overlapping bars remain after session filter: {session}")
+        return
+
+    print(f"SCOPED_ALIGNED={s_scoped.height} session={session}")
     print("Enriching Schwab bars...")
-    s_enriched = _enrich(s_aligned)
+    s_enriched = _enrich(s_scoped)
     print("Enriching Polygon bars...")
-    p_enriched = _enrich(p_aligned)
+    p_enriched = _enrich(p_scoped)
 
     feature_cols = _feature_columns(s_enriched)
     diff_rows = _build_diff_rows(s_enriched, p_enriched, feature_cols, window_start)
 
     summary = _summarize(diff_rows, feature_cols, pct_tolerance)
     print(f"BARS_IN_WINDOW={len(diff_rows)}")
-    print(f"OHLCV_DIVERGENT={summary['ohlcv_divergent']} (pct_tolerance={pct_tolerance})")
+    print(f"PRICE_DIVERGENT={summary['price_divergent']} (pct_tolerance={pct_tolerance})")
+    print(f"VOLUME_DIVERGENT={summary['volume_divergent']} (pct_tolerance={pct_tolerance})")
     print(f"FEATURE_DIVERGENT={summary['feature_divergent']}")
+    print(f"MAX_PRICE_PCT_DIFF={summary['max_price_pct']}")
     print(f"MAX_CLOSE_PCT_DIFF={summary['max_close_pct']}")
     print(f"MAX_VOLUME_PCT_DIFF={summary['max_volume_pct']}")
     if summary["worst_feature_name"]:
@@ -227,7 +291,12 @@ async def _run(
 
     if active_plan:
         await _compare_signals(
-            active_plan, symbol, s_enriched, p_enriched, window_start,
+            active_plan,
+            symbol,
+            s_enriched,
+            p_enriched,
+            window_start,
+            max_signal_details=max_signal_details,
         )
 
     if csv_path:
@@ -241,6 +310,7 @@ async def _compare_signals(
     s_enriched: pl.DataFrame,
     p_enriched: pl.DataFrame,
     window_start: datetime,
+    max_signal_details: int = 20,
 ) -> None:
     from bhiksha.app.bootstrap import build_runtime
     from bhiksha.app.replay import ReplaySignalEvaluator
@@ -287,12 +357,67 @@ async def _compare_signals(
             f"schwab_signals={len(s_signals)} polygon_signals={len(p_signals)} "
             f"both={len(both)} schwab_only={len(schwab_only)} polygon_only={len(polygon_only)}"
         )
-        for idx in sorted(schwab_only):
-            ts = ensure_utc(s_dep["timestamp"][idx]).astimezone(CT)
-            print(f"  SCHWAB_ONLY bar={idx} time_ct={ts.strftime('%I:%M %p')}")
-        for idx in sorted(polygon_only):
-            ts = ensure_utc(p_dep["timestamp"][idx]).astimezone(CT)
-            print(f"  POLYGON_ONLY bar={idx} time_ct={ts.strftime('%I:%M %p')}")
+        s_by_idx = dict(s_decisions)
+        p_by_idx = dict(p_decisions)
+        for idx in sorted(schwab_only)[:max_signal_details]:
+            ts_utc = ensure_utc(s_dep["timestamp"][idx])
+            ts = ts_utc.astimezone(CT)
+            schwab_decision = s_by_idx[idx]
+            polygon_decision = p_by_idx.get(idx)
+            print(
+                f"  SCHWAB_ONLY bar={idx} time_ct={ts.strftime('%I:%M %p')} "
+                f"session={_session_label(ts_utc)} reasons={schwab_decision.reason} "
+                f"features={_compact_features(schwab_decision.features)}"
+            )
+            if polygon_decision is not None:
+                print(
+                    f"    POLYGON_SAME_BAR signal={polygon_decision.signal} "
+                    f"reasons={polygon_decision.reason} features={_compact_features(polygon_decision.features)}"
+                )
+        if len(schwab_only) > max_signal_details:
+            print(f"  SCHWAB_ONLY_DETAIL_TRUNCATED remaining={len(schwab_only) - max_signal_details}")
+        for idx in sorted(polygon_only)[:max_signal_details]:
+            ts_utc = ensure_utc(p_dep["timestamp"][idx])
+            ts = ts_utc.astimezone(CT)
+            polygon_decision = p_by_idx[idx]
+            schwab_decision = s_by_idx.get(idx)
+            print(
+                f"  POLYGON_ONLY bar={idx} time_ct={ts.strftime('%I:%M %p')} "
+                f"session={_session_label(ts_utc)} reasons={polygon_decision.reason} "
+                f"features={_compact_features(polygon_decision.features)}"
+            )
+            if schwab_decision is not None:
+                print(
+                    f"    SCHWAB_SAME_BAR signal={schwab_decision.signal} "
+                    f"reasons={schwab_decision.reason} features={_compact_features(schwab_decision.features)}"
+                )
+        if len(polygon_only) > max_signal_details:
+            print(f"  POLYGON_ONLY_DETAIL_TRUNCATED remaining={len(polygon_only) - max_signal_details}")
+
+
+def _compact_features(features: dict) -> dict:
+    keys = [
+        "close",
+        "volume",
+        "volume_ma_20",
+        "vpoc_4h",
+        "vpoc_dist_pct",
+        "directional_mass",
+        "z_score",
+        "velocity",
+        "velocity_1m",
+        "accel_1m",
+        "jerk",
+        "jerk_smooth_1m",
+        "prev_jerk_smooth_1m",
+    ]
+    compact = {}
+    for key in keys:
+        if key not in features:
+            continue
+        value = features[key]
+        compact[key] = round(value, 6) if isinstance(value, float) else value
+    return compact
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -303,8 +428,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", required=True, help="Ticker symbol to compare")
     parser.add_argument("--trading-days", type=int, default=3, help="NYSE trading days to look back")
     parser.add_argument("--pct-tolerance", type=float, default=0.001, help="Pct diff threshold for divergence (0.001 = 0.1%%)")
+    parser.add_argument(
+        "--session",
+        choices=SESSION_CHOICES,
+        default="all",
+        help="Which aligned bars to enrich and compare. Use regular to isolate market-hours parity.",
+    )
     parser.add_argument("--active-plan", default=None, help="Path to active plan JSON for signal comparison")
     parser.add_argument("--csv", default=None, help="Output CSV path for bar-by-bar diffs")
+    parser.add_argument("--max-signal-details", type=int, default=20, help="Maximum one-sided signal details to print per deployment")
     args = parser.parse_args(argv)
 
     asyncio.run(
@@ -314,6 +446,8 @@ def main(argv: list[str] | None = None) -> int:
             pct_tolerance=args.pct_tolerance,
             csv_path=args.csv,
             active_plan=args.active_plan,
+            session=args.session,
+            max_signal_details=max(args.max_signal_details, 0),
         )
     )
     return 0
