@@ -326,7 +326,7 @@ def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_t
                 "symbol": "SPY",
                 "strategy_key": "market_impulse",
                 "strategy_family": "impulse",
-                "bionic_ready": "TRUE",
+                "bhiksha_ready": "TRUE",
                 "expectancy": "1.42",
                 "confidence": "0.67",
                 "thesis_exit_policy": "market_impulse_reclaim",
@@ -418,7 +418,7 @@ def test_compile_active_plan_from_google_sheets_suppresses_non_ready_catalog_row
                 "catalog_key": "market_impulse_spy_short_v1",
                 "symbol": "SPY",
                 "strategy_key": "market_impulse",
-                "bionic_ready": "FALSE",
+                "bhiksha_ready": "FALSE",
             }
         ],
     )
@@ -447,7 +447,7 @@ def test_compile_active_plan_from_google_sheets_suppresses_non_ready_catalog_row
 
     assert compiled.plan.deployments == []
     assert compiled.plan.summary["suppressed_count"] == 1
-    assert "not bionic_ready" in compiled.plan.suppressed[0]["reason"]
+    assert "not bhiksha_ready" in compiled.plan.suppressed[0]["reason"]
 
 
 def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(tmp_path: Path) -> None:
@@ -467,7 +467,7 @@ def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(
                 "strategy_family": "market_impulse",
                 "direction": "short",
                 "lifecycle_status": "active",
-                "bionic_ready": "TRUE",
+                "bhiksha_ready": "TRUE",
                 "last_validated_date": "2026-04-01",
                 "thesis_exit_policy": "fixed_rr_underlying",
                 "playbook_summary_json": json.dumps(
@@ -545,7 +545,7 @@ def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Pat
                 "strategy_family": "market_impulse",
                 "direction": "short",
                 "lifecycle_status": "candidate",
-                "bionic_ready": "TRUE",
+                "bhiksha_ready": "TRUE",
                 "operator_status_override": "shadow",
                 "playbook_summary_json": json.dumps(
                     {
@@ -617,7 +617,7 @@ def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Pat
     }
 
 
-def test_sync_google_strategy_catalog_writes_active_or_candidate_bionic_ready_supported_rows(tmp_path: Path) -> None:
+def test_sync_google_strategy_catalog_writes_active_or_candidate_bhiksha_ready_supported_rows(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
     (catalog_root / "manual.yaml").write_text(
@@ -645,14 +645,14 @@ def test_sync_google_strategy_catalog_writes_active_or_candidate_bionic_ready_su
                 symbol="SPY",
                 strategy_key="market_impulse",
                 lifecycle_status="active",
-                bionic_ready=True,
+                bhiksha_ready=True,
             ),
             _catalog_sheet_row(
                 catalog_key="candidate_shadow_market_impulse",
                 symbol="AMD",
                 strategy_key="market_impulse",
                 lifecycle_status="candidate",
-                bionic_ready=True,
+                bhiksha_ready=True,
                 operator_status_override="shadow",
             ),
             _catalog_sheet_row(
@@ -660,21 +660,21 @@ def test_sync_google_strategy_catalog_writes_active_or_candidate_bionic_ready_su
                 symbol="SPY",
                 strategy_key="market_impulse",
                 lifecycle_status="active",
-                bionic_ready=False,
+                bhiksha_ready=False,
             ),
             _catalog_sheet_row(
                 catalog_key="retired",
                 symbol="SPY",
                 strategy_key="market_impulse",
                 lifecycle_status="retired",
-                bionic_ready=True,
+                bhiksha_ready=True,
             ),
             _catalog_sheet_row(
                 catalog_key="unsupported",
                 symbol="SPY",
                 strategy_key="not_in_registry",
                 lifecycle_status="active",
-                bionic_ready=True,
+                bhiksha_ready=True,
             ),
         ],
     )
@@ -714,7 +714,7 @@ def test_compile_active_plan_cli_supports_google_sheets_path(tmp_path: Path, mon
                         "catalog_key": "qqq_market_impulse_short_v1",
                         "symbol": "QQQ",
                         "strategy_key": "market_impulse",
-                        "bionic_ready": "TRUE",
+                        "bhiksha_ready": "TRUE",
                     }
                 ],
             ),
@@ -836,7 +836,7 @@ def _catalog_sheet_row(**overrides):
         "strategy_family": "market_impulse",
         "direction": "short",
         "lifecycle_status": "active",
-        "bionic_ready": True,
+        "bhiksha_ready": True,
         "playbook_summary_json": {
             "entry_params": {"direction": "short"},
             "vehicle_mapping": {"profile": "single_leg_long_premium_v1"},

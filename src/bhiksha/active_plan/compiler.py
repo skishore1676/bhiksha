@@ -36,7 +36,7 @@ class StrategyCatalogSheetRow(BaseModel):
     lifecycle_status: str | None = None
     operator_status_override: str | None = None
     operator_notes: str | None = None
-    bionic_ready: bool = False
+    bhiksha_ready: bool = False
     first_validated_date: str | None = None
     last_validated_date: str | None = None
     validation_count: int | None = None
@@ -942,7 +942,7 @@ def _manual_strategy_catalog_ids(catalog_root: Path, generated_root: Path) -> se
 def _is_google_catalog_entry_promotable(entry: StrategyCatalogSheetRow, supported_keys: set[str]) -> bool:
     strategy_key = str(entry.strategy_key or "").strip()
     return (
-        entry.bionic_ready
+        entry.bhiksha_ready
         and entry.lifecycle_status in {"active", "candidate"}
         and bool(entry.catalog_key)
         and bool(entry.symbol)
@@ -1059,7 +1059,7 @@ def _google_catalog_metadata(entry: StrategyCatalogSheetRow | None) -> dict[str,
         "lifecycle_status": entry.lifecycle_status,
         "operator_status_override": entry.operator_status_override,
         "operator_notes": entry.operator_notes,
-        "bionic_ready": entry.bionic_ready,
+        "bhiksha_ready": entry.bhiksha_ready,
         "first_validated_date": entry.first_validated_date,
         "last_validated_date": entry.last_validated_date,
         "validation_count": entry.validation_count,
@@ -1079,8 +1079,8 @@ def _validate_google_catalog_alignment(
     local_entry: StrategyCatalogEntry,
     google_entry: StrategyCatalogSheetRow,
 ) -> None:
-    if not google_entry.bionic_ready:
-        raise ValueError(f"Strategy {strategy_id!r} is not bionic_ready in Google strategy catalog")
+    if not google_entry.bhiksha_ready:
+        raise ValueError(f"Strategy {strategy_id!r} is not bhiksha_ready in the Google strategy catalog")
     if google_entry.lifecycle_status == "retired":
         raise ValueError(f"Strategy {strategy_id!r} is retired in Google strategy catalog")
     if google_entry.symbol and google_entry.symbol != local_entry.symbol:
