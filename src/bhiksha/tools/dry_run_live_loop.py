@@ -17,7 +17,16 @@ async def _run(max_bars: int | None, live: bool, active_plan: str | None) -> Non
     unhealthy = [item for item in report.provider_health if not item.ok]
     if unhealthy:
         names = ",".join(item.name for item in unhealthy)
-        raise RuntimeError(f"Startup health check failed for: {names}")
+        msg = f"Startup health check failed for: {names}"
+        # Add remediation hints for token expiry
+        if any("token_expired" in item.detail for item in unhealthy):
+            msg += (
+                "\n\nSchwab token remediation:\n"
+                "  1. PYTHONPATH=src .venv/bin/python -m bhiksha.tools.schwab_auth url\n"
+                "  2. Visit the URL, authorize, and capture the redirect callback URL\n"
+                "  3. PYTHONPATH=src .venv/bin/python -m bhiksha.tools.schwab_auth exchange '<callback_url>'"
+            )
+        raise RuntimeError(msg)
     await runtime.run_session(live=live, max_bars=max_bars, output=print)
 
 

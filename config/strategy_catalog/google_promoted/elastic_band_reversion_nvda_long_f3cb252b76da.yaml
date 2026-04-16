@@ -15,12 +15,12 @@ execution:
   option_mapping: &id001
     long_signal: CALL
     short_signal: PUT
+  min_open_interest: 100
+  max_bid_ask_spread_pct: 0.2
   dte_min: 7
   dte_max: 21
   target_abs_delta_min: null
   target_abs_delta_max: null
-  min_open_interest: 100
-  max_bid_ask_spread_pct: 0.2
 risk:
   profile: elastic_band_reversion_risk_v1
   max_trade_premium_usd: 300.0
@@ -56,7 +56,8 @@ source:
     strategy_family: elastic_band_reversion
     direction: long
     lifecycle_status: active
-    bionic_ready: true
+    operator_status_override: live
+    bhiksha_ready: true
     first_validated_date: '2026-04-02'
     last_validated_date: '2026-04-02'
     validation_count: 1

@@ -12,8 +12,9 @@ from bhiksha.execution.brokers.public.client import PublicApiClient
 from bhiksha.execution.brokers.public.auth import get_access_token
 from bhiksha.execution.brokers.public.account import get_accounts, get_portfolio
 from bhiksha.execution.brokers.public.settings import PublicBrokerSettings
-from bhiksha.integrations.schwab.auth import build_authorize_url
+from bhiksha.integrations.schwab.auth import build_authorize_url, refresh_token_is_expired
 from bhiksha.integrations.schwab.settings import SchwabSettings
+from bhiksha.integrations.schwab.token_store import read_tokens
 
 
 async def check_public_auth() -> tuple[bool, str]:
@@ -69,5 +70,19 @@ async def check_schwab_setup() -> tuple[bool, str]:
             return False, "callback_pending_approval:https://127.0.0.1:8182/callback"
         url = build_authorize_url(settings)
         return True, f"authorize_url_ready:{url}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+async def check_schwab_token_health() -> tuple[bool, str]:
+    """Check if Schwab refresh token is valid (not expired). Long-term health safeguard."""
+    try:
+        settings = SchwabSettings.from_env()
+        tokens = read_tokens(settings.token_file)
+        if not tokens:
+            return False, "token_file_missing"
+        if refresh_token_is_expired(tokens):
+            return False, "refresh_token_expired"
+        return True, "token_valid"
     except Exception as exc:
         return False, str(exc)

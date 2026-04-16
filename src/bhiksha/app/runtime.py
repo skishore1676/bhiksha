@@ -27,14 +27,16 @@ from bhiksha.domain.runtime import ProviderHealth, StartupReport
 from bhiksha.execution.position_monitor import PositionMonitor
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
+from bhiksha.integrations.schwab.auth import refresh_token_is_expired
 from bhiksha.integrations.schwab.settings import SchwabSettings
+from bhiksha.integrations.schwab.token_store import read_tokens
 from bhiksha.market_data.bar_store import RollingBarStore
 from bhiksha.market_data.adapters.polygon import PolygonBarSource
 from bhiksha.market_data.adapters.schwab import SchwabBarSource
 from bhiksha.market_data.daemon import DataIngestionDaemon
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.market_data.trading_calendar import trading_window_start
-from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup
+from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup, check_schwab_token_health
 from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.position_tracker import TrackedPosition
@@ -89,6 +91,7 @@ class BhikshaRuntime:
         public_ok, public_detail = await check_public_auth()
         polygon_ok, polygon_detail = await check_polygon()
         schwab_ok, schwab_detail = await check_schwab_setup()
+        token_ok, token_detail = await check_schwab_token_health()
         return StartupReport(
             dry_run=self.app_config.dry_run,
             enabled_deployments=[deployment.deployment_id for deployment in self.enabled_deployments],
@@ -96,6 +99,7 @@ class BhikshaRuntime:
                 ProviderHealth(name="public", ok=public_ok, detail=public_detail),
                 ProviderHealth(name="polygon", ok=polygon_ok, detail=polygon_detail),
                 ProviderHealth(name="schwab", ok=schwab_ok, detail=schwab_detail),
+                ProviderHealth(name="schwab_token", ok=token_ok, detail=token_detail),
             ],
         )
 
@@ -202,6 +206,18 @@ class BhikshaRuntime:
                 output=output,
                 reason="startup",
             )
+
+            # PRE-WARMUP TOKEN HEALTH CHECK (near-term fix)
+            if self.provider_config.underlying_live_primary == "schwab":
+                settings = SchwabSettings.from_env()
+                tokens = read_tokens(settings.token_file)
+                if not tokens or refresh_token_is_expired(tokens):
+                    raise RuntimeError(
+                        "Schwab refresh token has expired before warmup. "
+                        "Run: PYTHONPATH=src .venv/bin/python -m bhiksha.tools.schwab_auth url\n"
+                        "Then: PYTHONPATH=src .venv/bin/python -m bhiksha.tools.schwab_auth exchange '<callback_url>'"
+                    )
+                output("TOKEN_HEALTH Schwab tokens are valid")
 
             for symbol in symbols:
                 warmed = await self.warm_start_symbol(symbol)

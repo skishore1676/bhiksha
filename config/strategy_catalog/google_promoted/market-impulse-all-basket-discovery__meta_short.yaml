@@ -1,0 +1,162 @@
+strategy_id: market-impulse-all-basket-discovery__meta_short
+enabled: true
+symbol: META
+strategy:
+  key: market_impulse
+  version: 1
+  params:
+    entry_buffer_minutes: 3
+    entry_window_minutes: 90
+    regime_timeframe: 30m
+    vwma_periods: &id001
+    - 5
+    - 13
+    - 21
+    direction: short
+execution:
+  profile: single_leg_long_premium_v1
+  shadow_only: true
+  option_mapping:
+    long_signal: CALL
+    short_signal: PUT
+  min_open_interest: 100
+  max_bid_ask_spread_pct: 0.2
+  dte: 7-21
+  delta_target: 0.35-0.55
+  entry_window_et: 09:45-14:30
+risk:
+  profile: market_impulse_risk_v1
+  max_trade_premium_usd: 300.0
+  hard_flat_time_et: '15:55'
+  stop_loss_pct: 0.35
+exit:
+  profile: market_impulse_exit_v1
+  use_algorithmic_exit: true
+  use_profit_target: false
+  profit_target_multiple: null
+  stop_loss_pct: 0.35
+  stop_to_breakeven_after_r_multiple: null
+  hard_flat_time_et: '15:55'
+  thesis_exit_policy: fixed_rr_underlying
+  thesis_exit_params:
+    stop_loss_underlying_pct: 0.005
+    take_profit_underlying_r_multiple: 2.0
+  catastrophe_exit_params:
+    hard_flat_time_et: '15:55'
+    stop_loss_pct: 0.35
+source:
+  origin: google_strategy_catalog
+  run_date: '2026-04-12'
+  artifact: market-impulse-all-basket-discovery__meta_short
+  metadata:
+    catalog_key: market-impulse-all-basket-discovery__meta_short
+    playbook_id: market-impulse-all-basket-discovery__meta_short
+    bias_template: bearish_trend_intraday
+    strategy_key: market_impulse
+    strategy_family: market_impulse
+    direction: short
+    lifecycle_status: candidate
+    bhiksha_ready: true
+    first_validated_date: '2026-04-12'
+    last_validated_date: '2026-04-12'
+    validation_count: 1
+    expectancy: 0.2607
+    confidence: 0.4469
+    signal_count: 226
+    execution_robustness: 0.884
+    thesis_exit_policy: fixed_rr_underlying
+    playbook_summary:
+      bhiksha_compatibility:
+        bionic_ready: false
+        has_optimized_thesis_exit: true
+        supported: false
+        note: "mala_v2 candidate \u2014 pending bhiksha config review"
+      entry_params:
+        entry_buffer_minutes: 3
+        entry_window_minutes: 90
+        regime_timeframe: 30m
+        vwma_periods: *id001
+      vehicle_mapping:
+        structure: long_put
+        dte: 7-21
+        delta_plan: 0.35-0.55
+        entry_window_et: 09:45-14:30
+        profit_take: 50-90% premium
+        risk_rule: hard stop at -35% premium
+      mc_metrics:
+        mc_prob_positive_exp: 0.884
+        mc_exp_r_mean: 0.117357
+        mc_exp_r_p50: 0.116046
+        mc_exp_r_p95: 0.283212
+        mc_total_r_p05: -9.289749
+        mc_total_r_p50: 26.22635
+        mc_total_r_p95: 64.005821
+      thesis_exit_params:
+        stop_loss_underlying_pct: 0.005
+        take_profit_underlying_r_multiple: 2.0
+      catastrophe_exit_params:
+        hard_flat_time_et: '15:55'
+        stop_loss_pct: 0.35
+      exit_candidate_policies:
+      - policy_name: trailing_vma_underlying:vma_10
+        thesis_exit_anchor: underlying
+        thesis_exit_policy: trailing_vma_underlying
+        thesis_exit_params:
+          vma_col: vma_10
+        metrics:
+          trade_count: 86
+          win_rate: 0.2558139534883721
+          expectancy: 0.20952093023255808
+          profit_factor: 1.260592895550535
+          total_pnl: 18.018799999999995
+          avg_winner: 3.9620090909090906
+          avg_loser: -1.0803968750000004
+      - policy_name: fixed_rr_underlying:0.0035x1.50
+        thesis_exit_anchor: underlying
+        thesis_exit_policy: fixed_rr_underlying
+        thesis_exit_params:
+          stop_loss_underlying_pct: 0.0035
+          take_profit_underlying_r_multiple: 1.5
+        metrics:
+          trade_count: 60
+          win_rate: 0.43333333333333335
+          expectancy: 0.1939716666666667
+          profit_factor: 1.1506416147412186
+          total_pnl: 11.638300000000003
+          avg_winner: 3.4190961538461546
+          avg_loser: -2.2723
+      - policy_name: fixed_rr_underlying:0.0050x2.00
+        thesis_exit_anchor: underlying
+        thesis_exit_policy: fixed_rr_underlying
+        thesis_exit_params:
+          stop_loss_underlying_pct: 0.005
+          take_profit_underlying_r_multiple: 2.0
+        metrics:
+          trade_count: 42
+          win_rate: 0.40476190476190477
+          expectancy: 0.6491357142857143
+          profit_factor: 1.3490539948839677
+          total_pnl: 27.2637
+          avg_winner: 6.198300000000001
+          avg_loser: -3.1242959999999997
+      - policy_name: fixed_rr_underlying:0.0075x2.00
+        thesis_exit_anchor: underlying
+        thesis_exit_policy: fixed_rr_underlying
+        thesis_exit_params:
+          stop_loss_underlying_pct: 0.0075
+          take_profit_underlying_r_multiple: 2.0
+        metrics:
+          trade_count: 34
+          win_rate: 0.4117647058823529
+          expectancy: 0.5797970588235294
+          profit_factor: 1.2462779892584213
+          total_pnl: 19.7131
+          avg_winner: 7.125514285714286
+          avg_loser: -4.002205
+    catalog_row_index: 10
+approval_status: approved
+tags:
+- google_promoted
+- market_impulse
+- short
+- bearish_trend_intraday
