@@ -77,7 +77,6 @@ async def refresh_access_token(settings: SchwabSettings) -> dict[str, Any]:
     if not refresh_token:
         raise ValueError("No Schwab refresh token found; complete manual auth first")
 
-    refresh_issued = datetime.fromisoformat(existing["refresh_token_issued"])
     async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
         response = await client.post(
             settings.token_url,
@@ -88,7 +87,13 @@ async def refresh_access_token(settings: SchwabSettings) -> dict[str, Any]:
             data={"grant_type": "refresh_token", "refresh_token": refresh_token},
         )
         response.raise_for_status()
-        payload = _normalize_token_payload(response.json(), refresh_issued_at=refresh_issued)
+        new_tokens = response.json()
+        # Schwab returns a new refresh token on each refresh, resetting the 7-day window.
+        # Update refresh_issued_at when we receive one so the expiry check stays current.
+        old_refresh = refresh_token
+        new_refresh = new_tokens.get("refresh_token")
+        refresh_issued_at = datetime.now(UTC) if new_refresh and new_refresh != old_refresh else datetime.fromisoformat(existing["refresh_token_issued"])
+        payload = _normalize_token_payload(new_tokens, refresh_issued_at=refresh_issued_at)
         write_tokens(settings.token_file, payload)
         return payload
 
