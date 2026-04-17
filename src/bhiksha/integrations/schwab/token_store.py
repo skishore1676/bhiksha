@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -26,4 +27,16 @@ def read_tokens(token_file: str | Path) -> dict[str, Any] | None:
 def write_tokens(token_file: str | Path, payload: dict[str, Any]) -> None:
     path = Path(token_file)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
+    except OSError as exc:
+        raise SchwabTokenStoreError(f"Unable to write Schwab token file {path}: {exc}") from exc
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()

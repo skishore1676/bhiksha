@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -54,7 +55,7 @@ class SQLiteBackend:
     def _ensure_db_sync(self) -> None:
         path = Path(self.db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect():
+        with closing(self.connect()):
             pass
 
 
@@ -81,7 +82,7 @@ class SQLiteEventRepository(EventRepository):
             self._initialized = True
 
     def _init_db(self) -> None:
-        with self.backend.connect() as conn:
+        with closing(self.backend.connect()) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -95,7 +96,7 @@ class SQLiteEventRepository(EventRepository):
             conn.commit()
 
     def _append_sync(self, event_type: str, payload: dict[str, Any]) -> None:
-        with self.backend.connect() as conn:
+        with closing(self.backend.connect()) as conn:
             conn.execute(
                 "INSERT INTO events (created_at, event_type, payload) VALUES (?, ?, ?)",
                 (
@@ -138,7 +139,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             self._initialized = True
 
     def _init_db(self) -> None:
-        with self.backend.connect() as conn:
+        with closing(self.backend.connect()) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS trade_sessions (
@@ -181,7 +182,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             conn.commit()
 
     def _upsert_trade_sync(self, record: TradeRecord) -> None:
-        with self.backend.connect() as conn:
+        with closing(self.backend.connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO trade_sessions (
@@ -234,7 +235,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             conn.commit()
 
     def _mark_closed_sync(self, trade_id: str, exit_order_id: str | None) -> None:
-        with self.backend.connect() as conn:
+        with closing(self.backend.connect()) as conn:
             conn.execute(
                 """
                 UPDATE trade_sessions
@@ -246,7 +247,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             conn.commit()
 
     def _get_open_trades_sync(self) -> list[TradeRecord]:
-        with self.backend.connect() as conn:
+        with closing(self.backend.connect()) as conn:
             rows = conn.execute(
                 """
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,

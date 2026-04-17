@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from contextlib import closing
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -221,7 +222,7 @@ async def _replay_summary(
 def _load_events(db_path: Path) -> list[dict[str, Any]]:
     if not db_path.exists():
         return []
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
             "SELECT created_at, event_type, payload FROM events ORDER BY id"
         ).fetchall()

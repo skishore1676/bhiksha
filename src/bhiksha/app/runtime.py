@@ -172,8 +172,8 @@ class BhikshaRuntime:
         stop_event = asyncio.Event()
         reconciliation_snapshot = ReconciliationSnapshot()
         symbol_queues = {symbol: asyncio.Queue() for symbol in symbols}
-        symbol_tasks = [
-            asyncio.create_task(
+        symbol_tasks = {
+            symbol: asyncio.create_task(
                 self._symbol_worker(
                     symbol,
                     symbol_queues[symbol],
@@ -192,7 +192,12 @@ class BhikshaRuntime:
                 )
             )
             for symbol in symbols
-        ]
+        }
+        daemon_task: asyncio.Task | None = None
+        background_tasks: dict[str, asyncio.Task] = {
+            f"symbol_worker:{symbol}": task
+            for symbol, task in symbol_tasks.items()
+        }
 
         try:
             startup_snapshot = self.startup_snapshot(live=live, max_bars=max_bars)
@@ -266,9 +271,43 @@ class BhikshaRuntime:
                     output=output,
                 )
             )
+            background_tasks.update(
+                {
+                    "public_token_daemon": public_token_task,
+                    "schwab_token_daemon": schwab_token_task,
+                    "pending_exit_loop": pending_exit_task,
+                    "manual_intrabar_loop": manual_intrabar_task,
+                    "reconciliation_loop": reconciliation_task,
+                }
+            )
             daemon_task = asyncio.create_task(daemon.run(max_bars=max_bars))
             seen = 0
             while True:
+                task_failure = _task_failure(background_tasks)
+                if task_failure is not None:
+                    task_name, task_error = task_failure
+                    await _append_event_best_effort(
+                        supervisor.event_repository,
+                        "runtime_issue",
+                        {
+                            "category": classify_runtime_issue_category(
+                                error=repr(task_error),
+                                event_type="background_task",
+                            ),
+                            "symbol": "ALL",
+                            "error": repr(task_error),
+                            "error_type": type(task_error).__name__,
+                            "stage": "background_task",
+                            "task": task_name,
+                        },
+                        output=output,
+                    )
+                    output(
+                        "RUNTIME_ISSUE ALL "
+                        f"stage=background_task task={task_name} "
+                        f"error_type={type(task_error).__name__} error={task_error!r}"
+                    )
+                    raise RuntimeError(f"Background task failed: {task_name}") from task_error
                 if daemon_task.done():
                     daemon_error = _task_exception(daemon_task)
                     if daemon_error is not None:
@@ -334,26 +373,16 @@ class BhikshaRuntime:
             schwab_token_daemon.stop()
             stop_event.set()
             reconcile_trigger.set()
-            with suppress(asyncio.CancelledError):
-                await daemon_task
-            with suppress(asyncio.CancelledError):
-                await public_token_task
-            with suppress(asyncio.CancelledError):
-                await schwab_token_task
-            with suppress(asyncio.CancelledError):
-                await pending_exit_task
-            with suppress(asyncio.CancelledError):
-                await manual_intrabar_task
-            with suppress(asyncio.CancelledError):
-                await reconciliation_task
-            for task in symbol_tasks:
-                with suppress(asyncio.CancelledError):
-                    await task
+            await _cancel_and_await([daemon_task, *background_tasks.values()])
         finally:
+            daemon.stop()
             public_token_daemon.stop()
             schwab_token_daemon.stop()
             stop_event.set()
             reconcile_trigger.set()
+            for queue_ in symbol_queues.values():
+                queue_.put_nowait(None)
+            await _cancel_and_await([daemon_task, *background_tasks.values()])
             await execution_dispatcher.stop()
             await supervisor.close()
             await source.close()
@@ -899,11 +928,11 @@ class BhikshaRuntime:
             for symbol, deployments in deployments_by_symbol.items():
                 if not deployments:
                     continue
-                snapshot = await source.fetch_live_price(symbol)
-                if snapshot is None:
-                    continue
-                price, snapshot_timestamp = snapshot
                 try:
+                    snapshot = await source.fetch_live_price(symbol)
+                    if snapshot is None:
+                        continue
+                    price, snapshot_timestamp = snapshot
                     await self._handle_manual_intrabar_price(
                         symbol=symbol,
                         price=price,
@@ -920,7 +949,8 @@ class BhikshaRuntime:
                         output=output,
                     )
                 except Exception as exc:
-                    await supervisor.event_repository.append(
+                    await _append_event_best_effort(
+                        supervisor.event_repository,
                         "runtime_issue",
                         {
                             "category": classify_runtime_issue_category(error=str(exc), event_type="manual_intrabar"),
@@ -928,6 +958,7 @@ class BhikshaRuntime:
                             "error": str(exc),
                             "stage": "manual_intrabar",
                         },
+                        output=output,
                     )
                     output(f"RUNTIME_ISSUE {symbol} stage=manual_intrabar error={exc}")
 
@@ -1031,7 +1062,8 @@ class BhikshaRuntime:
             async with sync_lock:
                 reconciliation_snapshot.last_error = str(exc)
                 reconciliation_snapshot.consecutive_failures += 1
-            await supervisor.event_repository.append(
+            await _append_event_best_effort(
+                supervisor.event_repository,
                 "runtime_issue",
                 {
                     "category": classify_runtime_issue_category(error=str(exc), event_type="reconciliation"),
@@ -1040,6 +1072,7 @@ class BhikshaRuntime:
                     "stage": "reconciliation",
                     "reason": reason,
                 },
+                output=output,
             )
             output(f"RUNTIME_ISSUE ALL stage=reconciliation reason={reason} error={exc}")
             output(f"RECONCILIATION_DEGRADED reason={reason} error={exc}")
@@ -1368,6 +1401,38 @@ def _entry_blocked_extra_details(plan) -> str:
         else:
             values.append(f"{key}={value}")
     return " " + " ".join(values) if values else ""
+
+
+async def _append_event_best_effort(
+    event_repository,
+    event_type: str,
+    payload: dict,
+    *,
+    output: callable | None = None,
+) -> None:
+    try:
+        await event_repository.append(event_type, payload)
+    except Exception as exc:
+        if output is not None:
+            output(f"RUNTIME_TELEMETRY_DROPPED event={event_type} error={exc}")
+
+
+async def _cancel_and_await(tasks) -> None:
+    unique_tasks = [task for task in dict.fromkeys(tasks) if task is not None]
+    for task in unique_tasks:
+        if not task.done():
+            task.cancel()
+    for task in unique_tasks:
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+def _task_failure(tasks: dict[str, asyncio.Task]) -> tuple[str, BaseException] | None:
+    for name, task in tasks.items():
+        error = _task_exception(task)
+        if error is not None:
+            return name, error
+    return None
 
 
 def _task_exception(task: asyncio.Task) -> BaseException | None:

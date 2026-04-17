@@ -160,6 +160,64 @@ def test_runtime_reload_bias_controls_updates_intraday_emergency_flag(tmp_path: 
     assert runtime.halt_and_flatten is True
 
 
+def test_manual_intrabar_loop_records_fetch_errors_without_crashing() -> None:
+    runtime = build_runtime()
+    runtime.app_config.bar_poll_interval_seconds = 1
+    stop_event = asyncio.Event()
+    recorded: list[tuple[str, dict]] = []
+    output_lines: list[str] = []
+
+    class FailingSource:
+        async def fetch_live_price(self, symbol: str):
+            raise RuntimeError(f"{symbol} quote failed")
+
+    class StubRepo:
+        async def append(self, event_type: str, payload: dict) -> None:
+            recorded.append((event_type, payload))
+
+    class StubSupervisor:
+        event_repository = StubRepo()
+
+    def output(line: str) -> None:
+        output_lines.append(line)
+        if line.startswith("RUNTIME_ISSUE"):
+            stop_event.set()
+
+    async def run() -> None:
+        await asyncio.wait_for(
+            runtime._manual_intrabar_loop(
+                source=FailingSource(),
+                store=None,
+                supervisor=StubSupervisor(),
+                evaluator=None,
+                execution_dispatcher=None,
+                deployments_by_symbol={"QQQ": [object()]},
+                reconciliation_snapshot=ReconciliationSnapshot(),
+                sync_lock=asyncio.Lock(),
+                reconcile_trigger=asyncio.Event(),
+                stop_event=stop_event,
+                live=False,
+                output=output,
+            ),
+            timeout=2,
+        )
+
+    asyncio.run(run())
+
+    assert recorded == [
+        (
+            "runtime_issue",
+            {
+                "category": "data",
+                "symbol": "QQQ",
+                "error": "QQQ quote failed",
+                "stage": "manual_intrabar",
+            },
+        )
+    ]
+    assert output_lines == ["RUNTIME_ISSUE QQQ stage=manual_intrabar error=QQQ quote failed"]
+
+
 def test_build_runtime_prefers_generated_deployments_for_same_symbol(tmp_path: Path) -> None:
     config_root = tmp_path / "config"
     deployments_root = config_root / "deployments"

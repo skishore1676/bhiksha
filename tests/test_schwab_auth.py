@@ -1,3 +1,6 @@
+import asyncio
+import json
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -6,6 +9,7 @@ from bhiksha.integrations.schwab.auth import (
     access_token_is_stale,
     build_authorize_url,
     extract_authorization_code,
+    refresh_access_token,
 )
 from bhiksha.integrations.schwab.settings import SchwabSettings
 from bhiksha.integrations.schwab.token_store import SchwabTokenStoreError, read_tokens
@@ -51,3 +55,86 @@ def test_read_tokens_raises_for_invalid_existing_token_file(tmp_path) -> None:
 
 def test_read_tokens_returns_none_for_missing_token_file(tmp_path) -> None:
     assert read_tokens(tmp_path / "missing_tokens.json") is None
+
+
+def test_refresh_access_token_preserves_existing_refresh_token_when_omitted(tmp_path, monkeypatch) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    issued_at = "2026-04-10T14:30:00+00:00"
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token_issued": issued_at,
+                "refresh_token_issued": issued_at,
+                "token_dictionary": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("bhiksha.integrations.schwab.auth.httpx.AsyncClient", _fake_client({"access_token": "new-access"}))
+    settings = SchwabSettings(app_key="key", app_secret="secret", token_file=str(token_file))
+
+    payload = asyncio.run(refresh_access_token(settings))
+
+    assert payload["token_dictionary"]["access_token"] == "new-access"
+    assert payload["token_dictionary"]["refresh_token"] == "old-refresh"
+    assert payload["refresh_token_issued"] == issued_at
+
+
+def test_refresh_access_token_rolls_refresh_issue_time_when_schwab_returns_new_refresh_token(tmp_path, monkeypatch) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    issued_at = "2026-04-10T14:30:00+00:00"
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token_issued": issued_at,
+                "refresh_token_issued": issued_at,
+                "token_dictionary": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "bhiksha.integrations.schwab.auth.httpx.AsyncClient",
+        _fake_client({"access_token": "new-access", "refresh_token": "new-refresh"}),
+    )
+    settings = SchwabSettings(app_key="key", app_secret="secret", token_file=str(token_file))
+
+    payload = asyncio.run(refresh_access_token(settings))
+
+    assert payload["token_dictionary"]["refresh_token"] == "new-refresh"
+    assert datetime.fromisoformat(payload["refresh_token_issued"]) > datetime.fromisoformat(issued_at)
+    assert datetime.fromisoformat(payload["refresh_token_issued"]).tzinfo is not None
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return dict(self._payload)
+
+
+def _fake_client(payload: dict):
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        async def post(self, *args, **kwargs) -> _FakeResponse:
+            return _FakeResponse(payload)
+
+    return FakeAsyncClient

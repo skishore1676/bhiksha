@@ -91,6 +91,8 @@ async def refresh_access_token(settings: SchwabSettings) -> dict[str, Any]:
         # Schwab returns a new refresh token on each refresh, resetting the 7-day window.
         # Update refresh_issued_at when we receive one so the expiry check stays current.
         old_refresh = refresh_token
+        if not new_tokens.get("refresh_token"):
+            new_tokens["refresh_token"] = old_refresh
         new_refresh = new_tokens.get("refresh_token")
         refresh_issued_at = datetime.now(UTC) if new_refresh and new_refresh != old_refresh else datetime.fromisoformat(existing["refresh_token_issued"])
         payload = _normalize_token_payload(new_tokens, refresh_issued_at=refresh_issued_at)
@@ -124,4 +126,3 @@ async def get_valid_access_token(settings: SchwabSettings) -> str:
     if not access_token:
         raise ValueError("Schwab access token missing from token payload")
     return str(access_token)
-

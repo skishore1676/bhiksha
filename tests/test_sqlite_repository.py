@@ -1,6 +1,10 @@
 import asyncio
+from contextlib import closing
+import os
 import sqlite3
 from datetime import UTC, datetime
+
+import pytest
 
 from bhiksha.domain.models import TradeRecord
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteEventRepository, SQLiteTradeStateRepository
@@ -25,7 +29,7 @@ def test_sqlite_backend_enables_wal_and_busy_timeout(tmp_path) -> None:
 
     asyncio.run(repo.append("test_event", {"hello": "world"}))
 
-    with backend.connect() as conn:
+    with closing(backend.connect()) as conn:
         journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
 
@@ -72,3 +76,31 @@ def test_sqlite_backend_serializes_shared_runtime_writes(tmp_path) -> None:
     assert event_count == 25
     assert trade_count == 25
     assert statuses == {"open_protected"}
+
+
+def test_sqlite_event_repository_does_not_leak_file_descriptors(tmp_path) -> None:
+    before = _open_fd_count()
+    if before is None:
+        pytest.skip("file descriptor count is not available on this platform")
+
+    db_path = tmp_path / "events.db"
+    repo = SQLiteEventRepository(str(db_path))
+
+    async def run() -> None:
+        for index in range(100):
+            await repo.append("runtime_metric", {"index": index})
+
+    asyncio.run(run())
+
+    after = _open_fd_count()
+    assert after is not None
+    assert after <= before + 3
+
+
+def _open_fd_count() -> int | None:
+    for fd_dir in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(fd_dir))
+        except OSError:
+            continue
+    return None

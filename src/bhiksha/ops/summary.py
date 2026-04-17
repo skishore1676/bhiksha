@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter, defaultdict
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,7 +42,7 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
     if not path.exists():
         return SessionSummary(total_events=0)
 
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         rows = conn.execute(
             "SELECT created_at, event_type, payload FROM events ORDER BY id"
         ).fetchall()
