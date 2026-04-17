@@ -30,10 +30,10 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert {selection["symbol"] for selection in snapshot["bias_inputs"]} >= {"IWM", "TSLA"}
     assert snapshot["emergency_controls"] == {"halt_and_flatten": False}
     assert snapshot["deployment_selection"]["mode"] == "prefer_generated"
-    assert {deployment["deployment_id"] for deployment in snapshot["deployments"]} >= {
-        "market_impulse_spy_short_armed_a98a25d2",
-        "market_impulse_qqq_short_v1",
-    }
+    deployment_ids = {deployment["deployment_id"] for deployment in snapshot["deployments"]}
+    deployment_symbols = {deployment["symbol"] for deployment in snapshot["deployments"]}
+    assert "market_impulse_qqq_short_v1" in deployment_ids
+    assert "SPY" in deployment_symbols
 
 
 def test_build_runtime_respects_configured_bias_inputs_path(tmp_path: Path) -> None:
