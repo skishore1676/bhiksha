@@ -50,6 +50,9 @@ class StubChainService:
 
 
 class StubOrderManager:
+    def __init__(self) -> None:
+        self.place_entry_order_calls = 0
+
     async def get_option_quote(self, option_symbol: str):
         return PublicQuote(
             symbol=option_symbol,
@@ -68,7 +71,22 @@ class StubOrderManager:
             estimated_cost=289.98,
         )
 
-    async def place_entry_order(self, option_symbol: str, limit_price: float, quantity: int):
+    async def get_portfolio(self):
+        return {
+            "buyingPower": {
+                "cashOnlyBuyingPower": "5000.00",
+            }
+        }
+
+    async def place_entry_order(
+        self,
+        option_symbol: str,
+        limit_price: float,
+        quantity: int,
+        order_id: str | None = None,
+    ):
+        del option_symbol, limit_price, quantity, order_id
+        self.place_entry_order_calls += 1
         class Result:
             order_id = "OID123"
             error = None
@@ -105,6 +123,15 @@ class ExpensiveQuoteOrderManager(StubOrderManager):
             open_interest=550,
             outcome="SUCCESS",
         )
+
+
+class LowCashOrderManager(StubOrderManager):
+    async def get_portfolio(self):
+        return {
+            "buyingPower": {
+                "cashOnlyBuyingPower": "150.00",
+            }
+        }
 
 
 def test_execution_planner_creates_dry_run_trade_plan():
@@ -284,3 +311,62 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
         "entry_price": 9.1,
         "min_contract_cost": 910.0,
     }
+
+
+def test_execution_planner_blocks_live_trade_when_cash_only_buying_power_is_insufficient(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_ENFORCE_CASH_ONLY_BUYING_POWER", "1")
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    order_manager = LowCashOrderManager()
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=order_manager,
+        position_tracker=PositionTracker(),
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.risk_reasons == ["insufficient_cash_only_buying_power"]
+    assert plan.risk_details == {
+        "required_cash": 290.04,
+        "cash_only_buying_power": 150.0,
+        "buying_power_requirement": 290.04,
+        "estimated_cost": 289.98,
+    }
+    assert order_manager.place_entry_order_calls == 0
+
+
+def test_execution_planner_ignores_cash_only_buying_power_when_guard_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("BHIKSHA_ENFORCE_CASH_ONLY_BUYING_POWER", raising=False)
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    order_manager = LowCashOrderManager()
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=order_manager,
+        position_tracker=PositionTracker(),
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.order_id == "OID123"
+    assert order_manager.place_entry_order_calls == 1

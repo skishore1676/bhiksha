@@ -63,6 +63,10 @@ Optional:
   - defaults to [logs](/Users/suman/kg_env/projects/bhiksha/artifacts/playbook/logs)
 - `BHIKSHA_ACTIVE_PLAN_SYNC_MINUTES`
   - optional polling interval for repeated sync
+- `BHIKSHA_ENFORCE_CASH_ONLY_BUYING_POWER`
+  - defaults to off
+  - when set to `1`, `true`, `yes`, or `on`, Bhiksha blocks live entries whose preflight cash requirement exceeds Public `cashOnlyBuyingPower`
+  - useful for cash accounts; leave it off for margin workflows
 
 ## Morning Workflow
 

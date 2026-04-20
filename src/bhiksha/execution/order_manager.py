@@ -129,6 +129,9 @@ class OrderManager:
             estimated_cost=_maybe_float(response.get("estimatedCost")),
         )
 
+    async def get_portfolio(self) -> dict[str, Any]:
+        return await self.broker.get_portfolio()
+
     async def place_entry_order(
         self,
         option_symbol: str,

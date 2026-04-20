@@ -47,6 +47,7 @@ class ExecutionSupervisor:
         self.manual_status_writer = manual_status_writer
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._disabled_entry_deployments: set[str] = set()
 
     async def close(self) -> None:
         await self.planner.close()
@@ -72,7 +73,11 @@ class ExecutionSupervisor:
                 "features": decision.features,
             },
         )
+        if not self.can_submit_deployment_entry(deployment):
+            return None
         if decision.signal:
+            if _is_self_disarming_manual_deployment(deployment):
+                self._disabled_entry_deployments.add(deployment.deployment_id)
             await self._record_manual_status(
                 deployment,
                 stage="signal_triggered",
@@ -205,6 +210,13 @@ class ExecutionSupervisor:
                     await self._emit_lifecycle_transition(transition, reason="dry_run_entry_open")
                 await self.event_repository.append("trade_plan", asdict(plan))
             return plan
+
+    def can_submit_deployment_entry(self, deployment: DeploymentManifest) -> bool:
+        if not deployment.enabled:
+            return False
+        if _is_self_disarming_manual_deployment(deployment):
+            return deployment.deployment_id not in self._disabled_entry_deployments
+        return True
 
     async def _protect_live_entry(self, plan: TradePlan, deployment: DeploymentManifest) -> TradePlan:
         filled, payload, error = await self.planner.order_manager.wait_for_fill(
@@ -1637,6 +1649,15 @@ def _tracked_trade_status(position: TrackedPosition) -> str:
     if position.target_order_id:
         return "target_active"
     return "open_protected" if position.stop_order_id else "open_unprotected"
+
+
+def _is_self_disarming_manual_deployment(deployment: DeploymentManifest) -> bool:
+    metadata = deployment.source.metadata or {}
+    return (
+        deployment.source.origin == "active_sheet_manual"
+        and metadata.get("row_index") is not None
+        and metadata.get("sheet_name") is not None
+    )
 
 
 def _hard_flat_market_fallback_due(

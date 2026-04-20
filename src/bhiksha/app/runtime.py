@@ -691,6 +691,8 @@ class BhikshaRuntime:
                 exited_deployments.add(evaluation.deployment.deployment_id)
 
         for deployment in deployments_by_symbol[bar.symbol]:
+            if not supervisor.can_submit_deployment_entry(deployment):
+                continue
             if deployment.deployment_id in exited_deployments:
                 output(f"{deployment.deployment_id}: entry_skipped_after_exit")
                 continue
@@ -988,6 +990,7 @@ class BhikshaRuntime:
         active_deployments = [
             deployment
             for deployment in deployments
+            if supervisor.can_submit_deployment_entry(deployment)
             if supervisor.lifecycle_store.can_submit_entry(symbol, deployment.deployment_id)
         ]
         if not active_deployments:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import time, timedelta
+import os
 import uuid
 
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
@@ -283,6 +284,68 @@ class ExecutionPlanner:
             )
 
         final_limit_price = float(preflight.payload["limitPrice"])
+        if _cash_only_buying_power_guard_enabled():
+            required_cash = max(
+                preflight.buying_power_requirement or 0.0,
+                preflight.estimated_cost or 0.0,
+                final_limit_price * quantity * 100,
+            )
+            try:
+                portfolio = await self.order_manager.get_portfolio()
+            except Exception as exc:
+                return TradePlan(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol=selection.option_symbol,
+                    quantity=quantity,
+                    estimated_entry_price=final_limit_price,
+                    risk_reasons=["cash_only_buying_power_check_failed"],
+                    dry_run=False,
+                    order_id=None,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
+                    risk_details={"error": str(exc)},
+                )
+            available_cash = _portfolio_cash_only_buying_power(portfolio)
+            if available_cash is None:
+                return TradePlan(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol=selection.option_symbol,
+                    quantity=quantity,
+                    estimated_entry_price=final_limit_price,
+                    risk_reasons=["cash_only_buying_power_unavailable"],
+                    dry_run=False,
+                    order_id=None,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
+                    risk_details={"required_cash": required_cash},
+                )
+            if required_cash > available_cash:
+                return TradePlan(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol=selection.option_symbol,
+                    quantity=quantity,
+                    estimated_entry_price=final_limit_price,
+                    risk_reasons=["insufficient_cash_only_buying_power"],
+                    dry_run=False,
+                    order_id=None,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
+                    risk_details={
+                        "required_cash": required_cash,
+                        "cash_only_buying_power": available_cash,
+                        "buying_power_requirement": preflight.buying_power_requirement,
+                        "estimated_cost": preflight.estimated_cost,
+                    },
+                )
         result: OrderResult = await self.order_manager.place_entry_order(
             selection.option_symbol,
             final_limit_price,
@@ -344,3 +407,21 @@ def _parse_optional_et_time(value: str | None) -> time | None:
     if value is None or not value.strip():
         return None
     return parse_time_text(value)
+
+
+def _cash_only_buying_power_guard_enabled() -> bool:
+    raw = os.getenv("BHIKSHA_ENFORCE_CASH_ONLY_BUYING_POWER")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _portfolio_cash_only_buying_power(portfolio: dict) -> float | None:
+    buying_power = portfolio.get("buyingPower") or {}
+    value = buying_power.get("cashOnlyBuyingPower")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

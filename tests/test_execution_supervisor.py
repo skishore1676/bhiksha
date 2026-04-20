@@ -421,6 +421,68 @@ def test_execution_supervisor_updates_manual_sheet_status_for_planned_entry(tmp_
     ]
 
 
+def test_execution_supervisor_self_disarms_sheet_backed_manual_deployment_after_first_trigger(tmp_path, monkeypatch) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    status_writer = RecordingManualStatusWriter()
+    supervisor = ExecutionSupervisor(
+        planner=StubPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        manual_status_writer=status_writer,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    base_deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = base_deployment.model_copy(
+        update={
+            "source": base_deployment.source.model_copy(
+                update={
+                    "origin": "active_sheet_manual",
+                    "metadata": {"row_index": 4, "sheet_name": "manual_entry"},
+                }
+            )
+        }
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+    )
+
+    async def _fake_plan_entry(*args, **kwargs):
+        del args, kwargs
+        return TradePlan(
+            trade_id="TRADE123",
+            deployment_id=deployment.deployment_id,
+            symbol="QQQ",
+            direction=SignalDirection.SHORT,
+            option_symbol="QQQ260330P00558000",
+            quantity=1,
+            estimated_entry_price=2.0,
+            risk_reasons=["approved"],
+            dry_run=True,
+            order_id="DRY_RUN",
+            underlying_entry_price=500.0,
+            entry_timestamp=decision.timestamp,
+        )
+
+    monkeypatch.setattr(supervisor.planner, "plan_entry", _fake_plan_entry)
+
+    first_plan = asyncio.run(supervisor.handle_signal(deployment, decision, dry_run=True))
+    second_plan = asyncio.run(supervisor.handle_signal(deployment, decision, dry_run=True))
+
+    assert first_plan is not None
+    assert second_plan is None
+    assert supervisor.can_submit_deployment_entry(deployment) is False
+    assert status_writer.calls == [
+        ("signal_triggered", deployment.deployment_id),
+        ("entry_planned", deployment.deployment_id),
+    ]
+
+
 def test_execution_supervisor_blocks_live_entry_when_reconciliation_is_stale(tmp_path, monkeypatch) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     status_writer = RecordingManualStatusWriter()
