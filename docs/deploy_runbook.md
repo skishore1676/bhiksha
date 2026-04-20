@@ -63,10 +63,14 @@ Optional:
   - defaults to [logs](/Users/suman/kg_env/projects/bhiksha/artifacts/playbook/logs)
 - `BHIKSHA_ACTIVE_PLAN_SYNC_MINUTES`
   - optional polling interval for repeated sync
-- `BHIKSHA_ENFORCE_CASH_ONLY_BUYING_POWER`
-  - defaults to off
-  - when set to `1`, `true`, `yes`, or `on`, Bhiksha blocks live entries whose preflight cash requirement exceeds Public `cashOnlyBuyingPower`
-  - useful for cash accounts; leave it off for margin workflows
+- `BHIKSHA_CASH_GUARD_MODE`
+  - defaults to `auto`
+  - `auto` enables the guard for Public `CASH` accounts and leaves it off for `MARGIN`
+  - `on` always enforces the guard
+  - `off` disables the guard
+- `BHIKSHA_CASH_GUARD_BUFFER_PCT`
+  - defaults to `0.05`
+  - Bhiksha seeds a daily usable cash budget from Public `cashOnlyBuyingPower`, applies this haircut, and does not recycle same-day sale proceeds back into that budget
 
 ## Morning Workflow
 

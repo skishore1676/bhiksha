@@ -132,6 +132,9 @@ class OrderManager:
     async def get_portfolio(self) -> dict[str, Any]:
         return await self.broker.get_portfolio()
 
+    async def get_account_info(self) -> dict[str, Any]:
+        return await self.broker.get_account_info()
+
     async def place_entry_order(
         self,
         option_symbol: str,

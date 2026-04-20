@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from bhiksha.domain.models import TradeRecord
+from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, TradeRecord
 
 
 class EventRepository(ABC):
@@ -44,3 +44,55 @@ class NullTradeStateRepository(TradeStateRepository):
 
     async def get_open_trades(self) -> list[TradeRecord]:
         return []
+
+
+class CashBudgetRepository(ABC):
+    @abstractmethod
+    async def get_day(self, trade_date: str) -> CashBudgetDay | None:
+        """Return the stored day budget for the trading date."""
+
+    @abstractmethod
+    async def upsert_day(self, day: CashBudgetDay) -> None:
+        """Create or update the stored day budget."""
+
+    @abstractmethod
+    async def get_reservation(self, trade_id: str) -> CashBudgetReservation | None:
+        """Return the reservation for the trade when present."""
+
+    @abstractmethod
+    async def upsert_reservation(self, reservation: CashBudgetReservation) -> None:
+        """Create or update a reservation row."""
+
+    @abstractmethod
+    async def mark_reservation_status(self, trade_id: str, status: str) -> None:
+        """Update a reservation status in place."""
+
+    @abstractmethod
+    async def reservation_totals(self, trade_date: str) -> dict[str, float]:
+        """Return summed reservation amounts by status for the trading date."""
+
+
+class NullCashBudgetRepository(CashBudgetRepository):
+    async def get_day(self, trade_date: str) -> CashBudgetDay | None:
+        del trade_date
+        return None
+
+    async def upsert_day(self, day: CashBudgetDay) -> None:
+        del day
+        return None
+
+    async def get_reservation(self, trade_id: str) -> CashBudgetReservation | None:
+        del trade_id
+        return None
+
+    async def upsert_reservation(self, reservation: CashBudgetReservation) -> None:
+        del reservation
+        return None
+
+    async def mark_reservation_status(self, trade_id: str, status: str) -> None:
+        del trade_id, status
+        return None
+
+    async def reservation_totals(self, trade_date: str) -> dict[str, float]:
+        del trade_date
+        return {"reserved": 0.0, "consumed": 0.0}

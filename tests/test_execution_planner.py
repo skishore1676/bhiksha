@@ -6,6 +6,8 @@ from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionContractSnapshot, SignalDecision
 from bhiksha.execution.order_manager import PublicQuote, PreflightCheck
 from bhiksha.execution.planner import ExecutionPlanner
+from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
+from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import PositionTracker
 
 
@@ -78,6 +80,9 @@ class StubOrderManager:
             }
         }
 
+    async def get_account_info(self):
+        return {"brokerageAccountType": "CASH"}
+
     async def place_entry_order(
         self,
         option_symbol: str,
@@ -132,6 +137,19 @@ class LowCashOrderManager(StubOrderManager):
                 "cashOnlyBuyingPower": "150.00",
             }
         }
+
+
+class MarginOrderManager(LowCashOrderManager):
+    async def get_account_info(self):
+        return {"brokerageAccountType": "MARGIN"}
+
+
+def _cash_guard(order_manager, tmp_path) -> CashGuard:
+    backend = SQLiteBackend(str(tmp_path / "bhiksha.db"))
+    return CashGuard(
+        order_manager=order_manager,
+        repository=SQLiteCashBudgetRepository(str(tmp_path / "bhiksha.db"), backend=backend),
+    )
 
 
 def test_execution_planner_creates_dry_run_trade_plan():
@@ -313,14 +331,16 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
     }
 
 
-def test_execution_planner_blocks_live_trade_when_cash_only_buying_power_is_insufficient(monkeypatch) -> None:
-    monkeypatch.setenv("BHIKSHA_ENFORCE_CASH_ONLY_BUYING_POWER", "1")
+def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insufficient(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "on")
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
     deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
     order_manager = LowCashOrderManager()
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
         order_manager=order_manager,
         position_tracker=PositionTracker(),
+        cash_guard=_cash_guard(order_manager, tmp_path),
     )
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
@@ -336,24 +356,31 @@ def test_execution_planner_blocks_live_trade_when_cash_only_buying_power_is_insu
 
     assert plan is not None
     assert plan.order_id is None
-    assert plan.risk_reasons == ["insufficient_cash_only_buying_power"]
+    assert plan.risk_reasons == ["insufficient_internal_settled_cash_budget"]
     assert plan.risk_details == {
         "required_cash": 290.04,
-        "cash_only_buying_power": 150.0,
         "buying_power_requirement": 290.04,
         "estimated_cost": 289.98,
+        "remaining_budget": 142.5,
+        "usable_budget": 142.5,
+        "broker_cash_only_buying_power": 150.0,
+        "buffer_pct": 0.05,
+        "account_type": "CASH",
+        "cash_guard_mode": "on",
     }
     assert order_manager.place_entry_order_calls == 0
 
 
-def test_execution_planner_ignores_cash_only_buying_power_when_guard_disabled(monkeypatch) -> None:
-    monkeypatch.delenv("BHIKSHA_ENFORCE_CASH_ONLY_BUYING_POWER", raising=False)
+def test_execution_planner_auto_guard_skips_margin_accounts(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "auto")
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
     deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
-    order_manager = LowCashOrderManager()
+    order_manager = MarginOrderManager()
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
         order_manager=order_manager,
         position_tracker=PositionTracker(),
+        cash_guard=_cash_guard(order_manager, tmp_path),
     )
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,

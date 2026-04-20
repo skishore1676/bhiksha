@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from bhiksha.domain.enums import ExitMode
-from bhiksha.domain.models import TradeRecord
-from bhiksha.persistence.repository import EventRepository, TradeStateRepository
+from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, TradeRecord
+from bhiksha.persistence.repository import CashBudgetRepository, EventRepository, TradeStateRepository
 
 ReadResultT = TypeVar("ReadResultT")
 
@@ -281,3 +281,198 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             )
             for row in rows
         ]
+
+
+class SQLiteCashBudgetRepository(CashBudgetRepository):
+    """SQLite-backed storage for conservative daily cash budgets."""
+
+    def __init__(self, db_path: str, *, backend: SQLiteBackend | None = None) -> None:
+        self.db_path = db_path
+        self.backend = backend or SQLiteBackend(db_path)
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+    async def get_day(self, trade_date: str) -> CashBudgetDay | None:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_day_sync, trade_date)
+
+    async def upsert_day(self, day: CashBudgetDay) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._upsert_day_sync, day)
+
+    async def get_reservation(self, trade_id: str) -> CashBudgetReservation | None:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_reservation_sync, trade_id)
+
+    async def upsert_reservation(self, reservation: CashBudgetReservation) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._upsert_reservation_sync, reservation)
+
+    async def mark_reservation_status(self, trade_id: str, status: str) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._mark_reservation_status_sync, trade_id, status)
+
+    async def reservation_totals(self, trade_date: str) -> dict[str, float]:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._reservation_totals_sync, trade_date)
+
+    async def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self.backend.run_write(self._init_db)
+            self._initialized = True
+
+    def _init_db(self) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cash_budget_days (
+                    trade_date TEXT PRIMARY KEY,
+                    account_type TEXT,
+                    broker_cash_only_buying_power REAL NOT NULL,
+                    usable_budget REAL NOT NULL,
+                    buffer_pct REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cash_budget_reservations (
+                    trade_id TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cash_budget_reservations_trade_date_status
+                ON cash_budget_reservations (trade_date, status)
+                """
+            )
+            conn.commit()
+
+    def _get_day_sync(self, trade_date: str) -> CashBudgetDay | None:
+        with closing(self.backend.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT trade_date, account_type, broker_cash_only_buying_power, usable_budget, buffer_pct
+                FROM cash_budget_days
+                WHERE trade_date = ?
+                """,
+                (trade_date,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CashBudgetDay(
+            trade_date=row[0],
+            account_type=row[1],
+            broker_cash_only_buying_power=float(row[2]),
+            usable_budget=float(row[3]),
+            buffer_pct=float(row[4]),
+        )
+
+    def _upsert_day_sync(self, day: CashBudgetDay) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO cash_budget_days (
+                    trade_date, account_type, broker_cash_only_buying_power, usable_budget, buffer_pct, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                    account_type=excluded.account_type,
+                    broker_cash_only_buying_power=excluded.broker_cash_only_buying_power,
+                    usable_budget=excluded.usable_budget,
+                    buffer_pct=excluded.buffer_pct,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    day.trade_date,
+                    day.account_type,
+                    day.broker_cash_only_buying_power,
+                    day.usable_budget,
+                    day.buffer_pct,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def _get_reservation_sync(self, trade_id: str) -> CashBudgetReservation | None:
+        with closing(self.backend.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT trade_id, trade_date, amount, status
+                FROM cash_budget_reservations
+                WHERE trade_id = ?
+                """,
+                (trade_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CashBudgetReservation(
+            trade_id=row[0],
+            trade_date=row[1],
+            amount=float(row[2]),
+            status=row[3],
+        )
+
+    def _upsert_reservation_sync(self, reservation: CashBudgetReservation) -> None:
+        now = datetime.now(UTC).isoformat()
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO cash_budget_reservations (
+                    trade_id, trade_date, amount, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    amount=excluded.amount,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    reservation.trade_id,
+                    reservation.trade_date,
+                    reservation.amount,
+                    reservation.status,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def _mark_reservation_status_sync(self, trade_id: str, status: str) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE cash_budget_reservations
+                SET status = ?, updated_at = ?
+                WHERE trade_id = ?
+                """,
+                (status, datetime.now(UTC).isoformat(), trade_id),
+            )
+            conn.commit()
+
+    def _reservation_totals_sync(self, trade_date: str) -> dict[str, float]:
+        with closing(self.backend.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COALESCE(SUM(amount), 0)
+                FROM cash_budget_reservations
+                WHERE trade_date = ?
+                GROUP BY status
+                """,
+                (trade_date,),
+            ).fetchall()
+        totals = {"reserved": 0.0, "consumed": 0.0}
+        for status, amount in rows:
+            if status in totals:
+                totals[status] = float(amount or 0.0)
+        return totals

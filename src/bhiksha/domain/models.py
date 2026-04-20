@@ -156,3 +156,20 @@ class TradeRecord:
     exit_limit_price: float | None = None
     exit_submitted_at: datetime | None = None
     exit_mode: ExitMode | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class CashBudgetDay:
+    trade_date: str
+    account_type: str | None
+    broker_cash_only_buying_power: float
+    usable_budget: float
+    buffer_pct: float
+
+
+@dataclass(slots=True, frozen=True)
+class CashBudgetReservation:
+    trade_id: str
+    trade_date: str
+    amount: float
+    status: str

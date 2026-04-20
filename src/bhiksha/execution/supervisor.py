@@ -235,6 +235,7 @@ class ExecutionSupervisor:
             },
         )
         if not filled:
+            await self._release_cash_guard_reservation(plan.trade_id)
             self.planner.position_tracker.close_position(
                 deployment.symbol,
                 deployment.deployment_id,
@@ -246,6 +247,7 @@ class ExecutionSupervisor:
             await self._emit_lifecycle_transition(transition, reason="entry_unfilled_closed")
             return plan
 
+        await self._finalize_cash_guard_reservation(plan.trade_id)
         stop_price = plan.estimated_entry_price * (1.0 - deployment.exit.stop_loss_pct)
         stop_result = await self.planner.order_manager.place_stop_loss_order(plan.option_symbol, stop_price, plan.quantity)
         target_order_id = None
@@ -1564,6 +1566,7 @@ class ExecutionSupervisor:
                     exit_mode=position.exit_mode,
                 )
             )
+        await self._sync_cash_guard()
 
     async def _emit_lifecycle_transition(
         self,
@@ -1622,6 +1625,27 @@ class ExecutionSupervisor:
 
     async def _upsert_trade_record(self, record: TradeRecord) -> None:
         await self.trade_state_repository.upsert_trade(record)
+
+    async def _finalize_cash_guard_reservation(self, trade_id: str) -> None:
+        cash_guard = getattr(self.planner, "cash_guard", None)
+        if cash_guard is None:
+            return
+        await cash_guard.finalize_entry(trade_id)
+
+    async def _release_cash_guard_reservation(self, trade_id: str) -> None:
+        cash_guard = getattr(self.planner, "cash_guard", None)
+        if cash_guard is None:
+            return
+        await cash_guard.release_entry(trade_id)
+
+    async def _sync_cash_guard(self) -> None:
+        cash_guard = getattr(self.planner, "cash_guard", None)
+        if cash_guard is None:
+            return
+        await cash_guard.sync_positions(
+            self.planner.position_tracker.active_positions(),
+            await self.trade_state_repository.get_open_trades(),
+        )
 
 
 def _target_price(entry_price: float, stop_loss_pct: float, r_multiple: float) -> float:

@@ -24,6 +24,8 @@ from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest, 
 from bhiksha.domain.events import BarClosedEvent
 from bhiksha.domain.models import Bar
 from bhiksha.domain.runtime import ProviderHealth, StartupReport
+from bhiksha.execution.order_manager import OrderManager
+from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.position_monitor import PositionMonitor
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
@@ -38,7 +40,8 @@ from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.market_data.trading_calendar import trading_window_start
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup, check_schwab_token_health
 from bhiksha.ops.issues import classify_runtime_issue_category
-from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteEventRepository, SQLiteTradeStateRepository
+from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
+from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
@@ -142,15 +145,26 @@ class BhikshaRuntime:
         evaluator = ReplaySignalEvaluator(FeatureService(), self.strategy_registry)
         sqlite_backend = SQLiteBackend(self.app_config.sqlite_path)
         event_repository = SQLiteEventRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        trade_state_repository = SQLiteTradeStateRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        cash_budget_repository = SQLiteCashBudgetRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        order_manager = OrderManager()
+        planner = ExecutionPlanner(
+            order_manager=order_manager,
+            cash_guard=CashGuard(
+                order_manager=order_manager,
+                repository=cash_budget_repository,
+            ),
+        )
         manual_status_writer = await self._build_manual_status_writer(
             output=output,
             event_repository=event_repository,
         )
         supervisor = ExecutionSupervisor(
+            planner=planner,
             event_repository=event_repository,
             app_config=self.app_config,
             event_bus=self.event_bus,
-            trade_state_repository=SQLiteTradeStateRepository(self.app_config.sqlite_path, backend=sqlite_backend),
+            trade_state_repository=trade_state_repository,
             manual_status_writer=manual_status_writer,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
