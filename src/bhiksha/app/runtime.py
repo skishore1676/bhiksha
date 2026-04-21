@@ -1207,6 +1207,7 @@ class BhikshaRuntime:
             if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):
                 mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")
                 label = "ENTRY_SUBMITTED" if mode == "live" else "ENTRY_PLANNED"
+                cash_summary = _cash_guard_reservation_summary(plan)
                 output(
                     f"{label} "
                     f"deployment={deployment.deployment_id} "
@@ -1216,6 +1217,7 @@ class BhikshaRuntime:
                     f"qty={plan.quantity} "
                     f"est={round(plan.estimated_entry_price, 2)} "
                     f"reasons={','.join(plan.risk_reasons)}"
+                    f"{cash_summary}"
                 )
             else:
                 extra_details = _entry_blocked_extra_details(plan)
@@ -1406,10 +1408,45 @@ def _frame_from_bars(symbol: str, bars) -> pl.DataFrame:
 
 def _entry_blocked_extra_details(plan) -> str:
     details = getattr(plan, "risk_details", None) or {}
-    if details.get("reason") != "insufficient_budget":
+    if details.get("reason") == "insufficient_budget":
+        values: list[str] = []
+        for key in ("max_premium", "entry_price", "min_contract_cost"):
+            value = details.get(key)
+            if value is None:
+                continue
+            if isinstance(value, float):
+                values.append(f"{key}={value:.2f}")
+            else:
+                values.append(f"{key}={value}")
+        return " " + " ".join(values) if values else ""
+    if "broker_cash_only_buying_power" in details:
+        return _format_cash_guard_fields(
+            details,
+            (
+                "account_type",
+                "required_cash",
+                "usable_budget",
+                "remaining_budget",
+                "broker_cash_only_buying_power",
+                "buffer_pct",
+            ),
+        )
+    return ""
+
+
+def _cash_guard_reservation_summary(plan) -> str:
+    details = getattr(plan, "risk_details", None) or {}
+    if "reserved_cash" not in details:
         return ""
+    return _format_cash_guard_fields(
+        details,
+        ("reserved_cash", "remaining_budget", "usable_budget"),
+    )
+
+
+def _format_cash_guard_fields(details: dict, keys: tuple[str, ...]) -> str:
     values: list[str] = []
-    for key in ("max_premium", "entry_price", "min_contract_cost"):
+    for key in keys:
         value = details.get(key)
         if value is None:
             continue
