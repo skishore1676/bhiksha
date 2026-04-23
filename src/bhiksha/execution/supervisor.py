@@ -37,6 +37,7 @@ class ExecutionSupervisor:
         event_bus: InMemoryEventBus | None = None,
         trade_state_repository: TradeStateRepository | None = None,
         manual_status_writer: ManualSheetStatusWriter | None = None,
+        reconcile_trigger: asyncio.Event | None = None,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
@@ -45,6 +46,7 @@ class ExecutionSupervisor:
         self.lifecycle_store = lifecycle_store or TradeLifecycleStore()
         self.event_bus = event_bus
         self.manual_status_writer = manual_status_writer
+        self.reconcile_trigger = reconcile_trigger
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._disabled_entry_deployments: set[str] = set()
@@ -235,54 +237,76 @@ class ExecutionSupervisor:
             },
         )
         if not filled:
-            await self._release_cash_guard_reservation(plan.trade_id)
-            self.planner.position_tracker.close_position(
+            normalized_error = (error or "").upper()
+            if normalized_error in {"REJECTED", "CANCELED", "EXPIRED"}:
+                await self._release_cash_guard_reservation(plan.trade_id)
+                self.planner.position_tracker.close_position(
+                    deployment.symbol,
+                    deployment.deployment_id,
+                    option_symbol=plan.option_symbol,
+                    order_id=plan.order_id,
+                )
+                await self.trade_state_repository.mark_closed(plan.trade_id)
+                transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
+                await self._emit_lifecycle_transition(transition, reason="entry_unfilled_closed")
+                await self.event_repository.append(
+                    "entry_reconcile_released",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "trade_id": plan.trade_id,
+                        "order_id": plan.order_id,
+                        "status": normalized_error or "UNKNOWN",
+                        "payload": payload or {},
+                    },
+                )
+                return plan
+            await self._upsert_trade_record(
+                TradeRecord(
+                    trade_id=plan.trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    option_symbol=plan.option_symbol,
+                    quantity=plan.quantity,
+                    entry_price=plan.estimated_entry_price,
+                    underlying_entry_price=plan.underlying_entry_price,
+                    entry_timestamp=plan.entry_timestamp,
+                    status="pending_entry_reconcile",
+                    entry_order_id=plan.order_id,
+                )
+            )
+            transition = self.lifecycle_store.mark_reconciliation_hold(
                 deployment.symbol,
                 deployment.deployment_id,
                 option_symbol=plan.option_symbol,
                 order_id=plan.order_id,
             )
-            await self.trade_state_repository.mark_closed(plan.trade_id)
-            transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
-            await self._emit_lifecycle_transition(transition, reason="entry_unfilled_closed")
+            await self._emit_lifecycle_transition(transition, reason="entry_fill_timeout_reconcile")
+            await self.event_repository.append(
+                "entry_fill_timeout_reconcile",
+                {
+                    "deployment_id": plan.deployment_id,
+                    "trade_id": plan.trade_id,
+                    "order_id": plan.order_id,
+                    "error": error,
+                    "payload": payload or {},
+                },
+            )
+            if self.reconcile_trigger is not None:
+                self.reconcile_trigger.set()
             return plan
 
         await self._finalize_cash_guard_reservation(plan.trade_id)
-        stop_price = plan.estimated_entry_price * (1.0 - deployment.exit.stop_loss_pct)
-        stop_result = await self.planner.order_manager.place_stop_loss_order(plan.option_symbol, stop_price, plan.quantity)
-        target_order_id = None
-        target_price = None
-        if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None:
-            target_price = _target_price(plan.estimated_entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
-            if self._supports_concurrent_exit_orders():
-                target_result = await self.planner.order_manager.place_target_order(
-                    plan.option_symbol,
-                    target_price,
-                    plan.quantity,
-                )
-                target_order_id = target_result.order_id
-                await self.event_repository.append(
-                    "profit_target_submission",
-                    {
-                        "deployment_id": plan.deployment_id,
-                        "entry_order_id": plan.order_id,
-                        "target_order_id": target_result.order_id,
-                        "target_error": target_result.error,
-                        "target_price": target_price,
-                    },
-                )
-            else:
-                await self.event_repository.append(
-                    "profit_target_armed",
-                    {
-                        "deployment_id": plan.deployment_id,
-                        "entry_order_id": plan.order_id,
-                        "target_order_id": None,
-                        "target_price": target_price,
-                        "mode": "virtual",
-                        "reason": "single_resting_exit_order_broker",
-                    },
-                )
+        stop_result, stop_price, target_order_id, target_price = await self._arm_position_protection(
+            deployment,
+            option_symbol=plan.option_symbol,
+            quantity=plan.quantity,
+            entry_price=plan.estimated_entry_price,
+            dry_run=False,
+            event_payload={
+                "deployment_id": plan.deployment_id,
+                "entry_order_id": plan.order_id,
+            },
+        )
         self.planner.position_tracker.open_position(
             deployment.symbol,
             deployment.deployment_id,
@@ -334,16 +358,6 @@ class ExecutionSupervisor:
                 protected=bool(stop_result.order_id),
             )
             await self._emit_lifecycle_transition(transition, reason="entry_filled_open_protected")
-        await self.event_repository.append(
-            "protective_stop_submission",
-            {
-                "deployment_id": plan.deployment_id,
-                "entry_order_id": plan.order_id,
-                "stop_order_id": stop_result.order_id,
-                "stop_error": stop_result.error,
-                "stop_price": stop_price,
-            },
-        )
         return replace(plan, stop_order_id=stop_result.order_id, target_order_id=target_order_id)
 
     async def manage_open_position(
@@ -373,12 +387,20 @@ class ExecutionSupervisor:
         updated = position
         quote = None
 
+        if updated.stop_order_id is None and updated.target_order_id is None:
+            updated = await self._restore_missing_protection(deployment, updated, dry_run=dry_run)
+
         async def ensure_quote():
             nonlocal quote
             if quote is None:
                 quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
             return quote
-        if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None and position.target_order_id is None:
+        if (
+            deployment.exit.use_profit_target
+            and deployment.exit.profit_target_multiple is not None
+            and updated.target_order_id is None
+            and updated.target_price is None
+        ):
             target_price = _target_price(position.entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
             if self._supports_concurrent_exit_orders():
                 target_order_id = "DRY_RUN_TARGET"
@@ -1531,19 +1553,41 @@ class ExecutionSupervisor:
         transitions = self.lifecycle_store.sync_from_positions(self.planner.position_tracker.active_positions())
         for transition in transitions:
             await self._emit_lifecycle_transition(transition, reason="broker_reconciliation_sync")
+        recent_trades = await self.trade_state_repository.get_recent_trades(limit=200)
+        recent_trade_ids = {trade.trade_id for trade in recent_trades}
+        open_trades = await self.trade_state_repository.get_open_trades()
+        open_trades_by_id = {trade.trade_id: trade for trade in open_trades}
         active_trade_ids = {
             position.trade_id
             for position in self.planner.position_tracker.active_positions()
             if position.trade_id is not None
         }
-        for trade in await self.trade_state_repository.get_open_trades():
+        for trade in open_trades:
             if trade.status == "pending_entry":
+                continue
+            if trade.status == "pending_entry_reconcile":
+                if trade.trade_id in active_trade_ids:
+                    continue
+                await self._reconcile_pending_entry_release(trade)
                 continue
             if trade.trade_id not in active_trade_ids:
                 await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
         for position in self.planner.position_tracker.active_positions():
             if position.trade_id is None or position.option_symbol is None:
                 continue
+            if position.source == "broker_recovered" and position.trade_id not in recent_trade_ids:
+                await self.event_repository.append(
+                    "orphan_position_recovered",
+                    {
+                        "deployment_id": position.deployment_id,
+                        "symbol": position.symbol,
+                        "trade_id": position.trade_id,
+                        "option_symbol": position.option_symbol,
+                        "quantity": position.quantity,
+                        "entry_price": position.entry_price,
+                        "entry_timestamp": position.entry_timestamp.isoformat() if position.entry_timestamp else None,
+                    },
+                )
             await self._upsert_trade_record(
                 TradeRecord(
                     trade_id=position.trade_id,
@@ -1566,7 +1610,172 @@ class ExecutionSupervisor:
                     exit_mode=position.exit_mode,
                 )
             )
+            previous = open_trades_by_id.get(position.trade_id)
+            if previous is not None and previous.status == "pending_entry_reconcile":
+                await self.event_repository.append(
+                    "entry_reconcile_recovered",
+                    {
+                        "deployment_id": position.deployment_id,
+                        "symbol": position.symbol,
+                        "trade_id": position.trade_id,
+                        "option_symbol": position.option_symbol,
+                        "entry_order_id": position.order_id,
+                    },
+                )
         await self._sync_cash_guard()
+
+    async def _reconcile_pending_entry_release(self, trade: TradeRecord) -> None:
+        if trade.entry_order_id is None:
+            return
+        status, payload, error = await self.planner.order_manager.get_order_status(trade.entry_order_id)
+        normalized = (status or error or "").upper()
+        if normalized not in {"REJECTED", "CANCELED", "EXPIRED"}:
+            return
+        await self._release_cash_guard_reservation(trade.trade_id)
+        await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
+        transition = self.lifecycle_store.mark_closed(trade.symbol, trade.deployment_id)
+        await self._emit_lifecycle_transition(transition, reason="entry_reconcile_released")
+        await self.event_repository.append(
+            "entry_reconcile_released",
+            {
+                "deployment_id": trade.deployment_id,
+                "symbol": trade.symbol,
+                "trade_id": trade.trade_id,
+                "entry_order_id": trade.entry_order_id,
+                "status": normalized,
+                "payload": payload or {},
+            },
+        )
+
+    async def _restore_missing_protection(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        dry_run: bool,
+    ) -> TrackedPosition:
+        stop_loss_pct, policy = _resolved_recovery_stop_loss_pct(deployment)
+        if stop_loss_pct is None or stop_loss_pct <= 0:
+            return position
+        await self.event_repository.append(
+            "protection_restore_attempt",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": position.symbol,
+                "trade_id": position.trade_id,
+                "option_symbol": position.option_symbol,
+                "policy": policy,
+                "dry_run": dry_run,
+            },
+        )
+        stop_result, stop_price, target_order_id, target_price = await self._arm_position_protection(
+            deployment,
+            option_symbol=position.option_symbol,
+            quantity=position.quantity,
+            entry_price=position.entry_price,
+            dry_run=dry_run,
+            event_payload={
+                "deployment_id": deployment.deployment_id,
+                "symbol": position.symbol,
+                "trade_id": position.trade_id,
+                "option_symbol": position.option_symbol,
+                "policy": policy,
+                "source": position.source,
+            },
+        )
+        if stop_result.order_id is None:
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": "protection_restore",
+                    "symbol": position.symbol,
+                    "deployment_id": deployment.deployment_id,
+                    "trade_id": position.trade_id,
+                    "error": stop_result.error or "missing_stop_order_id",
+                    "stage": "protection_restore",
+                },
+            )
+            return position
+        updated = _replace_position(
+            position,
+            stop_order_id=stop_result.order_id,
+            stop_price=stop_price,
+            target_order_id=target_order_id,
+            target_price=target_price,
+        )
+        transition = (
+            self.lifecycle_store.mark_target_active(
+                updated.symbol,
+                updated.deployment_id,
+                option_symbol=updated.option_symbol,
+                order_id=target_order_id,
+            )
+            if target_order_id
+            else self.lifecycle_store.mark_open(
+                updated.symbol,
+                updated.deployment_id,
+                option_symbol=updated.option_symbol,
+                order_id=stop_result.order_id,
+                protected=True,
+            )
+        )
+        await self._emit_lifecycle_transition(transition, reason="protection_restored")
+        return updated
+
+    async def _arm_position_protection(
+        self,
+        deployment: DeploymentManifest,
+        *,
+        option_symbol: str,
+        quantity: int,
+        entry_price: float,
+        dry_run: bool,
+        event_payload: dict[str, object],
+    ):
+        stop_loss_pct, _ = _resolved_recovery_stop_loss_pct(deployment)
+        stop_price = entry_price * (1.0 - (stop_loss_pct or 0.0))
+        stop_result = _DryRunOrderResult("DRY_RUN_STOP") if dry_run else await self.planner.order_manager.place_stop_loss_order(option_symbol, stop_price, quantity)
+        target_order_id = None
+        target_price = None
+        if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None:
+            target_price = _target_price(entry_price, stop_loss_pct or 0.0, deployment.exit.profit_target_multiple)
+            if self._supports_concurrent_exit_orders():
+                target_result = (
+                    _DryRunOrderResult("DRY_RUN_TARGET")
+                    if dry_run
+                    else await self.planner.order_manager.place_target_order(option_symbol, target_price, quantity)
+                )
+                target_order_id = target_result.order_id
+                await self.event_repository.append(
+                    "profit_target_submission",
+                    {
+                        **event_payload,
+                        "target_order_id": target_result.order_id,
+                        "target_error": target_result.error,
+                        "target_price": target_price,
+                    },
+                )
+            else:
+                await self.event_repository.append(
+                    "profit_target_armed",
+                    {
+                        **event_payload,
+                        "target_order_id": None,
+                        "target_price": target_price,
+                        "mode": "virtual",
+                        "reason": "single_resting_exit_order_broker",
+                    },
+                )
+        await self.event_repository.append(
+            "protective_stop_submission",
+            {
+                **event_payload,
+                "stop_order_id": stop_result.order_id,
+                "stop_error": stop_result.error,
+                "stop_price": stop_price,
+            },
+        )
+        return stop_result, stop_price, target_order_id, target_price
 
     async def _emit_lifecycle_transition(
         self,
@@ -1673,6 +1882,20 @@ def _tracked_trade_status(position: TrackedPosition) -> str:
     if position.target_order_id:
         return "target_active"
     return "open_protected" if position.stop_order_id else "open_unprotected"
+
+
+def _resolved_recovery_stop_loss_pct(deployment: DeploymentManifest) -> tuple[float | None, str]:
+    if deployment.exit.stop_loss_pct is not None and deployment.exit.stop_loss_pct > 0:
+        return deployment.exit.stop_loss_pct, "deployment_native"
+    if deployment.risk.stop_loss_pct is not None and deployment.risk.stop_loss_pct > 0:
+        return deployment.risk.stop_loss_pct, "global_fallback"
+    return None, "unavailable"
+
+
+class _DryRunOrderResult:
+    def __init__(self, order_id: str) -> None:
+        self.order_id = order_id
+        self.error = None
 
 
 def _is_self_disarming_manual_deployment(deployment: DeploymentManifest) -> bool:

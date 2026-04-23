@@ -11,6 +11,7 @@ from loguru import logger
 
 from bhiksha.execution.brokers.public.auth import get_access_token
 from bhiksha.execution.brokers.public.settings import PublicBrokerSettings
+from bhiksha.net.retry import retry_async
 
 
 class RateLimiter:
@@ -78,19 +79,28 @@ class PublicApiClient:
         }
 
     async def get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        await self._rate_limiter.acquire()
-        response = await self._client.get(endpoint, headers=await self._headers(), params=params)
-        return await self._handle_response("GET", endpoint, response)
+        async def operation() -> dict[str, Any]:
+            await self._rate_limiter.acquire()
+            response = await self._client.get(endpoint, headers=await self._headers(), params=params)
+            return await self._handle_response("GET", endpoint, response)
+
+        return await retry_async(operation, on_retry=self._log_retry)
 
     async def post(self, endpoint: str, json_data: dict[str, Any] | None = None) -> dict[str, Any]:
-        await self._rate_limiter.acquire()
-        response = await self._client.post(endpoint, headers=await self._headers(), json=json_data)
-        return await self._handle_response("POST", endpoint, response)
+        async def operation() -> dict[str, Any]:
+            await self._rate_limiter.acquire()
+            response = await self._client.post(endpoint, headers=await self._headers(), json=json_data)
+            return await self._handle_response("POST", endpoint, response)
+
+        return await retry_async(operation, on_retry=self._log_retry)
 
     async def delete(self, endpoint: str) -> dict[str, Any]:
-        await self._rate_limiter.acquire()
-        response = await self._client.delete(endpoint, headers=await self._headers())
-        return await self._handle_response("DELETE", endpoint, response)
+        async def operation() -> dict[str, Any]:
+            await self._rate_limiter.acquire()
+            response = await self._client.delete(endpoint, headers=await self._headers())
+            return await self._handle_response("DELETE", endpoint, response)
+
+        return await retry_async(operation, on_retry=self._log_retry)
 
     async def _handle_response(
         self,
@@ -111,3 +121,11 @@ class PublicApiClient:
             logger.error("Public API {} {} failed with status {}", method, endpoint, response.status_code)
             raise
 
+    async def _log_retry(self, exc: Exception, attempt: int, delay: float) -> None:
+        logger.warning(
+            "PUBLIC_API_RETRY attempt={} delay_s={:.2f} error_type={} error={}",
+            attempt,
+            delay,
+            type(exc).__name__,
+            exc,
+        )

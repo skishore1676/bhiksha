@@ -169,6 +169,78 @@ def test_server_session_restart_syncs_stops_and_restarts(tmp_path: Path, monkeyp
     ]]
 
 
+def test_server_session_ensure_running_starts_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pid_path = tmp_path / "runtime" / "bhiksha.pid"
+    runtime_log_dir = tmp_path / "runtime_logs"
+    active_plan_path = tmp_path / "active_plan.json"
+    active_plan_path.write_text("{}", encoding="utf-8")
+
+    class _FakeProcess:
+        pid = 54321
+
+    def _fake_popen(command, **kwargs):
+        assert kwargs["cwd"] == str(tmp_path.resolve())
+        return _FakeProcess()
+
+    def _fake_kill(pid: int, sig: int) -> None:
+        del pid, sig
+        raise ProcessLookupError
+
+    monkeypatch.setattr("bhiksha.tools.server_session.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("bhiksha.tools.server_session.os.kill", _fake_kill)
+
+    exit_code = server_session_main(
+        [
+            "ensure-running",
+            "--pid-path",
+            str(pid_path),
+            "--runtime-log-dir",
+            str(runtime_log_dir),
+            "--active-plan",
+            str(active_plan_path),
+            "--repo-root",
+            str(tmp_path),
+            "--python-executable",
+            "/tmp/python",
+            "--live",
+        ]
+    )
+
+    assert exit_code == 0
+    metadata = json.loads(pid_path.read_text(encoding="utf-8"))
+    assert metadata["pid"] == 54321
+
+
+def test_server_session_ensure_running_noops_when_alive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pid_path = tmp_path / "runtime" / "bhiksha.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(json.dumps({"pid": 11111}), encoding="utf-8")
+
+    def _fake_kill(pid: int, sig: int) -> None:
+        assert pid == 11111
+        assert sig == 0
+
+    monkeypatch.setattr("bhiksha.tools.server_session.os.kill", _fake_kill)
+
+    exit_code = server_session_main(
+        [
+            "ensure-running",
+            "--pid-path",
+            str(pid_path),
+            "--runtime-log-dir",
+            str(tmp_path / "runtime_logs"),
+            "--active-plan",
+            str(tmp_path / "active_plan.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-executable",
+            "/tmp/python",
+        ]
+    )
+
+    assert exit_code == 0
+
+
 def _sync_result(active_plan_path: Path, log_path: Path):
     from bhiksha.tools.sync_active_plan import SyncActivePlanResult
 

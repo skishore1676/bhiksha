@@ -129,6 +129,10 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         await self._ensure_initialized()
         return await self.backend.run_read(self._get_open_trades_sync)
 
+    async def get_recent_trades(self, *, limit: int = 100) -> list[TradeRecord]:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_recent_trades_sync, limit)
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -258,29 +262,22 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 ORDER BY updated_at DESC
                 """
             ).fetchall()
-        return [
-            TradeRecord(
-                trade_id=row[0],
-                deployment_id=row[1],
-                symbol=row[2],
-                option_symbol=row[3],
-                quantity=row[4],
-                entry_price=row[5],
-                underlying_entry_price=row[6],
-                entry_timestamp=datetime.fromisoformat(row[7]) if row[7] else None,
-                status=row[8],
-                entry_order_id=row[9],
-                stop_order_id=row[10],
-                stop_price=row[11],
-                target_order_id=row[12],
-                target_price=row[13],
-                exit_order_id=row[14],
-                exit_limit_price=row[15],
-                exit_submitted_at=datetime.fromisoformat(row[16]) if row[16] else None,
-                exit_mode=ExitMode(row[17]) if row[17] else None,
-            )
-            for row in rows
-        ]
+        return [_trade_record_from_row(row) for row in rows]
+
+    def _get_recent_trades_sync(self, limit: int) -> list[TradeRecord]:
+        with closing(self.backend.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
+                       entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
+                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode
+                FROM trade_sessions
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max(int(limit), 1),),
+            ).fetchall()
+        return [_trade_record_from_row(row) for row in rows]
 
 
 class SQLiteCashBudgetRepository(CashBudgetRepository):
@@ -476,3 +473,26 @@ class SQLiteCashBudgetRepository(CashBudgetRepository):
             if status in totals:
                 totals[status] = float(amount or 0.0)
         return totals
+
+
+def _trade_record_from_row(row) -> TradeRecord:
+    return TradeRecord(
+        trade_id=row[0],
+        deployment_id=row[1],
+        symbol=row[2],
+        option_symbol=row[3],
+        quantity=row[4],
+        entry_price=row[5],
+        underlying_entry_price=row[6],
+        entry_timestamp=datetime.fromisoformat(row[7]) if row[7] else None,
+        status=row[8],
+        entry_order_id=row[9],
+        stop_order_id=row[10],
+        stop_price=row[11],
+        target_order_id=row[12],
+        target_price=row[13],
+        exit_order_id=row[14],
+        exit_limit_price=row[15],
+        exit_submitted_at=datetime.fromisoformat(row[16]) if row[16] else None,
+        exit_mode=ExitMode(row[17]) if row[17] else None,
+    )

@@ -34,6 +34,10 @@ class TradeStateRepository(ABC):
     async def get_open_trades(self) -> list[TradeRecord]:
         """Return open or pending trade sessions."""
 
+    @abstractmethod
+    async def get_recent_trades(self, *, limit: int = 100) -> list[TradeRecord]:
+        """Return recent trade sessions, including recently closed rows."""
+
 
 class NullTradeStateRepository(TradeStateRepository):
     async def upsert_trade(self, record: TradeRecord) -> None:
@@ -43,6 +47,10 @@ class NullTradeStateRepository(TradeStateRepository):
         return None
 
     async def get_open_trades(self) -> list[TradeRecord]:
+        return []
+
+    async def get_recent_trades(self, *, limit: int = 100) -> list[TradeRecord]:
+        del limit
         return []
 
 

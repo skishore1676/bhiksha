@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 import os
 from zoneinfo import ZoneInfo
 
@@ -149,18 +149,19 @@ class CashGuard:
         if not _should_enforce(mode, account_type):
             return
         for position in positions:
-            if position.trade_id is None or position.entry_timestamp is None:
+            if position.trade_id is None:
                 continue
             reservation = await self.repository.get_reservation(position.trade_id)
             if reservation is None:
                 amount = _position_cash_cost(position)
                 if amount is None:
                     continue
-                await self._ensure_day(position.entry_timestamp, account_type=account_type)
+                entry_timestamp = position.entry_timestamp or datetime.now(UTC)
+                await self._ensure_day(entry_timestamp, account_type=account_type)
                 await self.repository.upsert_reservation(
                     CashBudgetReservation(
                         trade_id=position.trade_id,
-                        trade_date=trade_date_et(position.entry_timestamp),
+                        trade_date=trade_date_et(entry_timestamp),
                         amount=amount,
                         status="consumed",
                     )
@@ -171,7 +172,7 @@ class CashGuard:
         for trade in trades:
             if trade.trade_id is None or trade.entry_timestamp is None:
                 continue
-            if trade.status != "pending_entry":
+            if trade.status not in {"pending_entry", "pending_entry_reconcile"}:
                 continue
             reservation = await self.repository.get_reservation(trade.trade_id)
             if reservation is not None:

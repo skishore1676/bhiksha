@@ -9,6 +9,7 @@ import httpx
 
 from bhiksha.integrations.schwab.auth import get_valid_access_token
 from bhiksha.integrations.schwab.settings import SchwabSettings
+from bhiksha.net.retry import retry_async
 
 
 class SchwabApiClient:
@@ -25,14 +26,20 @@ class SchwabApiClient:
         return {"Authorization": f"Bearer {await get_valid_access_token(self.settings)}"}
 
     async def linked_accounts(self) -> list[dict[str, Any]]:
-        response = await self._client.get("/trader/v1/accounts/accountNumbers", headers=await self._headers())
-        response.raise_for_status()
-        return response.json()
+        async def operation() -> list[dict[str, Any]]:
+            response = await self._client.get("/trader/v1/accounts/accountNumbers", headers=await self._headers())
+            response.raise_for_status()
+            return response.json()
+
+        return await retry_async(operation)
 
     async def quote(self, symbol: str) -> dict[str, Any]:
-        response = await self._client.get(f"/marketdata/v1/{symbol}/quotes", headers=await self._headers())
-        response.raise_for_status()
-        return response.json()
+        async def operation() -> dict[str, Any]:
+            response = await self._client.get(f"/marketdata/v1/{symbol}/quotes", headers=await self._headers())
+            response.raise_for_status()
+            return response.json()
+
+        return await retry_async(operation)
 
     async def option_chain(
         self,
@@ -53,9 +60,12 @@ class SchwabApiClient:
             params["fromDate"] = from_date.isoformat()
         if to_date is not None:
             params["toDate"] = to_date.isoformat()
-        response = await self._client.get("/marketdata/v1/chains", headers=await self._headers(), params=params)
-        response.raise_for_status()
-        return response.json()
+        async def operation() -> dict[str, Any]:
+            response = await self._client.get("/marketdata/v1/chains", headers=await self._headers(), params=params)
+            response.raise_for_status()
+            return response.json()
+
+        return await retry_async(operation)
 
     async def price_history(
         self,
@@ -78,10 +88,13 @@ class SchwabApiClient:
             params["startDate"] = int(start_date.timestamp() * 1000)
         if end_date is not None:
             params["endDate"] = int(end_date.timestamp() * 1000)
-        response = await self._client.get(
-            f"/marketdata/v1/pricehistory",
-            headers=await self._headers(),
-            params={"symbol": symbol, **params},
-        )
-        response.raise_for_status()
-        return response.json()
+        async def operation() -> dict[str, Any]:
+            response = await self._client.get(
+                f"/marketdata/v1/pricehistory",
+                headers=await self._headers(),
+                params={"symbol": symbol, **params},
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await retry_async(operation)

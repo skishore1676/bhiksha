@@ -6,10 +6,10 @@ from bhiksha.config.models import AppConfig
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import ExitMode, SignalDirection
-from bhiksha.domain.models import ExitDecision, SignalDecision, TradePlan
+from bhiksha.domain.models import ExitDecision, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
-from bhiksha.persistence.sqlite import SQLiteEventRepository
+from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.lifecycle import TradeLifecycleStore
 from bhiksha.state.position_tracker import PositionTracker
 
@@ -69,6 +69,21 @@ class StubPlanner:
 
     async def plan_entry(self, *args, **kwargs):
         del args, kwargs
+        return None
+
+
+class RecordingCashGuard:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def finalize_entry(self, trade_id: str) -> None:
+        self.calls.append(("finalize", trade_id))
+
+    async def release_entry(self, trade_id: str) -> None:
+        self.calls.append(("release", trade_id))
+
+    async def sync_positions(self, positions, trades) -> None:
+        del positions, trades
         return None
 
 
@@ -174,7 +189,7 @@ def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
     assert supervisor.planner.position_tracker.active_positions()[0].stop_order_id == "STOP123"
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
-    assert [row[0] for row in rows] == ["entry_fill_check", "lifecycle_transition", "protective_stop_submission"]
+    assert [row[0] for row in rows] == ["entry_fill_check", "protective_stop_submission", "lifecycle_transition"]
 
 
 def test_execution_supervisor_publishes_lifecycle_transition_event(tmp_path) -> None:
@@ -662,6 +677,166 @@ def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:
     assert supervisor.planner.position_tracker.total_open_positions == 0
 
 
+def test_execution_supervisor_holds_fill_timeout_for_reconciliation(tmp_path) -> None:
+    class TimeoutOrderManager(StubOrderManager):
+        async def wait_for_fill(self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2):
+            del order_id, timeout_seconds, poll_seconds
+            return False, {"status": "NEW"}, "fill_timeout"
+
+    class TimeoutPlanner(StubPlanner):
+        def __init__(self):
+            super().__init__()
+            self.order_manager = TimeoutOrderManager()
+            self.cash_guard = RecordingCashGuard()
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    reconcile_trigger = asyncio.Event()
+    supervisor = ExecutionSupervisor(
+        planner=TimeoutPlanner(),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        reconcile_trigger=reconcile_trigger,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE123",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+        entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        await trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id=plan.trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                option_symbol=plan.option_symbol,
+                quantity=plan.quantity,
+                entry_price=plan.estimated_entry_price,
+                entry_timestamp=plan.entry_timestamp,
+                status="pending_entry",
+                entry_order_id=plan.order_id,
+            )
+        )
+        await supervisor._protect_live_entry(plan, deployment)
+
+    asyncio.run(run())
+
+    open_trades = asyncio.run(trade_repo.get_open_trades())
+    assert open_trades[0].status == "pending_entry_reconcile"
+    assert supervisor.lifecycle_store.get("QQQ", deployment.deployment_id).state.value == "reconciliation_hold"
+    assert reconcile_trigger.is_set() is True
+    assert supervisor.planner.cash_guard.calls == []
+
+
+def test_execution_supervisor_sync_lifecycle_recovers_timed_out_entry(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    planner = StubPlanner()
+    planner.cash_guard = RecordingCashGuard()
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+
+    async def run() -> None:
+        await trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE123",
+                deployment_id="market_impulse_qqq_short_v1",
+                symbol="QQQ",
+                option_symbol="QQQ260330P00558000",
+                quantity=1,
+                entry_price=2.0,
+                entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+                status="pending_entry_reconcile",
+                entry_order_id="ENTRY123",
+            )
+        )
+        supervisor.planner.position_tracker.open_position(
+            "QQQ",
+            "market_impulse_qqq_short_v1",
+            trade_id="TRADE123",
+            option_symbol="QQQ260330P00558000",
+            quantity=1,
+            entry_price=2.0,
+            entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+            source="broker_sync",
+            order_id="ENTRY123",
+            stop_order_id="STOP123",
+            stop_price=1.1,
+        )
+        await supervisor.sync_lifecycle()
+
+    asyncio.run(run())
+
+    open_trades = asyncio.run(trade_repo.get_open_trades())
+    assert open_trades[0].status == "open_protected"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "entry_reconcile_recovered" in event_types
+
+
+def test_execution_supervisor_sync_lifecycle_releases_terminal_reconcile_hold(tmp_path) -> None:
+    class CanceledOrderManager(StubOrderManager):
+        async def get_order_status(self, order_id: str):
+            del order_id
+            return "CANCELED", {"status": "CANCELED"}, None
+
+    class ReconcilePlanner(StubPlanner):
+        def __init__(self):
+            super().__init__()
+            self.order_manager = CanceledOrderManager()
+            self.cash_guard = RecordingCashGuard()
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=ReconcilePlanner(),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+
+    async def run() -> None:
+        await trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE123",
+                deployment_id="market_impulse_qqq_short_v1",
+                symbol="QQQ",
+                option_symbol="QQQ260330P00558000",
+                quantity=1,
+                entry_price=2.0,
+                entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+                status="pending_entry_reconcile",
+                entry_order_id="ENTRY123",
+            )
+        )
+        await supervisor.sync_lifecycle()
+
+    asyncio.run(run())
+
+    assert asyncio.run(trade_repo.get_open_trades()) == []
+    assert supervisor.planner.cash_guard.calls == [("release", "TRADE123")]
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "entry_reconcile_released" in event_types
+
+
 def test_execution_supervisor_hard_flats_due_positions(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     supervisor = ExecutionSupervisor(
@@ -892,8 +1067,8 @@ def test_execution_supervisor_arms_virtual_profit_target_when_broker_supports_si
     assert [row[0] for row in rows] == [
         "entry_fill_check",
         "profit_target_armed",
-        "lifecycle_transition",
         "protective_stop_submission",
+        "lifecycle_transition",
     ]
 
 

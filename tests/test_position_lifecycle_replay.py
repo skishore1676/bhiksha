@@ -184,3 +184,33 @@ def test_position_lifecycle_replay_preserves_active_stop_before_target_approach(
     assert managed.stop_order_id == "STOP123"
     assert managed.target_order_id is None
     assert order_manager.calls == []
+
+
+def test_position_lifecycle_replay_restores_missing_stop_after_reconciliation() -> None:
+    deployment = _target_enabled_deployment()
+    order_manager = SequenceOrderManager([3.10])
+    supervisor = ExecutionSupervisor(
+        planner=SequencePlanner(order_manager),
+        event_repository=NullEventRepository(),
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="recovered-trade",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="broker_recovered",
+        stop_order_id=None,
+        stop_price=None,
+    )
+
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    managed = asyncio.run(supervisor.manage_open_position(deployment, position, dry_run=False))
+
+    assert managed is not None
+    assert managed.stop_order_id == "STOP123"
+    assert managed.stop_price == 1.1
+    assert ("place_stop", 1.1) in order_manager.calls

@@ -159,6 +159,7 @@ class BhikshaRuntime:
             output=output,
             event_repository=event_repository,
         )
+        reconcile_trigger = asyncio.Event()
         supervisor = ExecutionSupervisor(
             planner=planner,
             event_repository=event_repository,
@@ -166,23 +167,69 @@ class BhikshaRuntime:
             event_bus=self.event_bus,
             trade_state_repository=trade_state_repository,
             manual_status_writer=manual_status_writer,
+            reconcile_trigger=reconcile_trigger,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker
         source = self._live_bar_source()
         public_token_daemon = PublicTokenRefreshDaemon()
         schwab_token_daemon = SchwabTokenRefreshDaemon()
+
+        async def handle_provider_backoff(symbol: str, provider: str, exc: Exception) -> None:
+            await _append_event_best_effort(
+                event_repository,
+                "provider_backoff",
+                {
+                    "symbol": symbol,
+                    "provider": provider,
+                    "error": repr(exc),
+                    "error_type": type(exc).__name__,
+                },
+                output=output,
+            )
+            await _append_event_best_effort(
+                event_repository,
+                "runtime_issue",
+                {
+                    "category": classify_runtime_issue_category(error=repr(exc), event_type="market_data_provider"),
+                    "symbol": symbol,
+                    "error": repr(exc),
+                    "error_type": type(exc).__name__,
+                    "stage": "market_data_provider",
+                    "provider": provider,
+                },
+                output=output,
+            )
+            output(
+                "PROVIDER_BACKOFF "
+                f"provider={provider} symbol={symbol} "
+                f"error_type={type(exc).__name__} error={exc!r}"
+            )
+
+        async def handle_provider_recovered(symbol: str, provider: str) -> None:
+            await _append_event_best_effort(
+                event_repository,
+                "provider_recovered",
+                {
+                    "symbol": symbol,
+                    "provider": provider,
+                },
+                output=output,
+            )
+            output(f"PROVIDER_RECOVERED provider={provider} symbol={symbol}")
+
         daemon = DataIngestionDaemon(
             source,
             self.event_bus,
             symbols=symbols,
             provider=self.provider_config.underlying_live_primary,
+            on_fetch_error=handle_provider_backoff,
+            on_fetch_recovered=handle_provider_recovered,
         )
         execution_dispatcher = SymbolExecutionDispatcher()
         execution_dispatcher.start(symbols)
         queue = self.event_bus.subscribe(BarClosedEvent)
         sync_lock = asyncio.Lock()
-        reconcile_trigger = asyncio.Event()
         stop_event = asyncio.Event()
         reconciliation_snapshot = ReconciliationSnapshot()
         symbol_queues = {symbol: asyncio.Queue() for symbol in symbols}
@@ -1068,12 +1115,12 @@ class BhikshaRuntime:
             reconciliation_snapshot.last_attempt_at = attempt_started_at
         try:
             portfolio = await self._fetch_reconciliation_portfolio(broker)
-            open_trades = await supervisor.trade_state_repository.get_open_trades()
+            recent_trades = await supervisor.trade_state_repository.get_recent_trades(limit=200)
             tracker_positions = reconcile_public_positions(
                 portfolio.get("positions", []),
                 self.enabled_deployments,
                 orders=portfolio.get("orders", []),
-                known_trades=open_trades,
+                known_trades=recent_trades,
             )
         except Exception as exc:
             async with sync_lock:
@@ -1106,6 +1153,14 @@ class BhikshaRuntime:
                 f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
                 for position in tracker_positions
             )
+        deployments_by_id = {deployment.deployment_id: deployment for deployment in self.enabled_deployments}
+        for position in tracker_positions:
+            if position.stop_order_id is not None or position.option_symbol is None:
+                continue
+            deployment = deployments_by_id.get(position.deployment_id)
+            if deployment is None:
+                continue
+            await supervisor.manage_open_position(deployment, position, dry_run=False)
         await supervisor.event_repository.append(
             "runtime_metric",
             {
