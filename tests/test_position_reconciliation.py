@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.config.loader import load_deployments
 from bhiksha.domain.enums import ExitMode
@@ -229,3 +231,64 @@ def test_reconcile_public_positions_skips_ambiguous_same_contract_trade_identity
     tracked = reconcile_public_positions(positions, [qqq, sibling], known_trades=known_trades)
 
     assert tracked == []
+
+
+def test_reconcile_public_positions_matches_recent_closed_trade_by_opened_at_and_price() -> None:
+    deployments = load_deployments("config/deployments")
+    qqq = next(d for d in deployments if d.deployment_id == "market_impulse_qqq_short_v1")
+    positions = [
+        {
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "quantity": "1.0",
+            "openedAt": "2026-03-30T14:31:00Z",
+            "costBasis": {
+                "unitCost": "2.73",
+            },
+        }
+    ]
+    known_trades = [
+        TradeRecord(
+            trade_id="TRADE123",
+            deployment_id=qqq.deployment_id,
+            symbol="QQQ",
+            option_symbol="QQQ260401P00556000",
+            quantity=1,
+            entry_price=2.73,
+            entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+            status="closed",
+            entry_order_id="ENTRY123",
+        )
+    ]
+
+    tracked = reconcile_public_positions(positions, [qqq], known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id == "TRADE123"
+    assert tracked[0].source == "broker_sync"
+
+
+def test_reconcile_public_positions_creates_synthetic_trade_for_orphan() -> None:
+    deployments = build_runtime().enabled_deployments
+    positions = [
+        {
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "quantity": "1.0",
+            "openedAt": "2026-03-30T14:31:00Z",
+            "costBasis": {
+                "unitCost": "2.73",
+            },
+        }
+    ]
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=[])
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id is not None
+    assert tracked[0].trade_id.startswith("recovered:")
+    assert tracked[0].source == "broker_recovered"

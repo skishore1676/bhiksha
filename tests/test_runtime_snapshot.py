@@ -352,6 +352,10 @@ def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
         async def get_open_trades(self) -> list:
             return []
 
+        async def get_recent_trades(self, *, limit: int = 100) -> list:
+            del limit
+            return []
+
     class StubSupervisor:
         def __init__(self) -> None:
             self.event_repository = StubRepo()
@@ -361,6 +365,10 @@ def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
 
         async def sync_lifecycle(self) -> None:
             self.sync_calls += 1
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position, dry_run
+            return None
 
     broker = StubBroker()
     supervisor = StubSupervisor()

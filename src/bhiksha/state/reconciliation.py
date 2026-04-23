@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import re
 from typing import Iterable
 
@@ -10,8 +11,8 @@ from bhiksha.domain.models import TradeRecord
 from bhiksha.execution.order_manager import normalize_option_symbol
 from bhiksha.state.position_tracker import TrackedPosition
 
-
 _OPTION_ROOT_RE = re.compile(r"^([A-Z]+)")
+_RECOVERY_MATCH_WINDOW = timedelta(hours=6)
 
 
 def reconcile_public_positions(
@@ -23,6 +24,7 @@ def reconcile_public_positions(
 ) -> list[TrackedPosition]:
     """Map Public portfolio positions into tracked deployment positions."""
     deployments_by_symbol: dict[str, list[DeploymentManifest]] = {}
+    deployments_by_id = {deployment.deployment_id: deployment for deployment in deployments}
     for deployment in deployments:
         deployments_by_symbol.setdefault(deployment.symbol, []).append(deployment)
     stop_orders_by_symbol, limit_orders_by_symbol = _index_open_exit_orders(orders or [])
@@ -45,29 +47,44 @@ def reconcile_public_positions(
         symbol = _parse_option_root(option_symbol)
         stop_order = stop_orders_by_symbol.get(option_symbol) or {}
         limit_order = limit_orders_by_symbol.get(option_symbol) or {}
+        broker_opened_at = _parse_opened_at(position)
+        broker_entry_price = _parse_entry_price(position)
         matched_trade = _resolve_trade(
             option_symbol,
             stop_order_id=stop_order.get("order_id"),
             exit_or_target_order_id=limit_order.get("order_id"),
             trades_by_option_symbol=trades_by_option_symbol,
             trades_by_order_id=trades_by_order_id,
+            broker_opened_at=broker_opened_at,
+            broker_entry_price=broker_entry_price,
         )
         deployment = None
         trade_id = None
-        entry_price = _parse_entry_price(position)
+        entry_price = broker_entry_price
+        entry_timestamp = broker_opened_at
+        source = "broker_sync"
         if matched_trade is not None:
-            deployment = next((candidate for candidate in deployments if candidate.deployment_id == matched_trade.deployment_id), None)
+            deployment = deployments_by_id.get(matched_trade.deployment_id)
             trade_id = matched_trade.trade_id
             entry_price = entry_price or matched_trade.entry_price
+            entry_timestamp = entry_timestamp or matched_trade.entry_timestamp
         else:
             symbol_deployments = deployments_by_symbol.get(symbol, [])
             if len(symbol_deployments) == 1:
                 deployment = symbol_deployments[0]
+                trade_id = _synthetic_trade_id(
+                    deployment_id=deployment.deployment_id,
+                    option_symbol=option_symbol,
+                    quantity=_parse_quantity(position),
+                    entry_price=entry_price,
+                    opened_at=entry_timestamp,
+                )
+                source = "broker_recovered"
             else:
                 continue
         if deployment is None:
             continue
-        quantity = int(float(position.get("quantity", "0") or 0))
+        quantity = _parse_quantity(position)
         if quantity <= 0:
             continue
         exit_order: dict[str, float | str] = {}
@@ -85,8 +102,8 @@ def reconcile_public_positions(
                 quantity=quantity,
                 entry_price=entry_price,
                 underlying_entry_price=matched_trade.underlying_entry_price if matched_trade is not None else None,
-                entry_timestamp=matched_trade.entry_timestamp if matched_trade is not None else None,
-                source="broker_sync",
+                entry_timestamp=entry_timestamp,
+                source=source,
                 order_id=matched_trade.entry_order_id if matched_trade is not None else None,
                 stop_order_id=stop_order.get("order_id") or (matched_trade.stop_order_id if matched_trade is not None else None),
                 stop_price=stop_order.get("price") or (matched_trade.stop_price if matched_trade is not None else None),
@@ -108,6 +125,8 @@ def _resolve_trade(
     exit_or_target_order_id: str | None,
     trades_by_option_symbol: dict[str, list[TradeRecord]],
     trades_by_order_id: dict[str, TradeRecord],
+    broker_opened_at: datetime | None,
+    broker_entry_price: float | None,
 ) -> TradeRecord | None:
     for order_id in (stop_order_id, exit_or_target_order_id):
         if order_id and order_id in trades_by_order_id:
@@ -115,7 +134,44 @@ def _resolve_trade(
     option_trades = trades_by_option_symbol.get(option_symbol, [])
     if len(option_trades) == 1:
         return option_trades[0]
+    time_matches = [
+        trade for trade in option_trades
+        if _matches_broker_opened_at(trade, broker_opened_at)
+    ]
+    if len(time_matches) == 1:
+        return time_matches[0]
+    price_matches = [
+        trade for trade in time_matches or option_trades
+        if _matches_broker_entry_price(trade, broker_entry_price)
+    ]
+    if len(price_matches) == 1:
+        return price_matches[0]
     return None
+
+
+def _matches_broker_opened_at(trade: TradeRecord, broker_opened_at: datetime | None) -> bool:
+    if broker_opened_at is None or trade.entry_timestamp is None:
+        return False
+    return abs(_ensure_utc(trade.entry_timestamp) - broker_opened_at) <= _RECOVERY_MATCH_WINDOW
+
+
+def _matches_broker_entry_price(trade: TradeRecord, broker_entry_price: float | None) -> bool:
+    if broker_entry_price is None or trade.entry_price is None:
+        return False
+    return abs(trade.entry_price - broker_entry_price) <= 0.05
+
+
+def _synthetic_trade_id(
+    *,
+    deployment_id: str,
+    option_symbol: str,
+    quantity: int,
+    entry_price: float | None,
+    opened_at: datetime | None,
+) -> str:
+    opened_token = opened_at.isoformat() if opened_at is not None else "unknown"
+    price_token = f"{entry_price:.2f}" if entry_price is not None else "unknown"
+    return f"recovered:{deployment_id}:{option_symbol}:{quantity}:{price_token}:{opened_token}"
 
 
 def _parse_option_root(option_symbol: str) -> str:
@@ -155,6 +211,39 @@ def _index_open_exit_orders(orders: Iterable[dict]) -> tuple[dict[str, dict[str,
 
 def _parse_entry_price(position: dict) -> float | None:
     return _maybe_float(((position.get("costBasis") or {}).get("unitCost")))
+
+
+def _parse_quantity(position: dict) -> int:
+    return int(float(position.get("quantity", "0") or 0))
+
+
+def _parse_opened_at(position: dict) -> datetime | None:
+    raw = (
+        position.get("openedAt")
+        or position.get("opened_at")
+        or position.get("openDate")
+        or position.get("open_date")
+    )
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(float(raw) / 1000.0, tz=UTC) if float(raw) > 10_000_000_000 else datetime.fromtimestamp(float(raw), tz=UTC)
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip()
+    if not normalized:
+        return None
+    normalized = normalized.replace("Z", "+00:00")
+    try:
+        return _ensure_utc(datetime.fromisoformat(normalized))
+    except ValueError:
+        return None
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _maybe_float(value) -> float | None:

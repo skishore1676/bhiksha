@@ -189,4 +189,25 @@ def _event_detail(event_type: str, payload: dict) -> str | None:
         if action:
             detail += f" action={action}"
         return detail
+    if event_type in {
+        "entry_fill_timeout_reconcile",
+        "entry_reconcile_recovered",
+        "entry_reconcile_released",
+        "orphan_position_recovered",
+        "protection_restore_attempt",
+        "provider_backoff",
+        "provider_recovered",
+    }:
+        keys = (
+            "trade_id",
+            "order_id",
+            "entry_order_id",
+            "option_symbol",
+            "provider",
+            "policy",
+            "status",
+            "error_type",
+        )
+        values = [f"{key}={payload.get(key)}" for key in keys if payload.get(key) is not None]
+        return " ".join(values) or None
     return None

@@ -90,3 +90,27 @@ def test_cash_guard_sync_positions_backfills_consumed_budget(monkeypatch, tmp_pa
     assert result.details["remaining_budget"] == 660.0
     assert blocked.blocked is True
     assert blocked.details["remaining_budget"] == 370.0
+
+
+def test_cash_guard_sync_positions_counts_pending_entry_reconcile(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "on")
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
+    guard = _guard(tmp_path)
+    timestamp = datetime(2026, 4, 20, 15, 0, tzinfo=UTC)
+
+    trade_pending_reconcile = TradeRecord(
+        trade_id="T5",
+        deployment_id="dep1",
+        symbol="QQQ",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.9,
+        entry_timestamp=timestamp,
+        status="pending_entry_reconcile",
+    )
+
+    asyncio.run(guard.sync_positions([], [trade_pending_reconcile]))
+    blocked = asyncio.run(guard.reserve_entry(trade_id="T6", required_cash=700.0, timestamp=timestamp))
+
+    assert blocked.blocked is True
+    assert blocked.details["remaining_budget"] == 660.0

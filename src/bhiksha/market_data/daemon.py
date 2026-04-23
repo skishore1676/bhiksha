@@ -6,6 +6,8 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Awaitable, Callable
 
+import httpx
+
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.domain.events import BarClosedEvent
 from bhiksha.market_data.adapters.base import UnderlyingBarSource
@@ -23,6 +25,8 @@ class DataIngestionDaemon:
         provider: str,
         heartbeat_second: int = 1,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        on_fetch_error: Callable[[str, str, Exception], Awaitable[None]] | None = None,
+        on_fetch_recovered: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.source = source
         self.event_bus = event_bus
@@ -30,8 +34,11 @@ class DataIngestionDaemon:
         self.provider = provider
         self.heartbeat_second = heartbeat_second
         self._sleep = sleep
+        self._on_fetch_error = on_fetch_error
+        self._on_fetch_recovered = on_fetch_recovered
         self._stopped = False
         self._last_seen: dict[str, datetime] = {}
+        self._degraded_symbols: set[str] = set()
 
     def stop(self) -> None:
         self._stopped = True
@@ -44,7 +51,19 @@ class DataIngestionDaemon:
             for symbol in self.symbols:
                 if self._stopped:
                     break
-                bar = await self.source.fetch_latest_completed_bar(symbol, now=now)
+                try:
+                    bar = await self.source.fetch_latest_completed_bar(symbol, now=now)
+                except Exception as exc:
+                    if _is_retryable_provider_error(exc):
+                        self._degraded_symbols.add(symbol)
+                        if self._on_fetch_error is not None:
+                            await self._on_fetch_error(symbol, self.provider, exc)
+                        continue
+                    raise
+                if symbol in self._degraded_symbols:
+                    self._degraded_symbols.discard(symbol)
+                    if self._on_fetch_recovered is not None:
+                        await self._on_fetch_recovered(symbol, self.provider)
                 if bar is None:
                     continue
                 previous = self._last_seen.get(symbol)
@@ -72,3 +91,11 @@ class DataIngestionDaemon:
         if next_tick <= current:
             next_tick = (current + timedelta(minutes=1)).replace(second=heartbeat_second, microsecond=0)
         return max((next_tick - current).total_seconds(), 0.0)
+
+
+def _is_retryable_provider_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TimeoutException | httpx.RequestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return False

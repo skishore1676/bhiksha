@@ -137,6 +137,25 @@ class TradeLifecycleStore:
         self._records[(symbol, deployment_id)] = next_record
         return _transition(previous, next_record)
 
+    def mark_reconciliation_hold(
+        self,
+        symbol: str,
+        deployment_id: str,
+        *,
+        option_symbol: str | None = None,
+        order_id: str | None = None,
+    ) -> LifecycleTransition | None:
+        previous = self.get(symbol, deployment_id)
+        next_record = TradeLifecycle(
+            symbol=symbol,
+            deployment_id=deployment_id,
+            state=LifecycleState.RECONCILIATION_HOLD,
+            option_symbol=option_symbol,
+            order_id=order_id,
+        )
+        self._records[(symbol, deployment_id)] = next_record
+        return _transition(previous, next_record)
+
     def sync_from_positions(self, positions: list[TrackedPosition]) -> list[LifecycleTransition]:
         transitions: list[LifecycleTransition] = []
         active_keys: set[tuple[str, str]] = set()

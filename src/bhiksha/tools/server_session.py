@@ -36,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
     status = subparsers.add_parser("status", help="Show background Bhiksha process status")
     _add_common_process_args(status, defaults)
 
+    ensure_running = subparsers.add_parser("ensure-running", help="Start Bhiksha when it is not already running")
+    _add_runtime_args(ensure_running, defaults)
+
     restart = subparsers.add_parser("restart", help="Sync the active plan and restart Bhiksha in one step")
     _add_sync_args(restart, defaults)
     _add_runtime_args(restart, defaults, include_active_plan=False)
@@ -56,6 +59,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "status":
         _print_status(_runtime_status(Path(args.pid_path)))
+        return 0
+    if args.command == "ensure-running":
+        info = _runtime_status(Path(args.pid_path))
+        if info["running"]:
+            _print_status({"action": "ensure-running", **info})
+            return 0
+        start_info = _start_runtime(args)
+        _print_status({"action": "ensure-running", **start_info})
         return 0
     if args.command == "restart":
         result = _sync_from_args(args)
