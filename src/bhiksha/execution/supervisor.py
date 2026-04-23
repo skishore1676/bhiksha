@@ -8,6 +8,7 @@ from dataclasses import asdict
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import UTC
+import math
 import uuid
 
 from bhiksha.app.event_bus import InMemoryEventBus
@@ -17,6 +18,7 @@ from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, Trad
 from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
+from bhiksha.execution.order_manager import OrderResult, round_price
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -1733,8 +1735,25 @@ class ExecutionSupervisor:
         event_payload: dict[str, object],
     ):
         stop_loss_pct, _ = _resolved_recovery_stop_loss_pct(deployment)
-        stop_price = entry_price * (1.0 - (stop_loss_pct or 0.0))
-        stop_result = _DryRunOrderResult("DRY_RUN_STOP") if dry_run else await self.planner.order_manager.place_stop_loss_order(option_symbol, stop_price, quantity)
+        requested_stop_price = entry_price * (1.0 - (stop_loss_pct or 0.0))
+        stop_price = requested_stop_price
+        quote_bid = None
+        stop_sanitized = False
+        stop_sanitized_reason = None
+        if event_payload.get("source") == "broker_sync":
+            stop_price, quote_bid, stop_sanitized_reason = await self._sanitize_recovered_stop_price(
+                option_symbol,
+                requested_stop_price,
+            )
+            stop_sanitized = stop_sanitized_reason is not None
+        if stop_price is None:
+            stop_result = OrderResult(order_id=None, error="recovered_stop_sanitization_failed")
+        else:
+            stop_result = (
+                _DryRunOrderResult("DRY_RUN_STOP")
+                if dry_run
+                else await self.planner.order_manager.place_stop_loss_order(option_symbol, stop_price, quantity)
+            )
         target_order_id = None
         target_price = None
         if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None:
@@ -1773,9 +1792,30 @@ class ExecutionSupervisor:
                 "stop_order_id": stop_result.order_id,
                 "stop_error": stop_result.error,
                 "stop_price": stop_price,
+                "requested_stop_price": round_price(requested_stop_price),
+                "quote_bid": quote_bid,
+                "stop_sanitized": stop_sanitized,
+                "stop_sanitized_reason": stop_sanitized_reason,
             },
         )
         return stop_result, stop_price, target_order_id, target_price
+
+    async def _sanitize_recovered_stop_price(
+        self,
+        option_symbol: str,
+        requested_stop_price: float,
+    ) -> tuple[float | None, float | None, str | None]:
+        quote = await self.planner.order_manager.get_option_quote(option_symbol)
+        if quote.bid is None:
+            return round_price(requested_stop_price), None, None
+        requested = round_price(requested_stop_price)
+        max_valid_stop = _max_valid_sell_stop_price(quote.bid)
+        if max_valid_stop is None:
+            return None, quote.bid, "no_valid_bid_buffer"
+        if requested < quote.bid:
+            return requested, quote.bid, None
+        sanitized = min(requested, max_valid_stop)
+        return sanitized, quote.bid, "below_bid_buffer"
 
     async def _emit_lifecycle_transition(
         self,
@@ -1859,6 +1899,15 @@ class ExecutionSupervisor:
 
 def _target_price(entry_price: float, stop_loss_pct: float, r_multiple: float) -> float:
     return entry_price * (1.0 + stop_loss_pct * r_multiple)
+
+
+def _max_valid_sell_stop_price(bid: float) -> float | None:
+    if bid <= 0.01:
+        return None
+    candidate = math.floor(((bid - 0.01) + 1e-9) * 100.0) / 100.0
+    if candidate <= 0:
+        return None
+    return round_price(candidate)
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:
