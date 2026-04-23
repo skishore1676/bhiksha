@@ -837,6 +837,53 @@ def test_execution_supervisor_sync_lifecycle_releases_terminal_reconcile_hold(tm
     assert "entry_reconcile_released" in event_types
 
 
+def test_execution_supervisor_sanitizes_recovered_stop_below_bid(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RecordingOrderManager(quote_bid=1.30)
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    base_deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = base_deployment.model_copy(
+        update={
+            "exit": base_deployment.exit.model_copy(
+                update={
+                    "stop_loss_pct": 0.35,
+                    "use_profit_target": False,
+                    "profit_target_multiple": None,
+                }
+            )
+        }
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE123",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.0,
+        entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        source="broker_sync",
+        order_id="ENTRY123",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+
+    updated = asyncio.run(supervisor._restore_missing_protection(deployment, position, dry_run=False))
+
+    assert ("place_stop", 1.29) in order_manager.calls
+    assert updated.stop_order_id == "STOP123"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        payload = conn.execute(
+            "SELECT payload FROM events WHERE event_type = 'protective_stop_submission' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert '"stop_sanitized": true' in payload
+    assert '"quote_bid": 1.3' in payload
+
+
 def test_execution_supervisor_hard_flats_due_positions(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     supervisor = ExecutionSupervisor(

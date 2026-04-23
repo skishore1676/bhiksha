@@ -336,7 +336,7 @@ class OrderManager:
             corrected_price = snap_price(original_price, increment, side=side)
             payload[price_key] = f"{corrected_price:.2f}"
             if corrected_price != round_price(original_price):
-                logger.info(
+                logger.debug(
                     "ORDER_PRICE_SNAPPED symbol={} side={} price_key={} increment={} original_price={} corrected_price={}",
                     symbol,
                     side,
@@ -363,7 +363,7 @@ class OrderManager:
         underlying = underlying_symbol_from_option(symbol)
         if underlying is not None:
             self._underlying_price_increments[underlying] = increment
-        logger.info("PRICE_INCREMENT_LEARNED symbol={} underlying={} increment={}", symbol, underlying, increment)
+        logger.debug("PRICE_INCREMENT_LEARNED symbol={} underlying={} increment={}", symbol, underlying, increment)
 
     @staticmethod
     def _entry_payload(
