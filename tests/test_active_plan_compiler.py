@@ -330,6 +330,8 @@ def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_t
                 "expectancy": "1.42",
                 "confidence": "0.67",
                 "thesis_exit_policy": "market_impulse_reclaim",
+                "steward_recommendation": "shadow",
+                "steward_notes": '{"rank":2,"reason":"advisory only"}',
             }
         ],
     )
@@ -395,6 +397,8 @@ def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_t
     assert strategy.source.metadata["catalog_key"] == "market_impulse_spy_short_v1"
     assert strategy.source.metadata["playbook_id"] == "pb_spy_01"
     assert strategy.source.metadata["expectancy"] == 1.42
+    assert "steward_recommendation" not in strategy.source.metadata
+    assert "steward_notes" not in strategy.source.metadata
     assert manual.source.metadata["row_index"] == 2
     assert manual.strategy.key == "manual_breakout"
     assert manual.execution.dte_max == 1
