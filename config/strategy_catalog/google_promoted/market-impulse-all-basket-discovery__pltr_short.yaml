@@ -8,7 +8,7 @@ strategy:
     entry_buffer_minutes: 3
     entry_window_minutes: 60
     regime_timeframe: 1h
-    vwma_periods: &id001
+    vwma_periods:
     - 5
     - 13
     - 21
@@ -67,92 +67,95 @@ source:
     thesis_exit_policy: fixed_rr_underlying
     playbook_summary:
       bhiksha_compatibility:
-        bionic_ready: false
+        bhiksha_ready: true
+        supported: true
         has_optimized_thesis_exit: true
-        supported: false
-        note: "mala_v2 candidate \u2014 pending bhiksha config review"
+        note: bhiksha strategy and exit policy both implemented
+      catastrophe_exit_params:
+        hard_flat_time_et: '15:55'
+        stop_loss_pct: 0.35
       entry_params:
         entry_buffer_minutes: 3
         entry_window_minutes: 60
         regime_timeframe: 1h
-        vwma_periods: *id001
-      vehicle_mapping:
-        structure: long_put
-        dte: 7-21
-        delta_plan: 0.35-0.55
-        entry_window_et: 09:45-14:30
-        profit_take: 50-90% premium
-        risk_rule: hard stop at -35% premium
+        vwma_periods:
+        - 5
+        - 13
+        - 21
+      exit_candidate_policies:
+      - metrics:
+          avg_loser: -0.5844419354838709
+          avg_winner: 1.6674615384615383
+          expectancy: 0.08089318181818182
+          profit_factor: 1.196454296075109
+          total_pnl: 3.5593000000000004
+          trade_count: 44
+          win_rate: 0.29545454545454547
+        policy_name: trailing_vma_underlying:vma_10
+        thesis_exit_anchor: underlying
+        thesis_exit_params:
+          vma_col: vma_10
+        thesis_exit_policy: trailing_vma_underlying
+      - metrics:
+          avg_loser: -0.544496551724138
+          avg_winner: 0.8152192307692309
+          expectancy: 0.09827818181818185
+          profit_factor: 1.3423155841523962
+          total_pnl: 5.405300000000001
+          trade_count: 55
+          win_rate: 0.4727272727272727
+        policy_name: fixed_rr_underlying:0.0035x1.50
+        thesis_exit_anchor: underlying
+        thesis_exit_params:
+          stop_loss_underlying_pct: 0.0035
+          take_profit_underlying_r_multiple: 1.5
+        thesis_exit_policy: fixed_rr_underlying
+      - metrics:
+          avg_loser: -0.7685103448275862
+          avg_winner: 1.552978947368421
+          expectancy: 0.15041249999999992
+          profit_factor: 1.323949602455265
+          total_pnl: 7.219799999999997
+          trade_count: 48
+          win_rate: 0.3958333333333333
+        policy_name: fixed_rr_underlying:0.0050x2.00
+        thesis_exit_anchor: underlying
+        thesis_exit_params:
+          stop_loss_underlying_pct: 0.005
+          take_profit_underlying_r_multiple: 2.0
+        thesis_exit_policy: fixed_rr_underlying
+      - metrics:
+          avg_loser: -1.1295347826086957
+          avg_winner: 2.2888133333333327
+          expectancy: 0.21981315789473693
+          profit_factor: 1.321521365086819
+          total_pnl: 8.352900000000004
+          trade_count: 38
+          win_rate: 0.39473684210526316
+        policy_name: fixed_rr_underlying:0.0075x2.00
+        thesis_exit_anchor: underlying
+        thesis_exit_params:
+          stop_loss_underlying_pct: 0.0075
+          take_profit_underlying_r_multiple: 2.0
+        thesis_exit_policy: fixed_rr_underlying
       mc_metrics:
-        mc_prob_positive_exp: 0.88225
         mc_exp_r_mean: 0.167615
         mc_exp_r_p50: 0.167301
         mc_exp_r_p95: 0.405423
+        mc_prob_positive_exp: 0.88225
         mc_total_r_p05: -7.391937
         mc_total_r_p50: 18.403127
         mc_total_r_p95: 44.596533
       thesis_exit_params:
         stop_loss_underlying_pct: 0.0075
         take_profit_underlying_r_multiple: 2.0
-      catastrophe_exit_params:
-        hard_flat_time_et: '15:55'
-        stop_loss_pct: 0.35
-      exit_candidate_policies:
-      - policy_name: trailing_vma_underlying:vma_10
-        thesis_exit_anchor: underlying
-        thesis_exit_policy: trailing_vma_underlying
-        thesis_exit_params:
-          vma_col: vma_10
-        metrics:
-          trade_count: 44
-          win_rate: 0.29545454545454547
-          expectancy: 0.08089318181818182
-          profit_factor: 1.196454296075109
-          total_pnl: 3.5593000000000004
-          avg_winner: 1.6674615384615383
-          avg_loser: -0.5844419354838709
-      - policy_name: fixed_rr_underlying:0.0035x1.50
-        thesis_exit_anchor: underlying
-        thesis_exit_policy: fixed_rr_underlying
-        thesis_exit_params:
-          stop_loss_underlying_pct: 0.0035
-          take_profit_underlying_r_multiple: 1.5
-        metrics:
-          trade_count: 55
-          win_rate: 0.4727272727272727
-          expectancy: 0.09827818181818185
-          profit_factor: 1.3423155841523962
-          total_pnl: 5.405300000000001
-          avg_winner: 0.8152192307692309
-          avg_loser: -0.544496551724138
-      - policy_name: fixed_rr_underlying:0.0050x2.00
-        thesis_exit_anchor: underlying
-        thesis_exit_policy: fixed_rr_underlying
-        thesis_exit_params:
-          stop_loss_underlying_pct: 0.005
-          take_profit_underlying_r_multiple: 2.0
-        metrics:
-          trade_count: 48
-          win_rate: 0.3958333333333333
-          expectancy: 0.15041249999999992
-          profit_factor: 1.323949602455265
-          total_pnl: 7.219799999999997
-          avg_winner: 1.552978947368421
-          avg_loser: -0.7685103448275862
-      - policy_name: fixed_rr_underlying:0.0075x2.00
-        thesis_exit_anchor: underlying
-        thesis_exit_policy: fixed_rr_underlying
-        thesis_exit_params:
-          stop_loss_underlying_pct: 0.0075
-          take_profit_underlying_r_multiple: 2.0
-        metrics:
-          trade_count: 38
-          win_rate: 0.39473684210526316
-          expectancy: 0.21981315789473693
-          profit_factor: 1.321521365086819
-          total_pnl: 8.352900000000004
-          avg_winner: 2.2888133333333327
-          avg_loser: -1.1295347826086957
+      vehicle_mapping:
+        delta_plan: 0.35-0.55
+        dte: 7-21
+        entry_window_et: 09:45-14:30
+        profit_take: 50-90% premium
+        risk_rule: hard stop at -35% premium
+        structure: long_put
     catalog_row_index: 11
 approval_status: approved
 tags:
