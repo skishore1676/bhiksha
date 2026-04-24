@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -955,7 +956,10 @@ def _normalize_sheet_mapping(data: dict[str, Any]) -> dict[str, Any]:
     for raw_key, raw_value in data.items():
         key = _normalize_key(str(raw_key))
         key = _COLUMN_ALIASES.get(key, key)
-        normalized[key] = _normalize_value(raw_value)
+        value = _normalize_value(raw_value)
+        if key in normalized and normalized[key] is not None and value is None:
+            continue
+        normalized[key] = value
     for key in ("after_time_et", "entry_window_start_et", "entry_window_end_et", "hard_flat_time_et"):
         normalized[key] = normalize_time_text(normalized.get(key))
     return normalized
@@ -1068,10 +1072,31 @@ def _google_catalog_metadata(entry: StrategyCatalogSheetRow | None) -> dict[str,
         "signal_count": entry.signal_count,
         "execution_robustness": entry.execution_robustness,
         "thesis_exit_policy": entry.thesis_exit_policy,
-        "playbook_summary": entry.playbook_summary_json,
+        "playbook_summary": _normalized_playbook_summary_metadata(entry),
         "catalog_row_index": entry.row_index,
     }
     return {key: value for key, value in metadata.items() if value is not None}
+
+
+def _normalized_playbook_summary_metadata(entry: StrategyCatalogSheetRow) -> dict[str, Any] | list[Any] | str | None:
+    summary = entry.playbook_summary_json
+    if not isinstance(summary, dict):
+        return summary
+    normalized = copy.deepcopy(summary)
+    compatibility = normalized.get("bhiksha_compatibility")
+    if isinstance(compatibility, dict):
+        canonical: dict[str, Any] = {
+            "bhiksha_ready": entry.bhiksha_ready,
+            "supported": entry.bhiksha_ready,
+        }
+        if "has_optimized_thesis_exit" in compatibility:
+            canonical["has_optimized_thesis_exit"] = compatibility["has_optimized_thesis_exit"]
+        if entry.bhiksha_ready:
+            canonical["note"] = "bhiksha strategy and exit policy both implemented"
+        elif "note" in compatibility:
+            canonical["note"] = compatibility["note"]
+        normalized["bhiksha_compatibility"] = canonical
+    return normalized
 
 
 def _validate_google_catalog_alignment(

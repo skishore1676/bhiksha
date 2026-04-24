@@ -12,7 +12,7 @@ strategy:
 execution:
   profile: single_leg_long_premium_v1
   shadow_only: true
-  option_mapping: &id001
+  option_mapping:
     long_signal: CALL
     short_signal: PUT
   min_open_interest: 100
@@ -67,10 +67,10 @@ source:
     thesis_exit_policy: fixed_rr_underlying
     playbook_summary:
       bhiksha_compatibility:
-        bionic_ready: true
-        has_optimized_thesis_exit: true
-        required_capabilities: []
+        bhiksha_ready: true
         supported: true
+        has_optimized_thesis_exit: true
+        note: bhiksha strategy and exit policy both implemented
       catastrophe_exit_params:
         hard_flat_time_et: '15:55'
         profit_target_multiple: null
@@ -88,7 +88,9 @@ source:
       vehicle_mapping:
         dte_max: 7
         dte_min: 0
-        option_mapping: *id001
+        option_mapping:
+          long_signal: CALL
+          short_signal: PUT
         profile: single_leg_long_premium_v1
     catalog_row_index: 5
 approval_status: approved

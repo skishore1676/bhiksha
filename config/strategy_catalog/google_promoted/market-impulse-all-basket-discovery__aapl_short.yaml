@@ -1,17 +1,17 @@
-strategy_id: market-impulse-all-basket-discovery__amd_short
+strategy_id: market-impulse-all-basket-discovery__aapl_short
 enabled: true
-symbol: AMD
+symbol: AAPL
 strategy:
   key: market_impulse
   version: 1
   params:
-    entry_buffer_minutes: 5
-    entry_window_minutes: 90
+    entry_buffer_minutes: 3
+    entry_window_minutes: 60
     regime_timeframe: 1h
     vwma_periods:
-    - 5
-    - 13
-    - 21
+    - 10
+    - 20
+    - 40
     direction: short
 execution:
   profile: single_leg_long_premium_v1
@@ -39,17 +39,17 @@ exit:
   hard_flat_time_et: '15:55'
   thesis_exit_policy: time_stop_underlying
   thesis_exit_params:
-    exit_time_et: '14:30'
+    exit_time_et: '15:55'
   catastrophe_exit_params:
     hard_flat_time_et: '15:55'
     stop_loss_pct: 0.35
 source:
   origin: google_strategy_catalog
   run_date: '2026-04-15'
-  artifact: market-impulse-all-basket-discovery__amd_short
+  artifact: market-impulse-all-basket-discovery__aapl_short
   metadata:
-    catalog_key: market-impulse-all-basket-discovery__amd_short
-    playbook_id: market-impulse-all-basket-discovery__amd_short
+    catalog_key: market-impulse-all-basket-discovery__aapl_short
+    playbook_id: market-impulse-all-basket-discovery__aapl_short
     bias_template: bearish_trend_intraday
     strategy_key: market_impulse
     strategy_family: market_impulse
@@ -59,10 +59,10 @@ source:
     first_validated_date: '2026-04-15'
     last_validated_date: '2026-04-15'
     validation_count: 1
-    expectancy: 0.5564
-    confidence: 0.5455
-    signal_count: 110
-    execution_robustness: 0.99825
+    expectancy: 0.2762
+    confidence: 0.4521
+    signal_count: 73
+    execution_robustness: 0.78175
     thesis_exit_policy: time_stop_underlying
     playbook_summary:
       bhiksha_compatibility:
@@ -74,73 +74,73 @@ source:
         hard_flat_time_et: '15:55'
         stop_loss_pct: 0.35
       entry_params:
-        entry_buffer_minutes: 5
-        entry_window_minutes: 90
+        entry_buffer_minutes: 3
+        entry_window_minutes: 60
         regime_timeframe: 1h
         vwma_periods:
-        - 5
-        - 13
-        - 21
+        - 10
+        - 20
+        - 40
       exit_candidate_policies:
       - metrics:
-          avg_loser: -3.3195666666666668
-          avg_winner: 4.662423076923077
-          expectancy: 0.8310680000000003
-          profit_factor: 1.521571590669465
-          total_pnl: 20.776700000000005
-          trade_count: 25
-          win_rate: 0.52
+          avg_loser: -1.9046750000000001
+          avg_winner: 2.161335714285715
+          expectancy: 0.6827863636363637
+          profit_factor: 1.985817790436689
+          total_pnl: 15.0213
+          trade_count: 22
+          win_rate: 0.6363636363636364
         policy_name: hold_to_eod_underlying
         thesis_exit_anchor: underlying
         thesis_exit_params: {}
         thesis_exit_policy: hold_to_eod_underlying
       - metrics:
-          avg_loser: -2.4593818181818183
-          avg_winner: 3.3899714285714286
-          expectancy: 0.8162560000000002
-          profit_factor: 1.75430632975027
-          total_pnl: 20.406400000000005
-          trade_count: 25
-          win_rate: 0.56
+          avg_loser: -0.8103428571428573
+          avg_winner: 1.5032066666666666
+          expectancy: 0.7670772727272728
+          profit_factor: 3.9750546505888154
+          total_pnl: 16.875700000000002
+          trade_count: 22
+          win_rate: 0.6818181818181818
         policy_name: time_stop_underlying:1130
         thesis_exit_anchor: underlying
         thesis_exit_params:
           exit_time_et: '11:30'
         thesis_exit_policy: time_stop_underlying
       - metrics:
-          avg_loser: -3.2749818181818187
-          avg_winner: 4.203828571428571
-          expectancy: 0.9131519999999997
-          profit_factor: 1.6336967866580796
-          total_pnl: 22.828799999999994
-          trade_count: 25
-          win_rate: 0.56
+          avg_loser: -1.6486
+          avg_winner: 1.7325071428571428
+          expectancy: 0.5030136363636363
+          profit_factor: 1.8390679970884385
+          total_pnl: 11.066299999999998
+          trade_count: 22
+          win_rate: 0.6363636363636364
         policy_name: time_stop_underlying:1430
         thesis_exit_anchor: underlying
         thesis_exit_params:
           exit_time_et: '14:30'
         thesis_exit_policy: time_stop_underlying
       - metrics:
-          avg_loser: -3.2652916666666667
-          avg_winner: 4.591292307692308
-          expectancy: 0.8201319999999996
-          profit_factor: 1.5232636186149784
-          total_pnl: 20.503299999999992
-          trade_count: 25
-          win_rate: 0.52
+          avg_loser: -1.79555
+          avg_winner: 2.2812357142857147
+          expectancy: 0.798768181818182
+          profit_factor: 2.2233647071927827
+          total_pnl: 17.572900000000004
+          trade_count: 22
+          win_rate: 0.6363636363636364
         policy_name: time_stop_underlying:1555
         thesis_exit_anchor: underlying
         thesis_exit_params:
           exit_time_et: '15:55'
         thesis_exit_policy: time_stop_underlying
       - metrics:
-          avg_loser: -0.6369113636363637
-          avg_winner: 0.8884454545454545
-          expectancy: 0.01681298701298701
-          profit_factor: 1.0461959527692235
-          total_pnl: 1.2945999999999998
-          trade_count: 77
-          win_rate: 0.42857142857142855
+          avg_loser: -0.39228666666666656
+          avg_winner: 0.5575157894736842
+          expectancy: -0.02399591836734693
+          profit_factor: 0.9000900701867685
+          total_pnl: -1.1757999999999995
+          trade_count: 49
+          win_rate: 0.3877551020408163
         policy_name: atr_trailing_underlying:atr_14_exitx1.50
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -148,13 +148,13 @@ source:
           atr_multiple: 1.5
         thesis_exit_policy: atr_trailing_underlying
       - metrics:
-          avg_loser: -0.7941739130434783
-          avg_winner: 1.167129166666667
-          expectancy: -0.12172714285714287
-          profit_factor: 0.76675517354648
-          total_pnl: -8.520900000000001
-          trade_count: 70
-          win_rate: 0.34285714285714286
+          avg_loser: -0.46131153846153844
+          avg_winner: 0.9583928571428572
+          expectancy: 0.035584999999999964
+          profit_factor: 1.1186750152158145
+          total_pnl: 1.4233999999999987
+          trade_count: 40
+          win_rate: 0.35
         policy_name: atr_trailing_underlying:atr_14_exitx2.00
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -162,13 +162,13 @@ source:
           atr_multiple: 2.0
         thesis_exit_policy: atr_trailing_underlying
       - metrics:
-          avg_loser: -0.9575176470588235
-          avg_winner: 2.0250545454545454
-          expectancy: 0.21420714285714287
-          profit_factor: 1.3684650259863127
-          total_pnl: 11.995600000000001
-          trade_count: 56
-          win_rate: 0.39285714285714285
+          avg_loser: -0.5611349999999999
+          avg_winner: 0.9409533333333334
+          expectancy: 0.08261714285714288
+          profit_factor: 1.2576563572045945
+          total_pnl: 2.8916000000000004
+          trade_count: 35
+          win_rate: 0.42857142857142855
         policy_name: atr_trailing_underlying:atr_30_exitx2.50
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -176,65 +176,65 @@ source:
           atr_multiple: 2.5
         thesis_exit_policy: atr_trailing_underlying
       - metrics:
-          avg_loser: -0.5500764705882354
-          avg_winner: 1.0030677419354836
-          expectancy: 0.037087804878048775
-          profit_factor: 1.108405604924805
-          total_pnl: 3.0411999999999995
-          trade_count: 82
-          win_rate: 0.3780487804878049
+          avg_loser: -0.2355428571428572
+          avg_winner: 0.6694526315789474
+          expectancy: 0.08288148148148149
+          profit_factor: 1.54289180009704
+          total_pnl: 4.4756
+          trade_count: 54
+          win_rate: 0.35185185185185186
         policy_name: ma_trailing_underlying:ema_8_exit
         thesis_exit_anchor: underlying
         thesis_exit_params:
           ma_col: ema_8_exit
         thesis_exit_policy: ma_trailing_underlying
       - metrics:
-          avg_loser: -0.576613043478261
-          avg_winner: 0.9560757575757575
-          expectancy: 0.06362405063291139
-          profit_factor: 1.1894986465190274
-          total_pnl: 5.0263
-          trade_count: 79
-          win_rate: 0.4177215189873418
+          avg_loser: -0.2611606060606061
+          avg_winner: 0.7676777777777778
+          expectancy: 0.10195882352941174
+          profit_factor: 1.6033556501862314
+          total_pnl: 5.199899999999999
+          trade_count: 51
+          win_rate: 0.35294117647058826
         policy_name: ma_trailing_underlying:ema_12_exit
         thesis_exit_anchor: underlying
         thesis_exit_params:
           ma_col: ema_12_exit
         thesis_exit_policy: ma_trailing_underlying
       - metrics:
-          avg_loser: -0.6082702127659576
-          avg_winner: 1.354769696969697
-          expectancy: 0.20148374999999996
-          profit_factor: 1.5638136746336835
-          total_pnl: 16.118699999999997
-          trade_count: 80
-          win_rate: 0.4125
+          avg_loser: -0.2551300000000001
+          avg_winner: 0.9454937500000001
+          expectancy: 0.16247826086956518
+          profit_factor: 1.9764956427442217
+          total_pnl: 7.473999999999998
+          trade_count: 46
+          win_rate: 0.34782608695652173
         policy_name: ma_trailing_underlying:ema_20_exit
         thesis_exit_anchor: underlying
         thesis_exit_params:
           ma_col: ema_20_exit
         thesis_exit_policy: ma_trailing_underlying
       - metrics:
-          avg_loser: -0.83909375
-          avg_winner: 1.5197969696969695
-          expectancy: 0.358496923076923
-          profit_factor: 1.8678373244944322
-          total_pnl: 23.302299999999995
-          trade_count: 65
-          win_rate: 0.5076923076923077
+          avg_loser: -0.27423333333333333
+          avg_winner: 0.3362933333333334
+          expectancy: -0.07072444444444444
+          profit_factor: 0.6131518171873102
+          total_pnl: -3.1826
+          trade_count: 45
+          win_rate: 0.3333333333333333
         policy_name: ma_trailing_underlying:ema_50_exit
         thesis_exit_anchor: underlying
         thesis_exit_params:
           ma_col: ema_50_exit
         thesis_exit_policy: ma_trailing_underlying
       - metrics:
-          avg_loser: -0.7906702702702703
-          avg_winner: 1.179330303030303
-          expectancy: 0.1380442857142857
-          profit_factor: 1.3303081887416768
-          total_pnl: 9.6631
-          trade_count: 70
-          win_rate: 0.4714285714285714
+          avg_loser: -0.3414724137931034
+          avg_winner: 0.7557117647058824
+          expectancy: 0.06400869565217386
+          profit_factor: 1.297333050582165
+          total_pnl: 2.9443999999999977
+          trade_count: 46
+          win_rate: 0.3695652173913043
         policy_name: ma_crossover_underlying:ema_8_exit>ema_20_exit
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -242,13 +242,13 @@ source:
           slow_ma_col: ema_20_exit
         thesis_exit_policy: ma_crossover_underlying
       - metrics:
-          avg_loser: -0.9746647058823531
-          avg_winner: 1.394632258064516
-          expectancy: 0.1553076923076923
-          profit_factor: 1.3046296463942348
-          total_pnl: 10.095
-          trade_count: 65
-          win_rate: 0.47692307692307695
+          avg_loser: -0.43414074074074066
+          avg_winner: 0.33750714285714284
+          expectancy: -0.1706512195121951
+          profit_factor: 0.40310361889812146
+          total_pnl: -6.9967
+          trade_count: 41
+          win_rate: 0.34146341463414637
         policy_name: ma_crossover_underlying:ema_12_exit>ema_50_exit
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -256,26 +256,26 @@ source:
           slow_ma_col: ema_50_exit
         thesis_exit_policy: ma_crossover_underlying
       - metrics:
-          avg_loser: -0.7591075
-          avg_winner: 1.4080666666666666
-          expectancy: -0.013031147540983633
-          profit_factor: 0.9738212308533376
-          total_pnl: -0.7949000000000016
-          trade_count: 61
-          win_rate: 0.3442622950819672
+          avg_loser: -0.377659375
+          avg_winner: 1.1366166666666666
+          expectancy: 0.035324999999999995
+          profit_factor: 1.128612920042035
+          total_pnl: 1.5542999999999998
+          trade_count: 44
+          win_rate: 0.2727272727272727
         policy_name: trailing_vma_underlying:vma_10
         thesis_exit_anchor: underlying
         thesis_exit_params:
           vma_col: vma_10
         thesis_exit_policy: trailing_vma_underlying
       - metrics:
-          avg_loser: -0.7388361702127657
-          avg_winner: 1.106108823529412
-          expectancy: 0.035585185185185206
-          profit_factor: 1.0830057623692242
-          total_pnl: 2.882400000000002
-          trade_count: 81
-          win_rate: 0.41975308641975306
+          avg_loser: -0.9151277777777778
+          avg_winner: 1.29718125
+          expectancy: 0.12595882352941168
+          profit_factor: 1.2599879798206686
+          total_pnl: 4.282599999999997
+          trade_count: 34
+          win_rate: 0.47058823529411764
         policy_name: fixed_rr_underlying:0.0035x1.50
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -283,13 +283,13 @@ source:
           take_profit_underlying_r_multiple: 1.5
         thesis_exit_policy: fixed_rr_underlying
       - metrics:
-          avg_loser: -1.0542874999999998
-          avg_winner: 2.1238826086956526
-          expectancy: 0.10599682539682537
-          profit_factor: 1.158348647783456
-          total_pnl: 6.677799999999998
-          trade_count: 63
-          win_rate: 0.36507936507936506
+          avg_loser: -1.2989142857142857
+          avg_winner: 1.970291666666667
+          expectancy: 0.20995000000000008
+          profit_factor: 1.3001792705996218
+          total_pnl: 5.458700000000002
+          trade_count: 26
+          win_rate: 0.46153846153846156
         policy_name: fixed_rr_underlying:0.0050x2.00
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -297,13 +297,13 @@ source:
           take_profit_underlying_r_multiple: 2.0
         thesis_exit_policy: fixed_rr_underlying
       - metrics:
-          avg_loser: -1.5010931034482762
-          avg_winner: 2.861510526315789
-          expectancy: 0.22577083333333337
-          profit_factor: 1.2489450216738605
-          total_pnl: 10.837000000000002
-          trade_count: 48
-          win_rate: 0.3958333333333333
+          avg_loser: -1.7154363636363639
+          avg_winner: 2.3167416666666667
+          expectancy: 0.38830869565217385
+          profit_factor: 1.4733012538553667
+          total_pnl: 8.931099999999999
+          trade_count: 23
+          win_rate: 0.5217391304347826
         policy_name: fixed_rr_underlying:0.0075x2.00
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -311,13 +311,13 @@ source:
           take_profit_underlying_r_multiple: 2.0
         thesis_exit_policy: fixed_rr_underlying
       - metrics:
-          avg_loser: -1.500371428571429
-          avg_winner: 3.363366666666667
-          expectancy: 0.19628139534883718
-          profit_factor: 1.200905013996534
-          total_pnl: 8.4401
-          trade_count: 43
-          win_rate: 0.3488372093023256
+          avg_loser: -1.68032
+          avg_winner: 2.306458333333333
+          expectancy: 0.49428636363636363
+          profit_factor: 1.6471564940011425
+          total_pnl: 10.8743
+          trade_count: 22
+          win_rate: 0.5454545454545454
         policy_name: fixed_rr_underlying:0.0075x3.00
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -325,13 +325,13 @@ source:
           take_profit_underlying_r_multiple: 3.0
         thesis_exit_policy: fixed_rr_underlying
       - metrics:
-          avg_loser: -1.8923749999999997
-          avg_winner: 4.15556875
-          expectancy: 0.5268024999999998
-          profit_factor: 1.4639694387564128
-          total_pnl: 21.072099999999995
-          trade_count: 40
-          win_rate: 0.4
+          avg_loser: -2.0044625
+          avg_winner: 2.3607785714285714
+          expectancy: 0.7734181818181817
+          profit_factor: 2.061082459761657
+          total_pnl: 17.015199999999997
+          trade_count: 22
+          win_rate: 0.6363636363636364
         policy_name: fixed_rr_underlying:0.0100x3.00
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -339,13 +339,13 @@ source:
           take_profit_underlying_r_multiple: 3.0
         thesis_exit_policy: fixed_rr_underlying
       - metrics:
-          avg_loser: -1.892283333333333
-          avg_winner: 4.5810375
-          expectancy: 0.697045
-          profit_factor: 1.6139364260109041
-          total_pnl: 27.881800000000002
-          trade_count: 40
-          win_rate: 0.4
+          avg_loser: -2.0044625
+          avg_winner: 2.161335714285715
+          expectancy: 0.6464999999999997
+          profit_factor: 1.8869584739050997
+          total_pnl: 14.222999999999995
+          trade_count: 22
+          win_rate: 0.6363636363636364
         policy_name: fixed_rr_underlying:0.0100x4.00
         thesis_exit_anchor: underlying
         thesis_exit_params:
@@ -353,15 +353,15 @@ source:
           take_profit_underlying_r_multiple: 4.0
         thesis_exit_policy: fixed_rr_underlying
       mc_metrics:
-        mc_exp_r_mean: 0.411535
-        mc_exp_r_p50: 0.408227
-        mc_exp_r_p95: 0.647642
-        mc_prob_positive_exp: 0.99825
-        mc_total_r_p05: 19.699468
-        mc_total_r_p50: 44.904922
-        mc_total_r_p95: 71.240671
+        mc_exp_r_mean: 0.134635
+        mc_exp_r_p50: 0.13378
+        mc_exp_r_p95: 0.42251
+        mc_prob_positive_exp: 0.78175
+        mc_total_r_p05: -11.012024
+        mc_total_r_p50: 9.765951
+        mc_total_r_p95: 30.843235
       thesis_exit_params:
-        exit_time_et: '14:30'
+        exit_time_et: '15:55'
       vehicle_mapping:
         delta_plan: 0.35-0.55
         dte: 7-21
@@ -369,7 +369,7 @@ source:
         profit_take: 50-90% premium
         risk_rule: hard stop at -35% premium
         structure: long_put
-    catalog_row_index: 9
+    catalog_row_index: 19
 approval_status: approved
 tags:
 - google_promoted

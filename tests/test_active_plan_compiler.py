@@ -555,6 +555,10 @@ def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Pat
                             "regime_timeframe": "1h",
                             "vwma_periods": [5, 13, 21],
                         },
+                        "bhiksha_compatibility": {
+                            "supported": False,
+                            "note": "mala_v2 candidate — pending bhiksha config review",
+                        },
                         "vehicle_mapping": {
                             "structure": "long_put",
                             "dte": "7-21",
@@ -615,6 +619,10 @@ def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Pat
         "stop_loss_underlying_pct": 0.0075,
         "take_profit_underlying_r_multiple": 2.0,
     }
+    compatibility = deployment.source.metadata["playbook_summary"]["bhiksha_compatibility"]
+    assert compatibility["bhiksha_ready"] is True
+    assert compatibility["supported"] is True
+    assert compatibility["note"] == "bhiksha strategy and exit policy both implemented"
 
 
 def test_sync_google_strategy_catalog_writes_active_or_candidate_bhiksha_ready_supported_rows(tmp_path: Path) -> None:

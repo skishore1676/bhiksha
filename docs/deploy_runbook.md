@@ -10,12 +10,18 @@ Use these 3 sheet tabs:
 
 - `Strategy_Catalog`
   - maintained by Mala or by occasional manual promotion work
-  - rows are promotable when `lifecycle_status=active` and `bionic_ready=true`
+  - rows are importable when `bhiksha_ready=true` and `lifecycle_status` is `active` or `candidate`
+  - `candidate` rows can still run if you explicitly enable them in `active_strategy`
 - `active_strategy`
   - turns approved catalog strategies on or off for the current session
   - `strategy` should contain the `catalog_key`
+  - `mode` controls execution authorization: `live` submits real orders, `shadow` does not
 - `manual_entry`
   - defines operator-authored manual setups like breakout triggers
+
+`operator_status_override` in `Strategy_Catalog` is retained as review metadata.
+It does not override `active_strategy.mode`; use the active sheet when deciding
+what is live for today's session.
 
 Bhiksha allows multiple same-symbol lanes, so `SPY` can have multiple active strategy rows and manual rows at the same time.
 
