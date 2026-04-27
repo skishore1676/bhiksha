@@ -88,9 +88,10 @@ class RecordingCashGuard:
 
 
 class RecordingOrderManager(StubOrderManager):
-    def __init__(self, *, quote_bid: float = 3.0, cancel_success: bool = True):
+    def __init__(self, *, quote_bid: float = 3.0, cancel_success: bool = True, portfolio: dict | None = None):
         self.quote_bid = quote_bid
         self.cancel_success = cancel_success
+        self.portfolio = portfolio or {}
         self.calls: list[tuple[str, str | float]] = []
 
     async def place_stop_loss_order(self, option_symbol: str, stop_price: float, quantity: int):
@@ -122,6 +123,10 @@ class RecordingOrderManager(StubOrderManager):
             open_interest=500,
             outcome="SUCCESS",
         )
+
+    async def get_portfolio(self):
+        self.calls.append(("get_portfolio", ""))
+        return self.portfolio
 
 
 class RecordingPlanner(StubPlanner):
@@ -882,6 +887,55 @@ def test_execution_supervisor_sanitizes_recovered_stop_below_bid(tmp_path) -> No
         ).fetchone()[0]
     assert '"stop_sanitized": true' in payload
     assert '"quote_bid": 1.3' in payload
+
+
+def test_execution_supervisor_skips_restore_when_active_close_order_exists(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RecordingOrderManager(
+        portfolio={
+            "orders": [
+                {
+                    "orderId": "STOP_EXISTING",
+                    "instrument": {"symbol": "QQQ260330P00558000", "type": "OPTION"},
+                    "type": "STOP",
+                    "side": "SELL",
+                    "status": "NEW",
+                    "openCloseIndicator": "CLOSE",
+                    "stopPrice": "1.30",
+                }
+            ]
+        }
+    )
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE123",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.0,
+        entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        source="broker_sync",
+        order_id="ENTRY123",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+
+    updated = asyncio.run(supervisor._restore_missing_protection(deployment, position, dry_run=False))
+
+    assert ("place_stop", 1.1) not in order_manager.calls
+    assert updated.stop_order_id == "STOP_EXISTING"
+    assert updated.stop_price == 1.3
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "protection_restore_skipped" in event_types
+    assert "protective_stop_submission" not in event_types
 
 
 def test_execution_supervisor_hard_flats_due_positions(tmp_path) -> None:

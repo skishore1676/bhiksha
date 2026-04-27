@@ -18,7 +18,7 @@ from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, Trad
 from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
-from bhiksha.execution.order_manager import OrderResult, round_price
+from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -1659,6 +1659,46 @@ class ExecutionSupervisor:
         stop_loss_pct, policy = _resolved_recovery_stop_loss_pct(deployment)
         if stop_loss_pct is None or stop_loss_pct <= 0:
             return position
+        existing_protection = await self._find_active_close_order(position.option_symbol)
+        if existing_protection is not None:
+            updated = _replace_position(
+                position,
+                stop_order_id=existing_protection["order_id"] if existing_protection["type"] == "STOP" else None,
+                stop_price=existing_protection["price"] if existing_protection["type"] == "STOP" else None,
+                target_order_id=existing_protection["order_id"] if existing_protection["type"] == "LIMIT" else None,
+                target_price=existing_protection["price"] if existing_protection["type"] == "LIMIT" else None,
+            )
+            await self.event_repository.append(
+                "protection_restore_skipped",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "trade_id": position.trade_id,
+                    "option_symbol": position.option_symbol,
+                    "reason": "active_close_order_exists",
+                    "order_id": existing_protection["order_id"],
+                    "order_type": existing_protection["type"],
+                    "price": existing_protection["price"],
+                },
+            )
+            transition = (
+                self.lifecycle_store.mark_target_active(
+                    updated.symbol,
+                    updated.deployment_id,
+                    option_symbol=updated.option_symbol,
+                    order_id=updated.target_order_id,
+                )
+                if updated.target_order_id
+                else self.lifecycle_store.mark_open(
+                    updated.symbol,
+                    updated.deployment_id,
+                    option_symbol=updated.option_symbol,
+                    order_id=updated.stop_order_id,
+                    protected=True,
+                )
+            )
+            await self._emit_lifecycle_transition(transition, reason="protection_reconciled")
+            return updated
         await self.event_repository.append(
             "protection_restore_attempt",
             {
@@ -1723,6 +1763,39 @@ class ExecutionSupervisor:
         )
         await self._emit_lifecycle_transition(transition, reason="protection_restored")
         return updated
+
+    async def _find_active_close_order(self, option_symbol: str | None) -> dict[str, object] | None:
+        if option_symbol is None:
+            return None
+        try:
+            portfolio = await self.planner.order_manager.get_portfolio()
+        except Exception:
+            return None
+        normalized_symbol = normalize_option_symbol(option_symbol)
+        for order in portfolio.get("orders", []) or []:
+            instrument = order.get("instrument", {}) or {}
+            if instrument.get("type") != "OPTION":
+                continue
+            if normalize_option_symbol(str(instrument.get("symbol", ""))) != normalized_symbol:
+                continue
+            if str(order.get("side", "")).upper() != "SELL":
+                continue
+            if str(order.get("openCloseIndicator", "")).upper() != "CLOSE":
+                continue
+            if str(order.get("status", "")).upper() not in {"NEW", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}:
+                continue
+            order_type = str(order.get("type", "")).upper()
+            if order_type == "STOP":
+                price = _maybe_float(order.get("stopPrice"))
+            elif order_type == "LIMIT":
+                price = _maybe_float(order.get("limitPrice"))
+            else:
+                continue
+            order_id = order.get("orderId")
+            if not order_id:
+                continue
+            return {"order_id": str(order_id), "type": order_type, "price": price}
+        return None
 
     async def _arm_position_protection(
         self,
@@ -1908,6 +1981,15 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
     if candidate <= 0:
         return None
     return round_price(candidate)
+
+
+def _maybe_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:
