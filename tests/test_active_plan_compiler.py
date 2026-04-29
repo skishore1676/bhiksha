@@ -529,8 +529,10 @@ def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(
     assert generated_payload["strategy_id"] == "market_impulse_spy_short_19383a3c9faf"
     assert generated_payload["strategy"]["key"] == "market_impulse"
     assert generated_payload["exit"]["thesis_exit_policy"] == "fixed_rr_underlying"
+    assert generated_payload["exit"]["use_algorithmic_exit"] is False
     assert compiled.plan.deployments[0].deployment_id == "strategy_market_impulse_spy_short_19383a3c9faf_live_row_2"
     assert compiled.plan.deployments[0].strategy.key == "market_impulse"
+    assert compiled.plan.deployments[0].exit.use_algorithmic_exit is False
 
 
 def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Path) -> None:
@@ -619,6 +621,7 @@ def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Pat
     assert deployment.execution.entry_window_end_et == "14:30"
     assert deployment.risk.stop_loss_pct == 0.35
     assert deployment.exit.thesis_exit_policy == "fixed_rr_underlying"
+    assert deployment.exit.use_algorithmic_exit is False
     assert deployment.exit.thesis_exit_params == {
         "stop_loss_underlying_pct": 0.0075,
         "take_profit_underlying_r_multiple": 2.0,
@@ -627,6 +630,61 @@ def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Pat
     assert compatibility["bhiksha_ready"] is True
     assert compatibility["supported"] is True
     assert compatibility["note"] == "bhiksha strategy and exit policy both implemented"
+
+
+def test_google_catalog_exit_controls_can_explicitly_enable_native_exit(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="strategy catalog",
+        rows=[
+            {
+                "catalog_key": "market_impulse_spy_short_native_exit",
+                "playbook_id": "playbook_123",
+                "symbol": "SPY",
+                "strategy_key": "market_impulse",
+                "strategy_family": "market_impulse",
+                "direction": "short",
+                "lifecycle_status": "active",
+                "bhiksha_ready": "TRUE",
+                "thesis_exit_policy": "fixed_rr_underlying",
+                "playbook_summary_json": json.dumps(
+                    {
+                        "entry_params": {"direction": "short"},
+                        "vehicle_mapping": {"profile": "single_leg_long_premium_v1"},
+                        "catastrophe_exit_params": {"hard_flat_time_et": "15:55", "stop_loss_pct": 0.45},
+                        "thesis_exit_params": {
+                            "stop_loss_underlying_pct": 0.0035,
+                            "take_profit_underlying_r_multiple": 1.5,
+                        },
+                        "exit_controls": {"use_algorithmic_exit": True},
+                    }
+                ),
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[{"enabled": "TRUE", "mode": "live", "strategy": "market_impulse_spy_short_native_exit"}],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="strategy catalog",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.deployments[0].exit.use_algorithmic_exit is True
 
 
 def test_sync_google_strategy_catalog_writes_active_or_candidate_bhiksha_ready_supported_rows(tmp_path: Path) -> None:

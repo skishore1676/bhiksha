@@ -769,6 +769,11 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
         catastrophe_exit_params.get("stop_to_breakeven_after_r_multiple")
     )
     strategy_key = str(entry.strategy_key or "").strip()
+    use_algorithmic_exit = _google_catalog_use_algorithmic_exit(
+        summary=summary,
+        strategy_key=strategy_key,
+        thesis_exit_policy=entry.thesis_exit_policy,
+    )
     execution_payload: dict[str, Any] = {
         "profile": str(vehicle_mapping.get("profile") or "single_leg_long_premium_v1"),
         "shadow_only": True,
@@ -810,7 +815,7 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
         },
         "exit": {
             "profile": f"{strategy_key}_exit_v1" if strategy_key else "catalog_promoted_exit_v1",
-            "use_algorithmic_exit": strategy_key in NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS,
+            "use_algorithmic_exit": use_algorithmic_exit,
             "use_profit_target": use_profit_target,
             "profit_target_multiple": profit_target_multiple,
             "stop_loss_pct": stop_loss_pct,
@@ -838,6 +843,24 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
             if tag
         ],
     }
+
+
+def _google_catalog_use_algorithmic_exit(
+    *,
+    summary: dict[str, Any],
+    strategy_key: str,
+    thesis_exit_policy: str | None,
+) -> bool:
+    exit_controls = summary.get("exit_controls")
+    if isinstance(exit_controls, dict) and "use_algorithmic_exit" in exit_controls:
+        explicit = _coerce_bool(exit_controls.get("use_algorithmic_exit"))
+        if explicit is not None:
+            return explicit
+
+    if thesis_exit_policy:
+        return False
+
+    return strategy_key in NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS
 
 
 def _option_mapping_from_structure(value: Any) -> dict[str, str]:
@@ -1159,6 +1182,21 @@ def _normalize_value(value: Any) -> Any:
                 return stripped
         return stripped
     return value
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    normalized = _normalize_value(value)
+    if isinstance(normalized, bool):
+        return normalized
+    if isinstance(normalized, (int, float)):
+        return bool(normalized)
+    if isinstance(normalized, str):
+        lowered = normalized.strip().lower()
+        if lowered in {"1", "on"}:
+            return True
+        if lowered in {"0", "off"}:
+            return False
+    return None
 
 
 def _looks_like_date(value: Any) -> bool:
