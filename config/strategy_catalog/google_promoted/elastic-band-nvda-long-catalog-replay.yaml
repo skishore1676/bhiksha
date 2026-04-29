@@ -139,6 +139,11 @@ source:
         profit_take: 50-70% spread value
         risk_rule: hard stop at -45% premium
         structure: call_debit_spread
+      exit_controls:
+        use_algorithmic_exit: false
+        native_strategy_exit_policy: null
+        exit_stack: thesis_exit_then_catastrophe
+        note: Mala thesis exit is authoritative; native exits require explicit opt-in.
     catalog_row_index: 6
 approval_status: approved
 tags:

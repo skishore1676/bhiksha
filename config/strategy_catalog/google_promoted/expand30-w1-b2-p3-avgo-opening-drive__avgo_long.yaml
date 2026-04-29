@@ -149,6 +149,11 @@ source:
         profit_take: 50-90% premium
         risk_rule: hard stop at -35% premium
         structure: long_call
+      exit_controls:
+        use_algorithmic_exit: false
+        native_strategy_exit_policy: null
+        exit_stack: thesis_exit_then_catastrophe
+        note: Mala thesis exit is authoritative; native exits require explicit opt-in.
     catalog_row_index: 23
 approval_status: approved
 tags:

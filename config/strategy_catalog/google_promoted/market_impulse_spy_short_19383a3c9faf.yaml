@@ -28,7 +28,7 @@ risk:
   stop_loss_pct: 0.45
 exit:
   profile: market_impulse_exit_v1
-  use_algorithmic_exit: true
+  use_algorithmic_exit: false
   use_profit_target: false
   profit_target_multiple: null
   stop_loss_pct: 0.45
@@ -92,6 +92,11 @@ source:
           long_signal: CALL
           short_signal: PUT
         profile: single_leg_long_premium_v1
+      exit_controls:
+        use_algorithmic_exit: false
+        native_strategy_exit_policy: null
+        exit_stack: thesis_exit_then_catastrophe
+        note: Mala thesis exit is authoritative; native exits require explicit opt-in.
     catalog_row_index: 3
 approval_status: approved
 tags:
