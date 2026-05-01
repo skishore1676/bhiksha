@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any
 
 from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, TradeRecord
@@ -27,7 +28,18 @@ class TradeStateRepository(ABC):
         """Create or update the durable trade session."""
 
     @abstractmethod
-    async def mark_closed(self, trade_id: str, *, exit_order_id: str | None = None) -> None:
+    async def mark_closed(
+        self,
+        trade_id: str,
+        *,
+        exit_order_id: str | None = None,
+        exit_price: float | None = None,
+        exit_filled_quantity: int | None = None,
+        exit_filled_at: datetime | None = None,
+        exit_order_status: str | None = None,
+        exit_order_type: str | None = None,
+        exit_broker_payload: dict[str, Any] | None = None,
+    ) -> None:
         """Mark a trade session as closed."""
 
     @abstractmethod
@@ -43,7 +55,26 @@ class NullTradeStateRepository(TradeStateRepository):
     async def upsert_trade(self, record: TradeRecord) -> None:
         return None
 
-    async def mark_closed(self, trade_id: str, *, exit_order_id: str | None = None) -> None:
+    async def mark_closed(
+        self,
+        trade_id: str,
+        *,
+        exit_order_id: str | None = None,
+        exit_price: float | None = None,
+        exit_filled_quantity: int | None = None,
+        exit_filled_at: datetime | None = None,
+        exit_order_status: str | None = None,
+        exit_order_type: str | None = None,
+        exit_broker_payload: dict[str, Any] | None = None,
+    ) -> None:
+        del (
+            exit_price,
+            exit_filled_quantity,
+            exit_filled_at,
+            exit_order_status,
+            exit_order_type,
+            exit_broker_payload,
+        )
         return None
 
     async def get_open_trades(self) -> list[TradeRecord]:

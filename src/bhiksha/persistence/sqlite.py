@@ -121,9 +121,30 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         await self._ensure_initialized()
         await self.backend.run_write(self._upsert_trade_sync, record)
 
-    async def mark_closed(self, trade_id: str, *, exit_order_id: str | None = None) -> None:
+    async def mark_closed(
+        self,
+        trade_id: str,
+        *,
+        exit_order_id: str | None = None,
+        exit_price: float | None = None,
+        exit_filled_quantity: int | None = None,
+        exit_filled_at: datetime | None = None,
+        exit_order_status: str | None = None,
+        exit_order_type: str | None = None,
+        exit_broker_payload: dict[str, Any] | None = None,
+    ) -> None:
         await self._ensure_initialized()
-        await self.backend.run_write(self._mark_closed_sync, trade_id, exit_order_id)
+        await self.backend.run_write(
+            self._mark_closed_sync,
+            trade_id,
+            exit_order_id,
+            exit_price,
+            exit_filled_quantity,
+            exit_filled_at,
+            exit_order_status,
+            exit_order_type,
+            exit_broker_payload,
+        )
 
     async def get_open_trades(self) -> list[TradeRecord]:
         await self._ensure_initialized()
@@ -165,6 +186,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_limit_price REAL,
                     exit_submitted_at TEXT,
                     exit_mode TEXT,
+                    exit_price REAL,
+                    exit_filled_quantity INTEGER,
+                    exit_filled_at TEXT,
+                    exit_order_status TEXT,
+                    exit_order_type TEXT,
+                    exit_broker_payload TEXT,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -183,6 +210,18 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_submitted_at TEXT")
             if "exit_mode" not in existing_columns:
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_mode TEXT")
+            if "exit_price" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_price REAL")
+            if "exit_filled_quantity" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_filled_quantity INTEGER")
+            if "exit_filled_at" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_filled_at TEXT")
+            if "exit_order_status" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_order_status TEXT")
+            if "exit_order_type" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_order_type TEXT")
+            if "exit_broker_payload" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_broker_payload TEXT")
             conn.commit()
 
     def _upsert_trade_sync(self, record: TradeRecord) -> None:
@@ -192,8 +231,9 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 INSERT INTO trade_sessions (
                     trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                     entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
-                    exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
+                    exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     deployment_id=excluded.deployment_id,
                     symbol=excluded.symbol,
@@ -212,6 +252,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_limit_price=excluded.exit_limit_price,
                     exit_submitted_at=excluded.exit_submitted_at,
                     exit_mode=excluded.exit_mode,
+                    exit_price=COALESCE(excluded.exit_price, trade_sessions.exit_price),
+                    exit_filled_quantity=COALESCE(excluded.exit_filled_quantity, trade_sessions.exit_filled_quantity),
+                    exit_filled_at=COALESCE(excluded.exit_filled_at, trade_sessions.exit_filled_at),
+                    exit_order_status=COALESCE(excluded.exit_order_status, trade_sessions.exit_order_status),
+                    exit_order_type=COALESCE(excluded.exit_order_type, trade_sessions.exit_order_type),
+                    exit_broker_payload=COALESCE(excluded.exit_broker_payload, trade_sessions.exit_broker_payload),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -233,20 +279,55 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     record.exit_limit_price,
                     record.exit_submitted_at.isoformat() if record.exit_submitted_at is not None else None,
                     record.exit_mode.value if record.exit_mode is not None else None,
+                    record.exit_price,
+                    record.exit_filled_quantity,
+                    record.exit_filled_at.isoformat() if record.exit_filled_at is not None else None,
+                    record.exit_order_status,
+                    record.exit_order_type,
+                    json.dumps(record.exit_broker_payload, default=str) if record.exit_broker_payload is not None else None,
                     datetime.now(UTC).isoformat(),
                 ),
             )
             conn.commit()
 
-    def _mark_closed_sync(self, trade_id: str, exit_order_id: str | None) -> None:
+    def _mark_closed_sync(
+        self,
+        trade_id: str,
+        exit_order_id: str | None,
+        exit_price: float | None,
+        exit_filled_quantity: int | None,
+        exit_filled_at: datetime | None,
+        exit_order_status: str | None,
+        exit_order_type: str | None,
+        exit_broker_payload: dict[str, Any] | None,
+    ) -> None:
         with closing(self.backend.connect()) as conn:
             conn.execute(
                 """
                 UPDATE trade_sessions
-                SET status = ?, exit_order_id = COALESCE(?, exit_order_id), updated_at = ?
+                SET status = ?,
+                    exit_order_id = COALESCE(?, exit_order_id),
+                    exit_price = COALESCE(?, exit_price),
+                    exit_filled_quantity = COALESCE(?, exit_filled_quantity),
+                    exit_filled_at = COALESCE(?, exit_filled_at),
+                    exit_order_status = COALESCE(?, exit_order_status),
+                    exit_order_type = COALESCE(?, exit_order_type),
+                    exit_broker_payload = COALESCE(?, exit_broker_payload),
+                    updated_at = ?
                 WHERE trade_id = ?
                 """,
-                ("closed", exit_order_id, datetime.now(UTC).isoformat(), trade_id),
+                (
+                    "closed",
+                    exit_order_id,
+                    exit_price,
+                    exit_filled_quantity,
+                    exit_filled_at.isoformat() if exit_filled_at is not None else None,
+                    exit_order_status,
+                    exit_order_type,
+                    json.dumps(exit_broker_payload, default=str) if exit_broker_payload is not None else None,
+                    datetime.now(UTC).isoformat(),
+                    trade_id,
+                ),
             )
             conn.commit()
 
@@ -256,7 +337,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 """
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
-                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode
+                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload
                 FROM trade_sessions
                 WHERE status != 'closed'
                 ORDER BY updated_at DESC
@@ -270,7 +352,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 """
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
-                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode
+                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload
                 FROM trade_sessions
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -495,4 +578,10 @@ def _trade_record_from_row(row) -> TradeRecord:
         exit_limit_price=row[15],
         exit_submitted_at=datetime.fromisoformat(row[16]) if row[16] else None,
         exit_mode=ExitMode(row[17]) if row[17] else None,
+        exit_price=row[18] if len(row) > 18 else None,
+        exit_filled_quantity=row[19] if len(row) > 19 else None,
+        exit_filled_at=datetime.fromisoformat(row[20]) if len(row) > 20 and row[20] else None,
+        exit_order_status=row[21] if len(row) > 21 else None,
+        exit_order_type=row[22] if len(row) > 22 else None,
+        exit_broker_payload=json.loads(row[23]) if len(row) > 23 and row[23] else None,
     )

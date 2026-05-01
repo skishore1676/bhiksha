@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from datetime import UTC
 import math
 import uuid
+from typing import Any
 
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.config.models import AppConfig
@@ -1150,7 +1151,12 @@ class ExecutionSupervisor:
                 option_symbol=position.option_symbol,
             )
             if position.trade_id is not None:
-                await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=position.exit_order_id)
+                await self._mark_trade_closed_with_exit_truth(
+                    position.trade_id,
+                    exit_order_id=position.exit_order_id,
+                    status=status,
+                    payload=payload,
+                )
             transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
             await self._emit_lifecycle_transition(transition, reason="exit_closed")
             plan = ExitPlan(
@@ -1573,7 +1579,8 @@ class ExecutionSupervisor:
                 await self._reconcile_pending_entry_release(trade)
                 continue
             if trade.trade_id not in active_trade_ids:
-                await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
+                await self._mark_disappeared_trade_closed(trade)
+        await self._enrich_recent_closed_exit_truth(recent_trades)
         for position in self.planner.position_tracker.active_positions():
             if position.trade_id is None or position.option_symbol is None:
                 continue
@@ -1625,6 +1632,91 @@ class ExecutionSupervisor:
                     },
                 )
         await self._sync_cash_guard()
+
+    async def _mark_disappeared_trade_closed(self, trade: TradeRecord) -> None:
+        exit_order_id, status, payload = await self._find_terminal_exit_order_payload(trade)
+        await self._mark_trade_closed_with_exit_truth(
+            trade.trade_id,
+            exit_order_id=exit_order_id or trade.exit_order_id,
+            status=status,
+            payload=payload,
+        )
+        if exit_order_id is not None and payload is not None:
+            await self.event_repository.append(
+                "exit_fill_enriched",
+                {
+                    "deployment_id": trade.deployment_id,
+                    "symbol": trade.symbol,
+                    "trade_id": trade.trade_id,
+                    "option_symbol": trade.option_symbol,
+                    "exit_order_id": exit_order_id,
+                    "status": status,
+                    "source": "disappeared_position_reconcile",
+                    "payload": payload,
+                },
+            )
+
+    async def _enrich_recent_closed_exit_truth(self, trades: list[TradeRecord]) -> None:
+        for trade in trades:
+            if trade.status != "closed" or trade.exit_price is not None:
+                continue
+            if not any((trade.exit_order_id, trade.stop_order_id, trade.target_order_id)):
+                continue
+            exit_order_id, status, payload = await self._find_terminal_exit_order_payload(trade)
+            if exit_order_id is None or payload is None:
+                continue
+            await self._mark_trade_closed_with_exit_truth(
+                trade.trade_id,
+                exit_order_id=exit_order_id,
+                status=status,
+                payload=payload,
+            )
+            await self.event_repository.append(
+                "exit_fill_enriched",
+                {
+                    "deployment_id": trade.deployment_id,
+                    "symbol": trade.symbol,
+                    "trade_id": trade.trade_id,
+                    "option_symbol": trade.option_symbol,
+                    "exit_order_id": exit_order_id,
+                    "status": status,
+                    "source": "recent_closed_retry",
+                    "payload": payload,
+                },
+            )
+
+    async def _find_terminal_exit_order_payload(self, trade: TradeRecord) -> tuple[str | None, str | None, dict | None]:
+        seen: set[str] = set()
+        order_ids = [
+            trade.exit_order_id,
+            trade.stop_order_id,
+            trade.target_order_id,
+        ]
+        for order_id in order_ids:
+            if not order_id or order_id in seen:
+                continue
+            seen.add(order_id)
+            status, payload, error = await self.planner.order_manager.get_order_status(order_id)
+            if error or payload is None:
+                continue
+            if _is_filled_exit_order(payload, status=status, option_symbol=trade.option_symbol):
+                return order_id, status, payload
+        return None, None, None
+
+    async def _mark_trade_closed_with_exit_truth(
+        self,
+        trade_id: str,
+        *,
+        exit_order_id: str | None,
+        status: str | None,
+        payload: dict | None,
+    ) -> None:
+        details = _exit_fill_details(payload, status=status)
+        await self.trade_state_repository.mark_closed(
+            trade_id,
+            exit_order_id=exit_order_id,
+            **details,
+        )
 
     async def _reconcile_pending_entry_release(self, trade: TradeRecord) -> None:
         if trade.entry_order_id is None:
@@ -1990,6 +2082,64 @@ def _maybe_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _maybe_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _is_filled_exit_order(payload: dict[str, Any], *, status: str | None, option_symbol: str | None) -> bool:
+    normalized_status = str(status or payload.get("status") or "").upper()
+    if normalized_status != "FILLED":
+        return False
+    side = str(payload.get("side") or payload.get("orderSide") or "").upper()
+    open_close = str(payload.get("openCloseIndicator") or "").upper()
+    instrument_symbol = normalize_option_symbol(str((payload.get("instrument") or {}).get("symbol", "")))
+    if option_symbol is not None and instrument_symbol and instrument_symbol != normalize_option_symbol(option_symbol):
+        return False
+    return side == "SELL" and open_close == "CLOSE"
+
+
+def _exit_fill_details(payload: dict | None, *, status: str | None) -> dict[str, Any]:
+    if payload is None:
+        return {
+            "exit_price": None,
+            "exit_filled_quantity": None,
+            "exit_filled_at": None,
+            "exit_order_status": status,
+            "exit_order_type": None,
+            "exit_broker_payload": None,
+        }
+    return {
+        "exit_price": _maybe_float(payload.get("averagePrice")),
+        "exit_filled_quantity": _maybe_int(payload.get("filledQuantity")),
+        "exit_filled_at": _maybe_datetime(payload.get("closedAt")),
+        "exit_order_status": status or payload.get("status"),
+        "exit_order_type": payload.get("type"),
+        "exit_broker_payload": payload,
+    }
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:

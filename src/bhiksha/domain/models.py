@@ -156,6 +156,12 @@ class TradeRecord:
     exit_limit_price: float | None = None
     exit_submitted_at: datetime | None = None
     exit_mode: ExitMode | None = None
+    exit_price: float | None = None
+    exit_filled_quantity: int | None = None
+    exit_filled_at: datetime | None = None
+    exit_order_status: str | None = None
+    exit_order_type: str | None = None
+    exit_broker_payload: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)

@@ -129,6 +129,15 @@ class RecordingOrderManager(StubOrderManager):
         return self.portfolio
 
 
+class StatusMapOrderManager(RecordingOrderManager):
+    def __init__(self, statuses: dict[str, tuple[str | None, dict | None, str | None]]):
+        super().__init__()
+        self.statuses = statuses
+
+    async def get_order_status(self, order_id: str):
+        return self.statuses.get(order_id, (None, None, "missing_status"))
+
+
 class RecordingPlanner(StubPlanner):
     def __init__(self, order_manager: RecordingOrderManager):
         self.order_manager = order_manager
@@ -1086,14 +1095,50 @@ def test_execution_supervisor_handles_algorithmic_exit(tmp_path) -> None:
 
 def test_execution_supervisor_closes_filled_pending_exit(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    order_manager = StatusMapOrderManager(
+        {
+            "CLOSE123": (
+                "FILLED",
+                {
+                    "orderId": "CLOSE123",
+                    "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+                    "status": "FILLED",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "1",
+                    "averagePrice": "2.35",
+                    "closedAt": "2026-03-30T14:36:12Z",
+                },
+                None,
+            )
+        }
+    )
     supervisor = ExecutionSupervisor(
-        planner=StubPlanner(),
+        planner=RecordingPlanner(order_manager),
         event_repository=repo,
+        trade_state_repository=trade_repo,
         app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
     )
     from bhiksha.config.loader import load_deployments
 
     deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE123",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                option_symbol="QQQ260401P00556000",
+                quantity=1,
+                entry_price=2.5,
+                entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY123",
+            )
+        )
+    )
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -1120,6 +1165,99 @@ def test_execution_supervisor_closes_filled_pending_exit(tmp_path) -> None:
     assert len(plans) == 1
     assert plans[0].order_id == "CLOSE123"
     assert supervisor.planner.position_tracker.total_open_positions == 0
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        row = conn.execute(
+            """
+            SELECT status, exit_order_id, exit_price, exit_filled_quantity, exit_filled_at,
+                   exit_order_status, exit_order_type
+            FROM trade_sessions
+            WHERE trade_id = 'TRADE123'
+            """
+        ).fetchone()
+    assert row == (
+        "closed",
+        "CLOSE123",
+        2.35,
+        1,
+        "2026-03-30T14:36:12+00:00",
+        "FILLED",
+        "LIMIT",
+    )
+
+
+def test_execution_supervisor_enriches_stop_filled_disappeared_position(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    order_manager = StatusMapOrderManager(
+        {
+            "STOP123": (
+                "FILLED",
+                {
+                    "orderId": "STOP123",
+                    "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+                    "status": "FILLED",
+                    "side": "SELL",
+                    "type": "STOP",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "1",
+                    "averagePrice": "1.20",
+                    "closedAt": "2026-03-30T15:01:00Z",
+                    "stopPrice": "1.20",
+                },
+                None,
+            )
+        }
+    )
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE123",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                option_symbol="QQQ260401P00556000",
+                quantity=1,
+                entry_price=2.5,
+                entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY123",
+                stop_order_id="STOP123",
+                stop_price=1.2,
+            )
+        )
+    )
+
+    asyncio.run(supervisor.sync_lifecycle())
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        row = conn.execute(
+            """
+            SELECT status, exit_order_id, exit_price, exit_filled_quantity, exit_filled_at,
+                   exit_order_status, exit_order_type
+            FROM trade_sessions
+            WHERE trade_id = 'TRADE123'
+            """
+        ).fetchone()
+        event_types = [event[0] for event in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+
+    assert row == (
+        "closed",
+        "STOP123",
+        1.2,
+        1,
+        "2026-03-30T15:01:00+00:00",
+        "FILLED",
+        "STOP",
+    )
+    assert "exit_fill_enriched" in event_types
 
 
 def test_execution_supervisor_arms_virtual_profit_target_when_broker_supports_single_exit_order(tmp_path) -> None:

@@ -78,6 +78,58 @@ def test_sqlite_backend_serializes_shared_runtime_writes(tmp_path) -> None:
     assert statuses == {"open_protected"}
 
 
+def test_trade_state_mark_closed_persists_exit_fill_truth(tmp_path) -> None:
+    db_path = tmp_path / "runtime.db"
+    repo = SQLiteTradeStateRepository(str(db_path))
+    filled_at = datetime(2026, 4, 30, 15, 2, 7, tzinfo=UTC)
+
+    async def run() -> None:
+        await repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE123",
+                deployment_id="market_impulse_qqq_short_v1",
+                symbol="QQQ",
+                option_symbol="QQQ260401P00556000",
+                quantity=1,
+                entry_price=2.5,
+                entry_timestamp=datetime(2026, 4, 30, 14, 30, tzinfo=UTC),
+                status="exit_pending",
+                exit_order_id="EXIT123",
+            )
+        )
+        await repo.mark_closed(
+            "TRADE123",
+            exit_order_id="EXIT123",
+            exit_price=2.35,
+            exit_filled_quantity=1,
+            exit_filled_at=filled_at,
+            exit_order_status="FILLED",
+            exit_order_type="LIMIT",
+            exit_broker_payload={"orderId": "EXIT123", "averagePrice": "2.35"},
+        )
+
+    asyncio.run(run())
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT status, exit_order_id, exit_price, exit_filled_quantity, exit_filled_at,
+                   exit_order_status, exit_order_type, exit_broker_payload
+            FROM trade_sessions
+            WHERE trade_id = 'TRADE123'
+            """
+        ).fetchone()
+
+    assert row[0] == "closed"
+    assert row[1] == "EXIT123"
+    assert row[2] == 2.35
+    assert row[3] == 1
+    assert row[4] == filled_at.isoformat()
+    assert row[5] == "FILLED"
+    assert row[6] == "LIMIT"
+    assert "averagePrice" in row[7]
+
+
 def test_sqlite_event_repository_does_not_leak_file_descriptors(tmp_path) -> None:
     before = _open_fd_count()
     if before is None:
