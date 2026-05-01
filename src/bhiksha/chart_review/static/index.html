@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bhiksha Trade Review</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Bhiksha Trade Review</h1>
+          <p id="sourceSummary">Loading trade review bundle...</p>
+        </div>
+        <div class="controls">
+          <label>
+            Symbol
+            <select id="symbolSelect"></select>
+          </label>
+          <label>
+            Strategy
+            <select id="strategySelect"></select>
+          </label>
+          <label>
+            Outcome
+            <select id="outcomeSelect">
+              <option value="all">All</option>
+              <option value="winner">Winners</option>
+              <option value="loser">Losers</option>
+              <option value="open">Open/missing exit</option>
+            </select>
+          </label>
+          <label>
+            Window
+            <select id="barWindowSelect">
+              <option value="50">50 bars</option>
+              <option value="100" selected>100 bars</option>
+              <option value="200">200 bars</option>
+              <option value="all">All bars</option>
+            </select>
+          </label>
+          <label class="checkbox-control">
+            <input id="collapseGapsToggle" type="checkbox" checked />
+            Collapse gaps
+          </label>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <section class="chart-region">
+          <div class="chart-toolbar">
+            <div>
+              <strong id="chartTitle">Chart</strong>
+              <span id="chartSubtitle"></span>
+            </div>
+            <div id="warningBadge" class="warning-badge" hidden></div>
+          </div>
+          <div id="chart"></div>
+          <div id="detailsPanel" class="details-panel"></div>
+        </section>
+
+        <aside class="trade-panel">
+          <div class="trade-panel-header">
+            <strong>Trades</strong>
+            <span id="tradeCount"></span>
+          </div>
+          <div id="tradeList" class="trade-list"></div>
+        </aside>
+      </section>
+    </main>
+
+    <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

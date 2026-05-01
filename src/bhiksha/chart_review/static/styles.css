@@ -1,0 +1,278 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #20242d;
+  --line: #2d3440;
+  --text: #edf0f5;
+  --muted: #9da7b5;
+  --good: #34c985;
+  --bad: #f05d5d;
+  --exit: #f5c84c;
+  --accent: #78a9ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #12151b;
+}
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 22px;
+  letter-spacing: 0;
+}
+
+p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.checkbox-control {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: end;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 0 10px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.checkbox-control input {
+  margin: 0;
+}
+
+select {
+  min-width: 130px;
+  max-width: 260px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+#strategySelect {
+  width: 260px;
+}
+
+.workspace {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+}
+
+.chart-region {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(420px, 1fr) auto;
+}
+
+.chart-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+#chartSubtitle {
+  margin-left: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.warning-badge {
+  border: 1px solid #735f26;
+  color: #ffd56b;
+  background: #2a2414;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+#chart {
+  min-height: 420px;
+}
+
+.details-panel {
+  min-height: 98px;
+  display: grid;
+  grid-template-columns: 1.1fr 2fr 2fr 1.6fr;
+  gap: 10px;
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--line);
+  background: #11141a;
+}
+
+.metric {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 10px;
+}
+
+.metric span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 5px;
+}
+
+.metric strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: normal;
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.trade-panel {
+  min-width: 0;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.trade-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.trade-panel-header span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trade-list {
+  overflow: auto;
+  padding: 8px;
+}
+
+.trade-card {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #151922;
+  color: inherit;
+  text-align: left;
+  padding: 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+
+.trade-card:hover,
+.trade-card.active {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+
+.trade-card-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.trade-card-title {
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.trade-card-time,
+.trade-card-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pnl-good {
+  color: var(--good);
+}
+
+.pnl-bad {
+  color: var(--bad);
+}
+
+.empty-state {
+  padding: 18px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+@media (max-width: 980px) {
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .controls {
+    justify-content: flex-start;
+  }
+
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .trade-panel {
+    border-left: none;
+    border-top: 1px solid var(--line);
+    min-height: 300px;
+  }
+
+  .details-panel {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
