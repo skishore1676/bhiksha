@@ -1361,6 +1361,55 @@ def test_execution_supervisor_places_profit_target_when_broker_supports_concurre
     assert tracked.target_price == 3.35
 
 
+def test_execution_supervisor_uses_option_profit_target_pct(tmp_path) -> None:
+    class ConcurrentExitOrderManager(StubOrderManager):
+        supports_concurrent_exit_orders = True
+
+    class ConcurrentExitPlanner(StubPlanner):
+        def __init__(self):
+            self.order_manager = ConcurrentExitOrderManager()
+            self.position_tracker = PositionTracker()
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=ConcurrentExitPlanner(),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_profit_target": True,
+                    "profit_target_multiple": None,
+                    "option_profit_target_pct": 0.35,
+                }
+            )
+        }
+    )
+    plan = TradePlan(
+        trade_id="TRADE123",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert protected.target_order_id == "TARGET123"
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.target_price == 2.7
+
+
 def test_execution_supervisor_promotes_stop_to_breakeven(tmp_path) -> None:
     class BreakevenOrderManager(StubOrderManager):
         async def get_option_quote(self, option_symbol: str):
