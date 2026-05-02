@@ -745,7 +745,80 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
         "take_profit_underlying_r_multiple": 2.0,
     }
     assert deployment.source.metadata["mala_handoff_version"] == 1
+    assert deployment.source.metadata["strategy_variant"] == "cross_reclaim"
+    assert deployment.source.metadata["bhiksha_capability_status"] == "supported"
     assert deployment.source.metadata["signal_window_et"] == "09:35-10:15"
+
+
+def test_compile_active_plan_suppresses_unsupported_mala_strategy_variant(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "mi_high_close.yaml",
+        strategy_id="mi-desc-high-close-semiconductors-m1__amd_short",
+        symbol="AMD",
+    )
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Mala_Evidence_v1",
+        rows=[
+            {
+                "mala_handoff_version": "1",
+                "catalog_key": "mi-desc-high-close-semiconductors-m1__amd_short",
+                "hypothesis_id": "mi-desc-high-close-semiconductors-m1",
+                "symbol": "AMD",
+                "direction": "short",
+                "strategy_key": "market_impulse",
+                "strategy_name": "MI High Close Reclaim",
+                "strategy_params_json": json.dumps(
+                    {
+                        "entry_mode": "close_location_reclaim",
+                        "min_close_location": 0.7,
+                        "entry_buffer_minutes": 3,
+                        "entry_window_minutes": 60,
+                    }
+                ),
+                "recommendation_tier": "shadow",
+                "thesis_exit_tested": "TRUE",
+                "thesis_exit_policy": "fixed_rr_underlying",
+                "thesis_exit_params_json": json.dumps(
+                    {
+                        "stop_loss_underlying_pct": 0.005,
+                        "take_profit_underlying_r_multiple": 2.0,
+                    }
+                ),
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "authorization_mode": "shadow",
+                "strategy_id": "mi-desc-high-close-semiconductors-m1__amd_short",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "unsupported_strategy_variant: market_impulse.close_location_reclaim" in compiled.plan.suppressed[0]["reason"]
 
 
 def test_google_catalog_exit_controls_can_explicitly_enable_native_exit(tmp_path: Path) -> None:

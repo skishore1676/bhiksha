@@ -1,0 +1,64 @@
+version: 1
+
+supported_thesis_exit_policies:
+  - fixed_rr_underlying
+  - trailing_vma_underlying
+  - time_stop_underlying
+  - hold_to_eod_underlying
+  - ma_trailing_underlying
+  - ma_crossover_underlying
+  - atr_trailing_underlying
+
+strategies:
+  market_impulse:
+    default_variant: cross_reclaim
+    variants:
+      cross_reclaim:
+        status: supported
+        required_params:
+          - direction
+          - entry_buffer_minutes
+          - entry_window_minutes
+          - regime_timeframe
+          - vwma_periods
+        allowed_entry_modes:
+          - null
+          - ""
+          - cross_reclaim
+      close_location_reclaim:
+        status: unsupported
+        reason: runtime_adapter_not_implemented
+      delayed_reclaim:
+        status: unsupported
+        reason: runtime_adapter_not_implemented
+      same_bar_shallow_reclaim:
+        status: unsupported
+        reason: runtime_adapter_not_implemented
+      continuation_confirmation:
+        status: unsupported
+        reason: runtime_adapter_not_implemented
+
+  opening_drive_classifier:
+    default_variant: default
+    variants:
+      default:
+        status: supported
+
+  jerk_pivot_momentum:
+    default_variant: default
+    variants:
+      default:
+        status: supported
+
+  elastic_band_reversion:
+    default_variant: default
+    variants:
+      default:
+        status: supported
+
+  compression_expansion_breakout:
+    default_variant: default
+    variants:
+      default:
+        status: unsupported
+        reason: runtime_adapter_not_implemented

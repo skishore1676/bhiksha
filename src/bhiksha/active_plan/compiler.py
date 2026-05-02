@@ -17,7 +17,11 @@ import yaml
 from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
-from bhiksha.strategy.capabilities import NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS
+from bhiksha.strategy.capabilities import (
+    NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS,
+    derive_strategy_variant,
+    evaluate_strategy_capability,
+)
 from bhiksha.strategy.registry import default_strategy_registry
 from bhiksha.time_utils import normalize_time_text
 
@@ -50,6 +54,7 @@ class StrategyCatalogSheetRow(BaseModel):
     mala_handoff_version: int | None = None
     hypothesis_id: str | None = None
     strategy_name: str | None = None
+    strategy_variant: str | None = None
     strategy_params_json: dict[str, Any] | list[Any] | str | None = None
     signal_window_et: str | None = None
     signal_window_derivation: str | None = None
@@ -59,6 +64,8 @@ class StrategyCatalogSheetRow(BaseModel):
     thesis_exit_metrics_json: dict[str, Any] | list[Any] | str | None = None
     exit_reliability: str | None = None
     exit_trade_count: int | None = None
+    bhiksha_capability_status: str | None = None
+    bhiksha_capability_reason: str | None = None
     warnings: str | None = None
     row_index: int | None = None
 
@@ -991,10 +998,27 @@ def _normalize_mala_evidence_row(normalized: dict[str, Any]) -> dict[str, Any]:
 
     recommendation_tier = str(row.get("recommendation_tier") or "").strip().lower()
     thesis_exit_tested = _coerce_bool(row.get("thesis_exit_tested"))
+    strategy_key = str(row.get("strategy_key") or "").strip().lower()
+    thesis_exit_policy = str(row.get("thesis_exit_policy") or "").strip() or None
+    strategy_variant = str(row.get("strategy_variant") or "").strip() or derive_strategy_variant(
+        strategy_key=strategy_key,
+        strategy_name=str(row.get("strategy_name") or ""),
+        strategy_params=strategy_params,
+    )
+    capability = evaluate_strategy_capability(
+        strategy_key=strategy_key,
+        strategy_variant=strategy_variant,
+        strategy_name=str(row.get("strategy_name") or ""),
+        strategy_params=strategy_params,
+        thesis_exit_policy=thesis_exit_policy,
+    )
     row["playbook_id"] = row.get("playbook_id") or row.get("hypothesis_id")
     row["strategy_family"] = row.get("strategy_family") or row.get("strategy_key")
     row["lifecycle_status"] = row.get("lifecycle_status") or ("candidate" if recommendation_tier != "watch_only" else "hold")
-    row["bhiksha_ready"] = bool(thesis_exit_tested and recommendation_tier != "watch_only")
+    row["strategy_variant"] = capability.strategy_variant
+    row["bhiksha_capability_status"] = capability.status
+    row["bhiksha_capability_reason"] = capability.reason
+    row["bhiksha_ready"] = bool(thesis_exit_tested and recommendation_tier != "watch_only" and capability.supported)
     row["validation_count"] = row.get("validation_count") or row.get("signal_count")
     row["last_validated_date"] = row.get("last_validated_date") or _run_date_from_path(row.get("run_dir"))
     if row.get("playbook_summary_json") is None:
@@ -1008,6 +1032,9 @@ def _normalize_mala_evidence_row(normalized: dict[str, Any]) -> dict[str, Any]:
             "mala_evidence": {
                 "mala_handoff_version": row.get("mala_handoff_version"),
                 "strategy_name": row.get("strategy_name"),
+                "strategy_variant": capability.strategy_variant,
+                "bhiksha_capability_status": capability.status,
+                "bhiksha_capability_reason": capability.reason,
                 "signal_window_et": row.get("signal_window_et"),
                 "signal_window_derivation": row.get("signal_window_derivation"),
                 "recommendation_tier": row.get("recommendation_tier"),
@@ -1131,12 +1158,23 @@ def _manual_strategy_catalog_ids(catalog_root: Path, generated_root: Path) -> se
 
 def _is_google_catalog_entry_promotable(entry: StrategyCatalogSheetRow, supported_keys: set[str]) -> bool:
     strategy_key = str(entry.strategy_key or "").strip()
+    capability_supported = True
+    if _uses_bhiksha_capability_contract(entry):
+        capability = evaluate_strategy_capability(
+            strategy_key=strategy_key,
+            strategy_variant=entry.strategy_variant,
+            strategy_name=entry.strategy_name,
+            strategy_params=entry.strategy_params_json if isinstance(entry.strategy_params_json, dict) else None,
+            thesis_exit_policy=entry.thesis_exit_policy,
+        )
+        capability_supported = capability.supported
     return (
         entry.bhiksha_ready
         and entry.lifecycle_status in {"active", "candidate"}
         and bool(entry.catalog_key)
         and bool(entry.symbol)
         and strategy_key in supported_keys
+        and capability_supported
     )
 
 
@@ -1264,6 +1302,9 @@ def _google_catalog_metadata(entry: StrategyCatalogSheetRow | None) -> dict[str,
         "mala_handoff_version": entry.mala_handoff_version,
         "hypothesis_id": entry.hypothesis_id,
         "strategy_name": entry.strategy_name,
+        "strategy_variant": entry.strategy_variant,
+        "bhiksha_capability_status": entry.bhiksha_capability_status,
+        "bhiksha_capability_reason": entry.bhiksha_capability_reason,
         "signal_window_et": entry.signal_window_et,
         "signal_window_derivation": entry.signal_window_derivation,
         "recommendation_tier": entry.recommendation_tier,
@@ -1303,6 +1344,18 @@ def _validate_google_catalog_alignment(
     local_entry: StrategyCatalogEntry,
     google_entry: StrategyCatalogSheetRow,
 ) -> None:
+    if _uses_bhiksha_capability_contract(google_entry):
+        capability = evaluate_strategy_capability(
+            strategy_key=google_entry.strategy_key,
+            strategy_variant=google_entry.strategy_variant,
+            strategy_name=google_entry.strategy_name,
+            strategy_params=google_entry.strategy_params_json if isinstance(google_entry.strategy_params_json, dict) else None,
+            thesis_exit_policy=google_entry.thesis_exit_policy,
+        )
+        if not capability.supported:
+            raise ValueError(
+                f"unsupported_strategy_variant: {capability.strategy_key}.{capability.strategy_variant} {capability.reason}"
+            )
     if not google_entry.bhiksha_ready:
         raise ValueError(f"Strategy {strategy_id!r} is not bhiksha_ready in the Google strategy catalog")
     if google_entry.lifecycle_status == "retired":
@@ -1317,6 +1370,15 @@ def _validate_google_catalog_alignment(
             f"Google strategy catalog strategy_key mismatch for {strategy_id!r}: "
             f"{google_entry.strategy_key!r} vs local {local_entry.strategy.key!r}"
         )
+
+
+def _uses_bhiksha_capability_contract(entry: StrategyCatalogSheetRow) -> bool:
+    return bool(
+        entry.mala_handoff_version is not None
+        or entry.strategy_variant
+        or entry.bhiksha_capability_status
+        or entry.bhiksha_capability_reason
+    )
 
 
 def _normalize_key(value: str) -> str:
