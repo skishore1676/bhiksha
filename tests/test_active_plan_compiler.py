@@ -684,6 +684,8 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "execution_window_end_et", "value": "16:00"},
             {"section": "default", "key": "max_trade_premium_usd", "value": "500"},
             {"section": "default", "key": "option_stop_pct", "value": "0.35"},
+            {"section": "default", "key": "option_profit_target_enabled", "value": "TRUE"},
+            {"section": "default", "key": "option_profit_target_pct", "value": "0.35"},
             {"section": "default", "key": "min_open_interest", "value": "25"},
             {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
             {"section": "default", "key": "dte_min", "value": "5"},
@@ -735,7 +737,9 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.risk.max_trade_premium_usd == 1000
     assert deployment.risk.stop_loss_pct == 0.35
     assert deployment.exit.use_algorithmic_exit is False
-    assert deployment.exit.use_profit_target is False
+    assert deployment.exit.use_profit_target is True
+    assert deployment.exit.option_profit_target_pct == 0.35
+    assert deployment.exit.profit_target_multiple is None
     assert deployment.exit.thesis_exit_params == {
         "stop_loss_underlying_pct": 0.005,
         "take_profit_underlying_r_multiple": 2.0,

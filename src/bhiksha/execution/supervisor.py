@@ -399,12 +399,11 @@ class ExecutionSupervisor:
                 quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
             return quote
         if (
-            deployment.exit.use_profit_target
-            and deployment.exit.profit_target_multiple is not None
+            _profit_target_configured(deployment)
             and updated.target_order_id is None
             and updated.target_price is None
         ):
-            target_price = _target_price(position.entry_price, deployment.exit.stop_loss_pct, deployment.exit.profit_target_multiple)
+            target_price = _deployment_target_price(deployment, position.entry_price)
             if self._supports_concurrent_exit_orders():
                 target_order_id = "DRY_RUN_TARGET"
                 target_error = None
@@ -1921,8 +1920,8 @@ class ExecutionSupervisor:
             )
         target_order_id = None
         target_price = None
-        if deployment.exit.use_profit_target and deployment.exit.profit_target_multiple is not None:
-            target_price = _target_price(entry_price, stop_loss_pct or 0.0, deployment.exit.profit_target_multiple)
+        if _profit_target_configured(deployment):
+            target_price = _deployment_target_price(deployment, entry_price)
             if self._supports_concurrent_exit_orders():
                 target_result = (
                     _DryRunOrderResult("DRY_RUN_TARGET")
@@ -2062,8 +2061,35 @@ class ExecutionSupervisor:
         )
 
 
-def _target_price(entry_price: float, stop_loss_pct: float, r_multiple: float) -> float:
-    return entry_price * (1.0 + stop_loss_pct * r_multiple)
+def _profit_target_configured(deployment: DeploymentManifest) -> bool:
+    return bool(
+        deployment.exit.use_profit_target
+        and (
+            deployment.exit.option_profit_target_pct is not None
+            or deployment.exit.profit_target_multiple is not None
+        )
+    )
+
+
+def _deployment_target_price(deployment: DeploymentManifest, entry_price: float) -> float:
+    return _target_price(
+        entry_price,
+        deployment.exit.stop_loss_pct,
+        deployment.exit.profit_target_multiple,
+        option_profit_target_pct=deployment.exit.option_profit_target_pct,
+    )
+
+
+def _target_price(
+    entry_price: float,
+    stop_loss_pct: float,
+    r_multiple: float | None,
+    *,
+    option_profit_target_pct: float | None = None,
+) -> float:
+    if option_profit_target_pct is not None:
+        return entry_price * (1.0 + option_profit_target_pct)
+    return entry_price * (1.0 + stop_loss_pct * (r_multiple or 0.0))
 
 
 def _max_valid_sell_stop_price(bid: float) -> float | None:

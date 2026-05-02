@@ -118,6 +118,7 @@ class ActivePlanSheetRow(BaseModel):
     hard_flat_time_et: str | None = None
     use_profit_target: bool | None = None
     profit_target_multiple: float | None = None
+    option_profit_target_pct: float | None = None
     stop_to_breakeven_after_r_multiple: float | None = None
     entry_window_start_et: str | None = None
     entry_window_end_et: str | None = None
@@ -666,7 +667,11 @@ def _compile_strategy_row(
 def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:
     stop_loss_pct = row.stop_loss_pct if row.stop_loss_pct is not None else 0.45
     hard_flat_time_et = row.hard_flat_time_et or "15:55"
-    use_profit_target = row.use_profit_target if row.use_profit_target is not None else row.profit_target_multiple is not None
+    use_profit_target = (
+        row.use_profit_target
+        if row.use_profit_target is not None
+        else row.profit_target_multiple is not None or row.option_profit_target_pct is not None
+    )
 
     payload: dict[str, Any] = {
         "deployment_id": row.row_id,
@@ -703,6 +708,7 @@ def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:
             "use_algorithmic_exit": False,
             "use_profit_target": use_profit_target,
             "profit_target_multiple": row.profit_target_multiple,
+            "option_profit_target_pct": row.option_profit_target_pct,
             "stop_loss_pct": stop_loss_pct,
             "stop_to_breakeven_after_r_multiple": row.stop_to_breakeven_after_r_multiple,
             "hard_flat_time_et": hard_flat_time_et,
@@ -769,6 +775,7 @@ def _compile_manual_breakout_row(row: ActivePlanSheetRow) -> DeploymentManifest:
             "use_algorithmic_exit": True,
             "use_profit_target": use_profit_target,
             "profit_target_multiple": profit_target_multiple,
+            "option_profit_target_pct": row.option_profit_target_pct,
             "stop_loss_pct": stop_loss_pct,
             "stop_to_breakeven_after_r_multiple": row.stop_to_breakeven_after_r_multiple,
             "hard_flat_time_et": hard_flat_time_et,
@@ -833,10 +840,19 @@ def _google_catalog_entry_payload(
         normalize_time_text(str(catastrophe_exit_params.get("hard_flat_time_et") or default_hard_flat_time or "15:55"))
         or "15:55"
     )
+    default_profit_target_enabled = (
+        _coerce_bool(defaults.get("option_profit_target_enabled")) if use_defaults else None
+    )
+    default_option_profit_target_pct = (
+        _coerce_float(defaults.get("option_profit_target_pct")) if use_defaults else None
+    )
     use_profit_target = _coerce_bool(catastrophe_exit_params.get("use_profit_target"))
     if use_profit_target is None:
-        use_profit_target = False
+        use_profit_target = bool(default_profit_target_enabled and default_option_profit_target_pct is not None)
     profit_target_multiple = _coerce_float(catastrophe_exit_params.get("profit_target_multiple"))
+    option_profit_target_pct = _coerce_float(catastrophe_exit_params.get("option_profit_target_pct"))
+    if option_profit_target_pct is None and use_profit_target:
+        option_profit_target_pct = default_option_profit_target_pct
     stop_to_breakeven_after_r_multiple = _coerce_float(
         catastrophe_exit_params.get("stop_to_breakeven_after_r_multiple")
     )
@@ -915,6 +931,7 @@ def _google_catalog_entry_payload(
             "use_algorithmic_exit": use_algorithmic_exit,
             "use_profit_target": use_profit_target,
             "profit_target_multiple": profit_target_multiple,
+            "option_profit_target_pct": option_profit_target_pct,
             "stop_loss_pct": stop_loss_pct,
             "stop_to_breakeven_after_r_multiple": stop_to_breakeven_after_r_multiple,
             "hard_flat_time_et": hard_flat_time_et,
@@ -1062,6 +1079,8 @@ def _apply_exit_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> d
         updated["use_profit_target"] = row.use_profit_target
     if row.profit_target_multiple is not None:
         updated["profit_target_multiple"] = row.profit_target_multiple
+    if row.option_profit_target_pct is not None:
+        updated["option_profit_target_pct"] = row.option_profit_target_pct
     if row.stop_loss_pct is not None:
         updated["stop_loss_pct"] = row.stop_loss_pct
     if row.hard_flat_time_et is not None:
@@ -1446,6 +1465,10 @@ _COLUMN_ALIASES = {
     "stop_pct": "stop_loss_pct",
     "target_r": "profit_target_multiple",
     "profit_target_r": "profit_target_multiple",
+    "target_pct": "option_profit_target_pct",
+    "profit_target_pct": "option_profit_target_pct",
+    "option_target_pct": "option_profit_target_pct",
+    "option_profit_target": "option_profit_target_pct",
     "flat_time": "hard_flat_time_et",
     "hard_flat": "hard_flat_time_et",
     "start": "entry_window_start_et",

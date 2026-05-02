@@ -81,7 +81,8 @@ def _normalize_nested_time_field(data: dict[str, Any], field_name: str, nested_k
 
 def _has_exit_fallback_protection(exit_spec: "ExitSpec") -> bool:
     return (exit_spec.stop_loss_pct is not None and exit_spec.stop_loss_pct > 0) or bool(exit_spec.thesis_exit_policy) or (
-        exit_spec.use_profit_target and exit_spec.profit_target_multiple is not None
+        exit_spec.use_profit_target
+        and (exit_spec.profit_target_multiple is not None or exit_spec.option_profit_target_pct is not None)
     )
 
 
@@ -226,6 +227,7 @@ class ExitSpec(BaseModel):
     use_algorithmic_exit: bool = True
     use_profit_target: bool = False
     profit_target_multiple: float | None = None
+    option_profit_target_pct: float | None = None
     target_approach_offset_pct: float | None = None
     target_pullback_restore_progress_pct: float | None = None
     stop_loss_pct: float = 0.45
