@@ -21,7 +21,7 @@ from bhiksha.bionic.session_ops import (
     session_summary_to_dict,
     write_feedback_bundle,
 )
-from bhiksha.config.environment import load_dotenv
+from bhiksha.config.environment import get_mala_evidence_sheet_name, load_dotenv
 from bhiksha.loop.observation import write_observation_reports
 from bhiksha.ops.summary import build_session_summary
 from bhiksha.tools.healthcheck import _run as run_healthcheck
@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     load_dotenv()
     default_google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
     default_credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_PATH")
-    default_catalog_sheet_name = os.getenv("STRATEGY_CATALOG_SHEET_NAME", "strategy catalog")
+    default_catalog_sheet_name = get_mala_evidence_sheet_name()
     default_defaults_sheet_name = os.getenv("OPERATOR_DEFAULTS_SHEET_NAME")
     default_strategy_sheet_name = os.getenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategies")
     default_manual_sheet_name = os.getenv("MANUAL_ENTRY_SHEET_NAME") or os.getenv("MANNUAL_ENTRY_SHEET_NAME") or "manual_entry"
@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--sheet", default=None, help="Legacy fallback: path to a local sheet export (.csv or .json)")
     prepare.add_argument("--google-sheet-id", default=None, help="Google spreadsheet URL or ID for the active control plane")
     prepare.add_argument("--credentials-path", default=default_credentials_path, help="Google service-account credentials JSON path")
-    prepare.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for the strategy catalog tab")
+    prepare.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for Mala_Evidence_v1")
     prepare.add_argument("--defaults-sheet-name", default=default_defaults_sheet_name, help="Optional worksheet name for operator defaults")
     prepare.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for approved strategy activations")
     prepare.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual trade setups")

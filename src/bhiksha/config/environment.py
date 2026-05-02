@@ -25,3 +25,15 @@ def load_dotenv(path: str | Path = ".env") -> None:
         value = value.strip().strip("'").strip('"')
         os.environ.setdefault(key, value)
 
+
+def get_mala_evidence_sheet_name(default: str = "strategy catalog") -> str:
+    """Return the Mala-owned evidence worksheet name.
+
+    ``STRATEGY_CATALOG_SHEET_NAME`` is kept as a backward-compatible alias for
+    older deployments.
+    """
+    return (
+        os.getenv("MALA_EVIDENCE_SHEET_NAME")
+        or os.getenv("STRATEGY_CATALOG_SHEET_NAME")
+        or default
+    )

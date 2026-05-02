@@ -8,14 +8,14 @@ import os
 from pathlib import Path
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets, write_compiled_active_plan
-from bhiksha.config.environment import load_dotenv
+from bhiksha.config.environment import get_mala_evidence_sheet_name, load_dotenv
 
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     default_google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
     default_credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_PATH")
-    default_catalog_sheet_name = os.getenv("STRATEGY_CATALOG_SHEET_NAME", "strategy catalog")
+    default_catalog_sheet_name = get_mala_evidence_sheet_name()
     default_defaults_sheet_name = os.getenv("OPERATOR_DEFAULTS_SHEET_NAME")
     default_strategy_sheet_name = os.getenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategies")
     default_manual_sheet_name = os.getenv("MANUAL_ENTRY_SHEET_NAME") or os.getenv("MANNUAL_ENTRY_SHEET_NAME") or "manual_entry"
@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         default=default_credentials_path,
         help="Google service-account credentials JSON path. Required with --google-sheet-id.",
     )
-    parser.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for the Mala-managed strategy catalog")
+    parser.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for Mala_Evidence_v1")
     parser.add_argument("--defaults-sheet-name", default=default_defaults_sheet_name, help="Optional worksheet name for operator defaults")
     parser.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for approved strategy activations")
     parser.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual trade setups")

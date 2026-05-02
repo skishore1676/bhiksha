@@ -14,7 +14,7 @@ def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.
     log_dir = tmp_path / "artifacts" / "playbook" / "logs"
     monkeypatch.setenv("GOOGLE_SHEET_ID", "spreadsheet123")
     monkeypatch.setenv("GOOGLE_API_CREDENTIALS_PATH", str(tmp_path / "credentials.json"))
-    monkeypatch.setenv("STRATEGY_CATALOG_SHEET_NAME", "Strategy_Catalog")
+    monkeypatch.setenv("MALA_EVIDENCE_SHEET_NAME", "Mala_Evidence_v1")
     monkeypatch.setenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategy")
     monkeypatch.setenv("MANUAL_ENTRY_SHEET_NAME", "manual_entry")
     monkeypatch.setenv("BHIKSHA_STRATEGY_CATALOG_PATH", str(tmp_path / "strategy_catalog"))
@@ -23,7 +23,7 @@ def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.
 
     def _fake_compile(**kwargs):
         assert kwargs["spreadsheet_id"] == "spreadsheet123"
-        assert kwargs["catalog_sheet_name"] == "Strategy_Catalog"
+        assert kwargs["catalog_sheet_name"] == "Mala_Evidence_v1"
         assert kwargs["strategy_sheet_name"] == "active_strategy"
         assert kwargs["manual_sheet_name"] == "manual_entry"
         return _compiled_plan("active_plan_2026-04-09")

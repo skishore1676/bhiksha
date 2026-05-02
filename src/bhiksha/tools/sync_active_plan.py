@@ -11,7 +11,7 @@ from pathlib import Path
 import time
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets
-from bhiksha.config.environment import load_dotenv
+from bhiksha.config.environment import get_mala_evidence_sheet_name, load_dotenv
 
 
 @dataclass(slots=True, frozen=True)
@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     default_google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
     default_credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_PATH")
-    default_catalog_sheet_name = os.getenv("STRATEGY_CATALOG_SHEET_NAME", "strategy catalog")
+    default_catalog_sheet_name = get_mala_evidence_sheet_name()
     default_defaults_sheet_name = os.getenv("OPERATOR_DEFAULTS_SHEET_NAME")
     default_strategy_sheet_name = os.getenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategies")
     default_manual_sheet_name = os.getenv("MANUAL_ENTRY_SHEET_NAME") or os.getenv("MANNUAL_ENTRY_SHEET_NAME") or "manual_entry"
@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--google-sheet-id", default=default_google_sheet_id, help="Google spreadsheet URL or ID")
     parser.add_argument("--credentials-path", default=default_credentials_path, help="Google service-account credentials JSON path")
-    parser.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for strategy catalog")
+    parser.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for Mala_Evidence_v1")
     parser.add_argument("--defaults-sheet-name", default=default_defaults_sheet_name, help="Optional worksheet name for operator defaults")
     parser.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for active strategies")
     parser.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual entries")

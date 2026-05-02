@@ -13,11 +13,13 @@ def test_server_session_sync_uses_env_defaults(tmp_path: Path, monkeypatch: pyte
     sync_log_dir = tmp_path / "artifacts" / "playbook" / "logs"
     monkeypatch.setenv("GOOGLE_SHEET_ID", "spreadsheet123")
     monkeypatch.setenv("GOOGLE_API_CREDENTIALS_PATH", str(tmp_path / "credentials.json"))
+    monkeypatch.setenv("MALA_EVIDENCE_SHEET_NAME", "Mala_Evidence_v1")
     monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_PATH", str(active_plan_path))
     monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_LOG_DIR", str(sync_log_dir))
 
     def _fake_sync(**kwargs):
         assert kwargs["spreadsheet_id"] == "spreadsheet123"
+        assert kwargs["catalog_sheet_name"] == "Mala_Evidence_v1"
         return _sync_result(active_plan_path, sync_log_dir / "active_plan_sync_2026-04-09.jsonl")
 
     monkeypatch.setattr("bhiksha.tools.server_session.sync_active_plan_once", _fake_sync)
