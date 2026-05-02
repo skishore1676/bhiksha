@@ -632,6 +632,118 @@ def test_compile_active_plan_maps_mala_v2_compact_playbook_summary(tmp_path: Pat
     assert compatibility["note"] == "bhiksha strategy and exit policy both implemented"
 
 
+def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Mala_Evidence_v1",
+        rows=[
+            {
+                "mala_handoff_version": "1",
+                "catalog_key": "market-impulse-all-basket-discovery__iwm_long",
+                "hypothesis_id": "market-impulse-all-basket-discovery",
+                "symbol": "IWM",
+                "direction": "long",
+                "strategy_key": "market_impulse",
+                "strategy_name": "Market Impulse (Cross & Reclaim)",
+                "strategy_params_json": json.dumps(
+                    {
+                        "entry_buffer_minutes": 5,
+                        "entry_window_minutes": 45,
+                        "regime_timeframe": "15m",
+                        "vwma_periods": [5, 13, 21],
+                    }
+                ),
+                "signal_window_et": "09:35-10:15",
+                "recommendation_tier": "shadow",
+                "expectancy": "0.56",
+                "confidence": "0.98",
+                "signal_count": "49",
+                "execution_robustness": "1.0",
+                "thesis_exit_tested": "TRUE",
+                "thesis_exit_policy": "fixed_rr_underlying",
+                "thesis_exit_params_json": json.dumps(
+                    {
+                        "stop_loss_underlying_pct": 0.005,
+                        "take_profit_underlying_r_multiple": 2.0,
+                    }
+                ),
+                "thesis_exit_metrics_json": json.dumps({"expectancy": 0.56, "profit_factor": 2.0}),
+                "exit_reliability": "thin",
+                "warnings": "legacy_m5_execution_mapping_ignored:entry_window_et",
+            }
+        ],
+    )
+    defaults_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Operator_Defaults_v1",
+        rows=[
+            {"section": "default", "key": "execution_window_start_et", "value": "09:30"},
+            {"section": "default", "key": "execution_window_end_et", "value": "16:00"},
+            {"section": "default", "key": "max_trade_premium_usd", "value": "500"},
+            {"section": "default", "key": "option_stop_pct", "value": "0.35"},
+            {"section": "default", "key": "min_open_interest", "value": "25"},
+            {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
+            {"section": "default", "key": "dte_min", "value": "5"},
+            {"section": "default", "key": "dte_max", "value": "21"},
+            {"section": "default", "key": "delta_min", "value": "0.15"},
+            {"section": "default", "key": "delta_max", "value": "0.40"},
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "authorization_mode": "live",
+                "strategy_id": "market-impulse-all-basket-discovery__iwm_long",
+                "entry_window_start_et": "09:30",
+                "max_trade_premium_usd": "1000",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        defaults_sheet_name="Operator_Defaults_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        defaults_client=defaults_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    deployment = compiled.plan.deployments[0]
+    assert deployment.strategy.params["entry_buffer_minutes"] == 5
+    assert deployment.strategy.params["direction"] == "long"
+    assert deployment.execution.dte_min == 5
+    assert deployment.execution.dte_max == 21
+    assert deployment.execution.target_abs_delta_min == 0.15
+    assert deployment.execution.target_abs_delta_max == 0.40
+    assert deployment.execution.min_open_interest == 25
+    assert deployment.execution.max_bid_ask_spread_pct == 0.10
+    assert deployment.execution.entry_window_start_et == "09:30"
+    assert deployment.execution.entry_window_end_et == "16:00"
+    assert deployment.risk.max_trade_premium_usd == 1000
+    assert deployment.risk.stop_loss_pct == 0.35
+    assert deployment.exit.use_algorithmic_exit is False
+    assert deployment.exit.use_profit_target is False
+    assert deployment.exit.thesis_exit_params == {
+        "stop_loss_underlying_pct": 0.005,
+        "take_profit_underlying_r_multiple": 2.0,
+    }
+    assert deployment.source.metadata["mala_handoff_version"] == 1
+    assert deployment.source.metadata["signal_window_et"] == "09:35-10:15"
+
+
 def test_google_catalog_exit_controls_can_explicitly_enable_native_exit(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
