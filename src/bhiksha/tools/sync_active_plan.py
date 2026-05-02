@@ -30,6 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     default_google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
     default_credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_PATH")
     default_catalog_sheet_name = os.getenv("STRATEGY_CATALOG_SHEET_NAME", "strategy catalog")
+    default_defaults_sheet_name = os.getenv("OPERATOR_DEFAULTS_SHEET_NAME")
     default_strategy_sheet_name = os.getenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategies")
     default_manual_sheet_name = os.getenv("MANUAL_ENTRY_SHEET_NAME") or os.getenv("MANNUAL_ENTRY_SHEET_NAME") or "manual_entry"
     default_strategy_catalog_path = os.getenv("BHIKSHA_STRATEGY_CATALOG_PATH", "config/strategy_catalog")
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--google-sheet-id", default=default_google_sheet_id, help="Google spreadsheet URL or ID")
     parser.add_argument("--credentials-path", default=default_credentials_path, help="Google service-account credentials JSON path")
     parser.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for strategy catalog")
+    parser.add_argument("--defaults-sheet-name", default=default_defaults_sheet_name, help="Optional worksheet name for operator defaults")
     parser.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for active strategies")
     parser.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual entries")
     parser.add_argument("--strategy-catalog", default=default_strategy_catalog_path, help="Local Bhiksha strategy catalog path")
@@ -77,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
                 spreadsheet_id=args.google_sheet_id,
                 credentials_path=args.credentials_path,
                 catalog_sheet_name=args.catalog_sheet_name,
+                defaults_sheet_name=args.defaults_sheet_name,
                 strategy_sheet_name=args.strategy_sheet_name,
                 manual_sheet_name=args.manual_sheet_name,
                 strategy_catalog_path=args.strategy_catalog,
@@ -120,6 +123,7 @@ def sync_active_plan_once(
     spreadsheet_id: str,
     credentials_path: str | Path,
     catalog_sheet_name: str,
+    defaults_sheet_name: str | None,
     strategy_sheet_name: str,
     manual_sheet_name: str,
     strategy_catalog_path: str | Path,
@@ -139,6 +143,7 @@ def sync_active_plan_once(
         spreadsheet_id=spreadsheet_id,
         credentials_path=credentials_path,
         catalog_sheet_name=catalog_sheet_name,
+        defaults_sheet_name=defaults_sheet_name,
         strategy_sheet_name=strategy_sheet_name,
         manual_sheet_name=manual_sheet_name,
         strategy_catalog_path=strategy_catalog_path,

@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     default_google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
     default_credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_PATH")
     default_catalog_sheet_name = os.getenv("STRATEGY_CATALOG_SHEET_NAME", "strategy catalog")
+    default_defaults_sheet_name = os.getenv("OPERATOR_DEFAULTS_SHEET_NAME")
     default_strategy_sheet_name = os.getenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategies")
     default_manual_sheet_name = os.getenv("MANUAL_ENTRY_SHEET_NAME") or os.getenv("MANNUAL_ENTRY_SHEET_NAME") or "manual_entry"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -43,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--google-sheet-id", default=None, help="Google spreadsheet URL or ID for the active control plane")
     prepare.add_argument("--credentials-path", default=default_credentials_path, help="Google service-account credentials JSON path")
     prepare.add_argument("--catalog-sheet-name", default=default_catalog_sheet_name, help="Worksheet name for the strategy catalog tab")
+    prepare.add_argument("--defaults-sheet-name", default=default_defaults_sheet_name, help="Optional worksheet name for operator defaults")
     prepare.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for approved strategy activations")
     prepare.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual trade setups")
     prepare.add_argument(
@@ -108,6 +110,7 @@ def _prepare(args: argparse.Namespace) -> int:
                 spreadsheet_id=google_sheet_id,
                 credentials_path=credentials_path,
                 catalog_sheet_name=args.catalog_sheet_name,
+                defaults_sheet_name=args.defaults_sheet_name,
                 strategy_sheet_name=args.strategy_sheet_name,
                 manual_sheet_name=args.manual_sheet_name,
                 strategy_catalog_path=strategy_catalog,

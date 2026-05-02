@@ -23,7 +23,7 @@ from bhiksha.time_utils import normalize_time_text
 
 
 class StrategyCatalogSheetRow(BaseModel):
-    """Read-only metadata row loaded from the Google strategy catalog tab."""
+    """Read-only metadata row loaded from a Mala catalog/evidence tab."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -47,6 +47,19 @@ class StrategyCatalogSheetRow(BaseModel):
     execution_robustness: float | None = None
     thesis_exit_policy: str | None = None
     playbook_summary_json: dict[str, Any] | list[Any] | str | None = None
+    mala_handoff_version: int | None = None
+    hypothesis_id: str | None = None
+    strategy_name: str | None = None
+    strategy_params_json: dict[str, Any] | list[Any] | str | None = None
+    signal_window_et: str | None = None
+    signal_window_derivation: str | None = None
+    recommendation_tier: str | None = None
+    thesis_exit_tested: bool | None = None
+    thesis_exit_params_json: dict[str, Any] | list[Any] | str | None = None
+    thesis_exit_metrics_json: dict[str, Any] | list[Any] | str | None = None
+    exit_reliability: str | None = None
+    exit_trade_count: int | None = None
+    warnings: str | None = None
     row_index: int | None = None
 
     @model_validator(mode="before")
@@ -55,9 +68,19 @@ class StrategyCatalogSheetRow(BaseModel):
         if not isinstance(data, dict):
             return data
         normalized = _normalize_sheet_mapping(data)
+        if normalized.get("mala_handoff_version") is not None:
+            normalized = _normalize_mala_evidence_row(normalized)
         if normalized.get("symbol") is not None:
             normalized["symbol"] = str(normalized["symbol"]).strip().upper()
-        for key in ("strategy_key", "strategy_family", "direction", "lifecycle_status", "operator_status_override"):
+        for key in (
+            "strategy_key",
+            "strategy_family",
+            "direction",
+            "lifecycle_status",
+            "operator_status_override",
+            "recommendation_tier",
+            "exit_reliability",
+        ):
             if normalized.get(key) is not None:
                 normalized[key] = str(normalized[key]).strip().lower()
         return normalized
@@ -235,6 +258,7 @@ def compile_active_plan_from_rows(
     source_name: str = "google_sheet_integration",
     source_details: dict[str, Any] | None = None,
     google_strategy_catalog: list[StrategyCatalogSheetRow] | None = None,
+    operator_defaults: dict[str, Any] | None = None,
     suppressed: list[dict[str, Any]] | None = None,
 ) -> CompiledActivePlan:
     suppressed_rows = list(suppressed or [])
@@ -242,6 +266,7 @@ def compile_active_plan_from_rows(
         sync_google_strategy_catalog(
             strategy_catalog_path=strategy_catalog_path,
             google_strategy_catalog=google_strategy_catalog,
+            operator_defaults=operator_defaults or {},
         )
     strategy_catalog = load_strategy_catalog(strategy_catalog_path)
     catalog_by_id = {entry.strategy_id: entry for entry in strategy_catalog}
@@ -311,9 +336,11 @@ def compile_active_plan_from_google_sheets(
     trading_date: str | None = None,
     source_name: str = "google_sheets_control_plane",
     catalog_sheet_name: str = "strategy catalog",
+    defaults_sheet_name: str | None = None,
     strategy_client: GoogleSheetTableClient | None = None,
     manual_client: GoogleSheetTableClient | None = None,
     catalog_client: GoogleSheetTableClient | None = None,
+    defaults_client: GoogleSheetTableClient | None = None,
 ) -> CompiledActivePlan:
     if catalog_client is None:
         catalog_client = GoogleSheetTableClient(
@@ -333,10 +360,21 @@ def compile_active_plan_from_google_sheets(
             sheet_name=manual_sheet_name,
             credentials_path=Path(credentials_path),
         )
+    if defaults_client is None and defaults_sheet_name:
+        defaults_client = GoogleSheetTableClient(
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=defaults_sheet_name,
+            credentials_path=Path(credentials_path),
+        )
 
     catalog_validation = load_strategy_catalog_sheet_rows_with_report(
         catalog_client.read_rows(),
         sheet_name=catalog_client.sheet_name,
+    )
+    operator_defaults = (
+        load_operator_defaults_sheet_rows(defaults_client.read_rows())
+        if defaults_client is not None
+        else {}
     )
     strategy_validation = load_rows_from_sheet_records_with_report(
         strategy_client.read_rows(),
@@ -362,10 +400,12 @@ def compile_active_plan_from_google_sheets(
         source_details={
             "spreadsheet_id": catalog_client.spreadsheet_id,
             "catalog_sheet_name": catalog_client.sheet_name,
+            "defaults_sheet_name": defaults_client.sheet_name if defaults_client is not None else None,
             "strategy_sheet_name": strategy_client.sheet_name,
             "manual_sheet_name": manual_client.sheet_name,
         },
         google_strategy_catalog=catalog_validation.rows,
+        operator_defaults=operator_defaults,
         suppressed=suppressed,
     )
 
@@ -439,6 +479,23 @@ def load_strategy_catalog_sheet_rows(rows: list[dict[str, Any]]) -> list[Strateg
     return load_strategy_catalog_sheet_rows_with_report(rows).rows
 
 
+def load_operator_defaults_sheet_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    defaults: dict[str, Any] = {}
+    for row in rows:
+        section = str(row.get("section") or "default").strip() or "default"
+        key = str(row.get("key") or "").strip()
+        if not key:
+            continue
+        value = _normalize_value(row.get("value"))
+        if section == "default":
+            defaults[key] = value
+            continue
+        nested = defaults.setdefault(section, {})
+        if isinstance(nested, dict):
+            nested[key] = value
+    return defaults
+
+
 def load_strategy_catalog_sheet_rows_with_report(
     rows: list[dict[str, Any]],
     *,
@@ -459,6 +516,7 @@ def sync_google_strategy_catalog(
     *,
     strategy_catalog_path: str | Path,
     google_strategy_catalog: list[StrategyCatalogSheetRow],
+    operator_defaults: dict[str, Any] | None = None,
 ) -> list[Path]:
     catalog_root = Path(strategy_catalog_path)
     generated_root = catalog_root / "google_promoted"
@@ -480,7 +538,7 @@ def sync_google_strategy_catalog(
     for entry in eligible_entries:
         output_path = generated_root / f"{entry.catalog_key}.yaml"
         output_path.write_text(
-            yaml.safe_dump(_google_catalog_entry_payload(entry), sort_keys=False),
+            yaml.safe_dump(_google_catalog_entry_payload(entry, operator_defaults=operator_defaults or {}), sort_keys=False),
             encoding="utf-8",
         )
         written_paths.append(output_path)
@@ -747,7 +805,13 @@ def _catalog_entry_payload(entry: StrategyCatalogEntry) -> dict[str, Any]:
     }
 
 
-def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, Any]:
+def _google_catalog_entry_payload(
+    entry: StrategyCatalogSheetRow,
+    *,
+    operator_defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    defaults = operator_defaults or {}
+    use_defaults = entry.mala_handoff_version is not None
     summary = entry.playbook_summary_json if isinstance(entry.playbook_summary_json, dict) else {}
     entry_params = dict(summary.get("entry_params") or {})
     vehicle_mapping = dict(summary.get("vehicle_mapping") or {})
@@ -761,9 +825,17 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
         if key in entry_params:
             entry_params[key] = normalize_time_text(str(entry_params[key]))
 
-    stop_loss_pct = _coerce_float(catastrophe_exit_params.get("stop_loss_pct")) or 0.45
-    hard_flat_time_et = normalize_time_text(str(catastrophe_exit_params.get("hard_flat_time_et") or "15:55")) or "15:55"
-    use_profit_target = bool(catastrophe_exit_params.get("use_profit_target", False))
+    default_stop_loss_pct = _coerce_float(defaults.get("option_stop_pct")) if use_defaults else None
+    default_hard_flat_time = defaults.get("hard_flat_time_et") if use_defaults else None
+
+    stop_loss_pct = _coerce_float(catastrophe_exit_params.get("stop_loss_pct")) or default_stop_loss_pct or 0.45
+    hard_flat_time_et = (
+        normalize_time_text(str(catastrophe_exit_params.get("hard_flat_time_et") or default_hard_flat_time or "15:55"))
+        or "15:55"
+    )
+    use_profit_target = _coerce_bool(catastrophe_exit_params.get("use_profit_target"))
+    if use_profit_target is None:
+        use_profit_target = False
     profit_target_multiple = _coerce_float(catastrophe_exit_params.get("profit_target_multiple"))
     stop_to_breakeven_after_r_multiple = _coerce_float(
         catastrophe_exit_params.get("stop_to_breakeven_after_r_multiple")
@@ -778,24 +850,49 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
         "profile": str(vehicle_mapping.get("profile") or "single_leg_long_premium_v1"),
         "shadow_only": True,
         "option_mapping": vehicle_mapping.get("option_mapping") or _option_mapping_from_structure(vehicle_mapping.get("structure")),
-        "min_open_interest": _coerce_int(vehicle_mapping.get("min_open_interest")) or 100,
-        "max_bid_ask_spread_pct": _coerce_float(vehicle_mapping.get("max_bid_ask_spread_pct")) or 0.20,
+        "min_open_interest": _coerce_int(vehicle_mapping.get("min_open_interest"))
+        or (_coerce_int(defaults.get("min_open_interest")) if use_defaults else None)
+        or 100,
+        "max_bid_ask_spread_pct": _coerce_float(vehicle_mapping.get("max_bid_ask_spread_pct"))
+        or (_coerce_float(defaults.get("max_bid_ask_spread_pct")) if use_defaults else None)
+        or 0.20,
     }
     dte_range = _compact_numeric_range_text(vehicle_mapping.get("dte") or vehicle_mapping.get("dte_target"))
     if dte_range is not None:
         execution_payload["dte"] = dte_range
     else:
-        execution_payload["dte_min"] = _coerce_int(vehicle_mapping.get("dte_min")) or 0
-        execution_payload["dte_max"] = _coerce_int(vehicle_mapping.get("dte_max")) or 7
+        execution_payload["dte_min"] = (
+            _coerce_int(vehicle_mapping.get("dte_min"))
+            or (_coerce_int(defaults.get("dte_min")) if use_defaults else None)
+            or 0
+        )
+        execution_payload["dte_max"] = (
+            _coerce_int(vehicle_mapping.get("dte_max"))
+            or (_coerce_int(defaults.get("dte_max")) if use_defaults else None)
+            or 7
+        )
     delta_range = _compact_numeric_range_text(vehicle_mapping.get("delta_target") or vehicle_mapping.get("delta_plan"))
     if delta_range is not None:
         execution_payload["delta_target"] = delta_range
     else:
-        execution_payload["target_abs_delta_min"] = _coerce_float(vehicle_mapping.get("target_abs_delta_min"))
-        execution_payload["target_abs_delta_max"] = _coerce_float(vehicle_mapping.get("target_abs_delta_max"))
+        execution_payload["target_abs_delta_min"] = _coerce_float(vehicle_mapping.get("target_abs_delta_min")) or (
+            _coerce_float(defaults.get("delta_min")) if use_defaults else None
+        )
+        execution_payload["target_abs_delta_max"] = _coerce_float(vehicle_mapping.get("target_abs_delta_max")) or (
+            _coerce_float(defaults.get("delta_max")) if use_defaults else None
+        )
     entry_window = vehicle_mapping.get("entry_window_et")
     if entry_window is not None:
         execution_payload["entry_window_et"] = entry_window
+    elif use_defaults:
+        start = normalize_time_text(str(defaults.get("execution_window_start_et") or ""))
+        end = normalize_time_text(str(defaults.get("execution_window_end_et") or ""))
+        if start:
+            execution_payload["entry_window_start_et"] = start
+        if end:
+            execution_payload["entry_window_end_et"] = end
+
+    default_max_premium = _coerce_float(defaults.get("max_trade_premium_usd")) if use_defaults else None
 
     return {
         "strategy_id": entry.catalog_key,
@@ -809,7 +906,7 @@ def _google_catalog_entry_payload(entry: StrategyCatalogSheetRow) -> dict[str, A
         "execution": execution_payload,
         "risk": {
             "profile": f"{strategy_key}_risk_v1" if strategy_key else "catalog_promoted_v1",
-            "max_trade_premium_usd": 300.0,
+            "max_trade_premium_usd": default_max_premium or 300.0,
             "hard_flat_time_et": hard_flat_time_et,
             "stop_loss_pct": stop_loss_pct,
         },
@@ -861,6 +958,56 @@ def _google_catalog_use_algorithmic_exit(
         return False
 
     return strategy_key in NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS
+
+
+def _normalize_mala_evidence_row(normalized: dict[str, Any]) -> dict[str, Any]:
+    row = dict(normalized)
+    strategy_params = row.get("strategy_params_json")
+    if not isinstance(strategy_params, dict):
+        strategy_params = {}
+    thesis_exit_params = row.get("thesis_exit_params_json")
+    if not isinstance(thesis_exit_params, dict):
+        thesis_exit_params = {}
+    thesis_exit_metrics = row.get("thesis_exit_metrics_json")
+    if not isinstance(thesis_exit_metrics, dict):
+        thesis_exit_metrics = {}
+
+    recommendation_tier = str(row.get("recommendation_tier") or "").strip().lower()
+    thesis_exit_tested = _coerce_bool(row.get("thesis_exit_tested"))
+    row["playbook_id"] = row.get("playbook_id") or row.get("hypothesis_id")
+    row["strategy_family"] = row.get("strategy_family") or row.get("strategy_key")
+    row["lifecycle_status"] = row.get("lifecycle_status") or ("candidate" if recommendation_tier != "watch_only" else "hold")
+    row["bhiksha_ready"] = bool(thesis_exit_tested and recommendation_tier != "watch_only")
+    row["validation_count"] = row.get("validation_count") or row.get("signal_count")
+    row["last_validated_date"] = row.get("last_validated_date") or _run_date_from_path(row.get("run_dir"))
+    if row.get("playbook_summary_json") is None:
+        direction = str(row.get("direction") or "").strip().lower()
+        entry_params = dict(strategy_params)
+        if direction and "direction" not in entry_params:
+            entry_params["direction"] = direction
+        row["playbook_summary_json"] = {
+            "entry_params": entry_params,
+            "thesis_exit_params": thesis_exit_params,
+            "mala_evidence": {
+                "mala_handoff_version": row.get("mala_handoff_version"),
+                "strategy_name": row.get("strategy_name"),
+                "signal_window_et": row.get("signal_window_et"),
+                "signal_window_derivation": row.get("signal_window_derivation"),
+                "recommendation_tier": row.get("recommendation_tier"),
+                "thesis_exit_tested": thesis_exit_tested,
+                "thesis_exit_metrics": thesis_exit_metrics,
+                "exit_reliability": row.get("exit_reliability"),
+                "exit_trade_count": row.get("exit_trade_count"),
+                "warnings": row.get("warnings"),
+            },
+        }
+    return row
+
+
+def _run_date_from_path(value: Any) -> str | None:
+    text = str(value or "")
+    match = re.search(r"(20\d{2}-\d{2}-\d{2})", text)
+    return match.group(1) if match else None
 
 
 def _option_mapping_from_structure(value: Any) -> dict[str, str]:
@@ -1095,6 +1242,16 @@ def _google_catalog_metadata(entry: StrategyCatalogSheetRow | None) -> dict[str,
         "signal_count": entry.signal_count,
         "execution_robustness": entry.execution_robustness,
         "thesis_exit_policy": entry.thesis_exit_policy,
+        "mala_handoff_version": entry.mala_handoff_version,
+        "hypothesis_id": entry.hypothesis_id,
+        "strategy_name": entry.strategy_name,
+        "signal_window_et": entry.signal_window_et,
+        "signal_window_derivation": entry.signal_window_derivation,
+        "recommendation_tier": entry.recommendation_tier,
+        "thesis_exit_tested": entry.thesis_exit_tested,
+        "exit_reliability": entry.exit_reliability,
+        "exit_trade_count": entry.exit_trade_count,
+        "warnings": entry.warnings,
         "playbook_summary": _normalized_playbook_summary_metadata(entry),
         "catalog_row_index": entry.row_index,
     }
