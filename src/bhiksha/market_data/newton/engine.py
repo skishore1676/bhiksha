@@ -66,8 +66,38 @@ class PhysicsEngine:
             for transform in self._registry.values()
             if transform.name in required_features or set(required_features) & transform.output_columns
         ]
+        candidates.extend(self._kinematic_transforms_for_features(required_features))
         candidates.extend(self._market_impulse_transforms_for_features(required_features))
         return self._resolve_transforms(candidates)
+
+    def _kinematic_transforms_for_features(self, required_features: set[str]) -> list[FeatureTransform]:
+        transforms: list[FeatureTransform] = []
+        for feature in sorted(required_features):
+            spec_match = _KINEMATIC_SPEC_RE.fullmatch(feature)
+            if spec_match:
+                periods_back = int(spec_match.group("periods_back") or "1")
+                if periods_back > 1:
+                    transforms.append(
+                        self._build_kinematic_transform(
+                            spec_match.group("kind"),
+                            periods_back,
+                        )
+                    )
+                continue
+
+            column_match = _KINEMATIC_COLUMN_RE.fullmatch(feature)
+            if not column_match:
+                continue
+            periods_back = int(column_match.group("periods_back"))
+            if periods_back <= 1:
+                continue
+            transforms.append(
+                self._build_kinematic_transform(
+                    _KINEMATIC_COLUMN_KIND[column_match.group("kind")],
+                    periods_back,
+                )
+            )
+        return transforms
 
     def _market_impulse_transforms_for_features(self, required_features: set[str]) -> list[FeatureTransform]:
         requests: dict[str, set[int]] = {}
@@ -172,6 +202,16 @@ class PhysicsEngine:
         ]
         return {transform.name: transform for transform in transforms}
 
+    @staticmethod
+    def _build_kinematic_transform(kind: str, periods_back: int) -> FeatureTransform:
+        if kind == "velocity":
+            return VelocityTransform(periods_back=periods_back)
+        if kind == "acceleration":
+            return AccelerationTransform(periods_back=periods_back)
+        if kind == "jerk":
+            return JerkTransform(periods_back=periods_back)
+        raise KeyError(f"Unknown kinematic transform {kind!r}")
+
     def _default_transforms(self) -> tuple[FeatureTransform, ...]:
         return (
             self._registry["velocity"],
@@ -202,6 +242,12 @@ class PhysicsEngine:
 
     def _coerce_transform(self, item: FeatureTransform | str) -> FeatureTransform:
         if isinstance(item, str):
+            kinematic_match = _KINEMATIC_SPEC_RE.fullmatch(item)
+            if kinematic_match:
+                return self._build_kinematic_transform(
+                    kinematic_match.group("kind"),
+                    int(kinematic_match.group("periods_back") or "1"),
+                )
             spec_match = _MARKET_IMPULSE_SPEC_RE.fullmatch(item)
             if spec_match:
                 return MarketImpulseTransform(
@@ -248,3 +294,10 @@ _MARKET_IMPULSE_SPEC_RE = re.compile(
 )
 _MARKET_IMPULSE_COLUMN_RE = re.compile(r"^impulse_(?:regime|stage)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$")
 _MARKET_IMPULSE_VMA_RE = re.compile(r"^vma_(?P<vma_length>\d+)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$")
+_KINEMATIC_SPEC_RE = re.compile(r"^(?P<kind>velocity|acceleration|jerk)(?::(?P<periods_back>\d+))?$")
+_KINEMATIC_COLUMN_RE = re.compile(r"^(?P<kind>velocity|accel|jerk)_(?P<periods_back>\d+)$")
+_KINEMATIC_COLUMN_KIND = {
+    "velocity": "velocity",
+    "accel": "acceleration",
+    "jerk": "jerk",
+}

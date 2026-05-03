@@ -57,6 +57,28 @@ def test_newton_engine_uses_custom_market_impulse_vwma_periods() -> None:
     assert transforms[0].timeframe == "1h"
 
 
+def test_newton_engine_builds_parametric_kinematic_features() -> None:
+    engine = PhysicsEngine()
+    frame = pl.DataFrame(
+        {
+            "symbol": ["AMD"] * 12,
+            "timestamp": [datetime(2026, 3, 30, 14, minute, 0) for minute in range(12)],
+            "open": [float(value) for value in range(12)],
+            "high": [float(value) + 0.5 for value in range(12)],
+            "low": [float(value) - 0.5 for value in range(12)],
+            "close": [float(value) for value in range(12)],
+            "volume": [1000.0] * 12,
+        }
+    )
+
+    enriched = engine.enrich_for_features(frame, {"jerk_3"})
+
+    assert {"velocity_3", "accel_3", "jerk_3"} <= set(enriched.columns)
+    assert enriched["velocity_3"].to_list()[-1] == 3.0
+    assert enriched["accel_3"].to_list()[-1] == 0.0
+    assert enriched["jerk_3"].to_list()[-1] == 0.0
+
+
 def test_market_impulse_short_exit_on_vma_reclaim() -> None:
     deployment = next(
         deployment

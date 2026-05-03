@@ -13,6 +13,25 @@ from bhiksha.market_data.newton.market_impulse import enrich_impulse_columns
 from bhiksha.market_data.newton.resampler import TimeframeResampler, timeframe_tag
 
 
+def velocity_column_name(periods_back: int) -> str:
+    return "velocity_1m" if periods_back == 1 else f"velocity_{periods_back}"
+
+
+def acceleration_column_name(periods_back: int) -> str:
+    return "accel_1m" if periods_back == 1 else f"accel_{periods_back}"
+
+
+def jerk_column_name(periods_back: int) -> str:
+    return "jerk_1m" if periods_back == 1 else f"jerk_{periods_back}"
+
+
+def validate_periods_back(periods_back: int) -> int:
+    normalized = int(periods_back)
+    if normalized <= 0:
+        raise ValueError("periods_back must be a positive integer.")
+    return normalized
+
+
 class FeatureTransform(ABC):
     """A named Newton transform with explicit inputs and outputs."""
 
@@ -36,44 +55,93 @@ class FeatureTransform(ABC):
 
 @dataclass(frozen=True, slots=True)
 class VelocityTransform(FeatureTransform):
+    periods_back: int = 1
     name: str = "velocity"
     depends_on: tuple[str, ...] = ()
     required_input_columns: set[str] = frozenset({"close"})
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "periods_back", validate_periods_back(self.periods_back))
+
+    @property
+    def spec(self) -> str:
+        return self.name if self.periods_back == 1 else f"{self.name}:{self.periods_back}"
+
     @property
     def output_columns(self) -> set[str]:
-        return {"velocity_1m"}
+        return {velocity_column_name(self.periods_back)}
 
     def apply(self, df: pl.DataFrame) -> pl.DataFrame:
-        return df.with_columns((pl.col("close") - pl.col("close").shift(1)).alias("velocity_1m"))
+        return df.with_columns(
+            (pl.col("close") - pl.col("close").shift(self.periods_back))
+            .alias(velocity_column_name(self.periods_back))
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class AccelerationTransform(FeatureTransform):
+    periods_back: int = 1
     name: str = "acceleration"
-    depends_on: tuple[str, ...] = ("velocity",)
-    required_input_columns: set[str] = frozenset({"velocity_1m"})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "periods_back", validate_periods_back(self.periods_back))
+
+    @property
+    def spec(self) -> str:
+        return self.name if self.periods_back == 1 else f"{self.name}:{self.periods_back}"
+
+    @property
+    def depends_on(self) -> tuple[str, ...]:
+        return ("velocity" if self.periods_back == 1 else f"velocity:{self.periods_back}",)
+
+    @property
+    def required_input_columns(self) -> set[str]:
+        return {velocity_column_name(self.periods_back)}
 
     @property
     def output_columns(self) -> set[str]:
-        return {"accel_1m"}
+        return {acceleration_column_name(self.periods_back)}
 
     def apply(self, df: pl.DataFrame) -> pl.DataFrame:
-        return df.with_columns((pl.col("velocity_1m") - pl.col("velocity_1m").shift(1)).alias("accel_1m"))
+        velocity_col = velocity_column_name(self.periods_back)
+        return df.with_columns(
+            (pl.col(velocity_col) - pl.col(velocity_col).shift(self.periods_back))
+            .alias(acceleration_column_name(self.periods_back))
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class JerkTransform(FeatureTransform):
+    periods_back: int = 1
     name: str = "jerk"
-    depends_on: tuple[str, ...] = ("acceleration",)
-    required_input_columns: set[str] = frozenset({"accel_1m"})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "periods_back", validate_periods_back(self.periods_back))
+
+    @property
+    def spec(self) -> str:
+        return self.name if self.periods_back == 1 else f"{self.name}:{self.periods_back}"
+
+    @property
+    def depends_on(self) -> tuple[str, ...]:
+        return (
+            "acceleration" if self.periods_back == 1 else f"acceleration:{self.periods_back}",
+        )
+
+    @property
+    def required_input_columns(self) -> set[str]:
+        return {acceleration_column_name(self.periods_back)}
 
     @property
     def output_columns(self) -> set[str]:
-        return {"jerk_1m"}
+        return {jerk_column_name(self.periods_back)}
 
     def apply(self, df: pl.DataFrame) -> pl.DataFrame:
-        return df.with_columns((pl.col("accel_1m") - pl.col("accel_1m").shift(1)).alias("jerk_1m"))
+        accel_col = acceleration_column_name(self.periods_back)
+        return df.with_columns(
+            (pl.col(accel_col) - pl.col(accel_col).shift(self.periods_back))
+            .alias(jerk_column_name(self.periods_back))
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,4 +301,3 @@ class MarketImpulseTransform(FeatureTransform):
 
 def transform_names(transforms: list[FeatureTransform]) -> list[str]:
     return [transform.spec for transform in transforms]
-
