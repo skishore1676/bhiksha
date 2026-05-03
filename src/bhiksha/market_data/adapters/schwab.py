@@ -33,13 +33,20 @@ class SchwabBarSource(UnderlyingBarSource):
         payload = await self.client.price_history(
             symbol,
             period_type="day",
-            period=10,
+            period=None,
             frequency_type="minute",
             frequency=1,
+            start_date=ensure_utc(start),
+            end_date=ensure_utc(end),
+            need_extended_hours_data=False,
         )
+        start_utc = ensure_utc(start)
+        end_utc = ensure_utc(end)
         bars: list[Bar] = []
         for candle in payload.get("candles", []):
-            bars.append(self._bar_from_candle(symbol, candle))
+            bar = self._bar_from_candle(symbol, candle)
+            if start_utc <= bar.timestamp <= end_utc:
+                bars.append(bar)
         return bars
 
     async def stream_closed_bars(self, symbols: list[str]) -> AsyncIterator[Bar]:
@@ -66,6 +73,7 @@ class SchwabBarSource(UnderlyingBarSource):
             frequency=1,
             start_date=start,
             end_date=end,
+            need_extended_hours_data=False,
         )
         return self._latest_completed_bar(symbol, payload.get("candles", []), now=end)
 

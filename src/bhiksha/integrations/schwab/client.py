@@ -72,22 +72,29 @@ class SchwabApiClient:
         symbol: str,
         *,
         period_type: str = "day",
-        period: int = 1,
+        period: int | None = 1,
         frequency_type: str = "minute",
         frequency: int = 1,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        need_extended_hours_data: bool | None = None,
+        need_previous_close: bool | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "periodType": period_type,
-            "period": period,
             "frequencyType": frequency_type,
             "frequency": frequency,
         }
+        if period is not None and start_date is None and end_date is None:
+            params["period"] = period
         if start_date is not None:
             params["startDate"] = int(start_date.timestamp() * 1000)
         if end_date is not None:
             params["endDate"] = int(end_date.timestamp() * 1000)
+        if need_extended_hours_data is not None:
+            params["needExtendedHoursData"] = str(bool(need_extended_hours_data)).lower()
+        if need_previous_close is not None:
+            params["needPreviousClose"] = str(bool(need_previous_close)).lower()
         async def operation() -> dict[str, Any]:
             response = await self._client.get(
                 f"/marketdata/v1/pricehistory",
