@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
 import time
+from typing import Iterator
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets
 from bhiksha.config.environment import get_mala_evidence_sheet_name, load_dotenv
+from bhiksha.strategy.capabilities import CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST_PATH
+from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
 
 
 @dataclass(slots=True, frozen=True)
@@ -36,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     default_strategy_catalog_path = os.getenv("BHIKSHA_STRATEGY_CATALOG_PATH", "config/strategy_catalog")
     default_output_path = os.getenv("BHIKSHA_ACTIVE_PLAN_PATH", "artifacts/playbook/active_plan.json")
     default_log_dir = os.getenv("BHIKSHA_ACTIVE_PLAN_LOG_DIR", "artifacts/playbook/logs")
+    default_runtime_capabilities_path = os.getenv(
+        "BHIKSHA_RUNTIME_CAPABILITIES_PATH",
+        "artifacts/capabilities/bhiksha_runtime_capabilities_v2.json",
+    )
     default_source_name = os.getenv("BHIKSHA_ACTIVE_PLAN_SOURCE_NAME", "google_sheet_integration")
     default_interval_minutes = _env_float("BHIKSHA_ACTIVE_PLAN_SYNC_MINUTES")
 
@@ -49,6 +57,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strategy-catalog", default=default_strategy_catalog_path, help="Local Bhiksha strategy catalog path")
     parser.add_argument("--out", default=default_output_path, help="Where to write the active plan JSON")
     parser.add_argument("--log-dir", default=default_log_dir, help="Directory for dated active-plan sync logs")
+    parser.add_argument(
+        "--runtime-capabilities",
+        default=default_runtime_capabilities_path,
+        help="Where to write the verified Bhiksha runtime capability manifest before compiling",
+    )
+    parser.add_argument(
+        "--skip-runtime-capability-refresh",
+        action="store_true",
+        help="Compile using the existing capability manifest instead of generating a fresh verified runtime snapshot",
+    )
     parser.add_argument("--source-name", default=default_source_name, help="Recorded source.name for this plan")
     parser.add_argument("--active-plan-id", default=None, help="Optional explicit active_plan_id")
     parser.add_argument("--trading-date", default=None, help="Optional trading date in YYYY-MM-DD format")
@@ -85,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
                 strategy_catalog_path=args.strategy_catalog,
                 output_path=output_path,
                 log_dir=log_dir,
+                runtime_capabilities_path=None if args.skip_runtime_capability_refresh else args.runtime_capabilities,
                 active_plan_id=args.active_plan_id,
                 trading_date=args.trading_date,
                 source_name=args.source_name,
@@ -129,6 +148,7 @@ def sync_active_plan_once(
     strategy_catalog_path: str | Path,
     output_path: str | Path,
     log_dir: str | Path,
+    runtime_capabilities_path: str | Path | None = None,
     active_plan_id: str | None = None,
     trading_date: str | None = None,
     source_name: str = "google_sheet_integration",
@@ -139,18 +159,27 @@ def sync_active_plan_once(
     resolved_log_dir = Path(log_dir).resolve()
     resolved_log_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(UTC)
-    compiled = compile_active_plan_from_google_sheets(
-        spreadsheet_id=spreadsheet_id,
-        credentials_path=credentials_path,
-        catalog_sheet_name=catalog_sheet_name,
-        defaults_sheet_name=defaults_sheet_name,
-        strategy_sheet_name=strategy_sheet_name,
-        manual_sheet_name=manual_sheet_name,
-        strategy_catalog_path=strategy_catalog_path,
-        active_plan_id=active_plan_id,
-        trading_date=trading_date,
-        source_name=source_name,
-    )
+    if runtime_capabilities_path is not None:
+        capability_path = Path(runtime_capabilities_path).expanduser().resolve()
+        generate_runtime_capability_manifest(
+            declared_manifest_path=DEFAULT_CAPABILITY_MANIFEST_PATH,
+            output_path=capability_path,
+        )
+    else:
+        capability_path = None
+    with _capability_manifest_override(capability_path):
+        compiled = compile_active_plan_from_google_sheets(
+            spreadsheet_id=spreadsheet_id,
+            credentials_path=credentials_path,
+            catalog_sheet_name=catalog_sheet_name,
+            defaults_sheet_name=defaults_sheet_name,
+            strategy_sheet_name=strategy_sheet_name,
+            manual_sheet_name=manual_sheet_name,
+            strategy_catalog_path=strategy_catalog_path,
+            active_plan_id=active_plan_id,
+            trading_date=trading_date,
+            source_name=source_name,
+        )
     payload = json.dumps(compiled.plan.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
     changed = _write_if_changed(resolved_output, payload)
     log_path = _append_sync_log(
@@ -216,6 +245,22 @@ def _append_sync_log(
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
     return log_path
+
+
+@contextmanager
+def _capability_manifest_override(path: Path | None) -> Iterator[None]:
+    if path is None:
+        yield
+        return
+    previous = os.environ.get(CAPABILITY_MANIFEST_ENV)
+    os.environ[CAPABILITY_MANIFEST_ENV] = str(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(CAPABILITY_MANIFEST_ENV, None)
+        else:
+            os.environ[CAPABILITY_MANIFEST_ENV] = previous
 
 
 if __name__ == "__main__":

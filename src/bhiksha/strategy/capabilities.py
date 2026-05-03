@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ import yaml
 NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS = frozenset({"manual_breakout", "market_impulse"})
 DEFAULT_CAPABILITY_MANIFEST_PATH = (
     Path(__file__).resolve().parents[3] / "config" / "capabilities" / "bhiksha_capabilities_v1.yaml"
+)
+DEFAULT_RUNTIME_CAPABILITY_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[3] / "artifacts" / "capabilities" / "bhiksha_runtime_capabilities_v2.json"
 )
 CAPABILITY_MANIFEST_ENV = "BHIKSHA_CAPABILITIES_PATH"
 
@@ -51,13 +55,16 @@ def default_capability_manifest_path() -> Path:
     configured = os.getenv(CAPABILITY_MANIFEST_ENV)
     if configured:
         return Path(configured).expanduser()
+    if DEFAULT_RUNTIME_CAPABILITY_MANIFEST_PATH.exists():
+        return DEFAULT_RUNTIME_CAPABILITY_MANIFEST_PATH
     return DEFAULT_CAPABILITY_MANIFEST_PATH
 
 
 def load_capability_manifest(path: str | Path | None = None) -> dict[str, Any]:
     """Load the Bhiksha capability manifest."""
     resolved = Path(path).expanduser() if path is not None else default_capability_manifest_path()
-    payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
+    raw = resolved.read_text(encoding="utf-8")
+    payload = json.loads(raw) if resolved.suffix.lower() == ".json" else yaml.safe_load(raw) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Capability manifest must be a mapping: {resolved}")
     if int(payload.get("version") or 0) < 1:
@@ -71,7 +78,7 @@ def load_capability_manifest(path: str | Path | None = None) -> dict[str, Any]:
 def load_capability_manifest_or_none(path: str | Path | None = None) -> dict[str, Any] | None:
     try:
         return load_capability_manifest(path)
-    except (FileNotFoundError, ValueError, yaml.YAMLError):
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, yaml.YAMLError):
         return None
 
 
@@ -187,6 +194,7 @@ def evaluate_strategy_capability(
 __all__ = [
     "CAPABILITY_MANIFEST_ENV",
     "DEFAULT_CAPABILITY_MANIFEST_PATH",
+    "DEFAULT_RUNTIME_CAPABILITY_MANIFEST_PATH",
     "NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS",
     "StrategyCapability",
     "default_capability_manifest_path",

@@ -91,6 +91,10 @@ def _defaults() -> dict[str, str | None]:
         "strategy_catalog_path": os.getenv("BHIKSHA_STRATEGY_CATALOG_PATH", "config/strategy_catalog"),
         "active_plan_path": os.getenv("BHIKSHA_ACTIVE_PLAN_PATH", "artifacts/playbook/active_plan.json"),
         "log_dir": os.getenv("BHIKSHA_ACTIVE_PLAN_LOG_DIR", "artifacts/playbook/logs"),
+        "runtime_capabilities_path": os.getenv(
+            "BHIKSHA_RUNTIME_CAPABILITIES_PATH",
+            "artifacts/capabilities/bhiksha_runtime_capabilities_v2.json",
+        ),
         "source_name": os.getenv("BHIKSHA_ACTIVE_PLAN_SOURCE_NAME", "google_sheet_integration"),
         "pid_path": os.getenv("BHIKSHA_RUNTIME_PID_PATH", "artifacts/playbook/runtime/bhiksha.pid"),
         "runtime_log_dir": os.getenv("BHIKSHA_RUNTIME_LOG_DIR", "artifacts/playbook/runtime"),
@@ -109,6 +113,16 @@ def _add_sync_args(parser: argparse.ArgumentParser, defaults: dict[str, str | No
     parser.add_argument("--strategy-catalog", default=defaults["strategy_catalog_path"], help="Local Bhiksha strategy catalog path")
     parser.add_argument("--active-plan", default=defaults["active_plan_path"], help="Where to write the compiled active plan JSON")
     parser.add_argument("--sync-log-dir", default=defaults["log_dir"], help="Directory for active-plan sync logs")
+    parser.add_argument(
+        "--runtime-capabilities",
+        default=defaults["runtime_capabilities_path"],
+        help="Where to write the verified runtime capability manifest before compiling",
+    )
+    parser.add_argument(
+        "--skip-runtime-capability-refresh",
+        action="store_true",
+        help="Compile using the existing capability manifest instead of generating a fresh verified runtime snapshot",
+    )
     parser.add_argument("--active-plan-id", default=None, help="Optional explicit active_plan_id")
     parser.add_argument("--trading-date", default=None, help="Optional trading date in YYYY-MM-DD format")
     parser.add_argument("--source-name", default=defaults["source_name"], help="Recorded source.name for this plan")
@@ -149,6 +163,7 @@ def _sync_from_args(args: argparse.Namespace):
         strategy_catalog_path=args.strategy_catalog,
         output_path=args.active_plan,
         log_dir=args.sync_log_dir,
+        runtime_capabilities_path=None if args.skip_runtime_capability_refresh else args.runtime_capabilities,
         active_plan_id=args.active_plan_id,
         trading_date=args.trading_date,
         source_name=args.source_name,

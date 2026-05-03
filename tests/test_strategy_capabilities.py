@@ -5,6 +5,7 @@ from bhiksha.strategy.capabilities import (
     evaluate_strategy_capability,
     load_capability_manifest,
 )
+from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
 
 
 def test_capability_manifest_marks_baseline_market_impulse_supported() -> None:
@@ -72,3 +73,21 @@ def test_strategy_variant_derives_from_market_impulse_name() -> None:
     assert derive_strategy_variant(strategy_key="market_impulse", strategy_name="MI High Close Reclaim") == (
         "close_location_reclaim"
     )
+
+
+def test_runtime_capability_manifest_is_verified_and_loadable(tmp_path) -> None:
+    output = tmp_path / "bhiksha_runtime_capabilities_v2.json"
+
+    payload = generate_runtime_capability_manifest(output_path=output)
+    manifest = load_capability_manifest(output)
+    capability = evaluate_strategy_capability(
+        strategy_key="opening_drive_classifier",
+        strategy_variant="default",
+        thesis_exit_policy="fixed_rr_underlying",
+        manifest=manifest,
+    )
+
+    assert payload["version"] == 2
+    assert payload["verification"]["status"] == "passed"
+    assert capability.status == "supported"
+    assert capability.supported is True
