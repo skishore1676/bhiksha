@@ -21,13 +21,17 @@ class JerkPivotMomentumStrategy:
 
     def required_features(self, params: dict[str, Any]) -> set[str]:
         volume_ma_period = int(params.get("volume_ma_period", 20))
+        kinematic_periods_back = max(int(params.get("kinematic_periods_back", 1)), 1)
+        velocity_col = _kinematic_column("velocity", kinematic_periods_back)
+        accel_col = _kinematic_column("accel", kinematic_periods_back)
+        jerk_col = _kinematic_column("jerk", kinematic_periods_back)
         required = {
             "timestamp",
             "symbol",
             "close",
-            "velocity_1m",
-            "accel_1m",
-            "jerk_1m",
+            velocity_col,
+            accel_col,
+            jerk_col,
             "vpoc_4h",
             "volume",
         }
@@ -45,10 +49,15 @@ class JerkPivotMomentumStrategy:
             raise ValueError(f"Jerk Pivot Momentum requires columns: {sorted(missing)}")
 
         jerk_lookback = max(int(params.get("jerk_lookback", 20)), 1)
+        kinematic_periods_back = max(int(params.get("kinematic_periods_back", 1)), 1)
+        velocity_col = _kinematic_column("velocity", kinematic_periods_back)
+        accel_col = _kinematic_column("accel", kinematic_periods_back)
+        jerk_col = _kinematic_column("jerk", kinematic_periods_back)
+        suffix = "1m" if kinematic_periods_back == 1 else str(kinematic_periods_back)
         volume_ma_period = int(params.get("volume_ma_period", 20))
         volume_ma_col = f"volume_ma_{volume_ma_period}"
         working = frame.with_columns(
-            pl.col("jerk_1m").rolling_mean(window_size=jerk_lookback).alias("_jerk_smooth")
+            pl.col(jerk_col).rolling_mean(window_size=jerk_lookback).alias("_jerk_smooth")
         ).with_columns(
             pl.col("_jerk_smooth").shift(1).alias("_prev_jerk_smooth")
         )
@@ -65,8 +74,8 @@ class JerkPivotMomentumStrategy:
         timestamp = latest["timestamp"]
         close = _as_float(latest.get("close"))
         vpoc = _as_float(latest.get("vpoc_4h"))
-        velocity = _as_float(latest.get("velocity_1m"))
-        accel = _as_float(latest.get("accel_1m"))
+        velocity = _as_float(latest.get(velocity_col))
+        accel = _as_float(latest.get(accel_col))
         jerk_smooth = _as_float(latest.get("_jerk_smooth"))
         prev_jerk_smooth = _as_float(latest.get("_prev_jerk_smooth"))
         volume = _as_float(latest.get("volume"))
@@ -194,10 +203,10 @@ class JerkPivotMomentumStrategy:
                 "close": close,
                 "vpoc_4h": vpoc,
                 "vpoc_dist_pct": vpoc_dist_pct,
-                "velocity_1m": velocity,
-                "accel_1m": accel,
-                "jerk_smooth_1m": jerk_smooth,
-                "prev_jerk_smooth_1m": prev_jerk_smooth,
+                velocity_col: velocity,
+                accel_col: accel,
+                f"jerk_smooth_{suffix}": jerk_smooth,
+                f"prev_jerk_smooth_{suffix}": prev_jerk_smooth,
                 "volume": volume,
                 volume_ma_col: volume_ma,
             },
@@ -286,3 +295,7 @@ def _as_float(value: Any) -> float | None:
     if math.isnan(numeric):
         return None
     return numeric
+
+
+def _kinematic_column(kind: str, periods_back: int) -> str:
+    return f"{kind}_1m" if periods_back == 1 else f"{kind}_{periods_back}"
