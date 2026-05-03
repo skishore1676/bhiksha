@@ -32,6 +32,9 @@ class OpeningDriveClassifierStrategy:
             required.add("volume")
         if bool(params.get("use_directional_mass", True)):
             required.add("directional_mass")
+        if bool(params.get("use_regime_filter", False)):
+            regime_timeframe = str(params.get("regime_timeframe", "5m"))
+            required.add(f"impulse_regime_{regime_timeframe}")
         return required
 
     def evaluate_entry(self, frame: pl.DataFrame, deployment_id: str, params: dict[str, Any]) -> SignalDecision:
@@ -53,6 +56,9 @@ class OpeningDriveClassifierStrategy:
         volume_multiplier = float(params.get("volume_multiplier", 1.2))
         use_directional_mass = bool(params.get("use_directional_mass", True))
         use_jerk_confirmation = bool(params.get("use_jerk_confirmation", True))
+        use_regime_filter = bool(params.get("use_regime_filter", False))
+        regime_timeframe = str(params.get("regime_timeframe", "5m"))
+        regime_col = f"impulse_regime_{regime_timeframe}"
         allow_long = bool(params.get("allow_long", True))
         allow_short = bool(params.get("allow_short", True))
         enable_continue = bool(params.get("enable_continue", True))
@@ -127,6 +133,8 @@ class OpeningDriveClassifierStrategy:
         short_mass_gate = pl.col("directional_mass") < 0 if use_directional_mass else pl.lit(True)
         long_jerk_gate = pl.col("_jerk") > 0 if use_jerk_confirmation else pl.lit(True)
         short_jerk_gate = pl.col("_jerk") < 0 if use_jerk_confirmation else pl.lit(True)
+        bullish_regime_gate = pl.col(regime_col) == "bullish" if use_regime_filter else pl.lit(True)
+        bearish_regime_gate = pl.col(regime_col) == "bearish" if use_regime_filter else pl.lit(True)
 
         continue_long = (
             in_entry_window
@@ -136,6 +144,7 @@ class OpeningDriveClassifierStrategy:
             & long_jerk_gate
             & volume_gate
             & long_mass_gate
+            & bullish_regime_gate
         )
         continue_short = (
             in_entry_window
@@ -145,6 +154,7 @@ class OpeningDriveClassifierStrategy:
             & short_jerk_gate
             & volume_gate
             & short_mass_gate
+            & bearish_regime_gate
         )
         fail_long = (
             in_entry_window
@@ -154,6 +164,7 @@ class OpeningDriveClassifierStrategy:
             & long_jerk_gate
             & volume_gate
             & long_mass_gate
+            & bullish_regime_gate
         )
         fail_short = (
             in_entry_window
@@ -163,6 +174,7 @@ class OpeningDriveClassifierStrategy:
             & short_jerk_gate
             & volume_gate
             & short_mass_gate
+            & bearish_regime_gate
         )
 
         long_raw = (
@@ -235,15 +247,19 @@ class OpeningDriveClassifierStrategy:
         close = _as_float(latest.get("close"))
         accel = _as_float(latest.get("_accel"))
         jerk = _as_float(latest.get("_jerk"))
+        suffix = "1m" if kinematic_periods_back == 1 else str(kinematic_periods_back)
         directional_mass = _as_float(latest.get("directional_mass"))
         volume = _as_float(latest.get("volume"))
         opening_volume_mean = _as_float(latest.get("_opening_vol_mean"))
+        regime = latest.get(regime_col) if use_regime_filter else None
 
         reasons = _shared_reasons(
             latest=latest,
             use_volume_filter=use_volume_filter,
             use_directional_mass=use_directional_mass,
             use_jerk_confirmation=use_jerk_confirmation,
+            use_regime_filter=use_regime_filter,
+            regime=regime,
             allow_long=allow_long,
             allow_short=allow_short,
             enable_continue=enable_continue,
@@ -283,8 +299,8 @@ class OpeningDriveClassifierStrategy:
             reason=reasons,
             features={
                 "close": close,
-                "accel_1m": accel,
-                "jerk_1m": jerk,
+                f"accel_{suffix}": accel,
+                f"jerk_{suffix}": jerk,
                 "directional_mass": directional_mass,
                 "volume": volume,
                 "opening_volume_mean": opening_volume_mean,
@@ -293,6 +309,7 @@ class OpeningDriveClassifierStrategy:
                 "opening_high": _as_float(latest.get("_opening_high")),
                 "opening_low": _as_float(latest.get("_opening_low")),
                 "opening_mid": _as_float(latest.get("_opening_mid")),
+                regime_col: regime,
             },
         )
 
@@ -324,6 +341,8 @@ def _shared_reasons(
     use_volume_filter: bool,
     use_directional_mass: bool,
     use_jerk_confirmation: bool,
+    use_regime_filter: bool,
+    regime: Any,
     allow_long: bool,
     allow_short: bool,
     enable_continue: bool,
@@ -383,6 +402,16 @@ def _shared_reasons(
             reasons.append("directional_mass_blocked")
     else:
         reasons.append("directional_mass_filter_disabled")
+
+    if use_regime_filter:
+        if regime == "bullish":
+            reasons.append("regime_bullish")
+        elif regime == "bearish":
+            reasons.append("regime_bearish")
+        else:
+            reasons.append("regime_neutral")
+    else:
+        reasons.append("regime_filter_disabled")
 
     if not allow_long:
         reasons.append("longs_disabled")

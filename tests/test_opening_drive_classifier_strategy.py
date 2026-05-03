@@ -96,6 +96,46 @@ def test_opening_drive_classifier_emits_fail_short_signal() -> None:
     assert decision.features["opening_drive_mode"] == "fail"
 
 
+def test_opening_drive_classifier_honors_regime_filter() -> None:
+    strategy = OpeningDriveClassifierStrategy()
+    params = {
+        "direction": "long",
+        "opening_window_minutes": 25,
+        "entry_start_offset_minutes": 30,
+        "entry_end_offset_minutes": 120,
+        "min_drive_return_pct": 0.0015,
+        "breakout_buffer_pct": 0.0,
+        "kinematic_periods_back": 1,
+        "use_volume_filter": False,
+        "use_directional_mass": False,
+        "use_jerk_confirmation": False,
+        "use_regime_filter": True,
+        "regime_timeframe": "5m",
+        "enable_continue": True,
+        "enable_fail": False,
+    }
+    frame = _opening_drive_frame(
+        closes=[100.0, 100.15, 100.2, 100.35, 100.4, 100.45, 100.5, 100.55, 100.6, 100.7],
+        directional_mass=[0.2] * 10,
+        volumes=[100.0] * 10,
+        impulse_regime_5m=["neutral"] * 10,
+    )
+
+    assert "impulse_regime_5m" in strategy.required_features(params)
+
+    blocked = strategy.evaluate_entry(frame, "opening-drive-regime", params)
+    allowed = strategy.evaluate_entry(
+        frame.with_columns(pl.lit("bullish").alias("impulse_regime_5m")),
+        "opening-drive-regime",
+        params,
+    )
+
+    assert blocked.signal is False
+    assert "regime_neutral" in blocked.reason
+    assert allowed.signal is True
+    assert "regime_bullish" in allowed.reason
+
+
 def test_opening_drive_classifier_exit_is_runtime_managed() -> None:
     strategy = OpeningDriveClassifierStrategy()
     frame = pl.DataFrame(
@@ -125,21 +165,23 @@ def _opening_drive_frame(
     closes: list[float],
     directional_mass: list[float],
     volumes: list[float],
+    impulse_regime_5m: list[str] | None = None,
 ) -> pl.DataFrame:
     start = datetime(2026, 4, 1, 13, 30, 0)
     timestamps = [start + timedelta(minutes=5 * idx) for idx in range(len(closes))]
     opens = [closes[0], *closes[:-1]]
     highs = [max(open_price, close) + 0.05 for open_price, close in zip(opens, closes, strict=False)]
     lows = [min(open_price, close) - 0.05 for open_price, close in zip(opens, closes, strict=False)]
-    return pl.DataFrame(
-        {
-            "symbol": ["SPY"] * len(closes),
-            "timestamp": timestamps,
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
-            "directional_mass": directional_mass,
-        }
-    )
+    data = {
+        "symbol": ["SPY"] * len(closes),
+        "timestamp": timestamps,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+        "directional_mass": directional_mass,
+    }
+    if impulse_regime_5m is not None:
+        data["impulse_regime_5m"] = impulse_regime_5m
+    return pl.DataFrame(data)
