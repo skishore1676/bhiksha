@@ -188,7 +188,55 @@ class ExecutionSupervisor:
                         order_id=plan.order_id,
                     )
                     await self._emit_lifecycle_transition(transition, reason="entry_submitted")
-                if not dry_run and plan.order_id:
+                if simulate_only and plan.quantity > 0 and plan.option_symbol and plan.order_id is None:
+                    self.planner.position_tracker.open_position(
+                        deployment.symbol,
+                        deployment.deployment_id,
+                        trade_id=plan.trade_id,
+                        option_symbol=plan.option_symbol,
+                        quantity=plan.quantity,
+                        entry_price=plan.estimated_entry_price,
+                        underlying_entry_price=plan.underlying_entry_price,
+                        entry_timestamp=plan.entry_timestamp,
+                        source="shadow",
+                        order_id="SHADOW_ENTRY",
+                    )
+                    await self._upsert_trade_record(
+                        TradeRecord(
+                            trade_id=plan.trade_id,
+                            deployment_id=deployment.deployment_id,
+                            symbol=deployment.symbol,
+                            option_symbol=plan.option_symbol,
+                            quantity=plan.quantity,
+                            entry_price=plan.estimated_entry_price,
+                            underlying_entry_price=plan.underlying_entry_price,
+                            entry_timestamp=plan.entry_timestamp,
+                            status="open_unprotected",
+                            entry_order_id="SHADOW_ENTRY",
+                        )
+                    )
+                    transition = self.lifecycle_store.mark_open(
+                        deployment.symbol,
+                        deployment.deployment_id,
+                        option_symbol=plan.option_symbol,
+                        order_id="SHADOW_ENTRY",
+                        protected=False,
+                    )
+                    await self._emit_lifecycle_transition(transition, reason="shadow_entry_open")
+                    await self.event_repository.append(
+                        "shadow_entry_assumed",
+                        {
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": deployment.symbol,
+                            "trade_id": plan.trade_id,
+                            "option_symbol": plan.option_symbol,
+                            "quantity": plan.quantity,
+                            "entry_price": plan.estimated_entry_price,
+                            "entry_timestamp": plan.entry_timestamp.isoformat() if plan.entry_timestamp else None,
+                            "risk_reasons": list(plan.risk_reasons),
+                        },
+                    )
+                elif not dry_run and plan.order_id:
                     plan = await self._protect_live_entry(plan, deployment)
                 elif dry_run and plan.order_id:
                     await self._upsert_trade_record(
@@ -398,6 +446,31 @@ class ExecutionSupervisor:
             if quote is None:
                 quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
             return quote
+        if dry_run and updated.source == "shadow":
+            current_quote = await ensure_quote()
+            reference_price = current_quote.exit_reference_price
+            await self.event_repository.append(
+                "shadow_mark",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": updated.symbol,
+                    "trade_id": updated.trade_id,
+                    "option_symbol": updated.option_symbol,
+                    "quantity": updated.quantity,
+                    "entry_price": updated.entry_price,
+                    "mark_price": reference_price,
+                    "bid": current_quote.bid,
+                    "ask": current_quote.ask,
+                    "last": current_quote.last,
+                    "spread_pct": current_quote.spread_pct,
+                    "unrealized_pnl_usd": _premium_pnl(updated.entry_price, reference_price, updated.quantity),
+                    "unrealized_stop_r": _realized_stop_r(
+                        updated.entry_price,
+                        reference_price,
+                        deployment.exit.stop_loss_pct or deployment.risk.stop_loss_pct,
+                    ),
+                },
+            )
         if (
             _profit_target_configured(deployment)
             and updated.target_order_id is None
@@ -785,15 +858,18 @@ class ExecutionSupervisor:
             )
 
         if dry_run:
+            fill_details = await self._paper_exit_fill_details(updated_position, order_id="DRY_RUN_EXIT")
             self.planner.position_tracker.close_position(
                 updated_position.symbol,
                 updated_position.deployment_id,
                 option_symbol=updated_position.option_symbol,
             )
             if updated_position.trade_id is not None:
-                await self.trade_state_repository.mark_closed(updated_position.trade_id, exit_order_id="DRY_RUN_EXIT")
+                await self.trade_state_repository.mark_closed(updated_position.trade_id, **fill_details)
             transition = self.lifecycle_store.mark_closed(updated_position.symbol, updated_position.deployment_id)
             await self._emit_lifecycle_transition(transition, reason="exit_closed")
+            if updated_position.source == "shadow":
+                await self._emit_shadow_exit_assumed(deployment, updated_position, fill_details, reason=decision.reason)
             plan = ExitPlan(
                 trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
                 deployment_id=deployment.deployment_id,
@@ -1309,22 +1385,26 @@ class ExecutionSupervisor:
                 continue
             if position.exit_mode is not None or position.exit_order_id is not None:
                 continue
+            position_dry_run = dry_run or position.source == "shadow"
             hard_flat_time = parse_time_text(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
             if now_et < hard_flat_time:
                 continue
 
             order_id = "DRY_RUN_CLOSE"
             error = None
-            if dry_run:
+            if position_dry_run:
+                fill_details = await self._paper_exit_fill_details(position, order_id=order_id)
                 self.planner.position_tracker.close_position(
                     position.symbol,
                     position.deployment_id,
                     option_symbol=position.option_symbol,
                 )
                 if position.trade_id is not None:
-                    await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
+                    await self.trade_state_repository.mark_closed(position.trade_id, **fill_details)
                 transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
                 await self._emit_lifecycle_transition(transition, reason="hard_flat_closed")
+                if position.source == "shadow":
+                    await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["hard_flat_time_reached"])
                 await self._record_manual_status(
                     deployment,
                     stage="hard_flat_closed",
@@ -1375,7 +1455,7 @@ class ExecutionSupervisor:
                 quantity=position.quantity,
                 estimated_entry_price=0.0,
                 risk_reasons=["hard_flat_time_reached"],
-                dry_run=dry_run,
+                dry_run=position_dry_run,
                 order_id=order_id,
             )
             await self.event_repository.append(
@@ -1408,6 +1488,7 @@ class ExecutionSupervisor:
                 continue
             if position.exit_mode is not None or position.exit_order_id is not None:
                 continue
+            position_dry_run = dry_run or position.source == "shadow"
 
             order_id = "DRY_RUN_EMERGENCY_FLAT"
             error = None
@@ -1477,16 +1558,19 @@ class ExecutionSupervisor:
                 )
                 closed.append(trade_plan)
                 continue
-            if dry_run:
+            if position_dry_run:
+                fill_details = await self._paper_exit_fill_details(position, order_id=order_id)
                 self.planner.position_tracker.close_position(
                     position.symbol,
                     position.deployment_id,
                     option_symbol=position.option_symbol,
                 )
                 if position.trade_id is not None:
-                    await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
+                    await self.trade_state_repository.mark_closed(position.trade_id, **fill_details)
                 transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
                 await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_closed")
+                if position.source == "shadow":
+                    await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["halt_and_flatten_triggered"])
                 await self._record_manual_status(
                     deployment,
                     stage="halt_and_flatten_closed",
@@ -1537,7 +1621,7 @@ class ExecutionSupervisor:
                 quantity=position.quantity,
                 estimated_entry_price=0.0,
                 risk_reasons=["halt_and_flatten_triggered"],
-                dry_run=dry_run,
+                dry_run=position_dry_run,
                 order_id=order_id,
             )
             await self.event_repository.append(
@@ -2051,6 +2135,66 @@ class ExecutionSupervisor:
             return
         await cash_guard.release_entry(trade_id)
 
+    async def _paper_exit_fill_details(self, position: TrackedPosition, *, order_id: str) -> dict[str, Any]:
+        exit_price = None
+        payload = None
+        status = "FILLED"
+        if position.option_symbol:
+            quote = await self.planner.order_manager.get_option_quote(position.option_symbol)
+            exit_price = quote.exit_reference_price
+            payload = {
+                "source": "paper_shadow" if position.source == "shadow" else "dry_run",
+                "symbol": position.option_symbol,
+                "bid": quote.bid,
+                "ask": quote.ask,
+                "last": quote.last,
+                "spread_pct": quote.spread_pct,
+                "averagePrice": exit_price,
+                "filledQuantity": position.quantity,
+                "closedAt": datetime.now(UTC).isoformat(),
+                "status": status,
+                "type": "PAPER",
+            }
+        return {
+            "exit_order_id": order_id,
+            "exit_price": exit_price,
+            "exit_filled_quantity": position.quantity if exit_price is not None else None,
+            "exit_filled_at": datetime.now(UTC) if exit_price is not None else None,
+            "exit_order_status": status if exit_price is not None else None,
+            "exit_order_type": "PAPER" if exit_price is not None else None,
+            "exit_broker_payload": payload,
+        }
+
+    async def _emit_shadow_exit_assumed(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        fill_details: dict[str, Any],
+        *,
+        reason: list[str],
+    ) -> None:
+        exit_price = fill_details.get("exit_price")
+        await self.event_repository.append(
+            "shadow_exit_assumed",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": position.symbol,
+                "trade_id": position.trade_id,
+                "option_symbol": position.option_symbol,
+                "quantity": position.quantity,
+                "entry_price": position.entry_price,
+                "exit_price": exit_price,
+                "realized_pnl_usd": _premium_pnl(position.entry_price, exit_price, position.quantity),
+                "realized_stop_r": _realized_stop_r(
+                    position.entry_price,
+                    exit_price,
+                    deployment.exit.stop_loss_pct or deployment.risk.stop_loss_pct,
+                ),
+                "exit_order_id": fill_details.get("exit_order_id"),
+                "reason": list(reason),
+            },
+        )
+
     async def _sync_cash_guard(self) -> None:
         cash_guard = getattr(self.planner, "cash_guard", None)
         if cash_guard is None:
@@ -2166,6 +2310,21 @@ def _exit_fill_details(payload: dict | None, *, status: str | None) -> dict[str,
         "exit_order_type": payload.get("type"),
         "exit_broker_payload": payload,
     }
+
+
+def _premium_pnl(entry_price: float | None, exit_price: float | None, quantity: int | None) -> float | None:
+    if entry_price is None or exit_price is None or not quantity:
+        return None
+    return round((exit_price - entry_price) * int(quantity) * 100.0, 2)
+
+
+def _realized_stop_r(entry_price: float | None, exit_price: float | None, stop_loss_pct: float | None) -> float | None:
+    if entry_price is None or exit_price is None or stop_loss_pct is None or stop_loss_pct <= 0:
+        return None
+    risk_per_contract = entry_price * stop_loss_pct
+    if risk_per_contract <= 0:
+        return None
+    return round((exit_price - entry_price) / risk_per_contract, 4)
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:
