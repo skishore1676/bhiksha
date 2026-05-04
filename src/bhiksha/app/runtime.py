@@ -22,7 +22,7 @@ from bhiksha.app.token_daemon import PublicTokenRefreshDaemon, SchwabTokenRefres
 from bhiksha.config.loader import load_bias_config
 from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest, ProviderConfig, StrategyCatalogEntry
 from bhiksha.domain.events import BarClosedEvent
-from bhiksha.domain.models import Bar
+from bhiksha.domain.models import Bar, SignalDecision
 from bhiksha.domain.runtime import ProviderHealth, StartupReport
 from bhiksha.execution.order_manager import OrderManager
 from bhiksha.execution.planner import ExecutionPlanner
@@ -47,6 +47,24 @@ from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
 
 MANUAL_INTRABAR_STRATEGY_KEYS = frozenset({"manual_breakout", "manual_trigger"})
+
+
+async def record_signal_evaluation(event_repository, decision: SignalDecision) -> None:
+    """Persist every runtime signal evaluation, including false decisions."""
+
+    await event_repository.append("signal_evaluation", _signal_decision_payload(decision))
+
+
+def _signal_decision_payload(decision: SignalDecision) -> dict:
+    return {
+        "deployment_id": decision.deployment_id,
+        "symbol": decision.symbol,
+        "timestamp": decision.timestamp.isoformat(),
+        "signal": decision.signal,
+        "direction": decision.direction.value if decision.direction else None,
+        "reason": decision.reason,
+        "features": decision.features,
+    }
 
 
 @dataclass(slots=True)
@@ -762,6 +780,7 @@ class BhikshaRuntime:
                 decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
             else:
                 decision = evaluator.evaluate_entry(deployment, frame)
+            await record_signal_evaluation(supervisor.event_repository, decision)
             output(
                 f"{deployment.deployment_id}: signal={decision.signal} "
                 f"direction={decision.direction.value if decision.direction else None} "
@@ -1067,6 +1086,7 @@ class BhikshaRuntime:
             if enriched is None:
                 continue
             decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
+            await record_signal_evaluation(supervisor.event_repository, decision)
             if not decision.signal:
                 continue
             output(

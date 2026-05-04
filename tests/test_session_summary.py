@@ -1,5 +1,10 @@
 import asyncio
+import json
+import sqlite3
+from datetime import UTC, datetime
 
+from bhiksha.app.runtime import record_signal_evaluation
+from bhiksha.domain.models import SignalDecision
 from bhiksha.ops.summary import build_session_summary
 from bhiksha.persistence.sqlite import SQLiteEventRepository
 
@@ -94,6 +99,33 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
     recent_details = [event.detail for event in summary.recent_events]
     assert "signal=True direction=short reasons=time_window_ok" in recent_details
     assert "exit=True action=square_off reasons=vma_reclaim_exit" in recent_details
+
+
+def test_record_signal_evaluation_persists_false_decision_without_signal_decision_count(tmp_path) -> None:
+    db_path = tmp_path / "events.db"
+    repo = SQLiteEventRepository(str(db_path))
+    decision = SignalDecision(
+        deployment_id="market_impulse_qqq_short_v1",
+        symbol="QQQ",
+        timestamp=datetime(2026, 5, 1, 14, 35, tzinfo=UTC),
+        signal=False,
+        reason=["volume_gate_blocked"],
+        features={"volume": 100.0},
+    )
+
+    asyncio.run(record_signal_evaluation(repo, decision))
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
+
+    assert [row[0] for row in rows] == ["signal_evaluation"]
+    payload = json.loads(rows[0][1])
+    assert payload["signal"] is False
+    assert payload["reason"] == ["volume_gate_blocked"]
+
+    summary = build_session_summary(str(db_path), recent_limit=5)
+    assert summary.event_type_counts["signal_evaluation"] == 1
+    assert summary.signal_true_counts == {}
 
 
 def test_session_summary_aggregates_runtime_metrics(tmp_path) -> None:
