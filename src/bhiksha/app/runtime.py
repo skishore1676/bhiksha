@@ -603,6 +603,14 @@ class BhikshaRuntime:
             last_synced_at = reconciliation_snapshot.last_success_at or reconciliation_snapshot.last_synced_at
             last_attempt_at = reconciliation_snapshot.last_attempt_at
             live_entry_block_reason = self._reconciliation_live_entry_block_reason(reconciliation_snapshot)
+        tracker_positions = _merge_tracked_positions(
+            tracker_positions,
+            [
+                position
+                for position in supervisor.planner.position_tracker.active_positions()
+                if position.source in {"shadow", "dry_run"}
+            ],
+        )
         staleness_anchor = last_synced_at or last_attempt_at
         await supervisor.event_repository.append(
             "runtime_metric",
@@ -1136,12 +1144,18 @@ class BhikshaRuntime:
         try:
             portfolio = await self._fetch_reconciliation_portfolio(broker)
             recent_trades = await supervisor.trade_state_repository.get_recent_trades(limit=200)
+            paper_positions = [
+                position
+                for position in supervisor.planner.position_tracker.active_positions()
+                if position.source in {"shadow", "dry_run"}
+            ]
             tracker_positions = reconcile_public_positions(
                 portfolio.get("positions", []),
                 self.enabled_deployments,
                 orders=portfolio.get("orders", []),
                 known_trades=recent_trades,
             )
+            tracker_positions = _merge_tracked_positions(tracker_positions, paper_positions)
         except Exception as exc:
             async with sync_lock:
                 reconciliation_snapshot.last_error = str(exc)
@@ -1325,7 +1339,7 @@ class BhikshaRuntime:
                 deployment,
                 position,
                 decision,
-                dry_run=not live,
+                dry_run=(not live) or deployment.execution.shadow_only or position.source == "shadow",
             )
             if exit_plan is not None:
                 output(
@@ -1353,7 +1367,7 @@ class BhikshaRuntime:
             managed = await supervisor.manage_open_position(
                 deployment,
                 position,
-                dry_run=not live,
+                dry_run=(not live) or deployment.execution.shadow_only or position.source == "shadow",
             )
             if managed is not None and managed != position:
                 output(
@@ -1530,6 +1544,17 @@ def _format_cash_guard_fields(details: dict, keys: tuple[str, ...]) -> str:
         else:
             values.append(f"{key}={value}")
     return " " + " ".join(values) if values else ""
+
+
+def _merge_tracked_positions(
+    broker_positions: list[TrackedPosition],
+    paper_positions: list[TrackedPosition],
+) -> list[TrackedPosition]:
+    merged: dict[tuple[str | None, str, str | None], TrackedPosition] = {}
+    for position in broker_positions + paper_positions:
+        key = (position.trade_id, position.deployment_id, position.option_symbol)
+        merged[key] = position
+    return list(merged.values())
 
 
 async def _append_event_best_effort(
