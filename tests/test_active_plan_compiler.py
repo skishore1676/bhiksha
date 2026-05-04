@@ -750,6 +750,70 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.source.metadata["signal_window_et"] == "09:35-10:15"
 
 
+def test_mala_evidence_preserves_explicit_bhiksha_ready_when_provider_columns_are_advisory(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "mi_amd.yaml",
+        strategy_id="market-impulse-all-basket-discovery__amd_short",
+        symbol="AMD",
+    )
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Mala_Evidence_v1",
+        rows=[
+            {
+                "mala_handoff_version": "1",
+                "catalog_key": "market-impulse-all-basket-discovery__amd_short",
+                "hypothesis_id": "market-impulse-all-basket-discovery",
+                "symbol": "AMD",
+                "direction": "short",
+                "strategy_key": "market_impulse",
+                "strategy_name": "Market Impulse (Cross & Reclaim)",
+                "strategy_variant": "cross_reclaim",
+                "strategy_params_json": json.dumps({"direction": "short"}),
+                "recommendation_tier": "shadow",
+                "bhiksha_ready": "TRUE",
+                "bhiksha_capability_status": "supported",
+                "bhiksha_capability_reason": "runtime_verified",
+                "provider_validation_status": "provider_watch",
+                "provider_feature_risk": "yellow",
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "authorization_mode": "shadow",
+                "strategy_id": "market-impulse-all-basket-discovery__amd_short",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.summary["suppressed_count"] == 0
+    assert [deployment.deployment_id for deployment in compiled.plan.deployments] == [
+        "strategy_market_impulse_all_basket_discovery_amd_short_shadow_row_2"
+    ]
+    assert compiled.plan.deployments[0].source.metadata["bhiksha_ready"] is True
+
+
 def test_compile_active_plan_suppresses_unsupported_mala_strategy_variant(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()

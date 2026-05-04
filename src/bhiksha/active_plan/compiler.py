@@ -1018,7 +1018,9 @@ def _normalize_mala_evidence_row(normalized: dict[str, Any]) -> dict[str, Any]:
     row["strategy_variant"] = capability.strategy_variant
     row["bhiksha_capability_status"] = capability.status
     row["bhiksha_capability_reason"] = capability.reason
-    row["bhiksha_ready"] = bool(thesis_exit_tested and recommendation_tier != "watch_only" and capability.supported)
+    explicit_bhiksha_ready = _coerce_bool(row.get("bhiksha_ready"))
+    readiness_asserted = bool(explicit_bhiksha_ready or thesis_exit_tested)
+    row["bhiksha_ready"] = bool(readiness_asserted and recommendation_tier != "watch_only" and capability.supported)
     row["validation_count"] = row.get("validation_count") or row.get("signal_count")
     row["last_validated_date"] = row.get("last_validated_date") or _run_date_from_path(row.get("run_dir"))
     if row.get("playbook_summary_json") is None:
