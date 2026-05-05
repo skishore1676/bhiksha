@@ -418,6 +418,8 @@ class ExecutionSupervisor:
         *,
         dry_run: bool,
     ) -> TrackedPosition | None:
+        if position.source == "shadow" or deployment.execution.shadow_only:
+            dry_run = True
         async with self._symbol_locks[position.symbol]:
             return await self._manage_open_position_locked(deployment, position, dry_run=dry_run)
 
@@ -1834,7 +1836,7 @@ class ExecutionSupervisor:
         stop_loss_pct, policy = _resolved_recovery_stop_loss_pct(deployment)
         if stop_loss_pct is None or stop_loss_pct <= 0:
             return position
-        existing_protection = await self._find_active_close_order(position.option_symbol)
+        existing_protection = None if dry_run else await self._find_active_close_order(position.option_symbol)
         if existing_protection is not None:
             updated = _replace_position(
                 position,
@@ -1898,6 +1900,7 @@ class ExecutionSupervisor:
                 "option_symbol": position.option_symbol,
                 "policy": policy,
                 "source": position.source,
+                "dry_run": dry_run,
             },
         )
         if stop_result.order_id is None:
