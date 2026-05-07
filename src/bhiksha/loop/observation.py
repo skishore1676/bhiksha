@@ -18,6 +18,7 @@ from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.market_data.session import ensure_utc
 from bhiksha.market_data.trading_calendar import trading_window_start
+from bhiksha.ops.shadow_evidence import build_shadow_evidence
 from bhiksha.ops.summary import build_session_summary
 
 
@@ -96,6 +97,7 @@ async def _deployment_packet(
     trade_plan_events = [event for event in relevant_events if event["event_type"] == "trade_plan"]
     exit_plan_events = [event for event in relevant_events if event["event_type"] == "exit_plan"]
     exit_decision_events = [event for event in relevant_events if event["event_type"] == "exit_decision"]
+    shadow_exit_events = [event for event in relevant_events if event["event_type"] == "shadow_exit_assumed"]
     lifecycle_blocked_events = [event for event in relevant_events if event["event_type"] == "lifecycle_entry_blocked"]
     pending_exit_events = [event for event in relevant_events if event["event_type"] == "exit_pending_status"]
     ambiguous_cancel_events = [event for event in relevant_events if event["event_type"] == "ambiguous_cancel"]
@@ -123,6 +125,10 @@ async def _deployment_packet(
     for event in exit_decision_events:
         for reason in event["payload"].get("reason") or []:
             exit_reason_counts[str(reason)] += 1
+    shadow_exit_reason_counts = Counter()
+    for event in shadow_exit_events:
+        for reason in event["payload"].get("reason") or []:
+            shadow_exit_reason_counts[str(reason)] += 1
 
     replay = await _replay_summary(
         runtime=runtime,
@@ -138,6 +144,10 @@ async def _deployment_packet(
     startup_selection = startup_snapshot.get("deployment_selection") or {}
     startup_session = startup_snapshot.get("session") or {}
     source_metadata = deployment.source.metadata or {}
+    shadow_evidence = build_shadow_evidence(relevant_events).get(
+        deployment.deployment_id,
+        _empty_shadow_evidence(),
+    )
     packet = {
         "deployment_id": deployment.deployment_id,
         "candidate_id": deployment.source.metadata.get("candidate_id"),
@@ -168,6 +178,8 @@ async def _deployment_packet(
         "blocked_entry_reasons": dict(blocked_entry_reasons),
         "signal_reason_counts": dict(signal_reason_counts),
         "exit_reason_counts": dict(exit_reason_counts),
+        "shadow_exit_reason_counts": dict(shadow_exit_reason_counts),
+        "shadow_evidence": shadow_evidence,
         "runtime_issue_counts": dict(runtime_issue_counts),
         "startup_deployment": startup_deployment,
         "replay": replay,
@@ -176,6 +188,23 @@ async def _deployment_packet(
         and sum(runtime_issue_counts.values()) == 0,
     }
     return packet
+
+
+def _empty_shadow_evidence() -> dict[str, Any]:
+    return {
+        "entry_count": 0,
+        "exit_count": 0,
+        "open_count": 0,
+        "mark_count": 0,
+        "realized_pnl_usd": 0.0,
+        "realized_stop_r_sum": 0.0,
+        "average_realized_stop_r": None,
+        "trade_level_mfe_usd": 0.0,
+        "trade_level_mae_usd": 0.0,
+        "trade_level_mfe_stop_r": 0.0,
+        "trade_level_mae_stop_r": 0.0,
+        "trades": [],
+    }
 
 
 async def _replay_summary(
@@ -304,6 +333,26 @@ def _packet_markdown(packet: dict[str, Any]) -> str:
         lines.extend(["", "## Exit Reasons"])
         for reason, count in sorted(packet["exit_reason_counts"].items()):
             lines.append(f"- `{reason}`: `{count}`")
+    if packet["shadow_exit_reason_counts"]:
+        lines.extend(["", "## Shadow Exit Reasons"])
+        for reason, count in sorted(packet["shadow_exit_reason_counts"].items()):
+            lines.append(f"- `{reason}`: `{count}`")
+    shadow = packet.get("shadow_evidence") or {}
+    if shadow.get("entry_count") or shadow.get("mark_count") or shadow.get("exit_count"):
+        lines.extend(
+            [
+                "",
+                "## Shadow PnL",
+                f"- entries: `{shadow.get('entry_count', 0)}`",
+                f"- exits: `{shadow.get('exit_count', 0)}`",
+                f"- open: `{shadow.get('open_count', 0)}`",
+                f"- marks: `{shadow.get('mark_count', 0)}`",
+                f"- realized_pnl_usd: `{shadow.get('realized_pnl_usd', 0.0)}`",
+                f"- average_realized_stop_r: `{shadow.get('average_realized_stop_r')}`",
+                f"- trade_level_mfe_usd: `{shadow.get('trade_level_mfe_usd', 0.0)}`",
+                f"- trade_level_mae_usd: `{shadow.get('trade_level_mae_usd', 0.0)}`",
+            ]
+        )
     if packet["blocked_entry_reasons"]:
         lines.extend(["", "## Blocked Entry Reasons"])
         for reason, count in sorted(packet["blocked_entry_reasons"].items()):

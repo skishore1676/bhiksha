@@ -134,6 +134,48 @@ def test_observation_report_summarizes_runtime_issues_and_blocked_reasons(tmp_pa
                 "error": "quote unavailable",
             },
         )
+        await repo.append(
+            "shadow_entry_assumed",
+            {
+                "deployment_id": "market_impulse_qqq_short_shadow_1234abcd",
+                "symbol": "QQQ",
+                "trade_id": "SHADOW1",
+                "option_symbol": "QQQ260401P00556000",
+                "quantity": 1,
+                "entry_price": 2.0,
+                "entry_timestamp": "2026-04-01T14:35:00+00:00",
+                "risk_reasons": ["approved"],
+            },
+        )
+        await repo.append(
+            "shadow_mark",
+            {
+                "deployment_id": "market_impulse_qqq_short_shadow_1234abcd",
+                "symbol": "QQQ",
+                "trade_id": "SHADOW1",
+                "option_symbol": "QQQ260401P00556000",
+                "quantity": 1,
+                "entry_price": 2.0,
+                "mark_price": 2.5,
+                "unrealized_pnl_usd": 50.0,
+                "unrealized_stop_r": 0.7143,
+            },
+        )
+        await repo.append(
+            "shadow_exit_assumed",
+            {
+                "deployment_id": "market_impulse_qqq_short_shadow_1234abcd",
+                "symbol": "QQQ",
+                "trade_id": "SHADOW1",
+                "option_symbol": "QQQ260401P00556000",
+                "quantity": 1,
+                "entry_price": 2.0,
+                "exit_price": 1.8,
+                "realized_pnl_usd": -20.0,
+                "realized_stop_r": -0.2857,
+                "reason": ["vma_reclaim_exit"],
+            },
+        )
 
     asyncio.run(seed())
 
@@ -153,6 +195,13 @@ def test_observation_report_summarizes_runtime_issues_and_blocked_reasons(tmp_pa
     assert packet["signal_true_count"] == 1
     assert packet["blocked_entry_reasons"]["public_spread_above_maximum"] == 1
     assert packet["runtime_issue_counts"]["data"] == 1
+    assert packet["shadow_exit_reason_counts"]["vma_reclaim_exit"] == 1
+    assert packet["shadow_evidence"]["entry_count"] == 1
+    assert packet["shadow_evidence"]["exit_count"] == 1
+    assert packet["shadow_evidence"]["realized_pnl_usd"] == -20.0
+    assert packet["shadow_evidence"]["average_realized_stop_r"] == -0.2857
+    assert packet["shadow_evidence"]["trade_level_mfe_usd"] == 50.0
+    assert packet["shadow_evidence"]["trade_level_mae_usd"] == -20.0
     assert packet["replay"]["status"] == "skipped"
     assert packet["safe_for_live_review"] is False
 

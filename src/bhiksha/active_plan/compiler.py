@@ -628,6 +628,12 @@ def _compile_strategy_row(
     enforce_google_catalog: bool,
 ) -> DeploymentManifest:
     strategy_id = row.strategy_id or ""
+    google_catalog_entry = google_catalog_by_id.get(strategy_id)
+    if enforce_google_catalog and google_catalog_entry is None:
+        raise ValueError(f"Strategy {strategy_id!r} is not present in Google strategy catalog")
+    if google_catalog_entry is not None:
+        _validate_google_catalog_exit_contract(strategy_id, google_catalog_entry)
+
     entry = catalog_by_id.get(strategy_id)
     if entry is None:
         available = ", ".join(sorted(catalog_by_id))
@@ -645,9 +651,6 @@ def _compile_strategy_row(
             f"Strategy row {row.row_id!r} overrides symbol {row.symbol!r}, "
             f"but catalog entry {strategy_id!r} is bound to {entry.symbol!r}"
         )
-    google_catalog_entry = google_catalog_by_id.get(strategy_id)
-    if enforce_google_catalog and google_catalog_entry is None:
-        raise ValueError(f"Strategy {strategy_id!r} is not present in Google strategy catalog")
     if google_catalog_entry is not None:
         _validate_google_catalog_alignment(strategy_id, entry, google_catalog_entry)
 
@@ -1160,6 +1163,10 @@ def _manual_strategy_catalog_ids(catalog_root: Path, generated_root: Path) -> se
 
 def _is_google_catalog_entry_promotable(entry: StrategyCatalogSheetRow, supported_keys: set[str]) -> bool:
     strategy_key = str(entry.strategy_key or "").strip()
+    try:
+        _validate_google_catalog_exit_contract(entry.catalog_key, entry)
+    except ValueError:
+        return False
     capability_supported = True
     if _uses_bhiksha_capability_contract(entry):
         capability = evaluate_strategy_capability(
@@ -1313,6 +1320,8 @@ def _google_catalog_metadata(entry: StrategyCatalogSheetRow | None) -> dict[str,
         "thesis_exit_tested": entry.thesis_exit_tested,
         "exit_reliability": entry.exit_reliability,
         "exit_trade_count": entry.exit_trade_count,
+        "exit_contract_status": "ok" if _uses_bhiksha_capability_contract(entry) else None,
+        "exit_contract_reason": "mala_thesis_exit_loaded" if _uses_bhiksha_capability_contract(entry) else None,
         "warnings": entry.warnings,
         "playbook_summary": _normalized_playbook_summary_metadata(entry),
         "catalog_row_index": entry.row_index,
@@ -1372,6 +1381,39 @@ def _validate_google_catalog_alignment(
             f"Google strategy catalog strategy_key mismatch for {strategy_id!r}: "
             f"{google_entry.strategy_key!r} vs local {local_entry.strategy.key!r}"
         )
+
+
+def _validate_google_catalog_exit_contract(strategy_id: str, google_entry: StrategyCatalogSheetRow) -> None:
+    if not _uses_bhiksha_capability_contract(google_entry):
+        return
+    if google_entry.mala_handoff_version is None:
+        return
+    if google_entry.thesis_exit_tested is not True:
+        raise ValueError(f"exit_contract_missing: Strategy {strategy_id!r} has thesis_exit_tested={google_entry.thesis_exit_tested!r}")
+    if not google_entry.thesis_exit_policy:
+        raise ValueError(f"exit_contract_missing: Strategy {strategy_id!r} is missing thesis_exit_policy")
+    if not isinstance(google_entry.thesis_exit_metrics_json, dict) or not google_entry.thesis_exit_metrics_json:
+        raise ValueError(f"exit_contract_missing: Strategy {strategy_id!r} is missing thesis_exit_metrics_json")
+    if not isinstance(google_entry.thesis_exit_params_json, dict):
+        raise ValueError(f"exit_contract_invalid: Strategy {strategy_id!r} has invalid thesis_exit_params_json")
+    if _missing_required_thesis_exit_params(google_entry.thesis_exit_policy, google_entry.thesis_exit_params_json):
+        missing = ", ".join(_missing_required_thesis_exit_params(google_entry.thesis_exit_policy, google_entry.thesis_exit_params_json))
+        raise ValueError(
+            f"exit_contract_missing: Strategy {strategy_id!r} thesis_exit_policy={google_entry.thesis_exit_policy!r} "
+            f"is missing params: {missing}"
+        )
+
+
+def _missing_required_thesis_exit_params(policy: str, params: dict[str, Any]) -> list[str]:
+    required_by_policy = {
+        "fixed_rr_underlying": ["stop_loss_underlying_pct", "take_profit_underlying_r_multiple"],
+        "time_stop_underlying": ["exit_time_et"],
+        "trailing_vma_underlying": ["vma_col"],
+        "ma_trailing_underlying": ["ma_col"],
+        "ma_crossover_underlying": ["fast_ma_col", "slow_ma_col"],
+        "atr_trailing_underlying": ["atr_col", "atr_multiple"],
+    }
+    return [key for key in required_by_policy.get(policy, []) if params.get(key) in (None, "")]
 
 
 def _uses_bhiksha_capability_contract(entry: StrategyCatalogSheetRow) -> bool:

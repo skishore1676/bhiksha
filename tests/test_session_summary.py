@@ -73,6 +73,48 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
             },
         )
         await repo.append(
+            "shadow_entry_assumed",
+            {
+                "deployment_id": "market_impulse_qqq_short_v1",
+                "symbol": "QQQ",
+                "trade_id": "SHADOW1",
+                "option_symbol": "QQQ260401P00556000",
+                "quantity": 1,
+                "entry_price": 2.0,
+                "entry_timestamp": "2026-04-01T14:35:00+00:00",
+                "risk_reasons": ["approved"],
+            },
+        )
+        await repo.append(
+            "shadow_mark",
+            {
+                "deployment_id": "market_impulse_qqq_short_v1",
+                "symbol": "QQQ",
+                "trade_id": "SHADOW1",
+                "option_symbol": "QQQ260401P00556000",
+                "quantity": 1,
+                "entry_price": 2.0,
+                "mark_price": 2.5,
+                "unrealized_pnl_usd": 50.0,
+                "unrealized_stop_r": 0.7143,
+            },
+        )
+        await repo.append(
+            "shadow_exit_assumed",
+            {
+                "deployment_id": "market_impulse_qqq_short_v1",
+                "symbol": "QQQ",
+                "trade_id": "SHADOW1",
+                "option_symbol": "QQQ260401P00556000",
+                "quantity": 1,
+                "entry_price": 2.0,
+                "exit_price": 1.8,
+                "realized_pnl_usd": -20.0,
+                "realized_stop_r": -0.2857,
+                "reason": ["vma_reclaim_exit"],
+            },
+        )
+        await repo.append(
             "lifecycle_transition",
             {
                 "deployment_id": "market_impulse_qqq_short_v1",
@@ -85,15 +127,22 @@ def test_session_summary_aggregates_lifecycle_and_trade_events(tmp_path) -> None
 
     asyncio.run(seed())
 
-    summary = build_session_summary(str(db_path), recent_limit=5)
+    summary = build_session_summary(str(db_path), recent_limit=10)
 
-    assert summary.total_events == 7
+    assert summary.total_events == 10
     assert summary.event_type_counts["lifecycle_transition"] == 3
-    assert summary.deployment_event_counts["market_impulse_qqq_short_v1"] == 7
+    assert summary.deployment_event_counts["market_impulse_qqq_short_v1"] == 10
     assert summary.signal_true_counts["market_impulse_qqq_short_v1"] == 1
     assert summary.exit_true_counts["market_impulse_qqq_short_v1"] == 1
     assert summary.pending_exit_counts["market_impulse_qqq_short_v1"] == 1
     assert summary.ambiguous_cancel_counts["market_impulse_qqq_short_v1"] == 1
+    assert summary.blocked_entry_reasons_by_deployment.get("market_impulse_qqq_short_v1", {}) == {}
+    shadow = summary.shadow_evidence_by_deployment["market_impulse_qqq_short_v1"]
+    assert shadow["entry_count"] == 1
+    assert shadow["exit_count"] == 1
+    assert shadow["realized_pnl_usd"] == -20.0
+    assert shadow["trade_level_mfe_usd"] == 50.0
+    assert shadow["trade_level_mae_usd"] == -20.0
     assert summary.lifecycle_last_state["market_impulse_qqq_short_v1"] == "open_protected"
     assert summary.recent_events[-1].detail == "exit_pending->open_protected (broker_reconciliation_sync)"
     recent_details = [event.detail for event in summary.recent_events]

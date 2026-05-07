@@ -9,6 +9,8 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from bhiksha.ops.shadow_evidence import build_shadow_evidence
+
 
 @dataclass(slots=True, frozen=True)
 class RecentEvent:
@@ -29,11 +31,15 @@ class SessionSummary:
     exit_true_counts: dict[str, int] = field(default_factory=dict)
     pending_exit_counts: dict[str, int] = field(default_factory=dict)
     ambiguous_cancel_counts: dict[str, int] = field(default_factory=dict)
+    blocked_entry_reasons_by_deployment: dict[str, dict[str, int]] = field(
+        default_factory=dict
+    )
     runtime_issue_counts: dict[str, int] = field(default_factory=dict)
     runtime_metric_latest: dict[str, float] = field(default_factory=dict)
     runtime_metric_average: dict[str, float] = field(default_factory=dict)
     latest_startup_created_at: str | None = None
     latest_startup_snapshot: dict = field(default_factory=dict)
+    shadow_evidence_by_deployment: dict[str, dict] = field(default_factory=dict)
     recent_events: list[RecentEvent] = field(default_factory=list)
 
 
@@ -54,16 +60,23 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
     exit_true_counts: Counter[str] = Counter()
     pending_exit_counts: Counter[str] = Counter()
     ambiguous_cancel_counts: Counter[str] = Counter()
+    blocked_entry_reasons_by_deployment: defaultdict[str, Counter[str]] = defaultdict(
+        Counter
+    )
     runtime_issue_counts: Counter[str] = Counter()
     runtime_metric_values: defaultdict[str, list[float]] = defaultdict(list)
     runtime_metric_latest: dict[str, float] = {}
     latest_startup_created_at: str | None = None
     latest_startup_snapshot: dict = {}
+    parsed_events: list[dict] = []
     recent: list[RecentEvent] = []
 
     for created_at, event_type, payload_text in rows:
         event_counts[event_type] += 1
         payload = _safe_json(payload_text)
+        parsed_events.append(
+            {"created_at": created_at, "event_type": event_type, "payload": payload}
+        )
         deployment_id = _maybe_str(payload.get("deployment_id"))
         symbol = _maybe_str(payload.get("symbol"))
         if deployment_id:
@@ -80,6 +93,12 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
             exit_true_counts[deployment_id] += 1
         if event_type == "ambiguous_cancel" and deployment_id:
             ambiguous_cancel_counts[deployment_id] += 1
+        if event_type == "trade_plan" and deployment_id:
+            for reason in payload.get("risk_reasons") or []:
+                blocked_entry_reasons_by_deployment[deployment_id][str(reason)] += 1
+        if event_type == "lifecycle_entry_blocked" and deployment_id:
+            state = _maybe_str(payload.get("state"))
+            blocked_entry_reasons_by_deployment[deployment_id][f"lifecycle_state:{state}"] += 1
         if event_type == "runtime_issue":
             category = _maybe_str(payload.get("category")) or "exception"
             runtime_issue_counts[category] += 1
@@ -111,6 +130,10 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
         exit_true_counts=dict(exit_true_counts),
         pending_exit_counts=dict(pending_exit_counts),
         ambiguous_cancel_counts=dict(ambiguous_cancel_counts),
+        blocked_entry_reasons_by_deployment={
+            deployment_id: dict(reasons)
+            for deployment_id, reasons in blocked_entry_reasons_by_deployment.items()
+        },
         runtime_issue_counts=dict(runtime_issue_counts),
         runtime_metric_latest=runtime_metric_latest,
         runtime_metric_average={
@@ -118,6 +141,7 @@ def build_session_summary(db_path: str, *, recent_limit: int = 10) -> SessionSum
         },
         latest_startup_created_at=latest_startup_created_at,
         latest_startup_snapshot=latest_startup_snapshot,
+        shadow_evidence_by_deployment=build_shadow_evidence(parsed_events),
         recent_events=recent[-recent_limit:],
     )
 

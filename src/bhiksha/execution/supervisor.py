@@ -138,7 +138,12 @@ class ExecutionSupervisor:
                     simulate_only=simulate_only,
                 )
             if plan is not None:
-                if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):
+                if (
+                    _entry_plan_approved(plan)
+                    and plan.quantity > 0
+                    and plan.option_symbol
+                    and (plan.order_id is not None or plan.dry_run)
+                ):
                     mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")
                     await self._record_manual_status(
                         deployment,
@@ -188,7 +193,13 @@ class ExecutionSupervisor:
                         order_id=plan.order_id,
                     )
                     await self._emit_lifecycle_transition(transition, reason="entry_submitted")
-                if simulate_only and plan.quantity > 0 and plan.option_symbol and plan.order_id is None:
+                if (
+                    simulate_only
+                    and _entry_plan_approved(plan)
+                    and plan.quantity > 0
+                    and plan.option_symbol
+                    and plan.order_id is None
+                ):
                     self.planner.position_tracker.open_position(
                         deployment.symbol,
                         deployment.deployment_id,
@@ -2338,6 +2349,10 @@ def _underlying_entry_price(decision: SignalDecision) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _entry_plan_approved(plan: TradePlan) -> bool:
+    return plan.risk_reasons == ["approved"]
 
 
 def _restore_threshold_price(entry_price: float, target_price: float, progress_pct: float) -> float:

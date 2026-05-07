@@ -56,7 +56,7 @@ def test_google_sheet_client_quotes_sheet_names_in_ranges(tmp_path: Path) -> Non
 
     assert captured["spreadsheetId"] == "spreadsheet123"
     assert captured["metadata_spreadsheetId"] == "spreadsheet123"
-    assert captured["range"] == "'strategy catalog'!A1:Z2000"
+    assert captured["range"] == "'strategy catalog'!A1:ZZ2000"
     assert rows[0]["row_index"] == 2
     assert rows[0]["strategy"] == "market_impulse_spy_short_v1"
 
@@ -101,7 +101,7 @@ def test_google_sheet_client_resolves_nearby_sheet_names(tmp_path: Path) -> None
     client.read_rows()
 
     assert client.sheet_name == "active_strategy"
-    assert service.spreadsheets_api.values_api.range == "'active_strategy'!A1:Z2000"
+    assert service.spreadsheets_api.values_api.range == "'active_strategy'!A1:ZZ2000"
 
 
 def test_google_sheet_client_updates_row_cells_and_extends_headers(tmp_path: Path) -> None:

@@ -32,7 +32,7 @@ class GoogleSheetTableClient:
             self.service = self._build_service()
         self.sheet_name = self._resolve_sheet_name(self.sheet_name)
 
-    def read_rows(self, *, range_suffix: str = "A1:Z2000") -> list[dict[str, Any]]:
+    def read_rows(self, *, range_suffix: str = "A1:ZZ2000") -> list[dict[str, Any]]:
         values = self._read_values(range_suffix=range_suffix)
         layout = _detect_layout(values)
         if layout is None:

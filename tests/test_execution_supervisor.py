@@ -703,6 +703,59 @@ def test_execution_supervisor_tracks_shadow_plan_as_paper_position(tmp_path) -> 
     assert "shadow_entry_assumed" in event_types
 
 
+def test_execution_supervisor_does_not_open_shadow_position_when_risk_rejects(tmp_path) -> None:
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 558.0},
+    )
+
+    class RejectedShadowPlanner(StubPlanner):
+        async def plan_entry(self, *args, **kwargs):
+            del args, kwargs
+            return TradePlan(
+                trade_id="SHADOW_REJECTED",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                direction=SignalDirection.SHORT,
+                option_symbol="QQQ260330P00558000",
+                quantity=1,
+                estimated_entry_price=2.0,
+                risk_reasons=["max_open_positions_per_symbol_reached"],
+                dry_run=True,
+                order_id=None,
+                underlying_entry_price=558.0,
+                entry_timestamp=decision.timestamp,
+            )
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "trades.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RejectedShadowPlanner(),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+
+    plan = asyncio.run(supervisor.handle_signal(deployment, decision, dry_run=True, simulate_only=True))
+
+    assert plan is not None
+    assert plan.risk_reasons == ["max_open_positions_per_symbol_reached"]
+    assert supervisor.planner.position_tracker.active_positions() == []
+    assert asyncio.run(trade_repo.get_open_trades()) == []
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "trade_plan" in event_types
+    assert "shadow_entry_assumed" not in event_types
+
+
 def test_execution_supervisor_records_shadow_exit_pnl(tmp_path) -> None:
     from bhiksha.config.loader import load_deployments
 
