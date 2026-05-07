@@ -226,7 +226,7 @@ def test_execution_planner_can_simulate_without_tracking_position() -> None:
         signal=True,
         direction=SignalDirection.SHORT,
         reason=["time_window_ok"],
-        features={},
+        features={"close": 250.25},
     )
 
     plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=True, simulate_only=True))
@@ -234,6 +234,8 @@ def test_execution_planner_can_simulate_without_tracking_position() -> None:
     assert plan is not None
     assert plan.order_id is None
     assert plan.quantity > 0
+    assert plan.underlying_entry_price == 250.25
+    assert plan.entry_timestamp == decision.timestamp
     assert tracker.active_positions() == []
 
 

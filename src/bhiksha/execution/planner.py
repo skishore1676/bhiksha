@@ -240,6 +240,8 @@ class ExecutionPlanner:
                     risk_reasons=risk.reasons,
                     dry_run=True,
                     order_id=None,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
                 )
             self.position_tracker.open_position(
                 deployment.symbol,

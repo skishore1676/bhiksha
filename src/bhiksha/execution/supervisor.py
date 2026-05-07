@@ -243,6 +243,7 @@ class ExecutionSupervisor:
                             "option_symbol": plan.option_symbol,
                             "quantity": plan.quantity,
                             "entry_price": plan.estimated_entry_price,
+                            "underlying_entry_price": plan.underlying_entry_price,
                             "entry_timestamp": plan.entry_timestamp.isoformat() if plan.entry_timestamp else None,
                             "risk_reasons": list(plan.risk_reasons),
                         },

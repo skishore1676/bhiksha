@@ -698,9 +698,14 @@ def test_execution_supervisor_tracks_shadow_plan_as_paper_position(tmp_path) -> 
     trades = asyncio.run(trade_repo.get_open_trades())
     assert len(trades) == 1
     assert trades[0].status == "open_unprotected"
+    assert trades[0].underlying_entry_price == 558.0
     with sqlite3.connect(tmp_path / "events.db") as conn:
         event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+        shadow_payload = conn.execute(
+            "SELECT payload FROM events WHERE event_type = 'shadow_entry_assumed'"
+        ).fetchone()[0]
     assert "shadow_entry_assumed" in event_types
+    assert json.loads(shadow_payload)["underlying_entry_price"] == 558.0
 
 
 def test_execution_supervisor_does_not_open_shadow_position_when_risk_rejects(tmp_path) -> None:
