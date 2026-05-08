@@ -21,4 +21,5 @@ artifacts/signal_inspector/
 artifacts/playbook/
 artifacts/observations/
 config/deployments/generated/
+config/strategy_catalog/google_promoted/
 artifacts/
