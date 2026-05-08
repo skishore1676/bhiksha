@@ -262,14 +262,14 @@ class PhysicsEngine:
         return item
 
     def _apply_transforms(self, df: pl.DataFrame, transforms: Sequence[FeatureTransform]) -> pl.DataFrame:
-        logger.info("Applying Newton transforms: {}", ", ".join(transform_names(list(transforms))) or "(none)")
+        logger.debug("Applying Newton transforms: {}", ", ".join(transform_names(list(transforms))) or "(none)")
         result = df
         for transform in transforms:
             missing = set(transform.required_input_columns) - set(result.columns)
             if missing:
                 raise ValueError(f"Transform '{transform.name}' requires columns: {sorted(missing)}")
             result = transform.apply(result)
-        logger.info("Physics enrichment complete - {} columns total", len(result.columns))
+        logger.debug("Physics enrichment complete - {} columns total", len(result.columns))
         return result
 
 

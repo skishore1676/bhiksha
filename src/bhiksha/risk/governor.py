@@ -26,17 +26,19 @@ class RiskGovernor:
         symbol_open_positions: int,
         deployment_open_positions: int,
         proposed_trade_premium_usd: float,
+        enforce_total_position_limit: bool = True,
+        enforce_symbol_position_limit: bool = True,
+        enforce_deployment_position_limit: bool = True,
     ) -> RiskDecision:
         reasons: list[str] = []
 
-        if total_open_positions >= self.profile.max_open_positions_total:
+        if enforce_total_position_limit and total_open_positions >= self.profile.max_open_positions_total:
             reasons.append("max_open_positions_total_reached")
-        if symbol_open_positions >= self.profile.max_open_positions_per_symbol:
+        if enforce_symbol_position_limit and symbol_open_positions >= self.profile.max_open_positions_per_symbol:
             reasons.append("max_open_positions_per_symbol_reached")
-        if deployment_open_positions >= self.profile.max_open_positions_per_deployment:
+        if enforce_deployment_position_limit and deployment_open_positions >= self.profile.max_open_positions_per_deployment:
             reasons.append("max_open_positions_per_deployment_reached")
         if proposed_trade_premium_usd > self.profile.max_trade_premium_usd:
             reasons.append("max_trade_premium_exceeded")
 
         return RiskDecision(approved=not reasons, reasons=reasons or ["approved"])
-

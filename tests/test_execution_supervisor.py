@@ -139,6 +139,11 @@ class StatusMapOrderManager(RecordingOrderManager):
         return self.statuses.get(order_id, (None, None, "missing_status"))
 
 
+class ExplodingStatusOrderManager(RecordingOrderManager):
+    async def get_order_status(self, order_id: str):
+        raise AssertionError(f"paper order id should not be polled: {order_id}")
+
+
 class RecordingPlanner(StubPlanner):
     def __init__(self, order_manager: RecordingOrderManager):
         self.order_manager = order_manager
@@ -1063,6 +1068,54 @@ def test_execution_supervisor_sync_lifecycle_releases_terminal_reconcile_hold(tm
     with sqlite3.connect(tmp_path / "events.db") as conn:
         event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
     assert "entry_reconcile_released" in event_types
+
+
+def test_execution_supervisor_recovers_open_paper_trade_after_restart(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(ExplodingStatusOrderManager()),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    entry_at = datetime(2026, 3, 30, 14, 30, tzinfo=UTC)
+
+    async def run() -> None:
+        await trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="SHADOW123",
+                deployment_id="market_impulse_qqq_short_v1",
+                symbol="QQQ",
+                option_symbol="QQQ260330P00558000",
+                quantity=1,
+                entry_price=2.0,
+                underlying_entry_price=558.0,
+                entry_timestamp=entry_at,
+                status="open_protected",
+                entry_order_id="SHADOW_ENTRY",
+                stop_order_id="DRY_RUN_STOP",
+                stop_price=1.3,
+            )
+        )
+        await supervisor.sync_lifecycle()
+
+    asyncio.run(run())
+
+    open_trades = asyncio.run(trade_repo.get_open_trades())
+    positions = supervisor.planner.position_tracker.active_positions()
+    assert len(open_trades) == 1
+    assert open_trades[0].status == "open_protected"
+    assert len(positions) == 1
+    assert positions[0].source == "shadow"
+    assert positions[0].order_id == "SHADOW_ENTRY"
+    assert positions[0].stop_order_id == "DRY_RUN_STOP"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
+    assert "paper_position_recovered" in [row[0] for row in rows]
+    recovered = next(json.loads(row[1]) for row in rows if row[0] == "paper_position_recovered")
+    assert recovered["trade_id"] == "SHADOW123"
+    assert recovered["source"] == "shadow"
 
 
 def test_execution_supervisor_sanitizes_recovered_stop_below_bid(tmp_path) -> None:

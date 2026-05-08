@@ -209,6 +209,8 @@ class ExecutionPlanner:
             symbol_open_positions=self.position_tracker.symbol_open_positions(deployment.symbol),
             deployment_open_positions=self.position_tracker.deployment_open_positions(deployment.deployment_id),
             proposed_trade_premium_usd=entry_price * quantity * 100,
+            enforce_total_position_limit=not simulate_only,
+            enforce_symbol_position_limit=not simulate_only,
         )
 
         if not risk.approved:
@@ -248,12 +250,12 @@ class ExecutionPlanner:
                 deployment.deployment_id,
                 trade_id=trade_id,
                 option_symbol=selection.option_symbol,
-                    quantity=quantity,
-                    underlying_entry_price=underlying_entry_price,
-                    entry_timestamp=decision.timestamp,
-                    source="dry_run",
-                    order_id="DRY_RUN",
-                )
+                quantity=quantity,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
+                source="dry_run",
+                order_id="DRY_RUN",
+            )
             return TradePlan(
                 trade_id=trade_id,
                 deployment_id=deployment.deployment_id,

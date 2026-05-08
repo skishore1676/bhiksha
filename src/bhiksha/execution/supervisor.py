@@ -1676,6 +1676,25 @@ class ExecutionSupervisor:
                 await self._reconcile_pending_entry_release(trade)
                 continue
             if trade.trade_id not in active_trade_ids:
+                if _is_paper_trade_record(trade):
+                    self._recover_paper_trade(trade)
+                    active_trade_ids.add(trade.trade_id)
+                    await self.event_repository.append(
+                        "paper_position_recovered",
+                        {
+                            "deployment_id": trade.deployment_id,
+                            "symbol": trade.symbol,
+                            "trade_id": trade.trade_id,
+                            "option_symbol": trade.option_symbol,
+                            "quantity": trade.quantity,
+                            "entry_price": trade.entry_price,
+                            "underlying_entry_price": trade.underlying_entry_price,
+                            "entry_timestamp": trade.entry_timestamp.isoformat() if trade.entry_timestamp else None,
+                            "source": _paper_trade_source(trade),
+                            "reason": "sync_lifecycle_rehydrate",
+                        },
+                    )
+                    continue
                 await self._mark_disappeared_trade_closed(trade)
         await self._enrich_recent_closed_exit_truth(recent_trades)
         for position in self.planner.position_tracker.active_positions():
@@ -1792,6 +1811,8 @@ class ExecutionSupervisor:
         for order_id in order_ids:
             if not order_id or order_id in seen:
                 continue
+            if _is_paper_order_id(order_id):
+                continue
             seen.add(order_id)
             status, payload, error = await self.planner.order_manager.get_order_status(order_id)
             if error or payload is None:
@@ -1836,6 +1857,28 @@ class ExecutionSupervisor:
                 "status": normalized,
                 "payload": payload or {},
             },
+        )
+
+    def _recover_paper_trade(self, trade: TradeRecord) -> None:
+        self.planner.position_tracker.open_position(
+            trade.symbol,
+            trade.deployment_id,
+            trade_id=trade.trade_id,
+            option_symbol=trade.option_symbol,
+            quantity=trade.quantity,
+            entry_price=trade.entry_price,
+            underlying_entry_price=trade.underlying_entry_price,
+            entry_timestamp=trade.entry_timestamp,
+            source=_paper_trade_source(trade),
+            order_id=trade.entry_order_id,
+            stop_order_id=trade.stop_order_id,
+            stop_price=trade.stop_price,
+            target_order_id=trade.target_order_id,
+            target_price=trade.target_price,
+            exit_order_id=trade.exit_order_id,
+            exit_limit_price=trade.exit_limit_price,
+            exit_submitted_at=trade.exit_submitted_at,
+            exit_mode=trade.exit_mode,
         )
 
     async def _restore_missing_protection(
@@ -2367,6 +2410,26 @@ def _tracked_trade_status(position: TrackedPosition) -> str:
     if position.target_order_id:
         return "target_active"
     return "open_protected" if position.stop_order_id else "open_unprotected"
+
+
+def _is_paper_order_id(order_id: str | None) -> bool:
+    return bool(order_id and (order_id == "SHADOW_ENTRY" or order_id.startswith("DRY_RUN")))
+
+
+def _is_paper_trade_record(trade: TradeRecord) -> bool:
+    return any(
+        _is_paper_order_id(order_id)
+        for order_id in (
+            trade.entry_order_id,
+            trade.stop_order_id,
+            trade.target_order_id,
+            trade.exit_order_id,
+        )
+    )
+
+
+def _paper_trade_source(trade: TradeRecord) -> str:
+    return "shadow" if trade.entry_order_id == "SHADOW_ENTRY" else "dry_run"
 
 
 def _resolved_recovery_stop_loss_pct(deployment: DeploymentManifest) -> tuple[float | None, str]:

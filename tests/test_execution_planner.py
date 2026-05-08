@@ -239,6 +239,70 @@ def test_execution_planner_can_simulate_without_tracking_position() -> None:
     assert tracker.active_positions() == []
 
 
+def test_execution_planner_shadow_ignores_book_position_caps() -> None:
+    deployment = next(
+        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
+    )
+    chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
+    tracker = PositionTracker()
+    tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="SHADOW-IWM", option_symbol="IWM260417C00210000")
+    tracker.open_position("AVGO", "opening_drive_avgo_long_v1", trade_id="SHADOW-AVGO", option_symbol="AVGO260417C02000000")
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=StubOrderManager(),
+        position_tracker=tracker,
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="TSLA",
+        timestamp=datetime(2026, 3, 30, 18, 0),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 250.25},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=True, simulate_only=True))
+
+    assert plan is not None
+    assert plan.quantity > 0
+    assert plan.risk_reasons == ["approved"]
+    assert plan.order_id is None
+    assert len(tracker.active_positions()) == 2
+
+
+def test_execution_planner_dry_run_still_honors_book_position_caps() -> None:
+    deployment = next(
+        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
+    )
+    chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
+    tracker = PositionTracker()
+    tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="DRY-IWM", option_symbol="IWM260417C00210000")
+    tracker.open_position("AVGO", "opening_drive_avgo_long_v1", trade_id="DRY-AVGO", option_symbol="AVGO260417C02000000")
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=StubOrderManager(),
+        position_tracker=tracker,
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="TSLA",
+        timestamp=datetime(2026, 3, 30, 18, 0),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 250.25},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=True))
+
+    assert plan is not None
+    assert plan.quantity > 0
+    assert plan.risk_reasons == ["max_open_positions_total_reached"]
+    assert plan.order_id is None
+    assert len(tracker.active_positions()) == 2
+
+
 def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
     deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
     planner = ExecutionPlanner(

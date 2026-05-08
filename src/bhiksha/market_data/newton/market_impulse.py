@@ -93,10 +93,9 @@ def enrich_impulse_columns(
     columns.append(pl.Series(f"impulse_stage{suffix}", stage))
 
     enriched = df.with_columns(columns)
-    logger.info(
+    logger.debug(
         "Market Impulse enrichment complete{} - {} bars",
         f" (suffix={suffix})" if suffix else "",
         len(enriched),
     )
     return enriched
-
