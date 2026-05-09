@@ -10,6 +10,7 @@ import polars as pl
 
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import ExitDecision, SignalDecision
+from bhiksha.market_data.newton.transforms import acceleration_column_name, jerk_column_name
 from bhiksha.market_data.session import ET, ensure_utc, et_time_expr, et_timestamp_expr
 from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.strategy.base import coerce_time
@@ -28,10 +29,14 @@ class OpeningDriveClassifierStrategy:
 
     def required_features(self, params: dict[str, Any]) -> set[str]:
         required = {"timestamp", "symbol", "open", "high", "low", "close"}
+        kinematic_periods_back = max(int(params.get("kinematic_periods_back", 1)), 1)
+        required.add(acceleration_column_name(kinematic_periods_back))
         if bool(params.get("use_volume_filter", True)):
             required.add("volume")
         if bool(params.get("use_directional_mass", True)):
             required.add("directional_mass")
+        if bool(params.get("use_jerk_confirmation", True)):
+            required.add(jerk_column_name(kinematic_periods_back))
         if bool(params.get("use_regime_filter", False)):
             regime_timeframe = str(params.get("regime_timeframe", "5m"))
             required.add(f"impulse_regime_{regime_timeframe}")
@@ -64,6 +69,8 @@ class OpeningDriveClassifierStrategy:
         enable_continue = bool(params.get("enable_continue", True))
         enable_fail = bool(params.get("enable_fail", True))
         kinematic_periods_back = max(int(params.get("kinematic_periods_back", 1)), 1)
+        accel_col = acceleration_column_name(kinematic_periods_back)
+        jerk_col = jerk_column_name(kinematic_periods_back)
         direction_filter = str(params.get("direction", "")).strip().lower() or None
 
         opening_end = _time_plus_minutes(market_open, opening_window_minutes)
@@ -88,6 +95,10 @@ class OpeningDriveClassifierStrategy:
                 ]
             )
         )
+        if accel_col in frame.columns:
+            working = working.with_columns(pl.col(accel_col).alias("_accel"))
+        if jerk_col in frame.columns:
+            working = working.with_columns(pl.col(jerk_col).alias("_jerk"))
 
         in_opening_window = (et_time_expr("timestamp") >= market_open) & (et_time_expr("timestamp") < opening_end)
         in_entry_window = (et_time_expr("timestamp") >= entry_start) & (et_time_expr("timestamp") <= entry_end)

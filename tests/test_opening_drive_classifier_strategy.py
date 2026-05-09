@@ -182,6 +182,19 @@ def _opening_drive_frame(
         "volume": volumes,
         "directional_mass": directional_mass,
     }
+    frame = pl.DataFrame(data).with_columns(
+        [
+            (pl.col("close") - pl.col("close").shift(1)).alias("velocity_1m"),
+        ]
+    ).with_columns(
+        [
+            (pl.col("velocity_1m") - pl.col("velocity_1m").shift(1)).alias("accel_1m"),
+        ]
+    ).with_columns(
+        [
+            (pl.col("accel_1m") - pl.col("accel_1m").shift(1)).alias("jerk_1m"),
+        ]
+    )
     if impulse_regime_5m is not None:
-        data["impulse_regime_5m"] = impulse_regime_5m
-    return pl.DataFrame(data)
+        frame = frame.with_columns(pl.Series("impulse_regime_5m", impulse_regime_5m))
+    return frame

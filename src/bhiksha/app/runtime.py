@@ -38,6 +38,12 @@ from bhiksha.market_data.adapters.schwab import SchwabBarSource
 from bhiksha.market_data.daemon import DataIngestionDaemon
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.market_data.trading_calendar import trading_window_start
+from bhiksha.market_data.warmup import (
+    effective_warmup_trading_days_by_deployment,
+    effective_warmup_trading_days_by_symbol,
+    effective_warmup_trading_days_for_deployments,
+    legacy_effective_warmup_trading_days,
+)
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup, check_schwab_token_health
 from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
@@ -124,11 +130,27 @@ class BhikshaRuntime:
             ],
         )
 
-    async def warm_start_symbol(self, symbol: str, *, provider: str | None = None) -> list[Bar]:
+    def warmup_trading_days_by_symbol(self) -> dict[str, int]:
+        return effective_warmup_trading_days_by_symbol(self.app_config, self.enabled_deployments)
+
+    def warmup_trading_days_for_symbol(self, symbol: str) -> int:
+        return self.warmup_trading_days_by_symbol().get(
+            symbol,
+            legacy_effective_warmup_trading_days(self.app_config),
+        )
+
+    async def warm_start_symbol(
+        self,
+        symbol: str,
+        *,
+        provider: str | None = None,
+        warmup_trading_days: int | None = None,
+    ) -> list[Bar]:
         """Warm start bars for a symbol using the configured provider."""
         provider = provider or self.provider_config.underlying_live_primary
         end = datetime.now(UTC)
-        start = trading_window_start(end, self.app_config.warmup_trading_days + 3)
+        days = warmup_trading_days if warmup_trading_days is not None else self.warmup_trading_days_for_symbol(symbol)
+        start = trading_window_start(end, days)
 
         if provider == "schwab":
             source = SchwabBarSource()
@@ -303,10 +325,12 @@ class BhikshaRuntime:
                     )
                 output("TOKEN_HEALTH Schwab tokens are valid")
 
+            warmup_days_by_symbol = self.warmup_trading_days_by_symbol()
             for symbol in symbols:
-                warmed = await self.warm_start_symbol(symbol)
+                warmup_days = warmup_days_by_symbol.get(symbol, legacy_effective_warmup_trading_days(self.app_config))
+                warmed = await self.warm_start_symbol(symbol, warmup_trading_days=warmup_days)
                 store.extend(symbol, warmed)
-                output(f"WARMED {symbol} bars={len(warmed)}")
+                output(f"WARMED {symbol} bars={len(warmed)} warmup_trading_days={warmup_days}")
 
             if max_bars == 0:
                 output("Stopping after warm start because --max-bars=0")
@@ -468,10 +492,23 @@ class BhikshaRuntime:
             self.stop()
 
     def startup_snapshot(self, *, live: bool, max_bars: int | None) -> dict:
+        warmup_by_symbol = effective_warmup_trading_days_by_symbol(self.app_config, self.enabled_deployments)
+        warmup_by_deployment = effective_warmup_trading_days_by_deployment(self.app_config, self.enabled_deployments)
         payload = {
             "app": self.app_config.model_dump(),
             "providers": self.provider_config.model_dump(),
             "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
+            "warmup": {
+                "policy": "feature_contract_v1",
+                "legacy_base_trading_days": self.app_config.warmup_trading_days,
+                "legacy_effective_trading_days": legacy_effective_warmup_trading_days(self.app_config),
+                "effective_trading_days": effective_warmup_trading_days_for_deployments(
+                    self.app_config,
+                    self.enabled_deployments,
+                ),
+                "by_symbol": warmup_by_symbol,
+                "by_deployment": warmup_by_deployment,
+            },
             "deployment_selection": self.deployment_selection,
             "active_plan": self.active_plan,
             "strategy_catalog": [

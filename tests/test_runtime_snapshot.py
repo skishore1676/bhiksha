@@ -34,6 +34,22 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     deployment_symbols = {deployment["symbol"] for deployment in snapshot["deployments"]}
     assert "market_impulse_qqq_short_v1" in deployment_ids
     assert "SPY" in deployment_symbols
+    assert snapshot["warmup"]["policy"] == "feature_contract_v1"
+    assert snapshot["warmup"]["legacy_effective_trading_days"] == 5
+    assert snapshot["warmup"]["effective_trading_days"] >= 5
+    assert snapshot["warmup"]["by_symbol"]
+
+
+def test_runtime_warmup_expands_for_hourly_market_impulse() -> None:
+    runtime = build_runtime()
+    runtime.deployments[0].symbol = "MU"
+    runtime.deployments[0].strategy.key = "market_impulse"
+    runtime.deployments[0].strategy.params = {
+        "regime_timeframe": "1h",
+        "vwma_periods": [10, 20, 40],
+    }
+
+    assert runtime.warmup_trading_days_for_symbol("MU") == 9
 
 
 def test_build_runtime_respects_configured_bias_inputs_path(tmp_path: Path) -> None:
