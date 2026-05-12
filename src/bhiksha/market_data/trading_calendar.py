@@ -6,6 +6,13 @@ from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 
 
+SPECIAL_FULL_DAY_CLOSURES: frozenset[date] = frozenset(
+    {
+        date(2025, 1, 9),  # National Day of Mourning for President Jimmy Carter.
+    }
+)
+
+
 def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
     first_day = date(year, month, 1)
     offset = (weekday - first_day.weekday()) % 7
@@ -36,6 +43,14 @@ def _easter(year: int) -> date:
     return date(year, month, day)
 
 
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    first_next_month = date(year + int(month == 12), 1 if month == 12 else month + 1, 1)
+    candidate = first_next_month - timedelta(days=1)
+    while candidate.weekday() != weekday:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 @lru_cache(maxsize=16)
 def nyse_holidays(year: int) -> frozenset[date]:
     holidays = {
@@ -43,18 +58,15 @@ def nyse_holidays(year: int) -> frozenset[date]:
         _nth_weekday_of_month(year, 1, 0, 3),
         _nth_weekday_of_month(year, 2, 0, 3),
         _easter(year) - timedelta(days=2),
-        _observe(date(year, 6, 19)),
         _observe(date(year, 7, 4)),
         _nth_weekday_of_month(year, 9, 0, 1),
         _nth_weekday_of_month(year, 11, 3, 4),
         _observe(date(year, 12, 25)),
+        _last_weekday_of_month(year, 5, 0),
     }
-
-    first_monday = _nth_weekday_of_month(year, 5, 0, 1)
-    last_monday = first_monday + timedelta(weeks=4)
-    if last_monday.month != 5:
-        last_monday = first_monday + timedelta(weeks=3)
-    holidays.add(last_monday)
+    if year >= 2022:
+        holidays.add(_observe(date(year, 6, 19)))
+    holidays.update(d for d in SPECIAL_FULL_DAY_CLOSURES if d.year == year)
 
     return frozenset(holidays)
 
