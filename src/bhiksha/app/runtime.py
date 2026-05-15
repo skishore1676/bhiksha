@@ -34,6 +34,7 @@ from bhiksha.integrations.schwab.settings import SchwabSettings
 from bhiksha.integrations.schwab.token_store import read_tokens
 from bhiksha.market_data.bar_store import RollingBarStore
 from bhiksha.market_data.adapters.polygon import PolygonBarSource
+from bhiksha.market_data.adapters.public import PublicBarSource
 from bhiksha.market_data.adapters.schwab import SchwabBarSource
 from bhiksha.market_data.daemon import DataIngestionDaemon
 from bhiksha.market_data.feature_service import FeatureService
@@ -115,19 +116,31 @@ class BhikshaRuntime:
 
     async def health_report(self) -> StartupReport:
         """Collect a dry-run startup health summary."""
-        public_ok, public_detail = await check_public_auth()
-        polygon_ok, polygon_detail = await check_polygon()
-        schwab_ok, schwab_detail = await check_schwab_setup()
-        token_ok, token_detail = await check_schwab_token_health()
+        configured_providers = {
+            self.provider_config.underlying_live_primary,
+            self.provider_config.underlying_backfill_primary,
+            self.provider_config.execution_broker_primary,
+        }
+        provider_health: list[ProviderHealth] = []
+        if "public" in configured_providers:
+            public_ok, public_detail = await check_public_auth()
+            provider_health.append(ProviderHealth(name="public", ok=public_ok, detail=public_detail))
+        if "polygon" in configured_providers:
+            polygon_ok, polygon_detail = await check_polygon()
+            provider_health.append(ProviderHealth(name="polygon", ok=polygon_ok, detail=polygon_detail))
+        if "schwab" in configured_providers:
+            schwab_ok, schwab_detail = await check_schwab_setup()
+            token_ok, token_detail = await check_schwab_token_health()
+            provider_health.extend(
+                [
+                    ProviderHealth(name="schwab", ok=schwab_ok, detail=schwab_detail),
+                    ProviderHealth(name="schwab_token", ok=token_ok, detail=token_detail),
+                ]
+            )
         return StartupReport(
             dry_run=self.app_config.dry_run,
             enabled_deployments=[deployment.deployment_id for deployment in self.enabled_deployments],
-            provider_health=[
-                ProviderHealth(name="public", ok=public_ok, detail=public_detail),
-                ProviderHealth(name="polygon", ok=polygon_ok, detail=polygon_detail),
-                ProviderHealth(name="schwab", ok=schwab_ok, detail=schwab_detail),
-                ProviderHealth(name="schwab_token", ok=token_ok, detail=token_detail),
-            ],
+            provider_health=provider_health,
         )
 
     def warmup_trading_days_by_symbol(self) -> dict[str, int]:
@@ -154,6 +167,12 @@ class BhikshaRuntime:
 
         if provider == "schwab":
             source = SchwabBarSource()
+            try:
+                return await source.warm_start(symbol, start, end)
+            finally:
+                await source.close()
+        if provider == "public":
+            source = PublicBarSource()
             try:
                 return await source.warm_start(symbol, start, end)
             finally:
@@ -213,7 +232,11 @@ class BhikshaRuntime:
         broker = supervisor.planner.order_manager.broker
         source = self._live_bar_source()
         public_token_daemon = PublicTokenRefreshDaemon()
-        schwab_token_daemon = SchwabTokenRefreshDaemon()
+        schwab_token_daemon = (
+            SchwabTokenRefreshDaemon()
+            if self.provider_config.underlying_live_primary == "schwab"
+            else None
+        )
 
         async def handle_provider_backoff(symbol: str, provider: str, exc: Exception) -> None:
             await _append_event_best_effort(
@@ -338,7 +361,11 @@ class BhikshaRuntime:
 
             output("Waiting for newly closed 1-minute bars...")
             public_token_task = asyncio.create_task(public_token_daemon.run())
-            schwab_token_task = asyncio.create_task(schwab_token_daemon.run())
+            schwab_token_task = (
+                asyncio.create_task(schwab_token_daemon.run())
+                if schwab_token_daemon is not None
+                else None
+            )
             pending_exit_task = asyncio.create_task(
                 self._pending_exit_loop(
                     supervisor=supervisor,
@@ -377,12 +404,13 @@ class BhikshaRuntime:
             background_tasks.update(
                 {
                     "public_token_daemon": public_token_task,
-                    "schwab_token_daemon": schwab_token_task,
                     "pending_exit_loop": pending_exit_task,
                     "manual_intrabar_loop": manual_intrabar_task,
                     "reconciliation_loop": reconciliation_task,
                 }
             )
+            if schwab_token_task is not None:
+                background_tasks["schwab_token_daemon"] = schwab_token_task
             daemon_task = asyncio.create_task(daemon.run(max_bars=max_bars))
             seen = 0
             while True:
@@ -473,14 +501,16 @@ class BhikshaRuntime:
             for queue_ in symbol_queues.values():
                 await queue_.put(None)
             public_token_daemon.stop()
-            schwab_token_daemon.stop()
+            if schwab_token_daemon is not None:
+                schwab_token_daemon.stop()
             stop_event.set()
             reconcile_trigger.set()
             await _cancel_and_await([daemon_task, *background_tasks.values()])
         finally:
             daemon.stop()
             public_token_daemon.stop()
-            schwab_token_daemon.stop()
+            if schwab_token_daemon is not None:
+                schwab_token_daemon.stop()
             stop_event.set()
             reconcile_trigger.set()
             for queue_ in symbol_queues.values():
@@ -590,6 +620,8 @@ class BhikshaRuntime:
         provider = self.provider_config.underlying_live_primary
         if provider == "schwab":
             return SchwabBarSource(poll_interval_seconds=self.app_config.bar_poll_interval_seconds)
+        if provider == "public":
+            return PublicBarSource(poll_interval_seconds=self.app_config.bar_poll_interval_seconds)
         if provider == "polygon":
             return PolygonBarSource()
         raise ValueError(f"Unsupported live provider: {provider}")

@@ -1,4 +1,3 @@
-underlying_live_primary: schwab
-underlying_backfill_primary: polygon
+underlying_live_primary: public
+underlying_backfill_primary: public
 execution_broker_primary: public
-

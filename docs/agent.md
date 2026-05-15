@@ -11,6 +11,20 @@ Purpose: keep a simple running record of what we changed, what we decided, and w
 
 ## Session Log
 
+### 2026-05-14
+
+Completed:
+
+- Switched the default provider contract to Public for underlying live bars, underlying warm starts/backfill, option-chain discovery, option quotes, and execution.
+- Added `PublicBarSource` for Public one-minute historical bars, latest completed bars, and live underlying quote lookup.
+- Added `PublicOptionChainService` so the execution planner no longer depends on Schwab for default contract discovery.
+- Kept Schwab and Polygon adapters available as explicit fallback/diagnostic paths, but removed them from default startup health and token-daemon requirements.
+
+Key decisions:
+
+- Public is now the default production provider surface. Polygon and Schwab are optional compatibility tools, not required startup dependencies.
+- Public bars are filtered locally from Public's period-based historical endpoint; cached/parquet research data can still be reused.
+
 ### 2026-03-29
 
 Completed:

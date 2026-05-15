@@ -151,8 +151,8 @@ class AppConfig(BaseModel):
 
 
 class ProviderConfig(BaseModel):
-    underlying_live_primary: str = "schwab"
-    underlying_backfill_primary: str = "polygon"
+    underlying_live_primary: str = "public"
+    underlying_backfill_primary: str = "public"
     execution_broker_primary: str = "public"
 
 

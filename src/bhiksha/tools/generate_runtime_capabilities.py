@@ -222,7 +222,7 @@ def _sample_ohlcv() -> pl.DataFrame:
 
 
 def _opening_drive_frame(regime: str) -> pl.DataFrame:
-    closes = [100.0, 100.15, 100.2, 100.35, 100.4, 100.45, 100.5, 100.55, 100.6, 100.7]
+    closes = [100.0, 100.15, 100.2, 100.35, 100.4, 100.45, 100.55]
     start = datetime(2026, 4, 1, 13, 30, tzinfo=UTC)
     timestamps = [start + timedelta(minutes=5 * idx) for idx in range(len(closes))]
     opens = [closes[0], *closes[:-1]]
@@ -236,6 +236,7 @@ def _opening_drive_frame(regime: str) -> pl.DataFrame:
             "close": closes,
             "volume": [1000.0] * len(closes),
             "directional_mass": [1.0] * len(closes),
+            "accel_1m": [0.1] * len(closes),
             "impulse_regime_5m": [regime] * len(closes),
         }
     )

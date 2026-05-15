@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from bhiksha.domain.models import Bar
 from bhiksha.market_data.adapters.polygon import PolygonBarSource
+from bhiksha.market_data.adapters.public import PublicBarSource
 from bhiksha.tools.export_thinkorswim_study import ThinkorswimTrade, load_trades
 
 
@@ -33,7 +34,7 @@ async def build_chart_review(
     start_date: date | None = None,
     end_date: date | None = None,
     include_open: bool = True,
-    candle_source: str = "polygon",
+    candle_source: str = "public",
     include_extended_hours: bool = False,
 ) -> Path:
     trades = load_trades(
@@ -102,11 +103,17 @@ async def _fetch_bars(
     *,
     candle_source: str,
 ) -> list[Bar]:
-    if candle_source != "polygon":
-        raise ValueError(f"Unsupported candle source: {candle_source}")
     start, end = _bar_window(trades)
-    source = PolygonBarSource()
-    return await source.warm_start(symbol, start, end)
+    if candle_source == "public":
+        source = PublicBarSource()
+        try:
+            return await source.warm_start(symbol, start, end)
+        finally:
+            await source.close()
+    if candle_source == "polygon":
+        source = PolygonBarSource()
+        return await source.warm_start(symbol, start, end)
+    raise ValueError(f"Unsupported candle source: {candle_source}")
 
 
 def _bar_window(trades: list[ThinkorswimTrade]) -> tuple[datetime, datetime]:
@@ -266,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="Include all persisted trades instead of the --days window")
     parser.add_argument("--closed-only", action="store_true", help="Only include closed trades")
     parser.add_argument("--include-extended-hours", action="store_true", help="Include premarket/after-hours candles")
+    parser.add_argument("--candle-source", choices=("public", "polygon"), default="public")
     args = parser.parse_args(argv)
 
     output_dir = Path(args.output_dir)
@@ -291,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
             start_date=start_date,
             end_date=end_date,
             include_open=not args.closed_only,
+            candle_source=args.candle_source,
             include_extended_hours=args.include_extended_hours,
         )
     )

@@ -6,7 +6,7 @@ The live trade source remains `oldmac`. The review viewer runs from this dev rep
 
 ## What The Viewer Shows
 
-- one-minute underlying candles from Polygon
+- one-minute underlying candles from Public by default, with Polygon still available as an explicit fallback
 - executed Bhiksha trades from `oldmac:/Users/sunny/Documents/bhiksha/bhiksha.db`
 - entry and exit markers on the underlying chart
 - trade cards with short IDs such as `e405`, `ad87`, `9698`
@@ -105,14 +105,14 @@ The recommended setup is:
 Prerequisites on the dev machine:
 
 - SSH alias `oldmac` works
-- `.env` has `POLYGON_API_KEY`
+- `.env` has Public credentials (`PUBLIC_SECRET_TOKEN` or a valid session); use `--candle-source polygon` only when intentionally falling back
 - `.venv` is installed
 
 Check:
 
 ```bash
 ssh oldmac 'test -f /Users/sunny/Documents/bhiksha/bhiksha.db && echo ok'
-grep '^POLYGON_API_KEY=' .env
+grep '^PUBLIC_SECRET_TOKEN=' .env
 ```
 
 No process needs to be added to `oldmac` for normal review. That keeps the trading server simple.
@@ -137,7 +137,7 @@ This refreshes the generated files. The `http.server` process can stay running s
 ## Data Integrity Rules
 
 - Trade data comes from a copied SQLite snapshot from `oldmac`.
-- Candle data comes from Polygon one-minute aggregate bars.
+- Candle data comes from Public one-minute bars by default.
 - Missing candles are shown as warnings.
 - The app does not synthesize prices.
 - With `Collapse gaps` enabled, only visual spacing changes; timestamps in the details remain the original Central times.
