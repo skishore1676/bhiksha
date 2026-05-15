@@ -25,6 +25,10 @@ Key decisions:
 - Public is now the default production provider surface. Polygon and Schwab are optional compatibility tools, not required startup dependencies.
 - Public bars are filtered locally from Public's period-based historical endpoint; cached/parquet research data can still be reused.
 
+Follow-up:
+
+- Rolled market-data defaults back to Schwab live bars, Polygon backfill, and Schwab option-chain discovery after a live Public probe confirmed `DAY/ONE_MINUTE` works but multi-day `ONE_MINUTE` historical periods return HTTP 400. Public remains available as explicit experimental market data and remains the execution broker.
+
 ### 2026-03-29
 
 Completed:

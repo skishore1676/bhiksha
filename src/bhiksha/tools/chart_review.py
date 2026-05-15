@@ -34,7 +34,7 @@ async def build_chart_review(
     start_date: date | None = None,
     end_date: date | None = None,
     include_open: bool = True,
-    candle_source: str = "public",
+    candle_source: str = "polygon",
     include_extended_hours: bool = False,
 ) -> Path:
     trades = load_trades(
@@ -273,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="Include all persisted trades instead of the --days window")
     parser.add_argument("--closed-only", action="store_true", help="Only include closed trades")
     parser.add_argument("--include-extended-hours", action="store_true", help="Include premarket/after-hours candles")
-    parser.add_argument("--candle-source", choices=("public", "polygon"), default="public")
+    parser.add_argument("--candle-source", choices=("public", "polygon"), default="polygon")
     args = parser.parse_args(argv)
 
     output_dir = Path(args.output_dir)

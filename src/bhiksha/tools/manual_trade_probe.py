@@ -11,7 +11,7 @@ from bhiksha.app.bootstrap import build_runtime
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionSelectionRequest
 from bhiksha.execution.order_manager import OrderManager
-from bhiksha.options.public_chain import PublicOptionChainService
+from bhiksha.integrations.schwab.chain import SchwabOptionChainService
 from bhiksha.options.vehicle_resolver import VehicleResolver
 from bhiksha.persistence.sqlite import SQLiteEventRepository
 
@@ -38,7 +38,7 @@ async def _run(symbol: str, quantity: int, live: bool, confirm_live: str | None)
     )
 
     repo = SQLiteEventRepository(runtime.app_config.sqlite_path)
-    chain_service = PublicOptionChainService()
+    chain_service = SchwabOptionChainService()
     resolver = VehicleResolver()
     order_manager = OrderManager()
     try:
