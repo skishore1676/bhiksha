@@ -17,16 +17,28 @@ from bhiksha.shared_kernel import ensure_kernel_on_path
 from bhiksha.state.lifecycle import TradeLifecycleStore
 
 ensure_kernel_on_path()
-from mala_bhiksha_kernel import ExecutionPacket, PacketStatus, RuntimeMode, read_packet_file  # noqa: E402
+from mala_bhiksha_kernel import (  # noqa: E402
+    ExecutionPacket,
+    ManagementPolicySpec,
+    PacketStatus,
+    RuntimeMode,
+    read_packet_file,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ManagementLifecycleSpec:
     policy_id: str
+    stop_family: str
+    stop_anchor: str
+    exit_family: str
+    target_model: str
     stop_loss_pct: float
+    option_stop_fallback_pct: float
     target_r: float
     hard_flat_time_et: str
     target_order_mode: str
+    source_config_id: str | None
     source: str
 
 
@@ -303,15 +315,23 @@ def _packet_blocks(ticket: dict[str, Any], packet: ExecutionPacket) -> list[str]
 def _resolve_management_policy(packet: ExecutionPacket, policy_id: str) -> ManagementLifecycleSpec | None:
     specs = packet.runtime_controls.get("management_policy_specs")
     if isinstance(specs, dict) and isinstance(specs.get(policy_id), dict):
-        raw = specs[policy_id]
+        raw = ManagementPolicySpec.model_validate(specs[policy_id])
         return ManagementLifecycleSpec(
             policy_id=policy_id,
-            stop_loss_pct=float(raw.get("stop_loss_pct", 0.45)),
-            target_r=float(raw.get("target_r", 1.0)),
-            hard_flat_time_et=str(raw.get("hard_flat_time_et", "15:55")),
-            target_order_mode=str(raw.get("target_order_mode", "virtual_or_broker")),
+            stop_family=raw.stop_family,
+            stop_anchor=raw.stop_anchor,
+            exit_family=raw.exit_family,
+            target_model=raw.target_model,
+            stop_loss_pct=float(raw.option_stop_fallback_pct),
+            option_stop_fallback_pct=float(raw.option_stop_fallback_pct),
+            target_r=float(raw.target_r),
+            hard_flat_time_et=raw.hard_flat_time_et,
+            target_order_mode=raw.target_order_mode,
+            source_config_id=raw.source_config_id,
             source="packet_runtime_controls",
         )
+    if packet.runtime_controls.get("management_policy_specs_required") is True:
+        return None
     defaults = {
         "reversal_extreme__fixed_1r": 1.0,
         "immediate_entry_bar_failure__fixed_2r": 2.0,
@@ -320,10 +340,16 @@ def _resolve_management_policy(packet: ExecutionPacket, policy_id: str) -> Manag
         return None
     return ManagementLifecycleSpec(
         policy_id=policy_id,
+        stop_family=policy_id.split("__", 1)[0],
+        stop_anchor="option_premium_fallback",
+        exit_family=policy_id.split("__", 1)[1] if "__" in policy_id else "unknown",
+        target_model="fixed_r",
         stop_loss_pct=0.45,
+        option_stop_fallback_pct=0.45,
         target_r=defaults[policy_id],
         hard_flat_time_et="15:55",
         target_order_mode="virtual_or_broker",
+        source_config_id=None,
         source="bhiksha_default_playbook_policy_v1",
     )
 

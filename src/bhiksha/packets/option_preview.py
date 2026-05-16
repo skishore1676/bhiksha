@@ -20,7 +20,7 @@ from bhiksha.shared_kernel import ensure_kernel_on_path
 from bhiksha.state.position_tracker import PositionTracker
 
 ensure_kernel_on_path()
-from mala_bhiksha_kernel import ExecutionPacket, read_packet_file  # noqa: E402
+from mala_bhiksha_kernel import ExecutionPacket, ManagementPolicySpec, read_packet_file  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +33,7 @@ class PlaybookOptionPreviewResult:
     direction: str
     timestamp: str
     selected_management_policy_id: str
+    management_spec: dict[str, Any]
     intent_artifact: str
     option_symbol: str
     quantity: int
@@ -70,11 +71,15 @@ async def build_playbook_option_preview(
 
     block_reasons = _intent_blocks(intent)
     block_reasons.extend(_packet_blocks(intent, packet))
+    management_spec = _resolve_management_policy(packet, str(intent.get("selected_management_policy_id", "")))
+    if management_spec is None and packet.runtime_controls.get("management_policy_specs_required") is True:
+        block_reasons.append(f"management_policy_spec_missing:{intent.get('selected_management_policy_id')}")
 
     plan: TradePlan | None = None
     if not block_reasons:
         deployment = _preview_deployment(
             intent,
+            management_spec=management_spec,
             max_trade_premium_usd=max_trade_premium_usd,
             dte_min=dte_min,
             dte_max=dte_max,
@@ -117,6 +122,7 @@ async def build_playbook_option_preview(
         direction=str(intent.get("direction", "")),
         timestamp=str(intent.get("timestamp", "")),
         selected_management_policy_id=str(intent.get("selected_management_policy_id", "")),
+        management_spec=management_spec.model_dump(mode="json") if management_spec is not None else {},
         intent_artifact=str(intent_artifact),
         option_symbol=plan.option_symbol if plan is not None else "",
         quantity=plan.quantity if plan is not None else 0,
@@ -176,6 +182,7 @@ def _packet_blocks(intent: dict[str, Any], packet: ExecutionPacket) -> list[str]
 def _preview_deployment(
     intent: dict[str, Any],
     *,
+    management_spec: ManagementPolicySpec | None,
     max_trade_premium_usd: float,
     dte_min: int,
     dte_max: int,
@@ -184,6 +191,10 @@ def _preview_deployment(
     min_open_interest: int,
     max_bid_ask_spread_pct: float,
 ) -> DeploymentManifest:
+    stop_loss_pct = management_spec.option_stop_fallback_pct if management_spec is not None else 0.45
+    hard_flat_time_et = management_spec.hard_flat_time_et if management_spec is not None else "15:55"
+    target_r = management_spec.target_r if management_spec is not None else 0.0
+    target_model = management_spec.target_model if management_spec is not None else ""
     return DeploymentManifest.model_validate(
         {
             "deployment_id": f"playbook_preview_{_slug(str(intent['packet_id']))}_{intent['symbol']}_{intent['direction']}",
@@ -212,15 +223,16 @@ def _preview_deployment(
             "risk": {
                 "profile": "conservative_day1",
                 "max_trade_premium_usd": max_trade_premium_usd,
-                "hard_flat_time_et": "15:55",
-                "stop_loss_pct": 0.45,
+                "hard_flat_time_et": hard_flat_time_et,
+                "stop_loss_pct": stop_loss_pct,
             },
             "exit": {
                 "profile": str(intent["selected_management_policy_id"]),
                 "use_algorithmic_exit": False,
-                "use_profit_target": False,
-                "stop_loss_pct": 0.45,
-                "hard_flat_time_et": "15:55",
+                "use_profit_target": target_model == "fixed_r" and target_r > 0,
+                "profit_target_multiple": target_r if target_r > 0 else None,
+                "stop_loss_pct": stop_loss_pct,
+                "hard_flat_time_et": hard_flat_time_et,
                 "thesis_exit_policy": str(intent["selected_management_policy_id"]),
             },
             "source": {
@@ -233,6 +245,13 @@ def _preview_deployment(
             },
         }
     )
+
+
+def _resolve_management_policy(packet: ExecutionPacket, policy_id: str) -> ManagementPolicySpec | None:
+    specs = packet.runtime_controls.get("management_policy_specs")
+    if isinstance(specs, dict) and isinstance(specs.get(policy_id), dict):
+        return ManagementPolicySpec.model_validate(specs[policy_id])
+    return None
 
 
 def _parse_operator_timestamp(value: str) -> datetime:
@@ -290,6 +309,8 @@ def _preview_markdown(payload: dict[str, Any]) -> str:
             f"- direction: `{payload['direction']}`",
             f"- timestamp: `{payload['timestamp']}`",
             f"- selected_management_policy_id: `{payload['selected_management_policy_id']}`",
+            f"- management_stop_anchor: `{payload['management_spec'].get('stop_anchor', '')}`",
+            f"- management_target_model: `{payload['management_spec'].get('target_model', '')}`",
             f"- option_symbol: `{payload['option_symbol']}`",
             f"- quantity: `{payload['quantity']}`",
             f"- estimated_entry_price: `{payload['estimated_entry_price']}`",

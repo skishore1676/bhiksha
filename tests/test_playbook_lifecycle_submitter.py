@@ -162,6 +162,8 @@ def test_playbook_lifecycle_submits_entry_and_arms_virtual_target(tmp_path: Path
     assert result.target_price == 4.21
     assert result.trade_state == "open_protected"
     assert result.management_spec["target_r"] == 1.0
+    assert result.management_spec["stop_anchor"] == "underlying_reversal_extreme"
+    assert result.management_spec["source"] == "packet_runtime_controls"
     assert order_manager.preflight_calls == 1
     assert order_manager.entry_calls == 1
     assert order_manager.stop_calls == 1
@@ -306,6 +308,33 @@ def _execution_packet(
                 "reversal_extreme__fixed_1r",
                 "immediate_entry_bar_failure__fixed_2r",
             ],
+            "management_policy_specs_required": True,
+            "management_policy_specs": {
+                "reversal_extreme__fixed_1r": {
+                    "policy_id": "reversal_extreme__fixed_1r",
+                    "stop_family": "reversal_extreme",
+                    "stop_anchor": "underlying_reversal_extreme",
+                    "exit_family": "fixed_1r",
+                    "target_model": "fixed_r",
+                    "target_r": 1.0,
+                    "hard_flat_time_et": "15:55",
+                    "option_stop_fallback_pct": 0.45,
+                    "target_order_mode": "virtual_or_broker",
+                    "source_config_id": "cfg_1",
+                },
+                "immediate_entry_bar_failure__fixed_2r": {
+                    "policy_id": "immediate_entry_bar_failure__fixed_2r",
+                    "stop_family": "immediate_entry_bar_failure",
+                    "stop_anchor": "underlying_entry_bar_failure",
+                    "exit_family": "fixed_2r",
+                    "target_model": "fixed_r",
+                    "target_r": 2.0,
+                    "hard_flat_time_et": "15:55",
+                    "option_stop_fallback_pct": 0.45,
+                    "target_order_mode": "virtual_or_broker",
+                    "source_config_id": "cfg_2",
+                },
+            },
             "shadow_only": shadow_only,
             "live_automated_allowed": False,
             "live_ticket_required": True,

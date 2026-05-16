@@ -126,8 +126,11 @@ def test_option_preview_writes_ready_preview_without_order_submission(tmp_path: 
     assert result.risk_reasons == ["approved"]
     assert result.order_submission_allowed is False
     assert result.live_approval_required is True
+    assert result.management_spec["stop_anchor"] == "underlying_reversal_extreme"
+    assert result.management_spec["target_r"] == 1.0
     payload = json.loads(Path(result.artifact_json).read_text(encoding="utf-8"))
     assert payload["safety_boundary"] == "option_preview_only_no_order_submission"
+    assert payload["management_spec"]["option_stop_fallback_pct"] == 0.45
     assert Path(result.artifact_md).exists()
 
 
@@ -250,6 +253,21 @@ def _execution_packet(runtime_controls: dict | None = None) -> ExecutionPacket:
         runtime_controls=runtime_controls
         or {
             "allowed_management_policy_ids": ["reversal_extreme__fixed_1r"],
+            "management_policy_specs_required": True,
+            "management_policy_specs": {
+                "reversal_extreme__fixed_1r": {
+                    "policy_id": "reversal_extreme__fixed_1r",
+                    "stop_family": "reversal_extreme",
+                    "stop_anchor": "underlying_reversal_extreme",
+                    "exit_family": "fixed_1r",
+                    "target_model": "fixed_r",
+                    "target_r": 1.0,
+                    "hard_flat_time_et": "15:55",
+                    "option_stop_fallback_pct": 0.45,
+                    "target_order_mode": "virtual_or_broker",
+                    "source_config_id": "cfg_1",
+                }
+            },
             "shadow_only": True,
             "live_automated_allowed": False,
             "operator_must_select_management_policy": True,

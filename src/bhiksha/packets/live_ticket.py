@@ -24,6 +24,7 @@ class PlaybookLiveTicketResult:
     direction: str
     timestamp: str
     selected_management_policy_id: str
+    management_spec: dict[str, Any]
     option_preview_artifact: str
     option_symbol: str
     quantity: int
@@ -78,6 +79,7 @@ def create_playbook_live_ticket(
         direction=str(preview.get("direction", "")),
         timestamp=str(preview.get("timestamp", "")),
         selected_management_policy_id=str(preview.get("selected_management_policy_id", "")),
+        management_spec=dict(preview.get("management_spec", {}) or {}),
         option_preview_artifact=str(option_preview_artifact),
         option_symbol=str(preview.get("option_symbol", "")),
         quantity=int(preview.get("quantity", 0) or 0),
@@ -159,6 +161,8 @@ def _ticket_markdown(payload: dict[str, Any]) -> str:
             f"- packet: `{payload['packet_id']}` v`{payload['packet_version']}`",
             f"- symbol: `{payload['symbol']}`",
             f"- direction: `{payload['direction']}`",
+            f"- management_policy_id: `{payload['selected_management_policy_id']}`",
+            f"- management_stop_anchor: `{payload['management_spec'].get('stop_anchor', '')}`",
             f"- option_symbol: `{payload['option_symbol']}`",
             f"- quantity: `{payload['quantity']}`",
             f"- limit_price: `{payload['limit_price']}`",

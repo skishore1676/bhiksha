@@ -114,6 +114,7 @@ def test_live_ticket_approval_writes_order_allowed_ticket_without_submission(tmp
     payload = json.loads(Path(result.artifact_json).read_text(encoding="utf-8"))
     assert payload["lane"] == "live"
     assert payload["submitter_status"] == "not_submitted"
+    assert payload["management_spec"]["stop_anchor"] == "underlying_reversal_extreme"
 
 
 def test_live_ticket_reject_records_non_submittable_ticket(tmp_path: Path) -> None:
@@ -185,6 +186,18 @@ def _write_preview(
         "direction": "short",
         "timestamp": "2026-05-11 09:40 America/Chicago",
         "selected_management_policy_id": "reversal_extreme__fixed_1r",
+        "management_spec": {
+            "policy_id": "reversal_extreme__fixed_1r",
+            "stop_family": "reversal_extreme",
+            "stop_anchor": "underlying_reversal_extreme",
+            "exit_family": "fixed_1r",
+            "target_model": "fixed_r",
+            "target_r": 1.0,
+            "hard_flat_time_et": "15:55",
+            "option_stop_fallback_pct": 0.45,
+            "target_order_mode": "virtual_or_broker",
+            "source_config_id": "cfg_1",
+        },
         "option_symbol": "IWM260330P00558000",
         "quantity": 1,
         "estimated_entry_price": 2.90,

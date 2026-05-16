@@ -199,14 +199,35 @@ artifacts/playbook/lifecycle/<lifecycle_id>/playbook_lifecycle_submission.json
 artifacts/playbook/lifecycle/<lifecycle_id>/PLAYBOOK_LIFECYCLE_SUBMISSION.md
 ```
 
-The supported default policy mapping is:
+Management now comes from `runtime_controls.management_policy_specs` when the
+packet provides it. Each policy spec carries:
+
+```text
+policy_id
+stop_family
+stop_anchor
+exit_family
+target_model
+target_r
+hard_flat_time_et
+option_stop_fallback_pct
+target_order_mode
+source_config_id
+```
+
+Bhiksha records this spec in option preview, live ticket, and lifecycle
+artifacts. The option-premium stop remains the broker-protective fallback; the
+next management depth layer is live monitoring of the underlying stop anchor.
+
+The compatibility fallback policy mapping is:
 
 ```text
 reversal_extreme__fixed_1r -> 45% option-premium stop, 1R target, hard flat 15:55 ET
 immediate_entry_bar_failure__fixed_2r -> 45% option-premium stop, 2R target, hard flat 15:55 ET
 ```
 
-Future packets can override these through `runtime_controls.management_policy_specs`.
+New packets should provide `runtime_controls.management_policy_specs` and may
+set `management_policy_specs_required=true` to forbid hidden defaults.
 
 ## Execution Boundary
 
