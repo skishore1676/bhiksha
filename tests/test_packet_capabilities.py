@@ -13,7 +13,7 @@ from mala_bhiksha_kernel import write_packet  # noqa: E402
 def test_packet_capability_manifest_supports_reversion_shadow_after_signal_parity(tmp_path):
     manifest = build_packet_capability_manifest()
     _write_parity_report(tmp_path)
-    packet_path = write_packet(tmp_path, _execution_packet())
+    packet_path = write_packet(tmp_path, _execution_packet(feature_contract=manifest.feature_contracts[0]))
 
     result = compile_packet_for_runtime(packet_path, capability_manifest=manifest)
 

@@ -31,6 +31,7 @@ class PacketCompileResult:
     executable: bool
     block_reasons: list[str]
     feature_contract_id: str
+    feature_contract_fingerprint: str
     runtime_mode: str | None = None
     management_policy_ids: list[str] | None = None
 
@@ -76,6 +77,7 @@ def compile_packet_for_runtime(
         executable=not block_reasons,
         block_reasons=block_reasons,
         feature_contract_id=packet.feature_contract.contract_id,
+        feature_contract_fingerprint=packet.feature_contract.fingerprint,
         runtime_mode=runtime_mode,
         management_policy_ids=management_policy_ids,
     )
@@ -211,6 +213,8 @@ def _capability_blocks(
         return ["capability_manifest_missing"]
     if not capability_manifest.supports_feature_contract(packet.feature_contract.contract_id):
         return [f"feature_contract_not_supported:{packet.feature_contract.contract_id}"]
+    if not capability_manifest.supports_exact_feature_contract(packet.feature_contract):
+        return [f"feature_contract_mismatch:{packet.feature_contract.contract_id}"]
 
     capability = _matching_capability(packet, capability_manifest)
     if capability is None:

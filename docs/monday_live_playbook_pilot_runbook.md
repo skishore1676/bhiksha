@@ -19,6 +19,13 @@ operator approval gated. This is not autonomous trading.
 
 ## Preflight
 
+The easiest Monday entrypoint is the guided pilot desk:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.playbook_pilot_desk preflight
+```
+
 ```bash
 PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
   -m bhiksha.tools.compile_packet \
@@ -27,8 +34,15 @@ PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
   --legacy-retirement-report artifacts/legacy_retirement/current.json
 ```
 
-Expected: `executable=true`, `runtime_mode=live_approval_gated`, no block
-reasons.
+Expected: `eligibility=eligible`, `executable=true`,
+`runtime_mode=live_approval_gated`, no block reasons.
+
+Check where you are in the flow:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.playbook_pilot_desk latest
+```
 
 ## Operator Flow
 
@@ -41,6 +55,16 @@ reasons.
 6. Start the live management monitor in dry mode first.
 7. After the lifecycle/trade state looks correct, restart the monitor with
    `--execute`.
+
+The guided version walks those first five steps with prompts:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.playbook_pilot_desk guided
+```
+
+By default, `guided` stops after an approved live ticket. To let it ask about
+broker submission too, add `--allow-live-submit`.
 
 ## Option Preview Example
 

@@ -42,11 +42,11 @@ def main(argv: list[str] | None = None) -> int:
         "version": result.version,
         "kind": result.kind,
         "status": result.status,
-        "decision": result.decision,
         "eligibility": result.eligibility,
         "executable": result.executable,
         "block_reasons": result.block_reasons,
         "feature_contract_id": result.feature_contract_id,
+        "feature_contract_fingerprint": result.feature_contract_fingerprint,
         "runtime_mode": result.runtime_mode,
         "management_policy_ids": result.management_policy_ids or [],
     }
