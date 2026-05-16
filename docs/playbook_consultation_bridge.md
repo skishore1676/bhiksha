@@ -12,6 +12,7 @@ operator chart read
   -> Bhiksha records the consultation artifact
   -> operator decides take/pass and management policy
   -> Bhiksha records a shadow execution intent
+  -> Bhiksha builds an option preview ticket
 ```
 
 The bridge does not submit orders. It is intentionally shadow-only until the
@@ -89,16 +90,39 @@ The intent can be `shadow_intent_ready`, `operator_pass`, or `blocked`.
 machine-readable handoff for the next option-preview/live-approval layer, not
 an order ticket.
 
+## Option Preview
+
+For a `shadow_intent_ready` artifact, Bhiksha can resolve the option candidate
+and run the same chain/quote/risk checks used by the execution planner:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.preview_playbook_option \
+  --intent-artifact artifacts/playbook/intents/<intent_id>/playbook_operator_decision.json \
+  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v1.json \
+  --underlying-price 210.25
+```
+
+It writes:
+
+```text
+artifacts/playbook/option_previews/<preview_id>/playbook_option_preview.json
+artifacts/playbook/option_previews/<preview_id>/PLAYBOOK_OPTION_PREVIEW.md
+```
+
+The preview can be `option_preview_ready` or `blocked`. A ready preview includes
+the option symbol, quantity, estimated entry price, and risk reasons. It still
+has `order_submission_allowed=false` and `live_approval_required=true`.
+
 ## Execution Boundary
 
 The current bridge is a consultation backend, not live trading automation.
 
 For live use, the next layer must add:
 
-1. option selection preview with liquidity and risk checks
-2. explicit live approval gate
-3. order submission and position manager
-4. fill/fire/outcome feedback artifact back to Mala
+1. explicit live approval gate
+2. order submission and position manager
+3. fill/fire/outcome feedback artifact back to Mala
 
 Until those exist, a green operator decision means "record the consultation and
 prepare the shadow decision," not "place a live order."
