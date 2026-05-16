@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from bhiksha.config.loader import load_active_plan
-from bhiksha.tools.sync_active_plan import main as sync_active_plan_main
+from bhiksha.tools.sync_active_plan import _write_if_changed, main as sync_active_plan_main
 
 
 def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -106,6 +106,40 @@ def test_sync_active_plan_logs_compile_failures(tmp_path: Path, monkeypatch: pyt
     log_entry = json.loads(log_files[0].read_text(encoding="utf-8").splitlines()[0])
     assert log_entry["status"] == "error"
     assert log_entry["error"] == "sheet access failed"
+
+
+def test_write_if_changed_preserves_existing_file_when_temp_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "active_plan.json"
+    output_path.write_text('{"active_plan_id": "previous"}\n', encoding="utf-8")
+
+    class FailingTempFile:
+        name = str(tmp_path / ".active_plan.json.fail.tmp")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def write(self, payload: str) -> None:
+            del payload
+            raise OSError("disk full")
+
+        def flush(self) -> None:
+            return None
+
+        def fileno(self) -> int:
+            return 0
+
+    monkeypatch.setattr("bhiksha.tools.sync_active_plan.tempfile.NamedTemporaryFile", lambda *args, **kwargs: FailingTempFile())
+
+    with pytest.raises(OSError, match="disk full"):
+        _write_if_changed(output_path, '{"active_plan_id": "new"}\n')
+
+    assert output_path.read_text(encoding="utf-8") == '{"active_plan_id": "previous"}\n'
 
 
 def _compiled_plan(active_plan_id: str):
