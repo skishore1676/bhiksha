@@ -311,6 +311,47 @@ def test_compile_active_plan_suppresses_invalid_rows_but_keeps_valid_rows(tmp_pa
     assert "manual_setup_type=manual_trigger or breakout" in compiled.plan.suppressed[0]["reason"]
 
 
+def test_compile_active_plan_suppresses_manual_row_with_invalid_after_time(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_impulse.yaml", strategy_id="market_impulse_spy_short_v1", symbol="SPY")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "id": "spy_strategy_lane",
+                "type": "strategy",
+                "mode": "shadow",
+                "strategy": "market_impulse_spy_short_v1",
+            },
+            {
+                "id": "bad_manual_after",
+                "type": "manual",
+                "setup": "breakout",
+                "mode": "shadow",
+                "symbol": "SPY",
+                "direction": "long",
+                "trigger": "603.25",
+                "trigger_when": "ABOVE",
+                "after": "bad-time",
+            },
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-04-10",
+    )
+
+    assert [deployment.deployment_id for deployment in compiled.plan.deployments] == ["spy_strategy_lane"]
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert compiled.plan.suppressed[0]["row_id"] == "bad_manual_after"
+    assert "Invalid time value" in compiled.plan.suppressed[0]["reason"]
+
+
 def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_tabs(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
@@ -1081,6 +1122,76 @@ def test_sync_google_strategy_catalog_writes_active_or_candidate_bhiksha_ready_s
     assert not (catalog_root / "google_promoted" / "not_ready.yaml").exists()
     assert not (catalog_root / "google_promoted" / "retired.yaml").exists()
     assert not (catalog_root / "google_promoted" / "unsupported.yaml").exists()
+
+
+def test_sync_google_strategy_catalog_preserves_existing_file_when_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    generated_root = catalog_root / "google_promoted"
+    generated_root.mkdir(parents=True)
+    existing_path = generated_root / "eligible_market_impulse.yaml"
+    existing_path.write_text("strategy_id: previous\n", encoding="utf-8")
+
+    def _fail_write(path: Path, payload: str) -> None:
+        del path, payload
+        raise OSError("disk full")
+
+    monkeypatch.setattr("bhiksha.active_plan.compiler._atomic_yaml_write", _fail_write)
+
+    with pytest.raises(OSError, match="disk full"):
+        sync_google_strategy_catalog(
+            strategy_catalog_path=catalog_root,
+            google_strategy_catalog=[
+                _catalog_sheet_row(
+                    catalog_key="eligible_market_impulse",
+                    symbol="SPY",
+                    strategy_key="market_impulse",
+                    lifecycle_status="active",
+                    bhiksha_ready=True,
+                )
+            ],
+        )
+
+    assert existing_path.read_text(encoding="utf-8") == "strategy_id: previous\n"
+
+
+def test_google_catalog_payload_preserves_explicit_zero_execution_limits(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+
+    sync_google_strategy_catalog(
+        strategy_catalog_path=catalog_root,
+        google_strategy_catalog=[
+            _catalog_sheet_row(
+                catalog_key="zero_dte_market_impulse",
+                symbol="SPY",
+                strategy_key="market_impulse",
+                lifecycle_status="active",
+                bhiksha_ready=True,
+                playbook_summary_json={
+                    "entry_params": {"direction": "short"},
+                    "vehicle_mapping": {
+                        "profile": "single_leg_long_premium_v1",
+                        "dte_min": 0,
+                        "dte_max": 0,
+                        "min_open_interest": 0,
+                        "target_abs_delta_min": 0,
+                        "target_abs_delta_max": 0,
+                    },
+                    "catastrophe_exit_params": {"hard_flat_time_et": "15:55", "stop_loss_pct": 0.45},
+                },
+            )
+        ],
+        operator_defaults={"dte_max": 7, "min_open_interest": 100},
+    )
+
+    payload = yaml.safe_load((catalog_root / "google_promoted" / "zero_dte_market_impulse.yaml").read_text(encoding="utf-8"))
+    assert payload["execution"]["dte_min"] == 0
+    assert payload["execution"]["dte_max"] == 0
+    assert payload["execution"]["min_open_interest"] == 0
+    assert payload["execution"]["target_abs_delta_min"] == 0
+    assert payload["execution"]["target_abs_delta_max"] == 0
 
 
 def test_compile_active_plan_cli_supports_google_sheets_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

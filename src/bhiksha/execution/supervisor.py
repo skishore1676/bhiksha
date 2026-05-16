@@ -370,6 +370,10 @@ class ExecutionSupervisor:
                 "entry_order_id": plan.order_id,
             },
         )
+        protection_error = None if stop_result.order_id else (stop_result.error or "missing_stop_order_id")
+        protection_status = "target_active" if target_order_id and stop_result.order_id else (
+            "open_protected" if stop_result.order_id else "open_unprotected"
+        )
         self.planner.position_tracker.open_position(
             deployment.symbol,
             deployment.deployment_id,
@@ -396,7 +400,7 @@ class ExecutionSupervisor:
                 entry_price=plan.estimated_entry_price,
                 underlying_entry_price=plan.underlying_entry_price,
                 entry_timestamp=plan.entry_timestamp,
-                status="target_active" if target_order_id else "open_protected",
+                status=protection_status,
                 entry_order_id=plan.order_id,
                 stop_order_id=stop_result.order_id,
                 stop_price=stop_price,
@@ -404,7 +408,21 @@ class ExecutionSupervisor:
                 target_price=target_price,
             )
         )
-        if target_order_id:
+        if protection_error is not None:
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": "protective_stop_failure",
+                    "symbol": deployment.symbol,
+                    "deployment_id": deployment.deployment_id,
+                    "trade_id": plan.trade_id,
+                    "option_symbol": plan.option_symbol,
+                    "entry_order_id": plan.order_id,
+                    "error": protection_error,
+                    "stage": "initial_protection",
+                },
+            )
+        if target_order_id and stop_result.order_id:
             transition = self.lifecycle_store.mark_target_active(
                 deployment.symbol,
                 deployment.deployment_id,
@@ -420,8 +438,14 @@ class ExecutionSupervisor:
                 order_id=stop_result.order_id or plan.order_id,
                 protected=bool(stop_result.order_id),
             )
-            await self._emit_lifecycle_transition(transition, reason="entry_filled_open_protected")
-        return replace(plan, stop_order_id=stop_result.order_id, target_order_id=target_order_id)
+            await self._emit_lifecycle_transition(
+                transition,
+                reason="entry_filled_open_protected" if stop_result.order_id else "entry_filled_open_unprotected",
+            )
+        risk_details = dict(plan.risk_details)
+        if protection_error is not None:
+            risk_details["protection_error"] = protection_error
+        return replace(plan, stop_order_id=stop_result.order_id, target_order_id=target_order_id, risk_details=risk_details)
 
     async def manage_open_position(
         self,

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Iterator
 
@@ -207,8 +208,30 @@ def sync_active_plan_once(
 def _write_if_changed(path: Path, payload: str) -> bool:
     if path.exists() and path.read_text(encoding="utf-8") == payload:
         return False
-    path.write_text(payload, encoding="utf-8")
+    _atomic_write_text(path, payload)
     return True
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
 def _env_float(name: str) -> float | None:

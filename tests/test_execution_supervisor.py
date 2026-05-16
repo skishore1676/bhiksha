@@ -130,6 +130,17 @@ class RecordingOrderManager(StubOrderManager):
         return self.portfolio
 
 
+class FailingStopOrderManager(RecordingOrderManager):
+    async def place_stop_loss_order(self, option_symbol: str, stop_price: float, quantity: int):
+        self.calls.append(("place_stop_failed", round(stop_price, 2)))
+
+        class Result:
+            order_id = None
+            error = "broker rejected stop"
+
+        return Result()
+
+
 class StatusMapOrderManager(RecordingOrderManager):
     def __init__(self, statuses: dict[str, tuple[str | None, dict | None, str | None]]):
         super().__init__()
@@ -210,6 +221,57 @@ def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
     assert [row[0] for row in rows] == ["entry_fill_check", "protective_stop_submission", "lifecycle_transition"]
+
+
+def test_execution_supervisor_records_live_entry_unprotected_when_initial_stop_fails(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "trades.db"))
+    bus = InMemoryEventBus()
+    queue = bus.subscribe(TradeLifecycleTransitionEvent)
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(FailingStopOrderManager()),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        event_bus=bus,
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_STOP_FAIL",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    async def run():
+        protected = await supervisor._protect_live_entry(plan, deployment)
+        event = await queue.get()
+        return protected, event
+
+    protected, event = asyncio.run(run())
+
+    assert protected.stop_order_id is None
+    assert protected.risk_details["protection_error"] == "broker rejected stop"
+    assert supervisor.planner.position_tracker.active_positions()[0].stop_order_id is None
+    assert event.new_state == "open_unprotected"
+    trades = asyncio.run(trade_repo.get_open_trades())
+    assert trades[0].status == "open_unprotected"
+    assert trades[0].stop_order_id is None
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+        runtime_issue = conn.execute("SELECT payload FROM events WHERE event_type = 'runtime_issue'").fetchone()[0]
+    assert event_types == ["entry_fill_check", "protective_stop_submission", "runtime_issue", "lifecycle_transition"]
+    issue_payload = json.loads(runtime_issue)
+    assert issue_payload["category"] == "protective_stop_failure"
+    assert issue_payload["error"] == "broker rejected stop"
 
 
 def test_execution_supervisor_publishes_lifecycle_transition_event(tmp_path) -> None:
