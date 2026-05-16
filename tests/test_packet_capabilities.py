@@ -10,12 +10,13 @@ ensure_kernel_on_path()
 from mala_bhiksha_kernel import write_packet  # noqa: E402
 
 
-def test_packet_capability_manifest_declares_reversion_blocked_until_parity(tmp_path):
+def test_packet_capability_manifest_supports_reversion_shadow_after_signal_parity(tmp_path):
     manifest = build_packet_capability_manifest()
     packet_path = write_packet(tmp_path, _execution_packet())
 
     result = compile_packet_for_runtime(packet_path, capability_manifest=manifest)
 
-    assert manifest.capabilities[0].supported is False
-    assert result.executable is False
-    assert result.block_reasons == ["signal_parity_not_passed"]
+    assert manifest.capabilities[0].supported is True
+    assert manifest.capabilities[0].runtime_modes == ["shadow"]
+    assert result.executable is True
+    assert result.block_reasons == []

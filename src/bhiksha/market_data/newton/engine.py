@@ -320,7 +320,9 @@ _MARKET_IMPULSE_SPEC_RE = re.compile(
     r"(?::vwma_(?P<vwma_periods>\d+(?:_\d+)*))?"
     r"$"
 )
-_MARKET_IMPULSE_COLUMN_RE = re.compile(r"^impulse_(?:regime|stage)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$")
+_MARKET_IMPULSE_COLUMN_RE = re.compile(
+    r"^(?:impulse_(?:regime|stage)|market_pulse_stage|vwma_stage)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$"
+)
 _MARKET_IMPULSE_VMA_RE = re.compile(r"^vma_(?P<vma_length>\d+)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$")
 _KINEMATIC_SPEC_RE = re.compile(r"^(?P<kind>velocity|acceleration|jerk)(?::(?P<periods_back>\d+))?$")
 _KINEMATIC_COLUMN_RE = re.compile(r"^(?P<kind>velocity|accel|jerk)_(?P<periods_back>\d+)$")

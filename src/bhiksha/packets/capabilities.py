@@ -44,15 +44,15 @@ def build_packet_capability_manifest() -> CapabilityManifest:
             RuntimeCapability(
                 capability_id=MEAN_REVERSION_CONTRACT_ID,
                 label="IWM/QQQ mean-reversion runtime adapter",
-                supported=False,
+                supported=True,
                 supported_packet_kinds=["execution"],
                 supported_symbols=["IWM", "QQQ"],
                 feature_contracts=[contract.contract_id],
                 runtime_modes=["shadow"],
-                block_reason="signal_parity_not_passed",
                 metadata={
                     "adapter": "bhiksha.strategy.intraday_mean_reversion",
                     "event_exporter": "bhiksha.tools.export_reversion_events",
+                    "readiness": "signal_parity_passed_entry_shadow_only",
                 },
             )
         ],

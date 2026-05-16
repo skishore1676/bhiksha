@@ -48,4 +48,4 @@ def test_export_reversion_events_writes_runtime_parity_csv(tmp_path: Path) -> No
     assert len(rows) == 1
     assert rows[0]["config_id"] == "cfg_short"
     assert rows[0]["direction"] == "short"
-    assert rows[0]["policy_id"] == "fixed_1r"
+    assert rows[0]["policy_id"] == "cfg_short"

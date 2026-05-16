@@ -488,9 +488,13 @@ class MarketImpulseTransform(FeatureTransform):
             f"vma_{self.vma_length}",
             "impulse_regime",
             "impulse_stage",
+            "market_pulse_stage",
+            "vwma_stage",
             f"vma_{self.vma_length}_{tag}",
             f"impulse_regime_{tag}",
             f"impulse_stage_{tag}",
+            f"market_pulse_stage_{tag}",
+            f"vwma_stage_{tag}",
         }
         columns.update(f"vwma_{period}" for period in self.vwma_periods)
         return columns
@@ -518,7 +522,13 @@ class MarketImpulseTransform(FeatureTransform):
             suffix=f"_{tag}",
         )
 
-        feature_columns = [f"impulse_regime_{tag}", f"impulse_stage_{tag}", f"vma_{self.vma_length}_{tag}"]
+        feature_columns = [
+            f"impulse_regime_{tag}",
+            f"impulse_stage_{tag}",
+            f"market_pulse_stage_{tag}",
+            f"vwma_stage_{tag}",
+            f"vma_{self.vma_length}_{tag}",
+        ]
         joined = resampler.join_timeframe_features(
             market_df,
             timeframe_df,

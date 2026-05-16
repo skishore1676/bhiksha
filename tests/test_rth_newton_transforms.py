@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import polars as pl
@@ -116,3 +116,29 @@ def test_relative_volume_rth_transform_ignores_premarket_bars() -> None:
     assert values[1] is None
     np.testing.assert_almost_equal(values[2], 200.0 / 150.0)
     np.testing.assert_almost_equal(values[3], 300.0 / 250.0)
+
+
+def test_market_impulse_exposes_market_pulse_stage_aliases() -> None:
+    timestamps = [
+        datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+        + timedelta(minutes=index)
+        for index in range(80)
+    ]
+    df = pl.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": np.linspace(100, 102, 80),
+            "high": np.linspace(100.1, 102.1, 80),
+            "low": np.linspace(99.9, 101.9, 80),
+            "close": np.linspace(100, 102, 80),
+            "volume": np.full(80, 1000.0),
+        }
+    )
+
+    result = PhysicsEngine().enrich_for_features(df, {"market_pulse_stage_5m"})
+
+    assert "market_pulse_stage" in result.columns
+    assert "market_pulse_stage_5m" in result.columns
+    assert set(result["market_pulse_stage"].drop_nulls().unique().to_list()).issubset(
+        {"bullish", "bearish", "accumulation", "distribution"}
+    )
