@@ -6,8 +6,11 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
+from bhiksha.domain.models import OptionContractSnapshot
+from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.execution.order_manager import OrderManager
 from bhiksha.packets.consultation_bridge import consult_mala_playbook
 from bhiksha.packets.live_ticket import APPROVAL_PHRASE, create_playbook_live_ticket
@@ -41,6 +44,32 @@ def main(argv: list[str] | None = None) -> int:
     latest = subparsers.add_parser("latest", help="Show latest pilot artifacts and likely next step.")
     latest.add_argument("--artifact-root", type=Path, default=Path("artifacts/playbook"))
 
+    latency = subparsers.add_parser("latency-probe", help="Time the pilot desk legs and write a latency artifact.")
+    _add_common(latency)
+    latency.add_argument("--artifact-root", type=Path, default=Path("artifacts/playbook"))
+    latency.add_argument("--symbol", default="QQQ")
+    latency.add_argument("--direction", default="short")
+    latency.add_argument("--timestamp", default="2024-07-19 08:45 America/Chicago")
+    latency.add_argument(
+        "--chart-read",
+        default="Latency probe: historical sample event; not a real trade decision.",
+    )
+    latency.add_argument("--decision", choices=["take", "pass"], default="take")
+    latency.add_argument("--management-policy", default="reversal_extreme__fixed_1r")
+    latency.add_argument("--underlying-price", type=float, default=475.0)
+    latency.add_argument("--underlying-stop-price", type=float, default=478.0)
+    latency.add_argument(
+        "--option-preview-mode",
+        choices=["live", "simulated", "skip"],
+        default="live",
+        help="Use live provider calls, simulated quote/chain services, or skip the preview leg.",
+    )
+    latency.add_argument(
+        "--update-mala-log",
+        action="store_true",
+        help="Let Mala update its consultation log during the probe. Default keeps the probe read-only to Mala logs.",
+    )
+
     guided = subparsers.add_parser("guided", help="Run a prompt-driven Monday pilot flow.")
     _add_common(guided)
     guided.add_argument("--artifact-root", type=Path, default=Path("artifacts/playbook"))
@@ -62,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "latest":
         _print_latest(args.artifact_root)
         return 0
+    if args.command == "latency-probe":
+        return asyncio.run(_latency_probe(args))
     if args.command == "guided":
         return asyncio.run(_guided(args))
     raise AssertionError(f"unhandled command {args.command!r}")
@@ -277,6 +308,145 @@ async def _guided(args: argparse.Namespace) -> int:
     return 2
 
 
+async def _latency_probe(args: argparse.Namespace) -> int:
+    """Time a consultation-to-preview pass without submitting any orders."""
+    probe_root = args.artifact_root / "latency"
+    probe_id = _now_id()
+    probe_dir = probe_root / probe_id
+    probe_dir.mkdir(parents=True, exist_ok=True)
+
+    legs: list[dict[str, Any]] = []
+    artifacts: dict[str, str] = {}
+
+    compile_result, compile_leg = _time_sync(
+        "preflight_compile",
+        lambda: _compile(args.packet, args.capability_manifest, args.legacy_retirement_report),
+    )
+    legs.append(compile_leg | _compile_payload(compile_result))
+    if not compile_result.executable:
+        payload = _latency_payload(args, probe_id, legs, artifacts, status="blocked_preflight")
+        payload = _write_latency_artifacts(probe_dir, payload)
+        _print_latency(payload)
+        return 2
+
+    consultation, consultation_leg = _time_sync(
+        "mala_consultation",
+        lambda: consult_mala_playbook(
+            packet_path=args.packet,
+            symbol=args.symbol.upper(),
+            direction=args.direction.lower(),
+            timestamp=args.timestamp,
+            chart_read=args.chart_read,
+            mala_repo=args.mala_repo,
+            capability_manifest_path=args.capability_manifest,
+            legacy_retirement_report_path=args.legacy_retirement_report,
+            out_root=args.artifact_root / "consultations",
+            update_mala_log=args.update_mala_log,
+        ),
+    )
+    legs.append(
+        consultation_leg
+        | {
+            "status": consultation.status,
+            "verdict": consultation.verdict,
+            "policy": consultation.policy,
+        }
+    )
+    artifacts["consultation_json"] = consultation.artifact_json
+    artifacts["consultation_md"] = consultation.artifact_md
+
+    selected_policy = args.management_policy if args.decision == "take" else None
+    intent, decision_leg = _time_sync(
+        "operator_decision_artifact",
+        lambda: record_playbook_operator_decision(
+            consultation_artifact=Path(consultation.artifact_json),
+            decision=args.decision,
+            selected_management_policy_id=selected_policy,
+            operator_note="Latency probe artifact; not a real trade decision.",
+            out_root=args.artifact_root / "intents",
+        ),
+    )
+    legs.append(
+        decision_leg
+        | {
+            "status": intent.status,
+            "execution_ready": intent.execution_ready,
+            "warning_reasons": intent.warning_reasons,
+            "block_reasons": intent.block_reasons,
+        }
+    )
+    artifacts["intent_json"] = intent.artifact_json
+    artifacts["intent_md"] = intent.artifact_md
+
+    if args.option_preview_mode == "skip" or not intent.execution_ready:
+        preview_status = "skipped"
+    else:
+        chain_service = (
+            _SimulatedChainService(args.symbol.upper(), args.direction.lower())
+            if args.option_preview_mode == "simulated"
+            else None
+        )
+        order_manager = _SimulatedOrderManager() if args.option_preview_mode == "simulated" else None
+        preview_start = perf_counter()
+        try:
+            preview = await build_playbook_option_preview(
+                intent_artifact=Path(intent.artifact_json),
+                packet_path=args.packet,
+                chain_service=chain_service,
+                order_manager=order_manager,
+                out_root=args.artifact_root / "option_previews",
+                underlying_price=args.underlying_price,
+                underlying_stop_price=args.underlying_stop_price,
+            )
+            preview_leg = {
+                "leg": "option_preview",
+                "ok": True,
+                "elapsed_seconds": round(perf_counter() - preview_start, 3),
+            }
+            legs.append(
+                preview_leg
+                | {
+                    "mode": args.option_preview_mode,
+                    "status": preview.status,
+                    "preview_ready": preview.preview_ready,
+                    "option_symbol": preview.option_symbol,
+                    "quantity": preview.quantity,
+                    "block_reasons": preview.block_reasons,
+                    "risk_reasons": preview.risk_reasons,
+                }
+            )
+            artifacts["option_preview_json"] = preview.artifact_json
+            artifacts["option_preview_md"] = preview.artifact_md
+            preview_status = preview.status
+        except Exception as exc:  # Provider/auth failures should become readiness evidence.
+            legs.append(
+                {
+                    "leg": "option_preview",
+                    "mode": args.option_preview_mode,
+                    "ok": False,
+                    "elapsed_seconds": round(perf_counter() - preview_start, 3),
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            preview_status = "failed"
+        finally:
+            if chain_service is not None:
+                await chain_service.close()
+            if order_manager is not None:
+                await order_manager.close()
+
+    status = "complete"
+    if preview_status == "failed":
+        status = "provider_or_auth_blocked"
+    elif preview_status == "skipped":
+        status = "preview_skipped"
+    payload = _latency_payload(args, probe_id, legs, artifacts, status=status)
+    payload = _write_latency_artifacts(probe_dir, payload)
+    _print_latency(payload)
+    return 0 if status in {"complete", "preview_skipped"} else 2
+
+
 def _print_latest(root: Path) -> None:
     _print_section("LATEST PILOT ARTIFACTS")
     latest = {
@@ -346,6 +516,138 @@ def _artifact_status(path: Path | None) -> str:
     except (OSError, json.JSONDecodeError):
         return ""
     return str(payload.get("status", ""))
+
+
+def _time_sync(leg: str, fn):
+    start = perf_counter()
+    result = fn()
+    elapsed = perf_counter() - start
+    return result, {"leg": leg, "ok": True, "elapsed_seconds": round(elapsed, 3)}
+
+
+def _latency_payload(
+    args: argparse.Namespace,
+    probe_id: str,
+    legs: list[dict[str, Any]],
+    artifacts: dict[str, str],
+    *,
+    status: str,
+) -> dict[str, Any]:
+    total = round(sum(float(leg.get("elapsed_seconds", 0.0) or 0.0) for leg in legs), 3)
+    return {
+        "status": status,
+        "probe_id": probe_id,
+        "symbol": args.symbol.upper(),
+        "direction": args.direction.lower(),
+        "timestamp": args.timestamp,
+        "decision": args.decision,
+        "option_preview_mode": args.option_preview_mode,
+        "total_measured_seconds": total,
+        "legs": legs,
+        "artifacts": artifacts,
+        "operator_note": "No order submission is possible from this probe.",
+    }
+
+
+def _write_latency_artifacts(probe_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    json_path = probe_dir / "playbook_latency_probe.json"
+    md_path = probe_dir / "PLAYBOOK_LATENCY_PROBE.md"
+    payload = payload | {
+        "artifact_json": str(json_path),
+        "artifact_md": str(md_path),
+    }
+    json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    md_path.write_text(_latency_markdown(payload), encoding="utf-8")
+    return payload
+
+
+def _latency_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        "# Playbook Latency Probe",
+        "",
+        f"- status: `{payload['status']}`",
+        f"- symbol: `{payload['symbol']}`",
+        f"- direction: `{payload['direction']}`",
+        f"- timestamp: `{payload['timestamp']}`",
+        f"- option_preview_mode: `{payload['option_preview_mode']}`",
+        f"- total_measured_seconds: `{payload['total_measured_seconds']}`",
+        "",
+        "## Legs",
+        "",
+    ]
+    for leg in payload["legs"]:
+        detail = leg.get("status") or leg.get("eligibility") or ""
+        lines.append(f"- `{leg['leg']}`: `{leg.get('elapsed_seconds', 0.0)}` sec `{detail}`")
+        if leg.get("error"):
+            lines.append(f"  - error: `{leg['error']}`")
+    lines.extend(["", "## Artifacts", ""])
+    for key, value in payload["artifacts"].items():
+        lines.append(f"- {key}: `{value}`")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _print_latency(payload: dict[str, Any]) -> None:
+    _print_section("LATENCY PROBE")
+    _print_key_values(
+        {
+            "status": payload["status"],
+            "total_measured_seconds": payload["total_measured_seconds"],
+            "option_preview_mode": payload["option_preview_mode"],
+            "artifact_md": payload.get("artifact_md", ""),
+        }
+    )
+    print("\nLegs:")
+    for leg in payload["legs"]:
+        status = leg.get("status") or leg.get("eligibility") or ""
+        error = f" error={leg['error']}" if leg.get("error") else ""
+        print(f"- {leg['leg']}: {leg.get('elapsed_seconds', 0.0)}s {status}{error}")
+
+
+def _now_id() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+class _SimulatedChainService:
+    def __init__(self, symbol: str, direction: str) -> None:
+        self.symbol = symbol
+        self.contract_type = "PUT" if direction == "short" else "CALL"
+
+    async def get_chain(self, symbol: str, **kwargs):
+        return [
+            OptionContractSnapshot(
+                option_symbol=f"{symbol}260515{self.contract_type[0]}00475000",
+                underlying_symbol=symbol,
+                contract_type=self.contract_type,
+                expiration_date="2026-05-15",
+                dte=0,
+                strike=475.0,
+                delta=-0.31 if self.contract_type == "PUT" else 0.31,
+                bid=2.70,
+                ask=2.90,
+                open_interest=500,
+            )
+        ]
+
+    async def close(self):
+        return None
+
+
+class _SimulatedOrderManager:
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=2.70,
+            ask=2.90,
+            last=2.80,
+            open_interest=500,
+            outcome="SIMULATED",
+        )
+
+    async def close(self):
+        return None
 
 
 def _ask(label: str, default: str) -> str:

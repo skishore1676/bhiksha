@@ -44,6 +44,32 @@ PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
   -m bhiksha.tools.playbook_pilot_desk latest
 ```
 
+## Latency Probe
+
+Run this before market open to separate desk orchestration latency from
+broker/provider readiness:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.playbook_pilot_desk latency-probe \
+  --option-preview-mode simulated
+```
+
+Run the live-provider version only as a readiness check. It does not submit
+orders, but it will fail fast if broker auth or option-chain access is not
+ready:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.playbook_pilot_desk latency-probe \
+  --option-preview-mode live
+```
+
+The probe writes `artifacts/playbook/latency/<timestamp>/PLAYBOOK_LATENCY_PROBE.md`.
+Current measured shape: preflight and decision capture are near-instant; Mala
+consultation is the dominant leg at roughly 3.5 seconds on the local cached
+historical sample.
+
 ## Operator Flow
 
 1. Consult from Bhiksha using the v2 packet and your pre-Mala chart read.
