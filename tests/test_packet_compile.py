@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from bhiksha.packets.runtime_compile import compile_packet_for_runtime
 from bhiksha.shared_kernel import ensure_kernel_on_path
@@ -24,6 +27,11 @@ from mala_bhiksha_kernel import (  # noqa: E402
     SourceArtifact,
     write_packet,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_parity_report(tmp_path: Path) -> None:
+    _write_parity_report(tmp_path)
 
 
 def test_playbook_packet_validates_but_fails_closed_for_execution(tmp_path: Path) -> None:
@@ -97,6 +105,39 @@ def test_execution_packet_blocks_when_legacy_retirement_report_is_not_clear(tmp_
 
     assert result.executable is False
     assert "legacy_retirement_blocked:8" in result.block_reasons
+
+
+def test_execution_packet_blocks_when_parity_report_is_not_passed(tmp_path: Path) -> None:
+    _write_parity_report(tmp_path, status="failed")
+    packet_path = write_packet(tmp_path, _execution_packet())
+
+    result = compile_packet_for_runtime(
+        packet_path,
+        capability_manifest=_supporting_manifest(),
+    )
+
+    assert result.executable is False
+    assert "parity_report_not_passed:failed" in result.block_reasons
+
+
+def test_execution_packet_blocks_when_parity_report_id_is_fake(tmp_path: Path) -> None:
+    packet_path = write_packet(tmp_path, _execution_packet())
+
+    result = compile_packet_for_runtime(
+        packet_path,
+        capability_manifest=_supporting_manifest(),
+    )
+
+    assert result.executable is True
+
+    _write_parity_report(tmp_path, report_id="parity.fake")
+    result = compile_packet_for_runtime(
+        packet_path,
+        capability_manifest=_supporting_manifest(),
+    )
+
+    assert result.executable is False
+    assert "parity_report_id_mismatch" in result.block_reasons
 
 
 def test_shadow_execution_packet_requires_shadow_only_controls(tmp_path: Path) -> None:
@@ -285,6 +326,26 @@ def _lineage() -> PacketLineage:
     return PacketLineage(
         source_system="mala_v2",
         source_artifacts=[
-            SourceArtifact(label="test", uri="data/results/playbooks/test")
+            SourceArtifact(label="test", uri="data/results/playbooks/test"),
+            SourceArtifact(label="parity_report", uri="PARITY_REPORT.json"),
         ],
     )
+
+
+def _write_parity_report(tmp_path: Path, *, status: str = "passed", report_id: str = "parity.mean_reversion.test") -> Path:
+    path = tmp_path / "PARITY_REPORT.json"
+    path.write_text(
+        json.dumps(
+            {
+                "report_id": report_id,
+                "packet_ref": {
+                    "packet_id": "playbook.mean_reversion_at_extremes.iwm_qqq",
+                    "version": 1,
+                    "kind": "playbook",
+                },
+                "status": status,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path

@@ -63,6 +63,7 @@ def test_consultation_bridge_fails_closed_when_packet_does_not_compile(tmp_path:
 def test_consultation_bridge_runs_mala_query_and_writes_bhiksha_artifact(tmp_path: Path) -> None:
     mala_repo = tmp_path / "mala_v2"
     mala_repo.mkdir()
+    _write_parity_report(tmp_path)
     packet_path = write_packet(tmp_path, _execution_packet())
     manifest_path = tmp_path / "capabilities.json"
     manifest_path.write_text(_supporting_manifest().model_dump_json(), encoding="utf-8")
@@ -159,7 +160,8 @@ def _execution_packet() -> ExecutionPacket:
         lineage=PacketLineage(
             source_system="mala_v2",
             source_artifacts=[
-                SourceArtifact(label="run_config", uri=str(_run_dir() / "run_config.json"))
+                SourceArtifact(label="run_config", uri=str(_run_dir() / "run_config.json")),
+                SourceArtifact(label="parity_report", uri="PARITY_REPORT.json"),
             ],
         ),
         operator_approval=OperatorApproval(status="approved", actor="operator"),
@@ -212,3 +214,20 @@ def _feature_contract() -> FeatureContract:
 
 def _run_dir() -> Path:
     return Path("data/results/playbooks/mean_reversion_at_extremes/test_run")
+
+
+def _write_parity_report(tmp_path: Path) -> None:
+    (tmp_path / "PARITY_REPORT.json").write_text(
+        json.dumps(
+            {
+                "report_id": "parity.mean_reversion.test",
+                "packet_ref": {
+                    "packet_id": "playbook.mean_reversion_at_extremes.iwm_qqq",
+                    "version": 1,
+                    "kind": "playbook",
+                },
+                "status": "passed",
+            }
+        ),
+        encoding="utf-8",
+    )

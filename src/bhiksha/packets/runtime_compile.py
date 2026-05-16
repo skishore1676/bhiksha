@@ -63,6 +63,7 @@ def compile_packet_for_runtime(
     runtime_mode = None
     if isinstance(packet, ExecutionPacket):
         runtime_mode = packet.runtime_mode.value
+        block_reasons.extend(_parity_report_blocks(packet, Path(packet_path)))
         block_reasons.extend(_capability_blocks(packet, capability_manifest))
         block_reasons.extend(_legacy_retirement_blocks(legacy_retirement_report))
         block_reasons.extend(_runtime_control_blocks(packet, management_policy_ids))
@@ -108,6 +109,52 @@ def _legacy_retirement_blocks(report: dict[str, Any] | None) -> list[str]:
     if str(report.get("status", "")) != "clear":
         return [f"legacy_retirement_status:{report.get('status')}"]
     return []
+
+
+def _parity_report_blocks(packet: ExecutionPacket, packet_path: Path) -> list[str]:
+    artifact = next(
+        (
+            artifact
+            for artifact in packet.lineage.source_artifacts
+            if artifact.label == "parity_report"
+        ),
+        None,
+    )
+    if artifact is None:
+        return ["parity_report_artifact_missing"]
+
+    report_path = Path(artifact.uri)
+    if not report_path.is_absolute():
+        report_path = _packet_root(packet_path) / report_path
+    if not report_path.exists():
+        return [f"parity_report_not_found:{artifact.uri}"]
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return [f"parity_report_invalid_json:{artifact.uri}"]
+
+    blocks: list[str] = []
+    if str(report.get("report_id", "")) != packet.parity_report_id:
+        blocks.append("parity_report_id_mismatch")
+    if str(report.get("status", "")) != "passed":
+        blocks.append(f"parity_report_not_passed:{report.get('status')}")
+    packet_ref = report.get("packet_ref")
+    expected_ref = packet.source_packet.model_dump(mode="json")
+    if packet_ref != expected_ref:
+        blocks.append("parity_report_packet_ref_mismatch")
+    return blocks
+
+
+def _packet_root(packet_path: Path) -> Path:
+    resolved = packet_path.resolve()
+    for parent in [resolved.parent, *resolved.parents]:
+        if (parent / "packet_index.json").exists():
+            return parent
+    for parent in resolved.parents:
+        if parent.name == "packets":
+            return parent.parent
+    return resolved.parent
 
 
 def _runtime_control_blocks(
