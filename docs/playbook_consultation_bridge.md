@@ -13,11 +13,15 @@ operator chart read
   -> operator decides take/pass and management policy
   -> Bhiksha records a shadow execution intent
   -> Bhiksha builds an option preview ticket
+  -> shadow lane records simulated option PnL
+  -> live lane can create an approval-gated ticket
 ```
 
-The bridge does not submit orders. It is intentionally shadow-only until the
-option selector, live position manager, and feedback writer are promoted under
-the same packet id.
+The bridge now has parallel shadow and live lanes. The shadow lane exists to
+learn whether the playbook would have made money using the option vehicle and
+management choice. The live lane exists to make a real order possible only
+after an explicit approval ticket. The submitter/reconciliation layer is still
+separate.
 
 ## Command
 
@@ -114,15 +118,65 @@ The preview can be `option_preview_ready` or `blocked`. A ready preview includes
 the option symbol, quantity, estimated entry price, and risk reasons. It still
 has `order_submission_allowed=false` and `live_approval_required=true`.
 
+## Shadow Outcome
+
+At management exit or end of day, record the simulated option result:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.record_playbook_shadow_outcome \
+  --option-preview-artifact artifacts/playbook/option_previews/<preview_id>/playbook_option_preview.json \
+  --exit-timestamp "2026-05-11 15:55 America/New_York" \
+  --exit-reason end_of_day_mark \
+  --exit-price 3.40
+```
+
+For live-market shadowing, `--quote-current` can use the current option quote
+as the exit mark. The output writes:
+
+```text
+artifacts/playbook/shadow_outcomes/<outcome_id>/playbook_shadow_outcome.json
+artifacts/playbook/shadow_outcomes/<outcome_id>/PLAYBOOK_SHADOW_OUTCOME.md
+```
+
+This is the artifact that tells us whether the playbook and management choice
+actually made or lost money in the shadow lane.
+
+## Live Ticket
+
+The live lane starts from the same option preview, but it requires an explicit
+operator approval phrase:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.create_playbook_live_ticket \
+  --option-preview-artifact artifacts/playbook/option_previews/<preview_id>/playbook_option_preview.json \
+  --decision approve \
+  --operator Suman \
+  --operator-note "Approve one contract only; manage with fixed 1R policy." \
+  --approval-phrase APPROVE_LIVE_PLAYBOOK_TICKET
+```
+
+It writes:
+
+```text
+artifacts/playbook/live_tickets/<ticket_id>/playbook_live_ticket.json
+artifacts/playbook/live_tickets/<ticket_id>/PLAYBOOK_LIVE_TICKET.md
+```
+
+An approved live ticket has `order_submission_allowed=true` but
+`submitter_status=not_submitted`. It is permission for the later submitter
+layer; it is not itself a broker order.
+
 ## Execution Boundary
 
 The current bridge is a consultation backend, not live trading automation.
 
 For live use, the next layer must add:
 
-1. explicit live approval gate
-2. order submission and position manager
+1. order submission from an approved live ticket
+2. position manager and broker reconciliation
 3. fill/fire/outcome feedback artifact back to Mala
 
-Until those exist, a green operator decision means "record the consultation and
-prepare the shadow decision," not "place a live order."
+Until those exist, a live approval ticket means "the submitter may act after
+its own final checks," not "an order has already been placed."
