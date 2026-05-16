@@ -24,9 +24,11 @@ Run the gate:
 Exit code `2` means at least one active legacy wire exists. That is expected
 until the old shadow lane is wound down; it is not approval to trade it.
 
-This gate is intentionally diagnostic for now. The next implementation step is
-to make active legacy wires non-loadable after the forensic parity report is
-written and the operator agrees which rows are retired versus re-hypothesized.
+Runtime loading also suppresses enabled Mala-origin legacy deployments with
+`legacy_wire_retired`, so stale ignored generated files cannot silently become
+runtime deployments. Strategy-catalog entries remain readable as historical
+fixtures, but they are disabled and `approval_status: retired` until they
+re-earn promotion.
 
 Packet compilation can also consume the report:
 

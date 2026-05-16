@@ -31,17 +31,17 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert snapshot["emergency_controls"] == {"halt_and_flatten": False}
     assert snapshot["deployment_selection"]["mode"] == "prefer_generated"
     deployment_ids = {deployment["deployment_id"] for deployment in snapshot["deployments"]}
-    deployment_symbols = {deployment["symbol"] for deployment in snapshot["deployments"]}
-    assert "market_impulse_qqq_short_v1" in deployment_ids
-    assert "SPY" in deployment_symbols
+    assert "market_impulse_qqq_short_v1" not in deployment_ids
+    assert "market_impulse_spy_short_v1" not in deployment_ids
     assert snapshot["warmup"]["policy"] == "feature_contract_v1"
     assert snapshot["warmup"]["legacy_effective_trading_days"] == 5
     assert snapshot["warmup"]["effective_trading_days"] >= 5
-    assert snapshot["warmup"]["by_symbol"]
+    assert snapshot["warmup"]["by_symbol"] == {}
 
 
 def test_runtime_warmup_expands_for_hourly_market_impulse() -> None:
     runtime = build_runtime()
+    runtime.deployments[0].enabled = True
     runtime.deployments[0].symbol = "MU"
     runtime.deployments[0].strategy.key = "market_impulse"
     runtime.deployments[0].strategy.params = {
@@ -334,6 +334,8 @@ def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> Non
 
 def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
     runtime = build_runtime()
+    qqq = next(deployment for deployment in runtime.deployments if deployment.symbol == "QQQ")
+    qqq.enabled = True
     snapshot = ReconciliationSnapshot()
 
     class StubBroker:

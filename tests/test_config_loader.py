@@ -24,7 +24,7 @@ def test_load_deployments_from_config_directory() -> None:
         "market_impulse_spy_short_v1",
     }
     tsla = next(deployment for deployment in deployments if deployment.deployment_id == "jerk_pivot_momentum_tsla_short_v1")
-    assert tsla.enabled is True
+    assert tsla.enabled is False
     assert tsla.execution.shadow_only is True
     assert tsla.execution.dte_min == 7
     assert tsla.execution.dte_max == 21
@@ -191,7 +191,8 @@ def test_load_strategy_catalog_from_config_directory() -> None:
         "market_impulse_spy_short_v1",
     }
     tsla = next(entry for entry in catalog if entry.strategy_id == "jerk_pivot_momentum_tsla_short_v1")
-    assert tsla.approval_status == "approved"
+    assert tsla.enabled is False
+    assert tsla.approval_status == "retired"
     assert tsla.execution.target_abs_delta_min == 0.35
     assert "mala_promoted" in tsla.tags
 

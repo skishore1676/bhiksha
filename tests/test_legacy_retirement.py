@@ -30,12 +30,12 @@ def test_legacy_retirement_reports_active_mala_promoted_wires(tmp_path: Path) ->
         ),
         encoding="utf-8",
     )
-    (catalog / "retired.yaml").write_text(
+    (catalog / "active.yaml").write_text(
         yaml.safe_dump(
             {
                 "strategy_id": "old_strategy",
-                "enabled": False,
-                "approval_status": "retired",
+                "enabled": True,
+                "approval_status": "approved",
                 "symbol": "SPY",
                 "strategy": {"key": "market_impulse"},
                 "source": {"origin": "mala"},
@@ -55,7 +55,10 @@ def test_legacy_retirement_reports_active_mala_promoted_wires(tmp_path: Path) ->
     assert report["status"] == "blocked"
     assert report["legacy_wire_count"] == 2
     assert report["active_legacy_wire_count"] == 1
-    assert report["active_legacy_ids"] == ["market_impulse_qqq_short_v1"]
+    assert report["active_legacy_ids"] == ["old_strategy"]
+    deployment_wire = next(wire for wire in report["wires"] if wire["surface"] == "deployment")
+    assert deployment_wire["runtime_reachable"] is False
+    assert deployment_wire["active"] is False
     assert report["next_action"] == "retire_or_repromote_active_legacy_wires"
 
 

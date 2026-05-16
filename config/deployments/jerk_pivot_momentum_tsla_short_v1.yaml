@@ -1,5 +1,5 @@
 deployment_id: jerk_pivot_momentum_tsla_short_v1
-enabled: true
+enabled: false
 symbol: TSLA
 
 strategy:

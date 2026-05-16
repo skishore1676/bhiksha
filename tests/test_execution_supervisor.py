@@ -3,6 +3,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 
+from bhiksha.config.loader import load_deployments
 from bhiksha.config.models import AppConfig
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
@@ -13,6 +14,13 @@ from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.lifecycle import TradeLifecycleStore
 from bhiksha.state.position_tracker import PositionTracker
+
+
+def _enabled_deployment(deployment_id: str):
+    deployment = next(
+        d for d in load_deployments("config/deployments") if d.deployment_id == deployment_id
+    )
+    return deployment.model_copy(update={"enabled": True})
 
 
 class StubOrderManager:
@@ -199,7 +207,7 @@ def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     plan = TradePlan(
         trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
@@ -237,7 +245,7 @@ def test_execution_supervisor_records_live_entry_unprotected_when_initial_stop_f
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     plan = TradePlan(
         trade_id="TRADE_STOP_FAIL",
         deployment_id=deployment.deployment_id,
@@ -286,7 +294,7 @@ def test_execution_supervisor_publishes_lifecycle_transition_event(tmp_path) -> 
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     plan = TradePlan(
         trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
@@ -330,7 +338,7 @@ def test_execution_supervisor_publishes_signal_event_even_when_lifecycle_blocks(
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -366,7 +374,7 @@ def test_execution_supervisor_publishes_exit_event(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -413,7 +421,7 @@ def test_execution_supervisor_blocks_entry_when_lifecycle_is_active(tmp_path) ->
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -450,7 +458,7 @@ def test_execution_supervisor_updates_manual_sheet_status_for_blocked_entry(tmp_
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -480,7 +488,7 @@ def test_execution_supervisor_updates_manual_sheet_status_for_planned_entry(tmp_
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -529,7 +537,7 @@ def test_execution_supervisor_self_disarms_sheet_backed_manual_deployment_after_
     )
     from bhiksha.config.loader import load_deployments
 
-    base_deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base_deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base_deployment.model_copy(
         update={
             "source": base_deployment.source.model_copy(
@@ -591,7 +599,7 @@ def test_execution_supervisor_blocks_live_entry_when_reconciliation_is_stale(tmp
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -628,7 +636,7 @@ def test_execution_supervisor_blocks_live_entry_when_reconciliation_is_stale(tmp
 def test_execution_supervisor_does_not_apply_stale_gate_to_dry_run_or_shadow_entries(tmp_path, monkeypatch) -> None:
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -717,7 +725,7 @@ def test_execution_supervisor_does_not_apply_stale_gate_to_dry_run_or_shadow_ent
 def test_execution_supervisor_tracks_shadow_plan_as_paper_position(tmp_path) -> None:
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -778,7 +786,7 @@ def test_execution_supervisor_tracks_shadow_plan_as_paper_position(tmp_path) -> 
 def test_execution_supervisor_does_not_open_shadow_position_when_risk_rejects(tmp_path) -> None:
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     decision = SignalDecision(
         deployment_id=deployment.deployment_id,
         symbol="QQQ",
@@ -831,7 +839,7 @@ def test_execution_supervisor_does_not_open_shadow_position_when_risk_rejects(tm
 def test_execution_supervisor_records_shadow_exit_pnl(tmp_path) -> None:
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     trade_repo = SQLiteTradeStateRepository(str(tmp_path / "trades.db"))
     supervisor = ExecutionSupervisor(
@@ -893,7 +901,7 @@ def test_execution_supervisor_forces_shadow_management_to_dry_run(tmp_path) -> N
     from bhiksha.config.loader import load_deployments
 
     order_manager = RecordingOrderManager(quote_bid=3.0)
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     supervisor = ExecutionSupervisor(
         planner=RecordingPlanner(order_manager),
@@ -945,7 +953,7 @@ def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -996,7 +1004,7 @@ def test_execution_supervisor_holds_fill_timeout_for_reconciliation(tmp_path) ->
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     plan = TradePlan(
         trade_id="TRADE123",
         deployment_id=deployment.deployment_id,
@@ -1190,7 +1198,7 @@ def test_execution_supervisor_sanitizes_recovered_stop_below_bid(tmp_path) -> No
     )
     from bhiksha.config.loader import load_deployments
 
-    base_deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base_deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base_deployment.model_copy(
         update={
             "exit": base_deployment.exit.model_copy(
@@ -1251,7 +1259,7 @@ def test_execution_supervisor_skips_restore_when_active_close_order_exists(tmp_p
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -1285,7 +1293,7 @@ def test_execution_supervisor_hard_flats_due_positions(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -1319,7 +1327,7 @@ def test_execution_supervisor_halt_and_flattens_positions(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -1359,7 +1367,7 @@ def test_execution_supervisor_halt_and_flattens_pending_entries_by_canceling_the
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -1392,7 +1400,7 @@ def test_execution_supervisor_handles_algorithmic_exit(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     supervisor.planner.position_tracker.open_position(
         "QQQ",
         deployment.deployment_id,
@@ -1452,7 +1460,7 @@ def test_execution_supervisor_closes_filled_pending_exit(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     asyncio.run(
         trade_repo.upsert_trade(
             TradeRecord(
@@ -1545,7 +1553,7 @@ def test_execution_supervisor_enriches_stop_filled_disappeared_position(tmp_path
     )
     from bhiksha.config.loader import load_deployments
 
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     asyncio.run(
         trade_repo.upsert_trade(
             TradeRecord(
@@ -1598,7 +1606,7 @@ def test_execution_supervisor_arms_virtual_profit_target_when_broker_supports_si
     )
     from bhiksha.config.loader import load_deployments
 
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(
@@ -1657,7 +1665,7 @@ def test_execution_supervisor_places_profit_target_when_broker_supports_concurre
     )
     from bhiksha.config.loader import load_deployments
 
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(
@@ -1707,7 +1715,7 @@ def test_execution_supervisor_uses_option_profit_target_pct(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(
@@ -1764,7 +1772,7 @@ def test_execution_supervisor_promotes_stop_to_breakeven(tmp_path) -> None:
     )
     from bhiksha.config.loader import load_deployments
 
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(
@@ -1803,7 +1811,7 @@ def test_execution_supervisor_activates_virtual_target_for_public(tmp_path) -> N
     )
     from bhiksha.config.loader import load_deployments
 
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(
@@ -1847,7 +1855,7 @@ def test_execution_supervisor_virtual_target_activation_allows_ambiguous_cancel(
     )
     from bhiksha.config.loader import load_deployments
 
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(
@@ -1890,7 +1898,7 @@ def test_execution_supervisor_restores_stop_after_virtual_target_pullback(tmp_pa
     )
     from bhiksha.config.loader import load_deployments
 
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(

@@ -1,5 +1,5 @@
 deployment_id: market_impulse_qqq_short_v1
-enabled: true
+enabled: false
 symbol: QQQ
 
 strategy:

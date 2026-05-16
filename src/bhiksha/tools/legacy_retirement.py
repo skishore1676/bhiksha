@@ -25,10 +25,11 @@ class LegacyWire:
     strategy_key: str
     symbol: str
     reasons: list[str]
+    runtime_reachable: bool
 
     @property
     def active(self) -> bool:
-        return self.enabled and self.approved
+        return self.enabled and self.approved and self.runtime_reachable
 
 
 def scan_legacy_wires(
@@ -61,6 +62,7 @@ def _scan_yaml_tree(root: Path, *, surface: str) -> list[LegacyWire]:
                 strategy_key=str(payload.get("strategy", {}).get("key", "")),
                 symbol=str(payload.get("symbol", "")),
                 reasons=reasons,
+                runtime_reachable=_runtime_reachable(surface, payload),
             )
         )
     return wires
@@ -91,6 +93,13 @@ def _legacy_reasons(payload: dict[str, Any]) -> list[str]:
     if metadata.get("promoted_from"):
         reasons.append("legacy_promoted_from")
     return reasons
+
+
+def _runtime_reachable(surface: str, payload: dict[str, Any]) -> bool:
+    if surface != "deployment":
+        return True
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    return str(source.get("origin", "")) not in LEGACY_ORIGINS
 
 
 def build_report(wires: list[LegacyWire]) -> dict[str, Any]:
