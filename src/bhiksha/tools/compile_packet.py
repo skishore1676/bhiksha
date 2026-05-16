@@ -6,7 +6,10 @@ import argparse
 import json
 from pathlib import Path
 
-from bhiksha.packets.runtime_compile import compile_packet_for_runtime
+from bhiksha.packets.runtime_compile import (
+    compile_packet_for_runtime,
+    load_legacy_retirement_report,
+)
 from bhiksha.shared_kernel import ensure_kernel_on_path
 
 ensure_kernel_on_path()
@@ -17,6 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packet", type=Path, required=True)
     parser.add_argument("--capability-manifest", type=Path)
+    parser.add_argument("--legacy-retirement-report", type=Path)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
 
@@ -25,7 +29,14 @@ def main(argv: list[str] | None = None) -> int:
         capability_manifest = CapabilityManifest.model_validate_json(
             args.capability_manifest.read_text(encoding="utf-8")
         )
-    result = compile_packet_for_runtime(args.packet, capability_manifest=capability_manifest)
+    legacy_retirement_report = None
+    if args.legacy_retirement_report:
+        legacy_retirement_report = load_legacy_retirement_report(args.legacy_retirement_report)
+    result = compile_packet_for_runtime(
+        args.packet,
+        capability_manifest=capability_manifest,
+        legacy_retirement_report=legacy_retirement_report,
+    )
     payload = {
         "packet_id": result.packet_id,
         "version": result.version,

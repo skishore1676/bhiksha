@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from bhiksha.shared_kernel import ensure_kernel_on_path
 
@@ -40,12 +42,11 @@ def compile_packet_for_runtime(
     packet_path: str | Path,
     *,
     capability_manifest: CapabilityManifest | None = None,
+    legacy_retirement_report: dict[str, Any] | None = None,
 ) -> PacketCompileResult:
     packet = read_packet_file(packet_path)
     block_reasons: list[str] = []
-    management_policy_ids = [
-        policy.policy_id for policy in getattr(packet, "management_policies", [])
-    ]
+    management_policy_ids = _management_policy_ids(packet)
 
     if packet.kind != PacketKind.EXECUTION:
         block_reasons.append("packet_kind_not_execution")
@@ -58,6 +59,7 @@ def compile_packet_for_runtime(
     if isinstance(packet, ExecutionPacket):
         runtime_mode = packet.runtime_mode.value
         block_reasons.extend(_capability_blocks(packet, capability_manifest))
+        block_reasons.extend(_legacy_retirement_blocks(legacy_retirement_report))
 
     return PacketCompileResult(
         packet_id=packet.packet_id,
@@ -70,6 +72,43 @@ def compile_packet_for_runtime(
         runtime_mode=runtime_mode,
         management_policy_ids=management_policy_ids,
     )
+
+
+def load_legacy_retirement_report(path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _management_policy_ids(packet: Any) -> list[str]:
+    policies = getattr(packet, "management_policies", None)
+    if policies is not None:
+        return [policy.policy_id for policy in policies]
+    if isinstance(packet, ExecutionPacket):
+        raw_ids = packet.runtime_controls.get("allowed_management_policy_ids", [])
+        if isinstance(raw_ids, list):
+            return [str(policy_id) for policy_id in raw_ids if str(policy_id)]
+    return []
+
+
+def _legacy_retirement_blocks(report: dict[str, Any] | None) -> list[str]:
+    if report is None:
+        return []
+    active_count = _safe_int(report.get("active_legacy_wire_count"))
+    if str(report.get("status", "")) == "clear" and active_count == 0:
+        return []
+    if active_count is None:
+        return ["legacy_retirement_report_invalid"]
+    if active_count > 0:
+        return [f"legacy_retirement_blocked:{active_count}"]
+    if str(report.get("status", "")) != "clear":
+        return [f"legacy_retirement_status:{report.get('status')}"]
+    return []
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _capability_blocks(

@@ -78,6 +78,23 @@ def test_execution_packet_compiles_when_manifest_supports_contract(tmp_path: Pat
     assert result.executable is True
     assert result.decision == "take"
     assert result.block_reasons == []
+    assert result.management_policy_ids == ["reversal_extreme__fixed_1_5r"]
+
+
+def test_execution_packet_blocks_when_legacy_retirement_report_is_not_clear(tmp_path: Path) -> None:
+    packet_path = write_packet(tmp_path, _execution_packet())
+
+    result = compile_packet_for_runtime(
+        packet_path,
+        capability_manifest=_supporting_manifest(),
+        legacy_retirement_report={
+            "status": "blocked",
+            "active_legacy_wire_count": 8,
+        },
+    )
+
+    assert result.executable is False
+    assert "legacy_retirement_blocked:8" in result.block_reasons
 
 
 def _playbook_packet() -> PlaybookPacket:
@@ -121,6 +138,28 @@ def _execution_packet() -> ExecutionPacket:
         runtime_mode=RuntimeMode.SHADOW,
         capability_manifest_id="bhiksha.test",
         parity_report_id="parity.mean_reversion.test",
+        runtime_controls={
+            "allowed_management_policy_ids": ["reversal_extreme__fixed_1_5r"],
+        },
+    )
+
+
+def _supporting_manifest() -> CapabilityManifest:
+    contract = _feature_contract()
+    return CapabilityManifest(
+        manifest_id="bhiksha.test",
+        feature_contracts=[contract],
+        capabilities=[
+            RuntimeCapability(
+                capability_id="mean_reversion_at_extremes_intraday_v1",
+                label="Mean reversion runtime adapter",
+                supported=True,
+                supported_packet_kinds=["execution"],
+                supported_symbols=["IWM", "QQQ"],
+                feature_contracts=[contract.contract_id],
+                runtime_modes=["shadow"],
+            )
+        ],
     )
 
 

@@ -27,3 +27,16 @@ until the old shadow lane is wound down; it is not approval to trade it.
 This gate is intentionally diagnostic for now. The next implementation step is
 to make active legacy wires non-loadable after the forensic parity report is
 written and the operator agrees which rows are retired versus re-hypothesized.
+
+Packet compilation can also consume the report:
+
+```bash
+./.venv/bin/python -m bhiksha.tools.compile_packet \
+  --packet ../mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v1.json \
+  --capability-manifest artifacts/capabilities/bhiksha_packet_capabilities_v1.json \
+  --legacy-retirement-report artifacts/legacy_retirement/current.json
+```
+
+If `active_legacy_wire_count` is greater than zero, execution packets are
+blocked with `legacy_retirement_blocked:<count>` even when feature capability
+exists.
