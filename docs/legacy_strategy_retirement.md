@@ -42,3 +42,8 @@ Packet compilation can also consume the report:
 If `active_legacy_wire_count` is greater than zero, execution packets are
 blocked with `legacy_retirement_blocked:<count>` even when feature capability
 exists.
+
+Once the report is clear, an approved shadow execution packet may compile, but
+Bhiksha still requires shadow-only runtime controls. A shadow packet with
+`live_automated_allowed=true`, missing `shadow_only=true`, or no operator
+management-policy selection gate is blocked.

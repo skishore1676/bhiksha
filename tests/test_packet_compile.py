@@ -97,6 +97,28 @@ def test_execution_packet_blocks_when_legacy_retirement_report_is_not_clear(tmp_
     assert "legacy_retirement_blocked:8" in result.block_reasons
 
 
+def test_shadow_execution_packet_requires_shadow_only_controls(tmp_path: Path) -> None:
+    packet_path = write_packet(
+        tmp_path,
+        _execution_packet(
+            runtime_controls={
+                "allowed_management_policy_ids": ["reversal_extreme__fixed_1_5r"],
+                "live_automated_allowed": True,
+            }
+        ),
+    )
+
+    result = compile_packet_for_runtime(
+        packet_path,
+        capability_manifest=_supporting_manifest(),
+    )
+
+    assert result.executable is False
+    assert "shadow_only_control_missing" in result.block_reasons
+    assert "live_automated_not_allowed_for_shadow" in result.block_reasons
+    assert "operator_management_policy_selection_missing" in result.block_reasons
+
+
 def _playbook_packet() -> PlaybookPacket:
     return PlaybookPacket(
         packet_id="playbook.mean_reversion_at_extremes.iwm_qqq",
@@ -119,7 +141,7 @@ def _playbook_packet() -> PlaybookPacket:
     )
 
 
-def _execution_packet() -> ExecutionPacket:
+def _execution_packet(runtime_controls: dict | None = None) -> ExecutionPacket:
     return ExecutionPacket(
         packet_id="execution.mean_reversion_at_extremes.iwm_qqq",
         version=1,
@@ -138,8 +160,12 @@ def _execution_packet() -> ExecutionPacket:
         runtime_mode=RuntimeMode.SHADOW,
         capability_manifest_id="bhiksha.test",
         parity_report_id="parity.mean_reversion.test",
-        runtime_controls={
+        runtime_controls=runtime_controls
+        or {
             "allowed_management_policy_ids": ["reversal_extreme__fixed_1_5r"],
+            "shadow_only": True,
+            "live_automated_allowed": False,
+            "operator_must_select_management_policy": True,
         },
     )
 

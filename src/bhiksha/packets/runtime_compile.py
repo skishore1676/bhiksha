@@ -60,6 +60,7 @@ def compile_packet_for_runtime(
         runtime_mode = packet.runtime_mode.value
         block_reasons.extend(_capability_blocks(packet, capability_manifest))
         block_reasons.extend(_legacy_retirement_blocks(legacy_retirement_report))
+        block_reasons.extend(_runtime_control_blocks(packet, management_policy_ids))
 
     return PacketCompileResult(
         packet_id=packet.packet_id,
@@ -102,6 +103,24 @@ def _legacy_retirement_blocks(report: dict[str, Any] | None) -> list[str]:
     if str(report.get("status", "")) != "clear":
         return [f"legacy_retirement_status:{report.get('status')}"]
     return []
+
+
+def _runtime_control_blocks(
+    packet: ExecutionPacket,
+    management_policy_ids: list[str],
+) -> list[str]:
+    blocks: list[str] = []
+    controls = packet.runtime_controls
+    if packet.runtime_mode.value == "shadow":
+        if controls.get("shadow_only") is not True:
+            blocks.append("shadow_only_control_missing")
+        if controls.get("live_automated_allowed") is True:
+            blocks.append("live_automated_not_allowed_for_shadow")
+    if not management_policy_ids:
+        blocks.append("management_policy_ids_missing")
+    if controls.get("operator_must_select_management_policy") is not True:
+        blocks.append("operator_management_policy_selection_missing")
+    return blocks
 
 
 def _safe_int(value: Any) -> int | None:
