@@ -134,6 +134,7 @@ def _write_consultation(
     *,
     policy: str = "take",
     compile_block_reasons: list[str] | None = None,
+    compile_eligibility: str = "eligible",
 ) -> Path:
     payload = {
         "status": "consulted",
@@ -143,6 +144,7 @@ def _write_consultation(
         "symbol": "IWM",
         "direction": "short",
         "timestamp": "2026-05-11 09:40 America/Chicago",
+        "compile_eligibility": compile_eligibility,
         "compile_decision": "take",
         "compile_block_reasons": compile_block_reasons or [],
         "verdict": "constructive",

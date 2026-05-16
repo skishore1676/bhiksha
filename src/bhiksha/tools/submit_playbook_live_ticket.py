@@ -52,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         "stop_price": result.stop_price,
         "target_order_id": result.target_order_id,
         "target_price": result.target_price,
+        "emergency_exit_order_id": result.emergency_exit_order_id,
         "management_policy_id": result.management_policy_id,
         "trade_state": result.trade_state,
         "block_reasons": result.block_reasons,
@@ -65,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(value, list):
                 value = ",".join(value)
             print(f"{key.upper()}={value}")
-    return 0 if result.status in {"lifecycle_started", "pending_entry_reconcile", "submitted"} else 2
+    return 0 if result.status in {"lifecycle_started", "pending_entry_reconcile"} else 2
 
 
 if __name__ == "__main__":

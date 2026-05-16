@@ -40,6 +40,7 @@ class ConsultationBridgeResult:
     direction: str
     timestamp: str
     chart_read: str
+    compile_eligibility: str
     compile_decision: str
     compile_block_reasons: list[str]
     query_json: str
@@ -148,6 +149,7 @@ def consult_mala_playbook(
         direction=normalized_direction,
         timestamp=timestamp,
         chart_read=chart_read.strip(),
+        compile_eligibility=compile_result.eligibility,
         compile_decision=compile_result.decision,
         compile_block_reasons=compile_result.block_reasons,
         query_json=str(query_json),
@@ -283,6 +285,7 @@ def _bridge_markdown(payload: dict[str, Any]) -> str:
             "",
             f"- packet: `{payload['packet_id']}` v`{payload['packet_version']}`",
             f"- runtime_mode: `{payload['runtime_mode']}`",
+            f"- compile_eligibility: `{payload['compile_eligibility']}`",
             f"- symbol: `{payload['symbol']}`",
             f"- direction: `{payload['direction']}`",
             f"- timestamp: `{payload['timestamp']}`",

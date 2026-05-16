@@ -29,13 +29,23 @@ from mala_bhiksha_kernel import (  # noqa: E402
 
 
 class StubOrderManager:
-    def __init__(self, *, filled: bool = True, supports_targets: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        filled: bool = True,
+        supports_targets: bool = False,
+        stop_order_id: str | None = "STOP123",
+        close_order_id: str | None = "EXIT123",
+    ) -> None:
         self.supports_concurrent_exit_orders = supports_targets
         self.preflight_calls = 0
         self.entry_calls = 0
         self.stop_calls = 0
         self.target_calls = 0
+        self.close_calls = 0
         self.filled = filled
+        self.stop_order_id = stop_order_id
+        self.close_order_id = close_order_id
 
     async def preflight_entry(self, option_symbol: str, limit_price: float, quantity: int):
         self.preflight_calls += 1
@@ -71,7 +81,7 @@ class StubOrderManager:
         order_id: str | None = None,
     ):
         self.stop_calls += 1
-        return OrderResult(order_id="STOP123")
+        return OrderResult(order_id=self.stop_order_id, error=None if self.stop_order_id else "stop_rejected")
 
     async def place_target_order(
         self,
@@ -83,6 +93,10 @@ class StubOrderManager:
     ):
         self.target_calls += 1
         return OrderResult(order_id="TARGET123")
+
+    async def place_close_order(self, option_symbol: str, quantity: int, *, exit_mode, limit_price=None, order_id=None):
+        self.close_calls += 1
+        return OrderResult(order_id=self.close_order_id, error=None if self.close_order_id else "close_rejected")
 
 
 class RecordingEvents:
@@ -221,6 +235,61 @@ def test_playbook_lifecycle_records_reconciliation_when_entry_does_not_fill(tmp_
     assert result.trade_state == "pending_entry_reconcile"
     assert result.stop_order_id is None
     assert trades.records[-1].status == "pending_entry_reconcile"
+
+
+def test_playbook_lifecycle_stop_arm_failure_emergency_flattens_and_blocks(tmp_path: Path) -> None:
+    ticket_path = _write_live_ticket(tmp_path)
+    packet_path = write_packet(tmp_path, _execution_packet())
+    trades = RecordingTrades()
+    events = RecordingEvents()
+    order_manager = StubOrderManager(stop_order_id=None)
+
+    result = asyncio.run(
+        submit_playbook_live_ticket(
+            live_ticket_artifact=ticket_path,
+            packet_path=packet_path,
+            order_manager=order_manager,
+            event_repository=events,
+            trade_state_repository=trades,
+            lifecycle_store=TradeLifecycleStore(),
+            out_root=tmp_path / "lifecycle",
+        )
+    )
+
+    assert result.status == "protection_failed_exit_pending"
+    assert result.lifecycle_started is False
+    assert result.trade_state == "protection_failed_exit_pending"
+    assert result.stop_order_id is None
+    assert result.emergency_exit_order_id == "EXIT123"
+    assert "critical_stop_arm_failed:stop_rejected" in result.block_reasons
+    assert order_manager.close_calls == 1
+    assert trades.records[-1].status == "protection_failed_exit_pending"
+    assert trades.records[-1].exit_order_id == "EXIT123"
+    assert events.events[-1][0] == "playbook_lifecycle_stop_arm_failed"
+
+
+def test_playbook_lifecycle_stop_arm_failure_without_flatten_is_critical(tmp_path: Path) -> None:
+    ticket_path = _write_live_ticket(tmp_path)
+    packet_path = write_packet(tmp_path, _execution_packet())
+    order_manager = StubOrderManager(stop_order_id=None, close_order_id=None)
+
+    result = asyncio.run(
+        submit_playbook_live_ticket(
+            live_ticket_artifact=ticket_path,
+            packet_path=packet_path,
+            order_manager=order_manager,
+            event_repository=RecordingEvents(),
+            trade_state_repository=RecordingTrades(),
+            lifecycle_store=TradeLifecycleStore(),
+            out_root=tmp_path / "lifecycle",
+        )
+    )
+
+    assert result.status == "critical_unprotected"
+    assert result.lifecycle_started is False
+    assert result.emergency_exit_order_id is None
+    assert "critical_stop_arm_failed:stop_rejected" in result.block_reasons
+    assert "close_rejected" in result.block_reasons
 
 
 def test_submit_playbook_live_ticket_cli_blocks_shadow_packet(tmp_path: Path) -> None:

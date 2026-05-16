@@ -212,6 +212,9 @@ When allowed, Bhiksha:
 - waits for fill or moves the trade into reconciliation
 - resolves the selected management policy into stop and target rules
 - places the protective stop
+- treats stop-arm failure after a filled entry as critical, attempts an
+  emergency close, and returns a non-success status instead of starting an
+  unprotected lifecycle
 - places the target order when the broker supports concurrent exits, otherwise
   records a virtual target for the position manager
 - persists the trade session and lifecycle state

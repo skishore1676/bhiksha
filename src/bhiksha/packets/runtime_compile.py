@@ -35,6 +35,10 @@ class PacketCompileResult:
     management_policy_ids: list[str] | None = None
 
     @property
+    def eligibility(self) -> str:
+        return "eligible" if self.executable else "blocked"
+
+    @property
     def decision(self) -> str:
         return "take" if self.executable else "block"
 

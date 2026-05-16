@@ -43,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         "kind": result.kind,
         "status": result.status,
         "decision": result.decision,
+        "eligibility": result.eligibility,
         "executable": result.executable,
         "block_reasons": result.block_reasons,
         "feature_contract_id": result.feature_contract_id,

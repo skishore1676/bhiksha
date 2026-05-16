@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import TradeRecord
 from bhiksha.execution.order_manager import OrderManager, PreflightCheck, round_price
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -62,6 +63,7 @@ class PlaybookLifecycleSubmitResult:
     stop_price: float | None
     target_order_id: str | None
     target_price: float | None
+    emergency_exit_order_id: str | None
     management_policy_id: str
     management_spec: dict[str, Any]
     trade_state: str
@@ -101,6 +103,7 @@ async def submit_playbook_live_ticket(
     entry_order_id: str | None = None
     stop_order_id: str | None = None
     target_order_id: str | None = None
+    emergency_exit_order_id: str | None = None
     stop_price: float | None = None
     target_price: float | None = None
     entry_price = 0.0
@@ -198,54 +201,107 @@ async def submit_playbook_live_ticket(
                 stop_order_id = stop_result.order_id
                 target_price = round_price(entry_price * (1.0 + management_spec.stop_loss_pct * management_spec.target_r))
                 target_order_id = None
-                if bool(getattr(order_manager, "supports_concurrent_exit_orders", False)):
-                    target_result = await order_manager.place_target_order(option_symbol, target_price, quantity)
-                    target_order_id = target_result.order_id
-                trade_state = "target_active" if stop_order_id and target_order_id else ("open_protected" if stop_order_id else "open_unprotected")
-                await trades.upsert_trade(
-                    TradeRecord(
-                        trade_id=trade_id,
-                        deployment_id=_deployment_id(packet, ticket),
-                        symbol=str(ticket["symbol"]),
-                        option_symbol=option_symbol,
-                        quantity=quantity,
-                        entry_price=entry_price,
-                        underlying_entry_price=underlying_entry_price,
-                        entry_timestamp=datetime.now(UTC),
-                        status=trade_state,
-                        entry_order_id=entry_order_id,
-                        stop_order_id=stop_order_id,
-                        stop_price=stop_price,
-                        target_order_id=target_order_id,
-                        target_price=target_price,
+                if stop_order_id is None:
+                    stop_error = stop_result.error or "missing_stop_order_id"
+                    blocks.append(f"critical_stop_arm_failed:{stop_error}")
+                    close_result = await order_manager.place_close_order(
+                        option_symbol,
+                        quantity,
+                        exit_mode=ExitMode.EMERGENCY,
                     )
-                )
-                if target_order_id:
-                    lifecycle.mark_target_active(str(ticket["symbol"]), _deployment_id(packet, ticket), option_symbol=option_symbol, order_id=target_order_id)
-                else:
+                    emergency_exit_order_id = close_result.order_id
+                    if emergency_exit_order_id is None:
+                        blocks.append(close_result.error or "emergency_flatten_failed")
+                        trade_state = "critical_unprotected"
+                    else:
+                        trade_state = "protection_failed_exit_pending"
+                    await trades.upsert_trade(
+                        TradeRecord(
+                            trade_id=trade_id,
+                            deployment_id=_deployment_id(packet, ticket),
+                            symbol=str(ticket["symbol"]),
+                            option_symbol=option_symbol,
+                            quantity=quantity,
+                            entry_price=entry_price,
+                            underlying_entry_price=underlying_entry_price,
+                            entry_timestamp=datetime.now(UTC),
+                            status=trade_state,
+                            entry_order_id=entry_order_id,
+                            stop_order_id=None,
+                            stop_price=stop_price,
+                            exit_order_id=emergency_exit_order_id,
+                            exit_submitted_at=datetime.now(UTC) if emergency_exit_order_id else None,
+                            exit_mode=ExitMode.EMERGENCY if emergency_exit_order_id else None,
+                        )
+                    )
                     lifecycle.mark_open(
                         str(ticket["symbol"]),
                         _deployment_id(packet, ticket),
                         option_symbol=option_symbol,
-                        order_id=stop_order_id or entry_order_id,
-                        protected=bool(stop_order_id),
+                        order_id=entry_order_id,
+                        protected=False,
                     )
-                await events.append(
-                    "playbook_lifecycle_management_armed",
-                    {
-                        "trade_id": trade_id,
-                        "entry_order_id": entry_order_id,
-                        "stop_order_id": stop_order_id,
-                        "stop_price": stop_price,
-                        "target_order_id": target_order_id,
-                        "target_price": target_price,
-                        "target_order_mode": "broker_order" if target_order_id else "virtual_target",
-                        "management_policy_id": management_spec.policy_id,
-                        "underlying_entry_price": underlying_entry_price,
-                        "underlying_stop_price": underlying_stop_price,
-                    },
-                )
-                lifecycle_started = bool(stop_order_id)
+                    await events.append(
+                        "playbook_lifecycle_stop_arm_failed",
+                        {
+                            "trade_id": trade_id,
+                            "entry_order_id": entry_order_id,
+                            "stop_price": stop_price,
+                            "stop_error": stop_error,
+                            "emergency_exit_order_id": emergency_exit_order_id,
+                            "emergency_exit_error": close_result.error,
+                            "management_policy_id": management_spec.policy_id,
+                        },
+                    )
+                elif bool(getattr(order_manager, "supports_concurrent_exit_orders", False)):
+                    target_result = await order_manager.place_target_order(option_symbol, target_price, quantity)
+                    target_order_id = target_result.order_id
+                if stop_order_id is not None:
+                    trade_state = "target_active" if target_order_id else "open_protected"
+                    await trades.upsert_trade(
+                        TradeRecord(
+                            trade_id=trade_id,
+                            deployment_id=_deployment_id(packet, ticket),
+                            symbol=str(ticket["symbol"]),
+                            option_symbol=option_symbol,
+                            quantity=quantity,
+                            entry_price=entry_price,
+                            underlying_entry_price=underlying_entry_price,
+                            entry_timestamp=datetime.now(UTC),
+                            status=trade_state,
+                            entry_order_id=entry_order_id,
+                            stop_order_id=stop_order_id,
+                            stop_price=stop_price,
+                            target_order_id=target_order_id,
+                            target_price=target_price,
+                        )
+                    )
+                    if target_order_id:
+                        lifecycle.mark_target_active(str(ticket["symbol"]), _deployment_id(packet, ticket), option_symbol=option_symbol, order_id=target_order_id)
+                    else:
+                        lifecycle.mark_open(
+                            str(ticket["symbol"]),
+                            _deployment_id(packet, ticket),
+                            option_symbol=option_symbol,
+                            order_id=stop_order_id,
+                            protected=True,
+                        )
+                    await events.append(
+                        "playbook_lifecycle_management_armed",
+                        {
+                            "trade_id": trade_id,
+                            "entry_order_id": entry_order_id,
+                            "stop_order_id": stop_order_id,
+                            "stop_price": stop_price,
+                            "target_order_id": target_order_id,
+                            "target_price": target_price,
+                            "target_order_mode": "broker_order" if target_order_id else "virtual_target",
+                            "management_policy_id": management_spec.policy_id,
+                            "underlying_entry_price": underlying_entry_price,
+                            "underlying_stop_price": underlying_stop_price,
+                        },
+                    )
+                    lifecycle_started = True
 
     status = _status_for(blocks, trade_state, lifecycle_started)
     artifact_dir = out_root / _lifecycle_id(packet, ticket, trade_id)
@@ -270,6 +326,7 @@ async def submit_playbook_live_ticket(
         stop_price=stop_price,
         target_order_id=target_order_id,
         target_price=target_price,
+        emergency_exit_order_id=emergency_exit_order_id,
         management_policy_id=str(ticket.get("selected_management_policy_id", "")),
         management_spec=spec_payload,
         trade_state=trade_state,
@@ -405,6 +462,8 @@ def _deployment_id(packet: ExecutionPacket, ticket: dict[str, Any]) -> str:
 
 
 def _status_for(blocks: list[str], trade_state: str, lifecycle_started: bool) -> str:
+    if trade_state in {"critical_unprotected", "protection_failed_exit_pending"}:
+        return trade_state
     if blocks:
         return "blocked"
     if lifecycle_started:
@@ -451,6 +510,7 @@ def _lifecycle_markdown(payload: dict[str, Any]) -> str:
             f"- stop_price: `{payload['stop_price']}`",
             f"- target_order_id: `{payload['target_order_id']}`",
             f"- target_price: `{payload['target_price']}`",
+            f"- emergency_exit_order_id: `{payload['emergency_exit_order_id']}`",
             f"- management_policy_id: `{payload['management_policy_id']}`",
             f"- trade_state: `{payload['trade_state']}`",
             f"- block_reasons: `{', '.join(payload['block_reasons'])}`",

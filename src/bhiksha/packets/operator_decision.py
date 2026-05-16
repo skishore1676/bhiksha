@@ -121,7 +121,11 @@ def _consultation_blocks(consultation: dict[str, Any]) -> list[str]:
     blocks: list[str] = []
     if consultation.get("status") != "consulted":
         blocks.append(f"consultation_status_not_consulted:{consultation.get('status')}")
-    if consultation.get("compile_decision") != "take":
+    compile_eligibility = consultation.get("compile_eligibility")
+    if compile_eligibility is not None:
+        if compile_eligibility != "eligible":
+            blocks.append(f"packet_compile_not_eligible:{compile_eligibility}")
+    elif consultation.get("compile_decision") != "take":
         blocks.append(f"packet_compile_not_take:{consultation.get('compile_decision')}")
     if consultation.get("runtime_mode") not in {"shadow", "live_approval_gated"}:
         blocks.append(f"runtime_mode_not_supported:{consultation.get('runtime_mode')}")

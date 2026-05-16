@@ -33,6 +33,7 @@ def test_playbook_packet_validates_but_fails_closed_for_execution(tmp_path: Path
 
     assert result.executable is False
     assert result.decision == "block"
+    assert result.eligibility == "blocked"
     assert "packet_kind_not_execution" in result.block_reasons
     assert "operator_approval_missing" in result.block_reasons
     assert result.management_policy_ids == ["reversal_extreme__fixed_1_5r"]
@@ -77,6 +78,7 @@ def test_execution_packet_compiles_when_manifest_supports_contract(tmp_path: Pat
 
     assert result.executable is True
     assert result.decision == "take"
+    assert result.eligibility == "eligible"
     assert result.block_reasons == []
     assert result.management_policy_ids == ["reversal_extreme__fixed_1_5r"]
 

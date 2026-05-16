@@ -13,6 +13,9 @@ operator approval gated. This is not autonomous trading.
 - live entry requires an approved live ticket
 - option preview requires the underlying stop price
 - live management requires a started lifecycle artifact
+- if the entry fills but the protective stop cannot be armed, Bhiksha records a
+  critical stop-arm failure, attempts an emergency close, and the submit command
+  exits non-zero
 
 ## Preflight
 
@@ -81,3 +84,6 @@ PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
 
 If compile, option preview, live ticket, lifecycle submit, or monitor reports a
 block reason, stop the pilot and fix the artifact/code path before trading.
+If lifecycle submit reports `protection_failed_exit_pending` or
+`critical_unprotected`, treat it as an active risk event, not a normal
+lifecycle start.

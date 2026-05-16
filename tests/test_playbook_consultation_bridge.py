@@ -89,12 +89,15 @@ def test_consultation_bridge_runs_mala_query_and_writes_bhiksha_artifact(tmp_pat
     assert result.direction == "short"
     assert result.verdict == "take"
     assert result.policy == "take"
+    assert result.compile_eligibility == "eligible"
+    assert result.compile_decision == "take"
     assert result.selected_exit == "vwap_return"
     assert result.allowed_management_policy_ids == ["reversal_extreme__fixed_1r"]
 
     artifact = json.loads(Path(result.artifact_json).read_text(encoding="utf-8"))
     assert artifact["packet_id"] == "execution.mean_reversion_at_extremes.iwm_qqq"
     assert artifact["chart_read"] == "price stretched above VWAP and started rejecting the push"
+    assert artifact["compile_eligibility"] == "eligible"
     assert artifact["policy"] == "take"
     assert artifact["selected_exit"] == "vwap_return"
     assert Path(result.artifact_md).exists()
