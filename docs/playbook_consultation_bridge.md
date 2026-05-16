@@ -15,6 +15,7 @@ operator chart read
   -> Bhiksha builds an option preview ticket
   -> shadow lane records simulated option PnL
   -> live lane can create an approval-gated ticket
+  -> Bhiksha submitter starts the managed lifecycle
 ```
 
 The bridge now has parallel shadow and live lanes. The shadow lane exists to
@@ -168,15 +169,57 @@ An approved live ticket has `order_submission_allowed=true` but
 `submitter_status=not_submitted`. It is permission for the later submitter
 layer; it is not itself a broker order.
 
+## Managed Lifecycle
+
+The submitter consumes an approved live ticket only when the execution packet
+has been promoted to `runtime_mode=live_approval_gated`. It refuses the current
+shadow-only packet.
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.submit_playbook_live_ticket \
+  --live-ticket-artifact artifacts/playbook/live_tickets/<ticket_id>/playbook_live_ticket.json \
+  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v1.json \
+  --db-path bhiksha.db
+```
+
+When allowed, Bhiksha:
+
+- submits the option entry order
+- waits for fill or moves the trade into reconciliation
+- resolves the selected management policy into stop and target rules
+- places the protective stop
+- places the target order when the broker supports concurrent exits, otherwise
+  records a virtual target for the position manager
+- persists the trade session and lifecycle state
+- writes a lifecycle submission artifact
+
+```text
+artifacts/playbook/lifecycle/<lifecycle_id>/playbook_lifecycle_submission.json
+artifacts/playbook/lifecycle/<lifecycle_id>/PLAYBOOK_LIFECYCLE_SUBMISSION.md
+```
+
+The supported default policy mapping is:
+
+```text
+reversal_extreme__fixed_1r -> 45% option-premium stop, 1R target, hard flat 15:55 ET
+immediate_entry_bar_failure__fixed_2r -> 45% option-premium stop, 2R target, hard flat 15:55 ET
+```
+
+Future packets can override these through `runtime_controls.management_policy_specs`.
+
 ## Execution Boundary
 
-The current bridge is a consultation backend, not live trading automation.
+The current checked-in reversion execution packet is still shadow-only, so the
+submitter blocks it. Live execution requires a new or promoted packet with
+`runtime_mode=live_approval_gated`, `shadow_only=false`, and
+`live_ticket_required=true`.
 
 For live use, the next layer must add:
 
-1. order submission from an approved live ticket
-2. position manager and broker reconciliation
+1. packet promotion to `live_approval_gated`
+2. runtime recovery of packet-native lifecycle state after restart
 3. fill/fire/outcome feedback artifact back to Mala
 
-Until those exist, a live approval ticket means "the submitter may act after
-its own final checks," not "an order has already been placed."
+Until packet promotion exists, a live approval ticket means "ready for a future
+submitter check," not "safe to place a real order."
