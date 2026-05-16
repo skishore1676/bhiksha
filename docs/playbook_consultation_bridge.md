@@ -7,15 +7,16 @@ It is the current implementation layer behind the future Trader Desk button:
 
 ```text
 operator chart read
-  -> Bhiksha compiles the approved shadow execution packet
+  -> Bhiksha compiles the approved shadow or live-gated execution packet
   -> Bhiksha calls Mala's playbook query and policy card
   -> Bhiksha records the consultation artifact
   -> operator decides take/pass and management policy
-  -> Bhiksha records a shadow execution intent
+  -> Bhiksha records a shadow or live execution intent
   -> Bhiksha builds an option preview ticket
   -> shadow lane records simulated option PnL
   -> live lane can create an approval-gated ticket
   -> Bhiksha submitter starts the managed lifecycle
+  -> Bhiksha monitors the underlying stop anchor and hard-flat rule
 ```
 
 The bridge now has parallel shadow and live lanes. The shadow lane exists to
@@ -23,6 +24,15 @@ learn whether the playbook would have made money using the option vehicle and
 management choice. The live lane exists to make a real order possible only
 after an explicit approval ticket. The submitter/reconciliation layer is still
 separate.
+
+The first live packet is still approval-gated, not autonomous:
+
+```text
+/Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json
+```
+
+It compiles as `runtime_mode=live_approval_gated`, requires a live ticket,
+requires an underlying stop price, and forbids live automation.
 
 ## Command
 
@@ -90,15 +100,16 @@ artifacts/playbook/intents/<intent_id>/playbook_operator_decision.json
 artifacts/playbook/intents/<intent_id>/PLAYBOOK_OPERATOR_DECISION.md
 ```
 
-The intent can be `shadow_intent_ready`, `operator_pass`, or `blocked`.
-`shadow_intent_ready` still has `order_submission_allowed=false`; it is the
-machine-readable handoff for the next option-preview/live-approval layer, not
-an order ticket.
+The intent can be `shadow_intent_ready`, `live_intent_ready`, `operator_pass`,
+or `blocked`. Ready intents still have `order_submission_allowed=false`; they
+are the machine-readable handoff for option preview/live approval, not order
+tickets.
 
 ## Option Preview
 
-For a `shadow_intent_ready` artifact, Bhiksha can resolve the option candidate
-and run the same chain/quote/risk checks used by the execution planner:
+For a `shadow_intent_ready` or `live_intent_ready` artifact, Bhiksha can resolve
+the option candidate and run the same chain/quote/risk checks used by the
+execution planner:
 
 ```bash
 PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
@@ -106,6 +117,18 @@ PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
   --intent-artifact artifacts/playbook/intents/<intent_id>/playbook_operator_decision.json \
   --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v1.json \
   --underlying-price 210.25
+```
+
+For the live-gated packet, add the underlying invalidation level from the
+playbook/chart read:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.preview_playbook_option \
+  --intent-artifact artifacts/playbook/intents/<intent_id>/playbook_operator_decision.json \
+  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json \
+  --underlying-price 286.38 \
+  --underlying-stop-price 287.10
 ```
 
 It writes:
@@ -172,14 +195,14 @@ layer; it is not itself a broker order.
 ## Managed Lifecycle
 
 The submitter consumes an approved live ticket only when the execution packet
-has been promoted to `runtime_mode=live_approval_gated`. It refuses the current
+has been promoted to `runtime_mode=live_approval_gated`. It refuses the v1
 shadow-only packet.
 
 ```bash
 PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
   -m bhiksha.tools.submit_playbook_live_ticket \
   --live-ticket-artifact artifacts/playbook/live_tickets/<ticket_id>/playbook_live_ticket.json \
-  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v1.json \
+  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json \
   --db-path bhiksha.db
 ```
 
@@ -216,8 +239,48 @@ source_config_id
 ```
 
 Bhiksha records this spec in option preview, live ticket, and lifecycle
-artifacts. The option-premium stop remains the broker-protective fallback; the
-next management depth layer is live monitoring of the underlying stop anchor.
+artifacts. The option-premium stop remains the broker-protective fallback; live
+management monitors the underlying stop anchor and hard-flat time.
+
+## Live Management Monitor
+
+Run dry first. Dry mode writes the same management artifact and reports whether
+an exit would submit, but it does not place the close order:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.manage_playbook_live_trade \
+  --lifecycle-artifact artifacts/playbook/lifecycle/<lifecycle_id>/playbook_lifecycle_submission.json \
+  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json \
+  --db-path bhiksha.db \
+  --quote-provider schwab \
+  --loop \
+  --json
+```
+
+After the live position is intentionally opened and the lifecycle artifact is
+correct, add `--execute` to let Bhiksha cancel existing exit protection and
+submit the emergency close when the underlying stop anchor or hard-flat rule
+triggers:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.manage_playbook_live_trade \
+  --lifecycle-artifact artifacts/playbook/lifecycle/<lifecycle_id>/playbook_lifecycle_submission.json \
+  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json \
+  --db-path bhiksha.db \
+  --quote-provider schwab \
+  --loop \
+  --execute \
+  --json
+```
+
+The monitor writes:
+
+```text
+artifacts/playbook/live_management/<management_id>/playbook_live_management.json
+artifacts/playbook/live_management/<management_id>/PLAYBOOK_LIVE_MANAGEMENT.md
+```
 
 The compatibility fallback policy mapping is:
 

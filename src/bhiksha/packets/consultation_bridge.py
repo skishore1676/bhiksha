@@ -93,8 +93,8 @@ def consult_mala_playbook(
             "packet is not executable for consultation bridge: "
             + ",".join(compile_result.block_reasons)
         )
-    if compile_result.runtime_mode != "shadow":
-        raise ValueError(f"consultation bridge only supports shadow packets, got {compile_result.runtime_mode!r}")
+    if compile_result.runtime_mode not in {"shadow", "live_approval_gated"}:
+        raise ValueError(f"consultation bridge does not support runtime mode {compile_result.runtime_mode!r}")
 
     effective_run_dir = mala_run_dir or _source_run_dir(packet, mala_repo)
     effective_python = mala_python or mala_repo / ".venv" / "bin" / "python"

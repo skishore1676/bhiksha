@@ -95,7 +95,7 @@ def test_option_preview_blocks_non_take_intent_without_provider_calls(tmp_path: 
 
     assert result.status == "blocked"
     assert result.preview_ready is False
-    assert "intent_status_not_shadow_ready:operator_pass" in result.block_reasons
+    assert "intent_status_not_ready:operator_pass" in result.block_reasons
     assert chain.calls == 0
     assert order_manager.quote_calls == 0
 
@@ -176,6 +176,58 @@ def test_option_preview_requires_packet_preview_boundary(tmp_path: Path) -> None
     assert "packet_shadow_only_missing" in result.block_reasons
 
 
+def test_option_preview_supports_live_gated_packet_with_underlying_stop(tmp_path: Path) -> None:
+    intent_path = _write_intent(tmp_path, status="live_intent_ready", execution_mode="live_approval_gated")
+    packet_path = write_packet(
+        tmp_path,
+        _execution_packet(
+            runtime_mode=RuntimeMode.LIVE_APPROVAL_GATED,
+            runtime_controls=_runtime_controls(shadow_only=False, live_ticket_required=True),
+        ),
+    )
+
+    result = asyncio.run(
+        build_playbook_option_preview(
+            intent_artifact=intent_path,
+            packet_path=packet_path,
+            chain_service=StubChainService(),
+            order_manager=StubOrderManager(),
+            out_root=tmp_path / "previews",
+            underlying_price=286.38,
+            underlying_stop_price=287.10,
+        )
+    )
+
+    assert result.status == "option_preview_ready"
+    assert result.underlying_stop_price == 287.10
+    assert result.management_spec["stop_anchor"] == "underlying_reversal_extreme"
+
+
+def test_option_preview_blocks_live_gated_without_underlying_stop(tmp_path: Path) -> None:
+    intent_path = _write_intent(tmp_path, status="live_intent_ready", execution_mode="live_approval_gated")
+    packet_path = write_packet(
+        tmp_path,
+        _execution_packet(
+            runtime_mode=RuntimeMode.LIVE_APPROVAL_GATED,
+            runtime_controls=_runtime_controls(shadow_only=False, live_ticket_required=True),
+        ),
+    )
+
+    result = asyncio.run(
+        build_playbook_option_preview(
+            intent_artifact=intent_path,
+            packet_path=packet_path,
+            chain_service=StubChainService(),
+            order_manager=StubOrderManager(),
+            out_root=tmp_path / "previews",
+            underlying_price=286.38,
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "underlying_stop_price_required" in result.block_reasons
+
+
 def test_preview_playbook_option_cli_returns_block_code_for_pass_intent(tmp_path: Path) -> None:
     intent_path = _write_intent(tmp_path, status="operator_pass", decision="pass", execution_ready=False)
     packet_path = write_packet(tmp_path, _execution_packet())
@@ -200,12 +252,13 @@ def _write_intent(
     status: str = "shadow_intent_ready",
     decision: str = "take",
     execution_ready: bool = True,
+    execution_mode: str = "shadow",
 ) -> Path:
     payload = {
         "status": status,
         "decision": decision,
         "execution_ready": execution_ready,
-        "execution_mode": "shadow",
+        "execution_mode": execution_mode,
         "packet_id": "execution.mean_reversion_at_extremes.iwm_qqq",
         "packet_version": 1,
         "symbol": "IWM",
@@ -221,7 +274,11 @@ def _write_intent(
     return path
 
 
-def _execution_packet(runtime_controls: dict | None = None) -> ExecutionPacket:
+def _execution_packet(
+    runtime_controls: dict | None = None,
+    *,
+    runtime_mode: RuntimeMode = RuntimeMode.SHADOW,
+) -> ExecutionPacket:
     return ExecutionPacket(
         packet_id="execution.mean_reversion_at_extremes.iwm_qqq",
         version=1,
@@ -247,30 +304,37 @@ def _execution_packet(runtime_controls: dict | None = None) -> ExecutionPacket:
             version=1,
             kind=PacketKind.PLAYBOOK,
         ),
-        runtime_mode=RuntimeMode.SHADOW,
+        runtime_mode=runtime_mode,
         capability_manifest_id="bhiksha.test",
         parity_report_id="parity.mean_reversion.test",
-        runtime_controls=runtime_controls
-        or {
-            "allowed_management_policy_ids": ["reversal_extreme__fixed_1r"],
-            "management_policy_specs_required": True,
-            "management_policy_specs": {
-                "reversal_extreme__fixed_1r": {
-                    "policy_id": "reversal_extreme__fixed_1r",
-                    "stop_family": "reversal_extreme",
-                    "stop_anchor": "underlying_reversal_extreme",
-                    "exit_family": "fixed_1r",
-                    "target_model": "fixed_r",
-                    "target_r": 1.0,
-                    "hard_flat_time_et": "15:55",
-                    "option_stop_fallback_pct": 0.45,
-                    "target_order_mode": "virtual_or_broker",
-                    "source_config_id": "cfg_1",
-                }
-            },
-            "shadow_only": True,
-            "live_automated_allowed": False,
-            "operator_must_select_management_policy": True,
-            "option_selection_preview_only": True,
-        },
+        runtime_controls=runtime_controls or _runtime_controls(),
     )
+
+
+def _runtime_controls(*, shadow_only: bool = True, live_ticket_required: bool = False) -> dict:
+    controls = {
+        "allowed_management_policy_ids": ["reversal_extreme__fixed_1r"],
+        "management_policy_specs_required": True,
+        "management_policy_specs": {
+            "reversal_extreme__fixed_1r": {
+                "policy_id": "reversal_extreme__fixed_1r",
+                "stop_family": "reversal_extreme",
+                "stop_anchor": "underlying_reversal_extreme",
+                "exit_family": "fixed_1r",
+                "target_model": "fixed_r",
+                "target_r": 1.0,
+                "hard_flat_time_et": "15:55",
+                "option_stop_fallback_pct": 0.45,
+                "target_order_mode": "virtual_or_broker",
+                "source_config_id": "cfg_1",
+            }
+        },
+        "shadow_only": shadow_only,
+        "live_automated_allowed": False,
+        "operator_must_select_management_policy": True,
+        "option_selection_preview_only": True,
+    }
+    if live_ticket_required:
+        controls["live_ticket_required"] = True
+        controls["requires_underlying_stop_price"] = True
+    return controls

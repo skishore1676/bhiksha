@@ -54,6 +54,8 @@ class PlaybookLifecycleSubmitResult:
     quantity: int
     limit_price: float
     entry_price: float
+    underlying_entry_price: float | None
+    underlying_stop_price: float | None
     trade_id: str
     entry_order_id: str | None
     stop_order_id: str | None
@@ -109,6 +111,8 @@ async def submit_playbook_live_ticket(
         option_symbol = str(ticket["option_symbol"])
         quantity = int(ticket["quantity"])
         requested_limit = float(ticket["limit_price"])
+        underlying_entry_price = _optional_float(ticket.get("underlying_entry_price"))
+        underlying_stop_price = _optional_float(ticket.get("underlying_stop_price"))
         preflight = await order_manager.preflight_entry(option_symbol, requested_limit, quantity)
         entry_price = _preflight_limit_price(preflight, fallback=requested_limit)
         result = await order_manager.place_entry_order(
@@ -143,6 +147,7 @@ async def submit_playbook_live_ticket(
                     option_symbol=option_symbol,
                     quantity=quantity,
                     entry_price=entry_price,
+                    underlying_entry_price=underlying_entry_price,
                     entry_timestamp=datetime.now(UTC),
                     status="pending_entry",
                     entry_order_id=entry_order_id,
@@ -174,6 +179,7 @@ async def submit_playbook_live_ticket(
                         option_symbol=option_symbol,
                         quantity=quantity,
                         entry_price=entry_price,
+                        underlying_entry_price=underlying_entry_price,
                         entry_timestamp=datetime.now(UTC),
                         status=trade_state,
                         entry_order_id=entry_order_id,
@@ -204,6 +210,7 @@ async def submit_playbook_live_ticket(
                         option_symbol=option_symbol,
                         quantity=quantity,
                         entry_price=entry_price,
+                        underlying_entry_price=underlying_entry_price,
                         entry_timestamp=datetime.now(UTC),
                         status=trade_state,
                         entry_order_id=entry_order_id,
@@ -234,6 +241,8 @@ async def submit_playbook_live_ticket(
                         "target_price": target_price,
                         "target_order_mode": "broker_order" if target_order_id else "virtual_target",
                         "management_policy_id": management_spec.policy_id,
+                        "underlying_entry_price": underlying_entry_price,
+                        "underlying_stop_price": underlying_stop_price,
                     },
                 )
                 lifecycle_started = bool(stop_order_id)
@@ -253,6 +262,8 @@ async def submit_playbook_live_ticket(
         quantity=int(ticket.get("quantity", 0) or 0),
         limit_price=float(ticket.get("limit_price", 0.0) or 0.0),
         entry_price=entry_price,
+        underlying_entry_price=_optional_float(ticket.get("underlying_entry_price")),
+        underlying_stop_price=_optional_float(ticket.get("underlying_stop_price")),
         trade_id=trade_id,
         entry_order_id=entry_order_id,
         stop_order_id=stop_order_id,
@@ -289,6 +300,8 @@ def _ticket_blocks(ticket: dict[str, Any]) -> list[str]:
         blocks.append("quantity_missing")
     if float(ticket.get("limit_price", 0.0) or 0.0) <= 0:
         blocks.append("limit_price_missing")
+    if ticket.get("underlying_stop_price") is None:
+        blocks.append("underlying_stop_price_missing")
     return blocks
 
 
@@ -373,6 +386,15 @@ def _filled_entry_price(payload: dict[str, Any] | None, *, fallback: float) -> f
         except (TypeError, ValueError):
             continue
     return fallback
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _deployment_id(packet: ExecutionPacket, ticket: dict[str, Any]) -> str:

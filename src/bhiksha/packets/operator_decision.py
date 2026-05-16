@@ -63,8 +63,10 @@ def record_playbook_operator_decision(
     execution_ready = False
     status = "operator_pass"
 
+    execution_mode = str(consultation.get("runtime_mode", "shadow"))
+
     if normalized_decision == "take":
-        status = "shadow_intent_ready"
+        status = "live_intent_ready" if execution_mode == "live_approval_gated" else "shadow_intent_ready"
         if not selected_policy:
             block_reasons.append("management_policy_required_for_take")
         elif selected_policy not in allowed_policy_ids:
@@ -86,7 +88,7 @@ def record_playbook_operator_decision(
         status=status,
         decision=normalized_decision,
         execution_ready=execution_ready,
-        execution_mode="shadow",
+        execution_mode=execution_mode,
         packet_id=str(consultation.get("packet_id", "")),
         packet_version=int(consultation.get("packet_version", 0) or 0),
         symbol=str(consultation.get("symbol", "")),
@@ -121,8 +123,8 @@ def _consultation_blocks(consultation: dict[str, Any]) -> list[str]:
         blocks.append(f"consultation_status_not_consulted:{consultation.get('status')}")
     if consultation.get("compile_decision") != "take":
         blocks.append(f"packet_compile_not_take:{consultation.get('compile_decision')}")
-    if consultation.get("runtime_mode") != "shadow":
-        blocks.append(f"runtime_mode_not_shadow:{consultation.get('runtime_mode')}")
+    if consultation.get("runtime_mode") not in {"shadow", "live_approval_gated"}:
+        blocks.append(f"runtime_mode_not_supported:{consultation.get('runtime_mode')}")
     compile_blocks = consultation.get("compile_block_reasons", [])
     if compile_blocks:
         blocks.extend(f"compile_block:{reason}" for reason in compile_blocks)

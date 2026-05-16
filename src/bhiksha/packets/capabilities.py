@@ -48,11 +48,12 @@ def build_packet_capability_manifest() -> CapabilityManifest:
                 supported_packet_kinds=["execution"],
                 supported_symbols=["IWM", "QQQ"],
                 feature_contracts=[contract.contract_id],
-                runtime_modes=["shadow"],
+                runtime_modes=["shadow", "live_approval_gated"],
                 metadata={
                     "adapter": "bhiksha.strategy.intraday_mean_reversion",
                     "event_exporter": "bhiksha.tools.export_reversion_events",
-                    "readiness": "signal_parity_passed_entry_shadow_only",
+                    "readiness": "signal_parity_passed_live_approval_gated",
+                    "live_boundary": "operator_ticket_required",
                 },
             )
         ],

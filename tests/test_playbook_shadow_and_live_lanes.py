@@ -201,6 +201,8 @@ def _write_preview(
         "option_symbol": "IWM260330P00558000",
         "quantity": 1,
         "estimated_entry_price": 2.90,
+        "underlying_entry_price": 286.38,
+        "underlying_stop_price": 287.10,
         "risk_reasons": ["approved"],
         "block_reasons": [],
         "order_submission_allowed": False,

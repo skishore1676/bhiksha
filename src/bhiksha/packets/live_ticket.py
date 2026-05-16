@@ -29,6 +29,8 @@ class PlaybookLiveTicketResult:
     option_symbol: str
     quantity: int
     limit_price: float
+    underlying_entry_price: float | None
+    underlying_stop_price: float | None
     operator: str
     operator_note: str
     order_submission_allowed: bool
@@ -84,6 +86,8 @@ def create_playbook_live_ticket(
         option_symbol=str(preview.get("option_symbol", "")),
         quantity=int(preview.get("quantity", 0) or 0),
         limit_price=float(preview.get("estimated_entry_price", 0.0) or 0.0),
+        underlying_entry_price=_optional_float(preview.get("underlying_entry_price")),
+        underlying_stop_price=_optional_float(preview.get("underlying_stop_price")),
         operator=actor,
         operator_note=note,
         order_submission_allowed=order_allowed,
@@ -126,7 +130,18 @@ def _preview_blocks(preview: dict[str, Any]) -> list[str]:
         blocks.append("quantity_missing")
     if float(preview.get("estimated_entry_price", 0.0) or 0.0) <= 0:
         blocks.append("limit_price_missing")
+    if preview.get("underlying_stop_price") is None and preview.get("management_spec", {}).get("stop_anchor"):
+        blocks.append("underlying_stop_price_missing")
     return blocks
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _ticket_id(preview: dict[str, Any], decision: LiveDecision) -> str:
@@ -166,6 +181,8 @@ def _ticket_markdown(payload: dict[str, Any]) -> str:
             f"- option_symbol: `{payload['option_symbol']}`",
             f"- quantity: `{payload['quantity']}`",
             f"- limit_price: `{payload['limit_price']}`",
+            f"- underlying_entry_price: `{payload['underlying_entry_price']}`",
+            f"- underlying_stop_price: `{payload['underlying_stop_price']}`",
             f"- operator: `{payload['operator']}`",
             f"- block_reasons: `{', '.join(payload['block_reasons'])}`",
             "",

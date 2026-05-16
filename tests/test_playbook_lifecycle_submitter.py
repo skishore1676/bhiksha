@@ -260,6 +260,8 @@ def _write_live_ticket(
         "option_symbol": "IWM260330P00558000",
         "quantity": 1,
         "limit_price": 2.90,
+        "underlying_entry_price": 286.38,
+        "underlying_stop_price": 287.10,
         "operator": "Suman",
         "order_submission_allowed": True,
         "live_approval_required": False,
@@ -339,6 +341,8 @@ def _execution_packet(
             "live_automated_allowed": False,
             "live_ticket_required": True,
             "operator_must_select_management_policy": True,
+            "requires_underlying_stop_price": True,
+            "live_management_required": True,
         },
     )
 

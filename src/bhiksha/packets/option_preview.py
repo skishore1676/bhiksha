@@ -39,6 +39,7 @@ class PlaybookOptionPreviewResult:
     quantity: int
     estimated_entry_price: float
     underlying_entry_price: float | None
+    underlying_stop_price: float | None
     risk_reasons: list[str]
     block_reasons: list[str]
     order_submission_allowed: bool
@@ -62,6 +63,7 @@ async def build_playbook_option_preview(
     min_open_interest: int = 100,
     max_bid_ask_spread_pct: float = 0.20,
     underlying_price: float | None = None,
+    underlying_stop_price: float | None = None,
 ) -> PlaybookOptionPreviewResult:
     """Resolve an option candidate and write an approval-gated preview artifact."""
     intent = _load_json(intent_artifact)
@@ -74,6 +76,8 @@ async def build_playbook_option_preview(
     management_spec = _resolve_management_policy(packet, str(intent.get("selected_management_policy_id", "")))
     if management_spec is None and packet.runtime_controls.get("management_policy_specs_required") is True:
         block_reasons.append(f"management_policy_spec_missing:{intent.get('selected_management_policy_id')}")
+    if _requires_underlying_stop_price(packet) and underlying_stop_price is None:
+        block_reasons.append("underlying_stop_price_required")
 
     plan: TradePlan | None = None
     if not block_reasons:
@@ -128,6 +132,7 @@ async def build_playbook_option_preview(
         quantity=plan.quantity if plan is not None else 0,
         estimated_entry_price=plan.estimated_entry_price if plan is not None else 0.0,
         underlying_entry_price=plan.underlying_entry_price if plan is not None else underlying_price,
+        underlying_stop_price=underlying_stop_price,
         risk_reasons=plan.risk_reasons if plan is not None else [],
         block_reasons=block_reasons,
         order_submission_allowed=False,
@@ -148,8 +153,8 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _intent_blocks(intent: dict[str, Any]) -> list[str]:
     blocks: list[str] = []
-    if intent.get("status") != "shadow_intent_ready":
-        blocks.append(f"intent_status_not_shadow_ready:{intent.get('status')}")
+    if intent.get("status") not in {"shadow_intent_ready", "live_intent_ready"}:
+        blocks.append(f"intent_status_not_ready:{intent.get('status')}")
     if intent.get("decision") != "take":
         blocks.append(f"intent_decision_not_take:{intent.get('decision')}")
     if intent.get("execution_ready") is not True:
@@ -170,13 +175,28 @@ def _packet_blocks(intent: dict[str, Any], packet: ExecutionPacket) -> list[str]
         blocks.append("packet_option_preview_only_missing")
     if controls.get("live_automated_allowed") is not False:
         blocks.append("packet_live_automated_boundary_missing")
-    if controls.get("shadow_only") is not True:
-        blocks.append("packet_shadow_only_missing")
+    if packet.runtime_mode.value == "shadow":
+        if controls.get("shadow_only") is not True:
+            blocks.append("packet_shadow_only_missing")
+    elif packet.runtime_mode.value == "live_approval_gated":
+        if controls.get("shadow_only") is not False:
+            blocks.append("packet_live_gated_shadow_boundary_missing")
+        if controls.get("live_ticket_required") is not True:
+            blocks.append("packet_live_ticket_required_missing")
+    else:
+        blocks.append(f"packet_runtime_mode_not_supported:{packet.runtime_mode.value}")
     selected_policy = str(intent.get("selected_management_policy_id", ""))
     allowed_policy_ids = [str(policy_id) for policy_id in controls.get("allowed_management_policy_ids", [])]
     if selected_policy not in allowed_policy_ids:
         blocks.append(f"selected_management_policy_not_allowed:{selected_policy}")
     return blocks
+
+
+def _requires_underlying_stop_price(packet: ExecutionPacket) -> bool:
+    return (
+        packet.runtime_mode.value == "live_approval_gated"
+        and packet.runtime_controls.get("requires_underlying_stop_price") is True
+    )
 
 
 def _preview_deployment(
@@ -314,6 +334,7 @@ def _preview_markdown(payload: dict[str, Any]) -> str:
             f"- option_symbol: `{payload['option_symbol']}`",
             f"- quantity: `{payload['quantity']}`",
             f"- estimated_entry_price: `{payload['estimated_entry_price']}`",
+            f"- underlying_stop_price: `{payload['underlying_stop_price']}`",
             f"- risk_reasons: `{', '.join(payload['risk_reasons'])}`",
             f"- block_reasons: `{', '.join(payload['block_reasons'])}`",
             "",

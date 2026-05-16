@@ -17,6 +17,6 @@ def test_packet_capability_manifest_supports_reversion_shadow_after_signal_parit
     result = compile_packet_for_runtime(packet_path, capability_manifest=manifest)
 
     assert manifest.capabilities[0].supported is True
-    assert manifest.capabilities[0].runtime_modes == ["shadow"]
+    assert manifest.capabilities[0].runtime_modes == ["shadow", "live_approval_gated"]
     assert result.executable is True
     assert result.block_reasons == []

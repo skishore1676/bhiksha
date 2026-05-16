@@ -16,6 +16,7 @@ from mala_bhiksha_kernel import (  # noqa: E402
     ExecutionPacket,
     PacketKind,
     PacketStatus,
+    RuntimeMode,
     RuntimeCapability,
     read_packet_file,
 )
@@ -111,15 +112,36 @@ def _runtime_control_blocks(
 ) -> list[str]:
     blocks: list[str] = []
     controls = packet.runtime_controls
-    if packet.runtime_mode.value == "shadow":
+    if packet.runtime_mode == RuntimeMode.SHADOW:
         if controls.get("shadow_only") is not True:
             blocks.append("shadow_only_control_missing")
         if controls.get("live_automated_allowed") is True:
             blocks.append("live_automated_not_allowed_for_shadow")
+    if packet.runtime_mode == RuntimeMode.LIVE_APPROVAL_GATED:
+        if controls.get("shadow_only") is not False:
+            blocks.append("live_gated_shadow_only_must_be_false")
+        if controls.get("live_automated_allowed") is not False:
+            blocks.append("live_gated_automated_boundary_missing")
+        if controls.get("live_ticket_required") is not True:
+            blocks.append("live_ticket_required_missing")
+        if controls.get("management_policy_specs_required") is not True:
+            blocks.append("management_policy_specs_required_missing")
+        if controls.get("requires_underlying_stop_price") is not True:
+            blocks.append("underlying_stop_price_requirement_missing")
+        if controls.get("live_management_required") is not True:
+            blocks.append("live_management_requirement_missing")
     if not management_policy_ids:
         blocks.append("management_policy_ids_missing")
     if controls.get("operator_must_select_management_policy") is not True:
         blocks.append("operator_management_policy_selection_missing")
+    specs = controls.get("management_policy_specs")
+    if controls.get("management_policy_specs_required") is True:
+        if not isinstance(specs, dict):
+            blocks.append("management_policy_specs_missing")
+        else:
+            missing_specs = [policy_id for policy_id in management_policy_ids if policy_id not in specs]
+            if missing_specs:
+                blocks.append("management_policy_specs_missing:" + ",".join(missing_specs))
     return blocks
 
 

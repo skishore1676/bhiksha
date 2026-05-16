@@ -23,6 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-open-interest", type=int, default=100)
     parser.add_argument("--max-bid-ask-spread-pct", type=float, default=0.20)
     parser.add_argument("--underlying-price", type=float)
+    parser.add_argument(
+        "--underlying-stop-price",
+        type=float,
+        help="Required for live approval-gated packets; the underlying invalidation level from the playbook.",
+    )
     parser.add_argument("--json", action="store_true", help="Print full result JSON.")
     args = parser.parse_args(argv)
 
@@ -39,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
             min_open_interest=args.min_open_interest,
             max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
             underlying_price=args.underlying_price,
+            underlying_stop_price=args.underlying_stop_price,
         )
     )
     payload = {
@@ -54,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         "quantity": result.quantity,
         "estimated_entry_price": result.estimated_entry_price,
         "underlying_entry_price": result.underlying_entry_price,
+        "underlying_stop_price": result.underlying_stop_price,
         "risk_reasons": result.risk_reasons,
         "block_reasons": result.block_reasons,
         "order_submission_allowed": result.order_submission_allowed,
