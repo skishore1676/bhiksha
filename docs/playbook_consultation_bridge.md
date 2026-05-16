@@ -11,6 +11,7 @@ operator chart read
   -> Bhiksha calls Mala's playbook query and policy card
   -> Bhiksha records the consultation artifact
   -> operator decides take/pass and management policy
+  -> Bhiksha records a shadow execution intent
 ```
 
 The bridge does not submit orders. It is intentionally shadow-only until the
@@ -52,6 +53,42 @@ The artifact records:
 - verdict, selected policy, and selected exit
 - allowed management policy ids from the execution packet
 
+## Operator Decision
+
+After reading the consultation, record the red/green decision from Bhiksha:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.decide_playbook_trade \
+  --consultation-artifact artifacts/playbook/consultations/<consultation_id>/consultation_bridge.json \
+  --decision take \
+  --selected-management-policy reversal_extreme__fixed_1r \
+  --operator-note "Taking; clean rejection and fast fixed-risk management only."
+```
+
+For a pass:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.decide_playbook_trade \
+  --consultation-artifact artifacts/playbook/consultations/<consultation_id>/consultation_bridge.json \
+  --decision pass \
+  --operator-note "Passing; setup is not clean enough for options risk."
+```
+
+The take path requires a management policy id from the execution packet's
+allowed list. It writes:
+
+```text
+artifacts/playbook/intents/<intent_id>/playbook_operator_decision.json
+artifacts/playbook/intents/<intent_id>/PLAYBOOK_OPERATOR_DECISION.md
+```
+
+The intent can be `shadow_intent_ready`, `operator_pass`, or `blocked`.
+`shadow_intent_ready` still has `order_submission_allowed=false`; it is the
+machine-readable handoff for the next option-preview/live-approval layer, not
+an order ticket.
+
 ## Execution Boundary
 
 The current bridge is a consultation backend, not live trading automation.
@@ -59,10 +96,9 @@ The current bridge is a consultation backend, not live trading automation.
 For live use, the next layer must add:
 
 1. option selection preview with liquidity and risk checks
-2. operator-selected management policy capture
-3. explicit live approval gate
-4. order submission and position manager
-5. fill/fire/outcome feedback artifact back to Mala
+2. explicit live approval gate
+3. order submission and position manager
+4. fill/fire/outcome feedback artifact back to Mala
 
 Until those exist, a green operator decision means "record the consultation and
 prepare the shadow decision," not "place a live order."
