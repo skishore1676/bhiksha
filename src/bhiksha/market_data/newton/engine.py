@@ -15,6 +15,9 @@ from bhiksha.market_data.newton.transforms import (
     FeatureTransform,
     JerkTransform,
     MarketImpulseTransform,
+    OpeningVwapRthTransform,
+    PriorRthCloseAtrTransform,
+    RelativeVolumeRthTransform,
     VelocityTransform,
     VolumeMaTransform,
     VpocTransform,
@@ -68,6 +71,7 @@ class PhysicsEngine:
         ]
         candidates.extend(self._kinematic_transforms_for_features(required_features))
         candidates.extend(self._market_impulse_transforms_for_features(required_features))
+        candidates.extend(self._relative_volume_rth_transforms_for_features(required_features))
         return self._resolve_transforms(candidates)
 
     def _kinematic_transforms_for_features(self, required_features: set[str]) -> list[FeatureTransform]:
@@ -190,6 +194,25 @@ class PhysicsEngine:
             )
         return transforms
 
+    def _relative_volume_rth_transforms_for_features(
+        self,
+        required_features: set[str],
+    ) -> list[FeatureTransform]:
+        transforms: list[FeatureTransform] = []
+        for feature in sorted(required_features):
+            column_match = _RELATIVE_VOLUME_RTH_COLUMN_RE.fullmatch(feature)
+            if column_match:
+                transforms.append(
+                    RelativeVolumeRthTransform(period=int(column_match.group("period")))
+                )
+                continue
+            spec_match = _RELATIVE_VOLUME_RTH_SPEC_RE.fullmatch(feature)
+            if spec_match:
+                transforms.append(
+                    RelativeVolumeRthTransform(period=int(spec_match.group("period")))
+                )
+        return transforms
+
     def _build_registry(self) -> dict[str, FeatureTransform]:
         transforms: list[FeatureTransform] = [
             VelocityTransform(),
@@ -197,6 +220,8 @@ class PhysicsEngine:
             JerkTransform(),
             EmaStackTransform(periods=self.ema_periods),
             VolumeMaTransform(period=self.volume_ma_period),
+            OpeningVwapRthTransform(),
+            PriorRthCloseAtrTransform(),
             DirectionalMassTransform(volume_ma_period=self.volume_ma_period),
             VpocTransform(lookback=self.vpoc_lookback),
         ]
@@ -255,6 +280,9 @@ class PhysicsEngine:
                     vwma_periods=_parse_vwma_periods(spec_match.group("vwma_periods")) or self.vwma_periods,
                     timeframe=spec_match.group("timeframe") or "5m",
                 )
+            relative_volume_rth_match = _RELATIVE_VOLUME_RTH_SPEC_RE.fullmatch(item)
+            if relative_volume_rth_match:
+                return RelativeVolumeRthTransform(period=int(relative_volume_rth_match.group("period")))
             try:
                 return self._registry[item]
             except KeyError as exc:
@@ -296,6 +324,8 @@ _MARKET_IMPULSE_COLUMN_RE = re.compile(r"^impulse_(?:regime|stage)(?:_(?P<timefr
 _MARKET_IMPULSE_VMA_RE = re.compile(r"^vma_(?P<vma_length>\d+)(?:_(?P<timeframe>[0-9]+[A-Za-z]+))?$")
 _KINEMATIC_SPEC_RE = re.compile(r"^(?P<kind>velocity|acceleration|jerk)(?::(?P<periods_back>\d+))?$")
 _KINEMATIC_COLUMN_RE = re.compile(r"^(?P<kind>velocity|accel|jerk)_(?P<periods_back>\d+)$")
+_RELATIVE_VOLUME_RTH_COLUMN_RE = re.compile(r"^relative_volume_rth_(?P<period>\d+)$")
+_RELATIVE_VOLUME_RTH_SPEC_RE = re.compile(r"^relative_volume_rth:(?P<period>\d+)$")
 _KINEMATIC_COLUMN_KIND = {
     "velocity": "velocity",
     "accel": "acceleration",
