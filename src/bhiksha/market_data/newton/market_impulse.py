@@ -71,6 +71,23 @@ def classify_stage(regime: np.ndarray, close: np.ndarray, vma: np.ndarray) -> np
     return stage
 
 
+def classify_market_pulse_stage(regime: np.ndarray, close: np.ndarray, vma: np.ndarray) -> np.ndarray:
+    """Classify bars using the Mala playbook MarketPulse vocabulary."""
+    stage = np.full(len(close), "distribution", dtype=object)
+    for index in range(len(close)):
+        if np.isnan(vma[index]):
+            continue
+        if regime[index] == "bullish" and close[index] >= vma[index]:
+            stage[index] = "bullish"
+        elif regime[index] == "bearish" and close[index] <= vma[index]:
+            stage[index] = "bearish"
+        elif close[index] >= vma[index]:
+            stage[index] = "accumulation"
+        else:
+            stage[index] = "distribution"
+    return stage
+
+
 def enrich_impulse_columns(
     df: pl.DataFrame,
     vma_length: int = 10,
@@ -85,12 +102,15 @@ def enrich_impulse_columns(
     vwmas = {period: compute_vwma(close, volume, period) for period in vwma_periods}
     regime = classify_regime(vwmas[vwma_periods[0]], vwmas[vwma_periods[1]], vwmas[vwma_periods[2]])
     stage = classify_stage(regime, close, vma)
+    market_pulse_stage = classify_market_pulse_stage(regime, close, vma)
 
     columns = [pl.Series(f"vma_{vma_length}{suffix}", vma)]
     for period in vwma_periods:
         columns.append(pl.Series(f"vwma_{period}{suffix}", vwmas[period]))
     columns.append(pl.Series(f"impulse_regime{suffix}", regime))
     columns.append(pl.Series(f"impulse_stage{suffix}", stage))
+    columns.append(pl.Series(f"market_pulse_stage{suffix}", market_pulse_stage))
+    columns.append(pl.Series(f"vwma_stage{suffix}", market_pulse_stage))
 
     enriched = df.with_columns(columns)
     logger.debug(

@@ -1,14 +1,14 @@
-deployment_id: market_impulse_qqq_short_v1
-enabled: true
-symbol: QQQ
+deployment_id: market_impulse_spy_short_v1
+enabled: false
+symbol: SPY
 
 strategy:
   key: market_impulse
   version: 1
   params:
     direction: short
-    entry_buffer_minutes: 5
-    entry_window_minutes: 60
+    entry_buffer_minutes: 3
+    entry_window_minutes: 45
     regime_timeframe: 1h
     vma_length: 10
     market_open_hour: 9

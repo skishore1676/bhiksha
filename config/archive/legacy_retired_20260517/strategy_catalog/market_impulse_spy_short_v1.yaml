@@ -1,14 +1,14 @@
-strategy_id: market_impulse_qqq_short_v1
-enabled: true
-symbol: QQQ
+strategy_id: market_impulse_spy_short_v1
+enabled: false
+symbol: SPY
 
 strategy:
   key: market_impulse
   version: 1
   params:
     direction: short
-    entry_buffer_minutes: 5
-    entry_window_minutes: 60
+    entry_buffer_minutes: 3
+    entry_window_minutes: 45
     regime_timeframe: 1h
     vma_length: 10
     market_open_hour: 9
@@ -46,9 +46,9 @@ source:
   run_date: "2026-03-28"
   artifact: "m5_execution_mapping.csv"
   metadata:
-    promoted_from: "market_impulse_qqq_short_v1"
+    promoted_from: "market_impulse_spy_short_v1"
 
-approval_status: approved
+approval_status: retired
 tags:
   - mala_promoted
   - intraday

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 import re
+import tempfile
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -23,7 +24,7 @@ from bhiksha.strategy.capabilities import (
     evaluate_strategy_capability,
 )
 from bhiksha.strategy.registry import default_strategy_registry
-from bhiksha.time_utils import normalize_time_text
+from bhiksha.time_utils import normalize_time_text, parse_time_text
 
 
 class StrategyCatalogSheetRow(BaseModel):
@@ -216,6 +217,13 @@ class ActivePlanSheetRow(BaseModel):
                 raise ValueError("manual rows require trigger_price")
             if self.trigger_direction is None:
                 raise ValueError("manual rows require trigger_direction")
+            if self.after_time_et is not None:
+                normalized_after = normalize_time_text(str(self.after_time_et))
+                if normalized_after is None:
+                    self.after_time_et = None
+                else:
+                    parse_time_text(normalized_after)
+                    self.after_time_et = normalized_after
         return self
 
 
@@ -538,18 +546,21 @@ def sync_google_strategy_catalog(
         if entry.catalog_key not in preserved_strategy_ids and _is_google_catalog_entry_promotable(entry, supported_keys)
     ]
 
-    stale_files = sorted(generated_root.rglob("*.yaml"))
-    for stale_file in stale_files:
-        stale_file.unlink()
-
+    expected_paths = {generated_root / f"{entry.catalog_key}.yaml" for entry in eligible_entries}
     written_paths: list[Path] = []
     for entry in eligible_entries:
         output_path = generated_root / f"{entry.catalog_key}.yaml"
-        output_path.write_text(
-            yaml.safe_dump(_google_catalog_entry_payload(entry, operator_defaults=operator_defaults or {}), sort_keys=False),
-            encoding="utf-8",
+        _atomic_yaml_write(
+            output_path,
+            yaml.safe_dump(
+                _google_catalog_entry_payload(entry, operator_defaults=operator_defaults or {}),
+                sort_keys=False,
+            ),
         )
         written_paths.append(output_path)
+    for stale_file in sorted(generated_root.rglob("*.yaml")):
+        if stale_file not in expected_paths:
+            stale_file.unlink()
     return written_paths
 
 
@@ -845,7 +856,7 @@ def _google_catalog_entry_payload(
     default_stop_loss_pct = _coerce_float(defaults.get("option_stop_pct")) if use_defaults else None
     default_hard_flat_time = defaults.get("hard_flat_time_et") if use_defaults else None
 
-    stop_loss_pct = _coerce_float(catastrophe_exit_params.get("stop_loss_pct")) or default_stop_loss_pct or 0.45
+    stop_loss_pct = _first_not_none(_coerce_float(catastrophe_exit_params.get("stop_loss_pct")), default_stop_loss_pct, 0.45)
     hard_flat_time_et = (
         normalize_time_text(str(catastrophe_exit_params.get("hard_flat_time_et") or default_hard_flat_time or "15:55"))
         or "15:55"
@@ -876,36 +887,46 @@ def _google_catalog_entry_payload(
         "profile": str(vehicle_mapping.get("profile") or "single_leg_long_premium_v1"),
         "shadow_only": True,
         "option_mapping": vehicle_mapping.get("option_mapping") or _option_mapping_from_structure(vehicle_mapping.get("structure")),
-        "min_open_interest": _coerce_int(vehicle_mapping.get("min_open_interest"))
-        or (_coerce_int(defaults.get("min_open_interest")) if use_defaults else None)
-        or 100,
-        "max_bid_ask_spread_pct": _coerce_float(vehicle_mapping.get("max_bid_ask_spread_pct"))
-        or (_coerce_float(defaults.get("max_bid_ask_spread_pct")) if use_defaults else None)
-        or 0.20,
+        "min_open_interest": _first_not_none(
+            _coerce_int(vehicle_mapping.get("min_open_interest")),
+            _coerce_int(defaults.get("min_open_interest")) if use_defaults else None,
+            100,
+        ),
+        "max_bid_ask_spread_pct": _first_not_none(
+            _coerce_float(vehicle_mapping.get("max_bid_ask_spread_pct")),
+            _coerce_float(defaults.get("max_bid_ask_spread_pct")) if use_defaults else None,
+            0.20,
+        ),
     }
     dte_range = _compact_numeric_range_text(vehicle_mapping.get("dte") or vehicle_mapping.get("dte_target"))
     if dte_range is not None:
         execution_payload["dte"] = dte_range
     else:
         execution_payload["dte_min"] = (
-            _coerce_int(vehicle_mapping.get("dte_min"))
-            or (_coerce_int(defaults.get("dte_min")) if use_defaults else None)
-            or 0
+            _first_not_none(
+                _coerce_int(vehicle_mapping.get("dte_min")),
+                _coerce_int(defaults.get("dte_min")) if use_defaults else None,
+                0,
+            )
         )
         execution_payload["dte_max"] = (
-            _coerce_int(vehicle_mapping.get("dte_max"))
-            or (_coerce_int(defaults.get("dte_max")) if use_defaults else None)
-            or 7
+            _first_not_none(
+                _coerce_int(vehicle_mapping.get("dte_max")),
+                _coerce_int(defaults.get("dte_max")) if use_defaults else None,
+                7,
+            )
         )
     delta_range = _compact_numeric_range_text(vehicle_mapping.get("delta_target") or vehicle_mapping.get("delta_plan"))
     if delta_range is not None:
         execution_payload["delta_target"] = delta_range
     else:
-        execution_payload["target_abs_delta_min"] = _coerce_float(vehicle_mapping.get("target_abs_delta_min")) or (
-            _coerce_float(defaults.get("delta_min")) if use_defaults else None
+        execution_payload["target_abs_delta_min"] = _first_not_none(
+            _coerce_float(vehicle_mapping.get("target_abs_delta_min")),
+            _coerce_float(defaults.get("delta_min")) if use_defaults else None,
         )
-        execution_payload["target_abs_delta_max"] = _coerce_float(vehicle_mapping.get("target_abs_delta_max")) or (
-            _coerce_float(defaults.get("delta_max")) if use_defaults else None
+        execution_payload["target_abs_delta_max"] = _first_not_none(
+            _coerce_float(vehicle_mapping.get("target_abs_delta_max")),
+            _coerce_float(defaults.get("delta_max")) if use_defaults else None,
         )
     entry_window = vehicle_mapping.get("entry_window_et")
     if entry_window is not None:
@@ -932,7 +953,7 @@ def _google_catalog_entry_payload(
         "execution": execution_payload,
         "risk": {
             "profile": f"{strategy_key}_risk_v1" if strategy_key else "catalog_promoted_v1",
-            "max_trade_premium_usd": default_max_premium or 300.0,
+            "max_trade_premium_usd": _first_not_none(default_max_premium, 300.0),
             "hard_flat_time_et": hard_flat_time_et,
             "stop_loss_pct": stop_loss_pct,
         },
@@ -985,6 +1006,34 @@ def _google_catalog_use_algorithmic_exit(
         return False
 
     return strategy_key in NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS
+
+
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _atomic_yaml_write(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
 def _normalize_mala_evidence_row(normalized: dict[str, Any]) -> dict[str, Any]:

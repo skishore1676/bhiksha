@@ -1,0 +1,243 @@
+"""Compile shared-kernel packets into Bhiksha runtime eligibility decisions."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from bhiksha.shared_kernel import ensure_kernel_on_path
+
+ensure_kernel_on_path()
+
+from mala_bhiksha_kernel import (  # noqa: E402
+    CapabilityManifest,
+    ExecutionPacket,
+    PacketKind,
+    PacketStatus,
+    RuntimeMode,
+    RuntimeCapability,
+    read_packet_file,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PacketCompileResult:
+    packet_id: str
+    version: int
+    kind: str
+    status: str
+    executable: bool
+    block_reasons: list[str]
+    feature_contract_id: str
+    feature_contract_fingerprint: str
+    runtime_mode: str | None = None
+    management_policy_ids: list[str] | None = None
+
+    @property
+    def eligibility(self) -> str:
+        return "eligible" if self.executable else "blocked"
+
+    @property
+    def decision(self) -> str:
+        return "take" if self.executable else "block"
+
+
+def compile_packet_for_runtime(
+    packet_path: str | Path,
+    *,
+    capability_manifest: CapabilityManifest | None = None,
+    legacy_retirement_report: dict[str, Any] | None = None,
+) -> PacketCompileResult:
+    packet = read_packet_file(packet_path)
+    block_reasons: list[str] = []
+    management_policy_ids = _management_policy_ids(packet)
+
+    if packet.kind != PacketKind.EXECUTION:
+        block_reasons.append("packet_kind_not_execution")
+    if packet.status != PacketStatus.APPROVED:
+        block_reasons.append(f"packet_status_not_approved:{packet.status.value}")
+    if packet.operator_approval.status != "approved":
+        block_reasons.append("operator_approval_missing")
+
+    runtime_mode = None
+    if isinstance(packet, ExecutionPacket):
+        runtime_mode = packet.runtime_mode.value
+        block_reasons.extend(_parity_report_blocks(packet, Path(packet_path)))
+        block_reasons.extend(_capability_blocks(packet, capability_manifest))
+        block_reasons.extend(_legacy_retirement_blocks(legacy_retirement_report))
+        block_reasons.extend(_runtime_control_blocks(packet, management_policy_ids))
+
+    return PacketCompileResult(
+        packet_id=packet.packet_id,
+        version=packet.version,
+        kind=packet.kind.value,
+        status=packet.status.value,
+        executable=not block_reasons,
+        block_reasons=block_reasons,
+        feature_contract_id=packet.feature_contract.contract_id,
+        feature_contract_fingerprint=packet.feature_contract.fingerprint,
+        runtime_mode=runtime_mode,
+        management_policy_ids=management_policy_ids,
+    )
+
+
+def load_legacy_retirement_report(path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _management_policy_ids(packet: Any) -> list[str]:
+    policies = getattr(packet, "management_policies", None)
+    if policies is not None:
+        return [policy.policy_id for policy in policies]
+    if isinstance(packet, ExecutionPacket):
+        raw_ids = packet.runtime_controls.get("allowed_management_policy_ids", [])
+        if isinstance(raw_ids, list):
+            return [str(policy_id) for policy_id in raw_ids if str(policy_id)]
+    return []
+
+
+def _legacy_retirement_blocks(report: dict[str, Any] | None) -> list[str]:
+    if report is None:
+        return []
+    active_count = _safe_int(report.get("active_legacy_wire_count"))
+    if str(report.get("status", "")) == "clear" and active_count == 0:
+        return []
+    if active_count is None:
+        return ["legacy_retirement_report_invalid"]
+    if active_count > 0:
+        return [f"legacy_retirement_blocked:{active_count}"]
+    if str(report.get("status", "")) != "clear":
+        return [f"legacy_retirement_status:{report.get('status')}"]
+    return []
+
+
+def _parity_report_blocks(packet: ExecutionPacket, packet_path: Path) -> list[str]:
+    artifact = next(
+        (
+            artifact
+            for artifact in packet.lineage.source_artifacts
+            if artifact.label == "parity_report"
+        ),
+        None,
+    )
+    if artifact is None:
+        return ["parity_report_artifact_missing"]
+
+    report_path = Path(artifact.uri)
+    if not report_path.is_absolute():
+        report_path = _packet_root(packet_path) / report_path
+    if not report_path.exists():
+        return [f"parity_report_not_found:{artifact.uri}"]
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return [f"parity_report_invalid_json:{artifact.uri}"]
+
+    blocks: list[str] = []
+    if str(report.get("report_id", "")) != packet.parity_report_id:
+        blocks.append("parity_report_id_mismatch")
+    if str(report.get("status", "")) != "passed":
+        blocks.append(f"parity_report_not_passed:{report.get('status')}")
+    packet_ref = report.get("packet_ref")
+    expected_ref = packet.source_packet.model_dump(mode="json")
+    if packet_ref != expected_ref:
+        blocks.append("parity_report_packet_ref_mismatch")
+    return blocks
+
+
+def _packet_root(packet_path: Path) -> Path:
+    resolved = packet_path.resolve()
+    for parent in [resolved.parent, *resolved.parents]:
+        if (parent / "packet_index.json").exists():
+            return parent
+    for parent in resolved.parents:
+        if parent.name == "packets":
+            return parent.parent
+    return resolved.parent
+
+
+def _runtime_control_blocks(
+    packet: ExecutionPacket,
+    management_policy_ids: list[str],
+) -> list[str]:
+    blocks: list[str] = []
+    controls = packet.runtime_controls
+    if packet.runtime_mode == RuntimeMode.SHADOW:
+        if controls.get("shadow_only") is not True:
+            blocks.append("shadow_only_control_missing")
+        if controls.get("live_automated_allowed") is True:
+            blocks.append("live_automated_not_allowed_for_shadow")
+    if packet.runtime_mode == RuntimeMode.LIVE_APPROVAL_GATED:
+        if controls.get("shadow_only") is not False:
+            blocks.append("live_gated_shadow_only_must_be_false")
+        if controls.get("live_automated_allowed") is not False:
+            blocks.append("live_gated_automated_boundary_missing")
+        if controls.get("live_ticket_required") is not True:
+            blocks.append("live_ticket_required_missing")
+        if controls.get("management_policy_specs_required") is not True:
+            blocks.append("management_policy_specs_required_missing")
+        if controls.get("requires_underlying_stop_price") is not True:
+            blocks.append("underlying_stop_price_requirement_missing")
+        if controls.get("live_management_required") is not True:
+            blocks.append("live_management_requirement_missing")
+    if not management_policy_ids:
+        blocks.append("management_policy_ids_missing")
+    if controls.get("operator_must_select_management_policy") is not True:
+        blocks.append("operator_management_policy_selection_missing")
+    specs = controls.get("management_policy_specs")
+    if controls.get("management_policy_specs_required") is True:
+        if not isinstance(specs, dict):
+            blocks.append("management_policy_specs_missing")
+        else:
+            missing_specs = [policy_id for policy_id in management_policy_ids if policy_id not in specs]
+            if missing_specs:
+                blocks.append("management_policy_specs_missing:" + ",".join(missing_specs))
+    return blocks
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _capability_blocks(
+    packet: ExecutionPacket,
+    capability_manifest: CapabilityManifest | None,
+) -> list[str]:
+    if capability_manifest is None:
+        return ["capability_manifest_missing"]
+    if not capability_manifest.supports_feature_contract(packet.feature_contract.contract_id):
+        return [f"feature_contract_not_supported:{packet.feature_contract.contract_id}"]
+    if not capability_manifest.supports_exact_feature_contract(packet.feature_contract):
+        return [f"feature_contract_mismatch:{packet.feature_contract.contract_id}"]
+
+    capability = _matching_capability(packet, capability_manifest)
+    if capability is None:
+        return ["runtime_capability_missing"]
+    if not capability.supported:
+        return [capability.block_reason or "runtime_capability_not_supported"]
+    return []
+
+
+def _matching_capability(
+    packet: ExecutionPacket,
+    capability_manifest: CapabilityManifest,
+) -> RuntimeCapability | None:
+    for capability in capability_manifest.capabilities:
+        if packet.feature_contract.contract_id not in capability.feature_contracts:
+            continue
+        if packet.kind.value not in capability.supported_packet_kinds:
+            continue
+        if packet.runtime_mode.value not in capability.runtime_modes:
+            continue
+        if capability.supported_symbols:
+            missing_symbols = set(packet.symbol_scope) - set(capability.supported_symbols)
+            if missing_symbols:
+                continue
+        return capability
+    return None

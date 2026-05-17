@@ -11,6 +11,13 @@ from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import PositionTracker
 
 
+def _enabled_deployment(deployment_id: str):
+    deployment = next(
+        d for d in load_deployments("config/deployments") if d.deployment_id == deployment_id
+    )
+    return deployment.model_copy(update={"enabled": True})
+
+
 class StubChainService:
     def __init__(
         self,
@@ -153,7 +160,7 @@ def _cash_guard(order_manager, tmp_path) -> CashGuard:
 
 
 def test_execution_planner_creates_dry_run_trade_plan():
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
     planner = ExecutionPlanner(
         chain_service=chain_service,
@@ -304,7 +311,7 @@ def test_execution_planner_dry_run_still_honors_book_position_caps() -> None:
 
 
 def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
         order_manager=QuoteErrorOrderManager(),
@@ -329,7 +336,7 @@ def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
 
 
 def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None:
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = deployment.model_copy(
         update={
             "execution": deployment.execution.model_copy(
@@ -368,7 +375,7 @@ def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None
 
 
 def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> None:
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
         order_manager=ExpensiveQuoteOrderManager(),
@@ -400,7 +407,7 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
 def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insufficient(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "on")
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     order_manager = LowCashOrderManager()
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
@@ -440,7 +447,7 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
 def test_execution_planner_auto_guard_skips_margin_accounts(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "auto")
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     order_manager = MarginOrderManager()
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),

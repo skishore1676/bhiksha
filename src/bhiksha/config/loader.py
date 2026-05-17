@@ -21,6 +21,7 @@ from bhiksha.config.models import (
 )
 
 ConfigModelT = TypeVar("ConfigModelT", bound=BaseModel)
+LEGACY_MALA_ORIGINS = {"mala", "mala_bias_translator_v1"}
 
 
 def _load_yaml(path: Path) -> dict:
@@ -166,6 +167,8 @@ def load_runtime_deployments(
     else:
         raise ValueError(f"Unsupported deployment selection mode: {selection_mode}")
 
+    selected = _suppress_legacy_runtime_wires(selected, report)
+
     report["selected"] = [
         {
             "deployment_id": manifest.deployment_id,
@@ -176,6 +179,30 @@ def load_runtime_deployments(
         for manifest in selected
     ]
     return selected, report
+
+
+def _suppress_legacy_runtime_wires(
+    deployments: list[DeploymentManifest],
+    report: dict[str, Any],
+) -> list[DeploymentManifest]:
+    selected: list[DeploymentManifest] = []
+    for manifest in deployments:
+        if _is_legacy_runtime_wire(manifest):
+            report["skipped"].append(
+                {
+                    "deployment_id": manifest.deployment_id,
+                    "reason": "legacy_wire_retired",
+                    "symbol": manifest.symbol,
+                    "source_kind": manifest.source_kind,
+                }
+            )
+            continue
+        selected.append(manifest)
+    return selected
+
+
+def _is_legacy_runtime_wire(manifest: DeploymentManifest) -> bool:
+    return bool(manifest.enabled and manifest.source.origin in LEGACY_MALA_ORIGINS)
 
 
 def load_bias_config(path: str | Path) -> BiasConfig:

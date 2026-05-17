@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import os
@@ -34,6 +35,7 @@ class CashGuard:
     ) -> None:
         self.order_manager = order_manager
         self.repository = repository or NullCashBudgetRepository()
+        self._reservation_lock = asyncio.Lock()
 
     async def reserve_entry(
         self,
@@ -54,51 +56,71 @@ class CashGuard:
                 details={"cash_guard_mode": mode, "account_type": account_type},
             )
 
-        trade_date = trade_date_et(timestamp)
-        day = await self.repository.get_day(trade_date)
-        if day is None:
-            try:
-                portfolio = await self.order_manager.get_portfolio()
-            except Exception as exc:
-                return CashGuardResult(
-                    enforced=True,
-                    blocked=True,
-                    reason="cash_guard_portfolio_unavailable",
-                    details={"error": str(exc), "cash_guard_mode": mode, "account_type": account_type},
-                )
-            broker_cash = _portfolio_cash_only_buying_power(portfolio)
-            if broker_cash is None:
-                return CashGuardResult(
-                    enforced=True,
-                    blocked=True,
-                    reason="cash_guard_cash_unavailable",
-                    details={"cash_guard_mode": mode, "account_type": account_type},
-                )
-            buffer_pct = cash_guard_buffer_pct()
-            day = CashBudgetDay(
-                trade_date=trade_date,
-                account_type=account_type,
-                broker_cash_only_buying_power=broker_cash,
-                usable_budget=round(max(0.0, broker_cash * (1.0 - buffer_pct)), 2),
-                buffer_pct=buffer_pct,
-            )
-            await self.repository.upsert_day(day)
-
-        totals = await self.repository.reservation_totals(trade_date)
-        consumed_cash = sum(
-            totals.get(status, 0.0)
-            for status in ACTIVE_RESERVATION_STATUSES
-        )
-        remaining_budget = round(max(0.0, day.usable_budget - consumed_cash), 2)
         required_cash = round(max(required_cash, 0.0), 2)
-        if required_cash > remaining_budget:
+        async with self._reservation_lock:
+            trade_date = trade_date_et(timestamp)
+            day = await self.repository.get_day(trade_date)
+            if day is None:
+                try:
+                    portfolio = await self.order_manager.get_portfolio()
+                except Exception as exc:
+                    return CashGuardResult(
+                        enforced=True,
+                        blocked=True,
+                        reason="cash_guard_portfolio_unavailable",
+                        details={"error": str(exc), "cash_guard_mode": mode, "account_type": account_type},
+                    )
+                broker_cash = _portfolio_cash_only_buying_power(portfolio)
+                if broker_cash is None:
+                    return CashGuardResult(
+                        enforced=True,
+                        blocked=True,
+                        reason="cash_guard_cash_unavailable",
+                        details={"cash_guard_mode": mode, "account_type": account_type},
+                    )
+                buffer_pct = cash_guard_buffer_pct()
+                day = CashBudgetDay(
+                    trade_date=trade_date,
+                    account_type=account_type,
+                    broker_cash_only_buying_power=broker_cash,
+                    usable_budget=round(max(0.0, broker_cash * (1.0 - buffer_pct)), 2),
+                    buffer_pct=buffer_pct,
+                )
+                await self.repository.upsert_day(day)
+
+            totals = await self.repository.reservation_totals(trade_date)
+            consumed_cash = sum(totals.get(status, 0.0) for status in ACTIVE_RESERVATION_STATUSES)
+            remaining_budget = round(max(0.0, day.usable_budget - consumed_cash), 2)
+            if required_cash > remaining_budget:
+                return CashGuardResult(
+                    enforced=True,
+                    blocked=True,
+                    reason="insufficient_internal_settled_cash_budget",
+                    details={
+                        "required_cash": required_cash,
+                        "remaining_budget": remaining_budget,
+                        "usable_budget": day.usable_budget,
+                        "broker_cash_only_buying_power": day.broker_cash_only_buying_power,
+                        "buffer_pct": day.buffer_pct,
+                        "account_type": account_type,
+                        "cash_guard_mode": mode,
+                    },
+                )
+
+            await self.repository.upsert_reservation(
+                CashBudgetReservation(
+                    trade_id=trade_id,
+                    trade_date=trade_date,
+                    amount=required_cash,
+                    status="reserved",
+                )
+            )
             return CashGuardResult(
                 enforced=True,
-                blocked=True,
-                reason="insufficient_internal_settled_cash_budget",
+                blocked=False,
                 details={
-                    "required_cash": required_cash,
-                    "remaining_budget": remaining_budget,
+                    "reserved_cash": required_cash,
+                    "remaining_budget": round(max(0.0, remaining_budget - required_cash), 2),
                     "usable_budget": day.usable_budget,
                     "broker_cash_only_buying_power": day.broker_cash_only_buying_power,
                     "buffer_pct": day.buffer_pct,
@@ -106,28 +128,6 @@ class CashGuard:
                     "cash_guard_mode": mode,
                 },
             )
-
-        await self.repository.upsert_reservation(
-            CashBudgetReservation(
-                trade_id=trade_id,
-                trade_date=trade_date,
-                amount=required_cash,
-                status="reserved",
-            )
-        )
-        return CashGuardResult(
-            enforced=True,
-            blocked=False,
-            details={
-                "reserved_cash": required_cash,
-                "remaining_budget": round(max(0.0, remaining_budget - required_cash), 2),
-                "usable_budget": day.usable_budget,
-                "broker_cash_only_buying_power": day.broker_cash_only_buying_power,
-                "buffer_pct": day.buffer_pct,
-                "account_type": account_type,
-                "cash_guard_mode": mode,
-            },
-        )
 
     async def finalize_entry(self, trade_id: str) -> None:
         reservation = await self.repository.get_reservation(trade_id)
