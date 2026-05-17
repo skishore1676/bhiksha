@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from bhiksha.app.bootstrap import build_runtime
+from bhiksha.domain.models import OptionContractSnapshot
+from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.packets.consultation_bridge import consult_mala_playbook
 from bhiksha.packets.live_ticket import APPROVAL_PHRASE, create_playbook_live_ticket
 from bhiksha.packets.operator_decision import record_playbook_operator_decision
@@ -166,14 +168,23 @@ class TraderDeskService:
 
     def preview_option(self, payload: dict[str, Any]) -> dict[str, Any]:
         async def _run() -> dict[str, Any]:
+            preview_mode = str(payload.get("preview_mode", "live")).strip().lower()
+            if preview_mode not in {"live", "simulated"}:
+                raise ValueError("preview_mode must be live or simulated")
+            symbol = str(payload.get("symbol", "QQQ")).strip().upper() or "QQQ"
+            direction = str(payload.get("direction", "short")).strip().lower() or "short"
+            chain_service = _SimulatedChainService(symbol, direction) if preview_mode == "simulated" else None
+            order_manager = _SimulatedOrderManager() if preview_mode == "simulated" else None
             result = await build_playbook_option_preview(
                 intent_artifact=Path(_required_text(payload, "intent_artifact")),
                 packet_path=self.config.packet,
+                chain_service=chain_service,
+                order_manager=order_manager,
                 out_root=self.config.artifact_root / "option_previews",
                 underlying_price=_optional_float(payload, "underlying_price"),
                 underlying_stop_price=_optional_float(payload, "underlying_stop_price"),
             )
-            return asdict(result)
+            return asdict(result) | {"preview_mode": preview_mode}
 
         return asyncio.run(_run())
 
@@ -254,3 +265,43 @@ def _suggest_next_step(latest: dict[str, dict[str, str]]) -> str:
     if latest["consultation"]["path"]:
         return "record take/pass decision"
     return "consult when the chart setup appears"
+
+
+class _SimulatedChainService:
+    def __init__(self, symbol: str, direction: str) -> None:
+        self.symbol = symbol
+        self.contract_type = "PUT" if direction == "short" else "CALL"
+
+    async def get_chain(self, symbol: str, **kwargs):
+        return [
+            OptionContractSnapshot(
+                option_symbol=f"{symbol}260515{self.contract_type[0]}00475000",
+                underlying_symbol=symbol,
+                contract_type=self.contract_type,
+                expiration_date="2026-05-15",
+                dte=0,
+                strike=475.0,
+                delta=-0.31 if self.contract_type == "PUT" else 0.31,
+                bid=2.70,
+                ask=2.90,
+                open_interest=500,
+            )
+        ]
+
+    async def close(self):
+        return None
+
+
+class _SimulatedOrderManager:
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=2.70,
+            ask=2.90,
+            last=2.80,
+            open_interest=500,
+            outcome="SIMULATED",
+        )
+
+    async def close(self):
+        return None

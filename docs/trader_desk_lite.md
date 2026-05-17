@@ -39,6 +39,10 @@ http://127.0.0.1:8766
 7. Use the live management/lifecycle lane outside UI v0 for broker submission
    and monitoring.
 
+Use `Rehearsal` preview mode to exercise the full desk flow without live
+option-chain or quote calls. Use `Live Provider` mode for real readiness; it
+will block when broker auth or market-data access is not healthy.
+
 ## Future Playbook Expansion
 
 The service exposes playbooks as cards. Future versions should populate those

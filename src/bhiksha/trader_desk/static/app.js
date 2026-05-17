@@ -95,6 +95,7 @@ function summarizeDecision(result) {
 function summarizePreview(result) {
   return [
     `status: ${result.status}`,
+    `mode: ${result.preview_mode || "live"}`,
     `option: ${result.option_symbol || "none"}`,
     `quantity: ${result.quantity}`,
     `entry: ${result.estimated_entry_price}`,
@@ -165,6 +166,9 @@ async function previewOption() {
     method: "POST",
     body: JSON.stringify({
       intent_artifact: state.intent.artifact_json,
+      preview_mode: $("previewMode").value,
+      symbol: state.intent.symbol,
+      direction: state.intent.direction,
       underlying_price: $("underlyingPrice").value,
       underlying_stop_price: $("underlyingStop").value,
     }),
