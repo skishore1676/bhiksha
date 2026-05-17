@@ -5,7 +5,7 @@ operator approval gated. This is not autonomous trading.
 
 ## Hard Boundary
 
-- packet: `/Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json`
+- packet: `${MALA_REPO_ROOT:-../mala_v2}/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json`
 - runtime mode: `live_approval_gated`
 - live automation: disabled
 - max quantity: `1`
@@ -22,16 +22,17 @@ operator approval gated. This is not autonomous trading.
 The easiest Monday entrypoint is the guided pilot desk:
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
-  -m bhiksha.tools.playbook_pilot_desk preflight
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" \
+  ./.venv/bin/python -m bhiksha.tools.playbook_pilot_desk preflight
 ```
 
 The browser-based desk is available as a sidecar:
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
-  -m bhiksha.tools.trader_desk \
-  --port 8766
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" \
+  ./.venv/bin/python -m bhiksha.tools.trader_desk --port 8766
 ```
 
 Open `http://127.0.0.1:8766`. UI v0 can consult, record
@@ -39,9 +40,10 @@ take/watch/pass, build option previews, and approve/reject live tickets. It
 does not submit broker orders.
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" ./.venv/bin/python \
   -m bhiksha.tools.compile_packet \
-  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json \
+  --packet "${MALA_REPO_ROOT:-../mala_v2}/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json" \
   --capability-manifest artifacts/capabilities/bhiksha_packet_capabilities_v1.json \
   --legacy-retirement-report artifacts/legacy_retirement/current.json
 ```
@@ -52,8 +54,7 @@ Expected: `eligibility=eligible`, `executable=true`,
 Check where you are in the flow:
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
-  -m bhiksha.tools.playbook_pilot_desk latest
+PYTHONPATH="../mala-bhiksha-kernel/src:src" ./.venv/bin/python -m bhiksha.tools.playbook_pilot_desk latest
 ```
 
 ## Latency Probe
@@ -62,7 +63,8 @@ Run this before market open to separate desk orchestration latency from
 broker/provider readiness:
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" ./.venv/bin/python \
   -m bhiksha.tools.playbook_pilot_desk latency-probe \
   --option-preview-mode simulated
 ```
@@ -72,7 +74,8 @@ orders, but it will fail fast if broker auth or option-chain access is not
 ready:
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" ./.venv/bin/python \
   -m bhiksha.tools.playbook_pilot_desk latency-probe \
   --option-preview-mode live
 ```
@@ -97,8 +100,9 @@ historical sample.
 The guided version walks those first five steps with prompts:
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
-  -m bhiksha.tools.playbook_pilot_desk guided
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" \
+  ./.venv/bin/python -m bhiksha.tools.playbook_pilot_desk guided
 ```
 
 By default, `guided` stops after an approved live ticket. To let it ask about
@@ -107,10 +111,11 @@ broker submission too, add `--allow-live-submit`.
 ## Option Preview Example
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" ./.venv/bin/python \
   -m bhiksha.tools.preview_playbook_option \
   --intent-artifact artifacts/playbook/intents/<intent_id>/playbook_operator_decision.json \
-  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json \
+  --packet "${MALA_REPO_ROOT:-../mala_v2}/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json" \
   --underlying-price <live_underlying_entry_price> \
   --underlying-stop-price <playbook_invalidation_price>
 ```
@@ -118,10 +123,11 @@ PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
 ## Live Management Dry Run
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" ./.venv/bin/python \
   -m bhiksha.tools.manage_playbook_live_trade \
   --lifecycle-artifact artifacts/playbook/lifecycle/<lifecycle_id>/playbook_lifecycle_submission.json \
-  --packet /Users/suman/code/mala_v2/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json \
+  --packet "${MALA_REPO_ROOT:-../mala_v2}/packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json" \
   --db-path bhiksha.db \
   --quote-provider schwab \
   --loop \
