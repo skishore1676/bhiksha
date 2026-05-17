@@ -8,9 +8,9 @@ import uuid
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import OrderManager, OrderResult
-from bhiksha.integrations.schwab.chain import SchwabOptionChainService
 from bhiksha.market_data.session import as_et_time
 from bhiksha.options.chain_service import OptionChainService
+from bhiksha.options.public_chain import PublicOptionChainService
 from bhiksha.options.vehicle_resolver import VehicleResolver
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.risk.governor import RiskGovernor
@@ -30,7 +30,7 @@ class ExecutionPlanner:
         position_tracker: PositionTracker | None = None,
         cash_guard: CashGuard | None = None,
     ) -> None:
-        self.chain_service = chain_service or SchwabOptionChainService()
+        self.chain_service = chain_service or PublicOptionChainService()
         self.vehicle_resolver = vehicle_resolver or VehicleResolver()
         self.order_manager = order_manager or OrderManager()
         self.position_tracker = position_tracker or PositionTracker()

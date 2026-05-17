@@ -22,11 +22,15 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert len(snapshot["config_fingerprint"]) == 16
     assert snapshot["session"] == {"live": False, "max_bars": 5}
     assert snapshot["app"]["app_name"] == "bhiksha"
+    assert snapshot["providers"]["underlying_live_primary"] == "public"
+    assert snapshot["providers"]["underlying_backfill_primary"] == "polygon"
     assert snapshot["providers"]["execution_broker_primary"] == "public"
-    assert {entry["strategy_id"] for entry in snapshot["strategy_catalog"]} >= {
-        "market_impulse_qqq_short_v1",
-        "market_impulse_spy_short_v1",
-    }
+    assert {entry["strategy_id"] for entry in snapshot["strategy_catalog"]}.isdisjoint(
+        {
+            "market_impulse_qqq_short_v1",
+            "market_impulse_spy_short_v1",
+        }
+    )
     assert {selection["symbol"] for selection in snapshot["bias_inputs"]} >= {"IWM", "TSLA"}
     assert snapshot["emergency_controls"] == {"halt_and_flatten": False}
     assert snapshot["deployment_selection"]["mode"] == "prefer_generated"
@@ -334,8 +338,8 @@ def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> Non
 
 def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
     runtime = build_runtime()
-    qqq = next(deployment for deployment in runtime.deployments if deployment.symbol == "QQQ")
-    qqq.enabled = True
+    deployment = next(deployment for deployment in runtime.deployments if deployment.symbol == "SPY")
+    deployment.enabled = True
     snapshot = ReconciliationSnapshot()
 
     class StubBroker:
@@ -348,11 +352,11 @@ def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
                 raise httpx.TimeoutException("timed out")
             return {
                 "positions": [
-                    {
-                        "instrument": {
-                            "symbol": "QQQ260401P00556000",
-                            "type": "OPTION",
-                        },
+                        {
+                            "instrument": {
+                                "symbol": "SPY260401P00556000",
+                                "type": "OPTION",
+                            },
                         "quantity": "1.0",
                     }
                 ],

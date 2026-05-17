@@ -349,11 +349,19 @@ class BhikshaRuntime:
                 output("TOKEN_HEALTH Schwab tokens are valid")
 
             warmup_days_by_symbol = self.warmup_trading_days_by_symbol()
+            warmup_provider = self.provider_config.underlying_backfill_primary
             for symbol in symbols:
                 warmup_days = warmup_days_by_symbol.get(symbol, legacy_effective_warmup_trading_days(self.app_config))
-                warmed = await self.warm_start_symbol(symbol, warmup_trading_days=warmup_days)
+                warmed = await self.warm_start_symbol(
+                    symbol,
+                    provider=warmup_provider,
+                    warmup_trading_days=warmup_days,
+                )
                 store.extend(symbol, warmed)
-                output(f"WARMED {symbol} bars={len(warmed)} warmup_trading_days={warmup_days}")
+                output(
+                    f"WARMED {symbol} bars={len(warmed)} "
+                    f"warmup_trading_days={warmup_days} provider={warmup_provider}"
+                )
 
             if max_bars == 0:
                 output("Stopping after warm start because --max-bars=0")

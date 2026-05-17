@@ -11,6 +11,28 @@ Purpose: keep a simple running record of what we changed, what we decided, and w
 
 ## Session Log
 
+### 2026-05-17
+
+Completed:
+
+- Re-promoted Public to the default live and execution provider after a fresh
+  no-order smoke confirmed account auth, underlying quotes, option chains,
+  option quotes, greeks, and single-leg preflight.
+- Kept Polygon as the warmup/backfill provider because Public still rejects
+  multi-day `ONE_MINUTE` history such as `WEEK/ONE_MINUTE`.
+- Changed runtime warmup to use `underlying_backfill_primary` instead of the
+  live provider, so Public live polling no longer has to satisfy multi-day
+  feature warmup.
+- Changed default option-chain discovery from Schwab to Public. Schwab remains
+  available as an explicit fallback/diagnostic integration, not a startup
+  dependency.
+
+Key decisions:
+
+- Default provider posture is now Public live bars, Polygon warmup/backfill,
+  and Public execution. Schwab should not be on the critical Monday startup
+  path unless we intentionally select it for comparison or fallback.
+
 ### 2026-05-14
 
 Completed:
