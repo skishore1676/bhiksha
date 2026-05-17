@@ -10,6 +10,10 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from bhiksha.shared_kernel import ensure_kernel_on_path
+
+ensure_kernel_on_path()
+
 from bhiksha.domain.models import OptionContractSnapshot
 from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.execution.order_manager import OrderManager
@@ -21,9 +25,6 @@ from bhiksha.packets.runtime_compile import compile_packet_for_runtime, load_leg
 from bhiksha.packets.playbook_lifecycle import submit_playbook_live_ticket
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.lifecycle import TradeLifecycleStore
-from bhiksha.shared_kernel import ensure_kernel_on_path
-
-ensure_kernel_on_path()
 from mala_bhiksha_kernel import CapabilityManifest  # noqa: E402
 
 
