@@ -9,6 +9,10 @@ import os
 from pathlib import Path
 from typing import Any
 
+from bhiksha.shared_kernel import ensure_kernel_on_path
+
+ensure_kernel_on_path()
+
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.domain.models import OptionContractSnapshot
 from bhiksha.execution.order_manager import PublicQuote
@@ -17,9 +21,6 @@ from bhiksha.packets.live_ticket import APPROVAL_PHRASE, create_playbook_live_ti
 from bhiksha.packets.operator_decision import record_playbook_operator_decision
 from bhiksha.packets.option_preview import build_playbook_option_preview
 from bhiksha.packets.runtime_compile import compile_packet_for_runtime, load_legacy_retirement_report
-from bhiksha.shared_kernel import ensure_kernel_on_path
-
-ensure_kernel_on_path()
 from mala_bhiksha_kernel import CapabilityManifest  # noqa: E402
 
 
