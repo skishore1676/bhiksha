@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-OperatorDecision = Literal["take", "pass"]
+OperatorDecision = Literal["take", "watch", "pass"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +61,7 @@ def record_playbook_operator_decision(
     ]
     selected_policy = (selected_management_policy_id or "").strip()
     execution_ready = False
-    status = "operator_pass"
+    status = "operator_watch" if normalized_decision == "watch" else "operator_pass"
 
     execution_mode = str(consultation.get("runtime_mode", "shadow"))
 
@@ -137,8 +137,8 @@ def _consultation_blocks(consultation: dict[str, Any]) -> list[str]:
 
 def _normalize_decision(decision: str) -> OperatorDecision:
     normalized = decision.strip().lower()
-    if normalized not in {"take", "pass"}:
-        raise ValueError("decision must be take or pass")
+    if normalized not in {"take", "watch", "pass"}:
+        raise ValueError("decision must be take, watch, or pass")
     return normalized  # type: ignore[return-value]
 
 

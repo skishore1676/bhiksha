@@ -29,6 +29,24 @@ def test_operator_decision_records_pass_without_management_policy(tmp_path: Path
     assert Path(result.artifact_md).exists()
 
 
+def test_operator_decision_records_watch_without_execution_intent(tmp_path: Path) -> None:
+    consultation_path = _write_consultation(tmp_path, policy="take")
+
+    result = record_playbook_operator_decision(
+        consultation_artifact=consultation_path,
+        decision="watch",
+        operator_note="Close, but waiting for a cleaner rejection.",
+        out_root=tmp_path / "intents",
+    )
+
+    assert result.status == "operator_watch"
+    assert result.execution_ready is False
+    assert result.order_submission_allowed is False
+    assert result.block_reasons == []
+    payload = json.loads(Path(result.artifact_json).read_text(encoding="utf-8"))
+    assert payload["decision"] == "watch"
+
+
 def test_operator_decision_take_requires_allowed_management_policy(tmp_path: Path) -> None:
     consultation_path = _write_consultation(tmp_path, policy="take")
 

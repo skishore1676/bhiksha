@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bhiksha Trader Desk</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Mala 2.2 Playbook Operations</p>
+      <h1>Bhiksha Trader Desk</h1>
+    </div>
+    <div class="guardrail">No live broker submit from UI v0</div>
+  </header>
+
+  <main class="layout">
+    <section class="rail" aria-label="System readiness">
+      <div class="section-title">System</div>
+      <div id="systemTiles" class="tile-grid"></div>
+      <button id="refreshStatus" class="secondary">Refresh</button>
+      <button id="refreshHealth" class="secondary">Health</button>
+    </section>
+
+    <section class="workspace">
+      <div class="playbook-row">
+        <article class="playbook-card">
+          <div class="section-title">Active Playbook</div>
+          <h2 id="playbookTitle">Loading</h2>
+          <div id="playbookMeta" class="meta"></div>
+          <div id="playbookPolicies" class="policy-list"></div>
+        </article>
+        <article class="next-card">
+          <div class="section-title">Next</div>
+          <p id="nextStep">Loading</p>
+          <div id="latestArtifacts" class="artifact-list"></div>
+        </article>
+      </div>
+
+      <section class="decision-grid">
+        <article class="panel">
+          <div class="section-title">1. Chart Context</div>
+          <div class="form-grid">
+            <label>Symbol <input id="symbol" value="QQQ"></label>
+            <label>Direction
+              <select id="direction">
+                <option value="short">Short</option>
+                <option value="long">Long</option>
+              </select>
+            </label>
+            <label>Timestamp <input id="timestamp" value="2024-07-19 08:45 America/Chicago"></label>
+          </div>
+          <label>Unbiased Chart Read
+            <textarea id="chartRead" rows="5" placeholder="Write what you see before Mala speaks."></textarea>
+          </label>
+          <button id="consultBtn">Consult Mala</button>
+        </article>
+
+        <article class="panel">
+          <div class="section-title">2. Decision Card</div>
+          <div id="consultationSummary" class="summary empty">No consultation yet.</div>
+          <div class="button-row">
+            <button id="takeBtn" class="take">Take</button>
+            <button id="watchBtn" class="watch">Watch</button>
+            <button id="passBtn" class="pass">Pass</button>
+          </div>
+          <label>Management Policy
+            <select id="managementPolicy"></select>
+          </label>
+          <label>Operator Note
+            <textarea id="operatorNote" rows="3" placeholder="Why take, watch, or pass?"></textarea>
+          </label>
+        </article>
+
+        <article class="panel">
+          <div class="section-title">3. Option Preview</div>
+          <div class="form-grid">
+            <label>Underlying Price <input id="underlyingPrice" type="number" step="0.01"></label>
+            <label>Stop / Invalidation <input id="underlyingStop" type="number" step="0.01"></label>
+          </div>
+          <button id="previewBtn">Build Preview</button>
+          <div id="previewSummary" class="summary empty">No preview yet.</div>
+        </article>
+
+        <article class="panel">
+          <div class="section-title">4. Live Ticket</div>
+          <label>Approval Phrase
+            <input id="approvalPhrase" placeholder="APPROVE_LIVE_PLAYBOOK_TICKET">
+          </label>
+          <label>Ticket Note
+            <textarea id="ticketNote" rows="3" placeholder="Final approval note."></textarea>
+          </label>
+          <div class="button-row">
+            <button id="approveTicketBtn" class="take">Approve Ticket</button>
+            <button id="rejectTicketBtn" class="pass">Reject</button>
+          </div>
+          <div id="ticketSummary" class="summary empty">No live ticket yet.</div>
+        </article>
+      </section>
+    </section>
+
+    <section class="rail" aria-label="Feedback and machine state">
+      <div class="section-title">Visibility</div>
+      <div class="visibility-list">
+        <div><strong>Operator led</strong><span>Bias, consult, take/watch/pass, policy, live approval, feedback.</span></div>
+        <div><strong>Machine led</strong><span>Preflight, parity, option preview, risk gates, lifecycle, outcome capture.</span></div>
+        <div><strong>Minimum visibility</strong><span>Health, setup, stop anchor, ticket, lifecycle status, outcome.</span></div>
+      </div>
+      <pre id="eventLog"></pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

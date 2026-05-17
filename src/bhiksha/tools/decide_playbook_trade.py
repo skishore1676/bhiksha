@@ -1,4 +1,4 @@
-"""Record a take/pass operator decision for a Bhiksha playbook consultation."""
+"""Record a take/watch/pass operator decision for a Bhiksha playbook consultation."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from bhiksha.packets.operator_decision import record_playbook_operator_decision
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--consultation-artifact", type=Path, required=True)
-    parser.add_argument("--decision", choices=["take", "pass"], required=True)
+    parser.add_argument("--decision", choices=["take", "watch", "pass"], required=True)
     parser.add_argument("--operator-note", required=True)
     parser.add_argument("--selected-management-policy")
     parser.add_argument("--out-root", type=Path, default=Path("artifacts/playbook/intents"))

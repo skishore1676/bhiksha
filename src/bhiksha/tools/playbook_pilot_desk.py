@@ -493,7 +493,7 @@ def _suggest_next_step(latest: dict[str, Path | None]) -> str:
         return "fix blocked option preview or pass the trade"
     if intent_status in {"live_intent_ready", "shadow_intent_ready"}:
         return "build option preview with underlying stop"
-    if intent_status in {"operator_pass", "blocked"}:
+    if intent_status in {"operator_watch", "operator_pass", "blocked"}:
         return "run guided consultation when a fresh setup appears"
     if latest["consultation"]:
         return "record take/pass decision"

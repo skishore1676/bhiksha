@@ -26,6 +26,18 @@ PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
   -m bhiksha.tools.playbook_pilot_desk preflight
 ```
 
+The browser-based desk is available as a sidecar:
+
+```bash
+PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
+  -m bhiksha.tools.trader_desk \
+  --port 8766
+```
+
+Open `http://127.0.0.1:8766`. UI v0 can consult, record
+take/watch/pass, build option previews, and approve/reject live tickets. It
+does not submit broker orders.
+
 ```bash
 PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
   -m bhiksha.tools.compile_packet \

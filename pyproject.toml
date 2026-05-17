@@ -24,3 +24,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "bhiksha.chart_review" = ["static/*"]
+"bhiksha.trader_desk" = ["static/*"]
