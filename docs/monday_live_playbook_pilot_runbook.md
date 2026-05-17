@@ -35,9 +35,15 @@ PYTHONPATH="../mala-bhiksha-kernel/src:src" \
   ./.venv/bin/python -m bhiksha.tools.trader_desk --port 8766
 ```
 
-Open `http://127.0.0.1:8766`. UI v0 can consult, record
-take/watch/pass, build option previews, and approve/reject live tickets. It
-does not submit broker orders.
+Open `http://127.0.0.1:8766`. UI v1 can consult, record take/watch/pass,
+build option previews, and submit an approval-gated live order through the
+Approve+Submit flow.
+
+When the UI is running on oldmac and you are operating from this Mac:
+
+```bash
+scripts/open_oldmac_trader_desk.sh
+```
 
 ```bash
 MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
@@ -91,10 +97,10 @@ historical sample.
 2. If taking, record a `take` decision and select one allowed management policy.
 3. Preview the option and include both current underlying price and the
    underlying stop price.
-4. Approve the live ticket with `APPROVE_LIVE_PLAYBOOK_TICKET`.
-5. Submit the approved live ticket with the v2 packet.
-6. Start the live management monitor in dry mode first.
-7. After the lifecycle/trade state looks correct, restart the monitor with
+4. Hold Approve+Submit in Trader Desk to create the approved ticket and submit
+   the live order.
+5. Start the live management monitor in dry mode first.
+6. After the lifecycle/trade state looks correct, restart the monitor with
    `--execute`.
 
 The guided version walks those first five steps with prompts:

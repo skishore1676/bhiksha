@@ -11,8 +11,8 @@ projects.
 - Mala is queried only through the playbook consultation bridge.
 - The operator owns chart context, take/watch/pass, policy selection, live
   ticket approval, emergency intervention, and subjective feedback.
-- UI v0 cannot submit broker orders. It can create an approved live ticket, but
-  broker submission remains outside the desk.
+- UI v1 can submit a broker order only through the approval-gated
+  Approve+Submit flow, then Bhiksha immediately starts lifecycle management.
 
 ## Start
 
@@ -20,6 +20,12 @@ projects.
 MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
 PYTHONPATH="../mala-bhiksha-kernel/src:src" \
   ./.venv/bin/python -m bhiksha.tools.trader_desk --port 8766
+```
+
+From this Mac, when Bhiksha runs on oldmac, use:
+
+```bash
+scripts/open_oldmac_trader_desk.sh
 ```
 
 Open:
@@ -30,14 +36,14 @@ http://127.0.0.1:8766
 
 ## Operator Flow
 
-1. Check the system rail: packet, runtime mode, live boundary, and health.
+1. Check readiness: packet, runtime mode, market state, provider health, and quote.
 2. Write the unbiased chart read.
-3. Consult Mala from the desk.
-4. Choose take, watch, or pass.
-5. If taking, select the management policy and build option preview.
-6. Approve or reject the live ticket.
-7. Use the live management/lifecycle lane outside UI v0 for broker submission
-   and monitoring.
+3. Consult Mala using the default market-now timestamp.
+4. Select the management policy and preview the option.
+5. Hold the Approve+Submit button to create the live ticket, submit the order,
+   and start lifecycle management.
+6. Watch lifecycle state and intervene if Bhiksha reports a critical protection
+   failure.
 
 Use `Rehearsal` preview mode to exercise the full desk flow without live
 option-chain or quote calls. Use `Live Provider` mode for real readiness; it

@@ -9,111 +9,109 @@
 <body>
   <header class="topbar">
     <div>
-      <p class="eyebrow">Mala 2.2 Playbook Operations</p>
-      <h1>Bhiksha Trader Desk</h1>
+      <p class="eyebrow">Bhiksha Live-Gated Playbook</p>
+      <h1>Trader Desk</h1>
     </div>
-    <div class="guardrail">No live broker submit from UI v0</div>
+    <div id="clock" class="clock">Loading</div>
   </header>
 
-  <main class="layout">
-    <section class="rail" aria-label="System readiness">
-      <div class="section-title">System</div>
-      <div id="systemTiles" class="tile-grid"></div>
-      <button id="refreshStatus" class="secondary">Refresh</button>
-      <button id="refreshHealth" class="secondary">Health</button>
-    </section>
+  <main class="shell">
+    <section id="readiness" class="readiness"></section>
 
-    <section class="workspace">
-      <div class="playbook-row">
-        <article class="playbook-card">
-          <div class="section-title">Active Playbook</div>
-          <h2 id="playbookTitle">Loading</h2>
-          <div id="playbookMeta" class="meta"></div>
-          <div id="playbookPolicies" class="policy-list"></div>
-        </article>
-        <article class="next-card">
-          <div class="section-title">Next</div>
-          <p id="nextStep">Loading</p>
-          <div id="latestArtifacts" class="artifact-list"></div>
-        </article>
-      </div>
-
-      <section class="decision-grid">
-        <article class="panel">
-          <div class="section-title">1. Chart Context</div>
-          <div class="form-grid">
-            <label>Symbol <input id="symbol" value="QQQ"></label>
-            <label>Direction
-              <select id="direction">
-                <option value="short">Short</option>
-                <option value="long">Long</option>
-              </select>
-            </label>
-            <label>Timestamp <input id="timestamp" value="2024-07-19 08:45 America/Chicago"></label>
+    <section class="grid">
+      <article class="panel trade-card">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Trade</p>
+            <h2 id="playbookTitle">IWM/QQQ Mean Reversion</h2>
           </div>
-          <label>Unbiased Chart Read
-            <textarea id="chartRead" rows="5" placeholder="Write what you see before Mala speaks."></textarea>
-          </label>
-          <button id="consultBtn">Consult Mala</button>
-        </article>
+          <button id="refreshBtn" class="icon-btn" title="Refresh">Refresh</button>
+        </div>
 
-        <article class="panel">
-          <div class="section-title">2. Decision Card</div>
-          <div id="consultationSummary" class="summary empty">No consultation yet.</div>
-          <div class="button-row">
-            <button id="takeBtn" class="take">Take</button>
-            <button id="watchBtn" class="watch">Watch</button>
-            <button id="passBtn" class="pass">Pass</button>
+        <div class="compact-row">
+          <label>Symbol
+            <select id="symbol">
+              <option value="QQQ">QQQ</option>
+              <option value="IWM">IWM</option>
+            </select>
+          </label>
+          <label>Direction
+            <select id="direction">
+              <option value="short">Short</option>
+              <option value="long">Long</option>
+            </select>
+          </label>
+        </div>
+
+        <label>Chart Read
+          <textarea id="chartRead" rows="4" placeholder="What do you see before Mala speaks?"></textarea>
+        </label>
+
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <label>Timestamp Override
+            <input id="timestamp" placeholder="Defaults to market now">
+          </label>
+        </details>
+
+        <button id="consultBtn" class="primary">Consult Mala Now</button>
+        <div id="consultationSummary" class="summary empty">No consultation yet.</div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Preview</p>
+            <h2>Option & Risk</h2>
           </div>
-          <label>Management Policy
-            <select id="managementPolicy"></select>
-          </label>
-          <label>Operator Note
-            <textarea id="operatorNote" rows="3" placeholder="Why take, watch, or pass?"></textarea>
-          </label>
-        </article>
+          <span id="quoteBadge" class="badge">No quote</span>
+        </div>
 
-        <article class="panel">
-          <div class="section-title">3. Option Preview</div>
+        <label>Management
+          <select id="managementPolicy"></select>
+        </label>
+        <label>Stop / Invalidation
+          <input id="underlyingStop" type="number" step="0.01" placeholder="Required if Mala cannot infer it">
+        </label>
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <label>Underlying Price Override
+            <input id="underlyingPrice" type="number" step="0.01" placeholder="Defaults to live quote">
+          </label>
           <label>Preview Mode
             <select id="previewMode">
               <option value="live">Live Provider</option>
               <option value="simulated">Rehearsal</option>
             </select>
           </label>
-          <div class="form-grid">
-            <label>Underlying Price <input id="underlyingPrice" type="number" step="0.01"></label>
-            <label>Stop / Invalidation <input id="underlyingStop" type="number" step="0.01"></label>
-          </div>
-          <button id="previewBtn">Build Preview</button>
-          <div id="previewSummary" class="summary empty">No preview yet.</div>
-        </article>
+        </details>
 
-        <article class="panel">
-          <div class="section-title">4. Live Ticket</div>
-          <label>Approval Phrase
-            <input id="approvalPhrase" placeholder="APPROVE_LIVE_PLAYBOOK_TICKET">
-          </label>
-          <label>Ticket Note
-            <textarea id="ticketNote" rows="3" placeholder="Final approval note."></textarea>
-          </label>
-          <div class="button-row">
-            <button id="approveTicketBtn" class="take">Approve Ticket</button>
-            <button id="rejectTicketBtn" class="pass">Reject</button>
-          </div>
-          <div id="ticketSummary" class="summary empty">No live ticket yet.</div>
-        </article>
-      </section>
-    </section>
+        <button id="takePreviewBtn" class="primary">Take & Preview</button>
+        <div id="previewSummary" class="summary empty">No option preview yet.</div>
+      </article>
 
-    <section class="rail" aria-label="Feedback and machine state">
-      <div class="section-title">Visibility</div>
-      <div class="visibility-list">
-        <div><strong>Operator led</strong><span>Bias, consult, take/watch/pass, policy, live approval, feedback.</span></div>
-        <div><strong>Machine led</strong><span>Preflight, parity, option preview, risk gates, lifecycle, outcome capture.</span></div>
-        <div><strong>Minimum visibility</strong><span>Health, setup, stop anchor, ticket, lifecycle status, outcome.</span></div>
-      </div>
-      <pre id="eventLog"></pre>
+      <article class="panel submit-card">
+        <p class="eyebrow">Submit</p>
+        <h2>Approve+Submit</h2>
+        <div id="orderSummary" class="order-summary empty">Preview a trade first.</div>
+        <label>Submit Note
+          <textarea id="submitNote" rows="3" placeholder="One-contract pilot. Stop/invalidation is clear."></textarea>
+        </label>
+        <button id="approveSubmitBtn" class="danger" disabled>Hold To Submit Live Order</button>
+        <div id="submitSummary" class="summary empty">No live order submitted.</div>
+      </article>
+
+      <article class="panel live-card">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Live State</p>
+            <h2>Lifecycle</h2>
+          </div>
+          <button id="liveStateBtn" class="icon-btn" title="Refresh live state">State</button>
+        </div>
+        <div id="liveState" class="summary empty">No lifecycle yet.</div>
+        <pre id="eventLog"></pre>
+      </article>
     </section>
   </main>
 

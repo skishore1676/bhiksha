@@ -1,8 +1,10 @@
 const state = {
+  context: null,
   consultation: null,
   intent: null,
   preview: null,
-  ticket: null,
+  submitted: null,
+  submitHoldTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -20,46 +22,31 @@ async function api(path, options = {}) {
 }
 
 function log(message, payload) {
-  const stamp = new Date().toLocaleTimeString();
   const detail = payload ? `\n${JSON.stringify(payload, null, 2)}` : "";
-  $("eventLog").textContent = `[${stamp}] ${message}${detail}\n\n${$("eventLog").textContent}`;
+  $("eventLog").textContent = `[${new Date().toLocaleTimeString()}] ${message}${detail}\n\n${$("eventLog").textContent}`;
 }
 
-function tile(label, ok, detail) {
+function pill(label, ok, detail = "") {
   const cls = ok === true ? "ok" : ok === false ? "bad" : "warn";
-  return `<div class="tile ${cls}"><strong>${label}</strong><span>${detail || ""}</span></div>`;
+  return `<div class="pill ${cls}"><strong>${label}</strong><span>${detail}</span></div>`;
 }
 
-function artifactRows(latest) {
-  return Object.entries(latest)
-    .map(([key, value]) => {
-      const status = value.status || "none";
-      return `<div><strong>${key}</strong>: ${status}</div>`;
-    })
-    .join("");
-}
-
-function renderStatus(payload) {
+function renderContext(payload) {
+  state.context = payload;
   const preflight = payload.preflight || {};
-  const playbook = (payload.playbooks || [])[0] || {};
-  $("playbookTitle").textContent = playbook.title || playbook.id || "No playbook";
-  $("playbookMeta").textContent = `${playbook.id || ""} v${playbook.version || ""} | ${playbook.runtime_mode || ""}`;
-  $("playbookPolicies").innerHTML = (playbook.management_policy_ids || [])
-    .map((policy) => `<div class="tile"><strong>${policy}</strong><span>Allowed management policy</span></div>`)
-    .join("");
-  $("nextStep").textContent = payload.next_step || "";
-  $("latestArtifacts").innerHTML = artifactRows(payload.latest || {});
-  $("systemTiles").innerHTML = [
-    tile("Packet", preflight.executable, preflight.eligibility || "unknown"),
-    tile("Runtime", true, preflight.runtime_mode || "unknown"),
-    tile("Live Boundary", true, payload.safety_boundary || "guarded"),
+  const health = payload.health || {};
+  const providers = health.providers || [];
+  const quote = payload.quote || {};
+  $("clock").textContent = `${payload.market_timestamp || ""} ${payload.rth_open ? "RTH" : "Closed"}`;
+  $("quoteBadge").textContent = quote.ok ? `${quote.symbol} ${Number(quote.price).toFixed(2)}` : "No quote";
+  $("readiness").innerHTML = [
+    pill("Packet", preflight.executable, preflight.eligibility || "unknown"),
+    pill("Runtime", true, preflight.runtime_mode || "unknown"),
+    pill("Market", payload.rth_open, payload.rth_open ? "open" : "closed"),
+    ...providers.map((provider) => pill(provider.name, provider.ok, provider.detail || "")),
   ].join("");
-  if (payload.health) {
-    $("systemTiles").innerHTML += (payload.health.providers || [])
-      .map((provider) => tile(provider.name, provider.ok, provider.detail))
-      .join("");
-  }
-  setPolicyOptions(playbook.management_policy_ids || []);
+  const policies = preflight.management_policy_ids || [];
+  setPolicyOptions(policies);
 }
 
 function setPolicyOptions(policies) {
@@ -74,131 +61,137 @@ function setPolicyOptions(policies) {
 
 function summarizeConsultation(result) {
   return [
-    `status: ${result.status}`,
     `verdict: ${result.verdict || "unknown"}`,
     `policy: ${result.policy || "unknown"}`,
-    `selected_exit: ${result.selected_exit || "none"}`,
-    `artifact: ${result.artifact_md}`,
-  ].join("\n");
-}
-
-function summarizeDecision(result) {
-  return [
-    `status: ${result.status}`,
-    `decision: ${result.decision}`,
-    `execution_ready: ${result.execution_ready}`,
-    `policy: ${result.selected_management_policy_id || "none"}`,
-    `warnings: ${(result.warning_reasons || []).join(", ") || "none"}`,
+    `exit: ${result.selected_exit || "none"}`,
+    `time: ${result.timestamp}`,
   ].join("\n");
 }
 
 function summarizePreview(result) {
   return [
-    `status: ${result.status}`,
-    `mode: ${result.preview_mode || "live"}`,
     `option: ${result.option_symbol || "none"}`,
     `quantity: ${result.quantity}`,
     `entry: ${result.estimated_entry_price}`,
+    `underlying: ${result.underlying_entry_price}`,
     `stop: ${result.underlying_stop_price}`,
     `blocks: ${(result.block_reasons || []).join(", ") || "none"}`,
   ].join("\n");
 }
 
-function summarizeTicket(result) {
+function renderOrderSummary() {
+  if (!state.preview || state.preview.status !== "option_preview_ready") {
+    $("orderSummary").classList.add("empty");
+    $("orderSummary").textContent = "Preview a trade first.";
+    $("approveSubmitBtn").disabled = true;
+    return;
+  }
+  $("orderSummary").classList.remove("empty");
+  $("orderSummary").innerHTML = [
+    `<strong>${state.preview.option_symbol}</strong>`,
+    `<span>Qty ${state.preview.quantity} @ ${state.preview.estimated_entry_price}</span>`,
+    `<span>Stop ${state.preview.underlying_stop_price} | Policy ${state.preview.selected_management_policy_id}</span>`,
+  ].join("");
+  $("approveSubmitBtn").disabled = false;
+}
+
+function summarizeSubmit(result) {
+  const lifecycle = result.lifecycle || {};
   return [
     `status: ${result.status}`,
-    `order_submission_allowed: ${result.order_submission_allowed}`,
-    `option: ${result.option_symbol || "none"}`,
-    `quantity: ${result.quantity}`,
-    `limit: ${result.limit_price}`,
+    `trade_state: ${lifecycle.trade_state || ""}`,
+    `entry_order: ${lifecycle.entry_order_id || ""}`,
+    `stop_order: ${lifecycle.stop_order_id || ""}`,
+    `target_order: ${lifecycle.target_order_id || ""}`,
     `blocks: ${(result.block_reasons || []).join(", ") || "none"}`,
   ].join("\n");
 }
 
-async function refreshStatus(includeHealth = false) {
-  const payload = await api(`/api/status${includeHealth ? "?health=1" : ""}`);
-  renderStatus(payload);
-  log(includeHealth ? "Health refreshed" : "Status refreshed");
+async function refreshContext() {
+  const symbol = $("symbol").value || "QQQ";
+  const payload = await api(`/api/live-context?symbol=${encodeURIComponent(symbol)}`);
+  renderContext(payload);
+  return payload;
 }
 
 async function consult() {
-  const result = await api("/api/consult", {
-    method: "POST",
-    body: JSON.stringify({
-      symbol: $("symbol").value,
-      direction: $("direction").value,
-      timestamp: $("timestamp").value,
-      chart_read: $("chartRead").value,
-    }),
-  });
+  const body = {
+    symbol: $("symbol").value,
+    direction: $("direction").value,
+    chart_read: $("chartRead").value,
+  };
+  const override = $("timestamp").value.trim();
+  if (override) {
+    body.timestamp = override;
+  }
+  const result = await api("/api/consult", { method: "POST", body: JSON.stringify(body) });
   state.consultation = result;
   $("consultationSummary").classList.remove("empty");
   $("consultationSummary").textContent = summarizeConsultation(result);
   setPolicyOptions(result.allowed_management_policy_ids || []);
-  log("Consultation complete", result);
-  await refreshStatus();
+  log("Consulted Mala", { verdict: result.verdict, timestamp: result.timestamp });
 }
 
-async function decide(decision) {
+async function takeAndPreview() {
   if (!state.consultation) {
-    throw new Error("Consultation is required first.");
+    await consult();
   }
-  const result = await api("/api/decision", {
+  const decision = await api("/api/decision", {
     method: "POST",
     body: JSON.stringify({
       consultation_artifact: state.consultation.artifact_json,
-      decision,
-      selected_management_policy_id: decision === "take" ? $("managementPolicy").value : "",
-      operator_note: $("operatorNote").value || `${decision} from Trader Desk`,
+      decision: "take",
+      selected_management_policy_id: $("managementPolicy").value,
+      operator_note: "Take from Trader Desk cockpit",
     }),
   });
-  state.intent = result;
-  $("consultationSummary").textContent = `${summarizeConsultation(state.consultation)}\n\n${summarizeDecision(result)}`;
-  log(`Decision recorded: ${decision}`, result);
-  await refreshStatus();
-}
-
-async function previewOption() {
-  if (!state.intent) {
-    throw new Error("Take decision is required first.");
+  state.intent = decision;
+  const body = {
+    intent_artifact: decision.artifact_json,
+    preview_mode: $("previewMode").value,
+    symbol: decision.symbol,
+    direction: decision.direction,
+    underlying_stop_price: $("underlyingStop").value,
+  };
+  if ($("underlyingPrice").value) {
+    body.underlying_price = $("underlyingPrice").value;
   }
-  const result = await api("/api/option-preview", {
-    method: "POST",
-    body: JSON.stringify({
-      intent_artifact: state.intent.artifact_json,
-      preview_mode: $("previewMode").value,
-      symbol: state.intent.symbol,
-      direction: state.intent.direction,
-      underlying_price: $("underlyingPrice").value,
-      underlying_stop_price: $("underlyingStop").value,
-    }),
-  });
-  state.preview = result;
+  const preview = await api("/api/option-preview", { method: "POST", body: JSON.stringify(body) });
+  state.preview = preview;
   $("previewSummary").classList.remove("empty");
-  $("previewSummary").textContent = summarizePreview(result);
-  log("Option preview complete", result);
-  await refreshStatus();
+  $("previewSummary").textContent = summarizePreview(preview);
+  renderOrderSummary();
+  log("Option preview ready", { status: preview.status, option: preview.option_symbol });
 }
 
-async function liveTicket(decision) {
-  if (!state.preview) {
-    throw new Error("Option preview is required first.");
+async function approveSubmit() {
+  if (!state.preview || state.preview.status !== "option_preview_ready") {
+    throw new Error("Ready option preview is required first.");
   }
-  const result = await api("/api/live-ticket", {
+  const result = await api("/api/approve-submit", {
     method: "POST",
     body: JSON.stringify({
       option_preview_artifact: state.preview.artifact_json,
-      decision,
+      approval_confirmed: true,
       operator: "Suman",
-      operator_note: $("ticketNote").value || `${decision} from Trader Desk`,
-      approval_phrase: $("approvalPhrase").value,
+      operator_note: $("submitNote").value || "Approved from Trader Desk cockpit",
     }),
   });
-  state.ticket = result;
-  $("ticketSummary").classList.remove("empty");
-  $("ticketSummary").textContent = summarizeTicket(result);
-  log(`Live ticket ${decision}`, result);
-  await refreshStatus();
+  state.submitted = result;
+  $("submitSummary").classList.remove("empty");
+  $("submitSummary").textContent = summarizeSubmit(result);
+  await refreshLiveState();
+  log("Approve+Submit completed", { status: result.status });
+}
+
+async function refreshLiveState() {
+  const payload = await api("/api/live-management/status");
+  $("liveState").classList.remove("empty");
+  $("liveState").textContent = [
+    `status: ${payload.status}`,
+    `trade_state: ${payload.trade_state || "none"}`,
+    `critical: ${payload.critical}`,
+  ].join("\n");
 }
 
 function bind(id, fn) {
@@ -212,14 +205,46 @@ function bind(id, fn) {
   });
 }
 
-bind("refreshStatus", () => refreshStatus(false));
-bind("refreshHealth", () => refreshStatus(true));
-bind("consultBtn", consult);
-bind("takeBtn", () => decide("take"));
-bind("watchBtn", () => decide("watch"));
-bind("passBtn", () => decide("pass"));
-bind("previewBtn", previewOption);
-bind("approveTicketBtn", () => liveTicket("approve"));
-bind("rejectTicketBtn", () => liveTicket("reject"));
+function bindHoldToSubmit() {
+  const button = $("approveSubmitBtn");
+  const start = () => {
+    if (button.disabled) return;
+    button.classList.add("holding");
+    button.textContent = "Keep Holding...";
+    state.submitHoldTimer = setTimeout(async () => {
+      try {
+        button.textContent = "Submitting...";
+        await approveSubmit();
+      } catch (error) {
+        log("Submit blocked", { error: error.message });
+        alert(error.message);
+      } finally {
+        button.classList.remove("holding");
+        button.textContent = "Hold To Submit Live Order";
+      }
+    }, 900);
+  };
+  const cancel = () => {
+    clearTimeout(state.submitHoldTimer);
+    if (!button.classList.contains("holding")) return;
+    button.classList.remove("holding");
+    button.textContent = "Hold To Submit Live Order";
+  };
+  button.addEventListener("mousedown", start);
+  button.addEventListener("touchstart", start);
+  button.addEventListener("mouseup", cancel);
+  button.addEventListener("mouseleave", cancel);
+  button.addEventListener("touchend", cancel);
+}
 
-refreshStatus(false).catch((error) => log("Initial status failed", { error: error.message }));
+bind("refreshBtn", refreshContext);
+bind("consultBtn", consult);
+bind("takePreviewBtn", takeAndPreview);
+bind("liveStateBtn", refreshLiveState);
+bindHoldToSubmit();
+
+$("symbol").addEventListener("change", () => refreshContext().catch((error) => log("Context refresh failed", { error: error.message })));
+
+refreshContext()
+  .then(refreshLiveState)
+  .catch((error) => log("Initial load failed", { error: error.message }));
