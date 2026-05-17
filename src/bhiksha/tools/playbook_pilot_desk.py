@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -26,11 +27,26 @@ ensure_kernel_on_path()
 from mala_bhiksha_kernel import CapabilityManifest  # noqa: E402
 
 
-DEFAULT_PACKET = Path(
-    "/Users/suman/code/mala_v2/packets/execution/"
-    "execution.mean_reversion_at_extremes.iwm_qqq/v2.json"
-)
-DEFAULT_MALA_REPO = Path("/Users/suman/code/mala_v2")
+def _default_mala_repo() -> Path:
+    bhiksha_repo = Path(__file__).resolve().parents[3]
+    candidates = [
+        os.getenv("MALA_REPO_ROOT"),
+        os.getenv("MALA_V2_REPO_ROOT"),
+        str(bhiksha_repo.parent / "mala_v2"),
+        str(Path.home() / "Documents" / "mala_v2"),
+        str(Path.home() / "code" / "mala_v2"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if (path / "packets").exists():
+            return path
+    return bhiksha_repo.parent / "mala_v2"
+
+
+DEFAULT_MALA_REPO = _default_mala_repo()
+DEFAULT_PACKET = DEFAULT_MALA_REPO / "packets/execution/execution.mean_reversion_at_extremes.iwm_qqq/v2.json"
 DEFAULT_CAPABILITY_MANIFEST = Path("artifacts/capabilities/bhiksha_packet_capabilities_v1.json")
 DEFAULT_LEGACY_REPORT = Path("artifacts/legacy_retirement/current.json")
 DEFAULT_DB_PATH = "bhiksha.db"

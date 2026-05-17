@@ -17,9 +17,9 @@ projects.
 ## Start
 
 ```bash
-PYTHONPATH=/Users/suman/code/mala-bhiksha-kernel/src:src ./.venv/bin/python \
-  -m bhiksha.tools.trader_desk \
-  --port 8766
+MALA_REPO_ROOT="${MALA_REPO_ROOT:-../mala_v2}" \
+PYTHONPATH="../mala-bhiksha-kernel/src:src" \
+  ./.venv/bin/python -m bhiksha.tools.trader_desk --port 8766
 ```
 
 Open:
