@@ -48,6 +48,13 @@ class TraderDeskHandler(SimpleHTTPRequestHandler):
             latest = self.service.latest_artifacts()
             self._send_json({"latest": latest})
             return
+        if parsed.path == "/api/live-context":
+            payload = {key: value[0] for key, value in parse_qs(parsed.query).items() if value}
+            self._send_json(self.service.live_context(payload))
+            return
+        if parsed.path == "/api/live-management/status":
+            self._send_json(self.service.live_management_status())
+            return
         if parsed.path == "/":
             self.path = "/index.html"
         super().do_GET()
@@ -58,6 +65,7 @@ class TraderDeskHandler(SimpleHTTPRequestHandler):
             "/api/decision": self.service.decide,
             "/api/option-preview": self.service.preview_option,
             "/api/live-ticket": self.service.live_ticket,
+            "/api/approve-submit": self.service.approve_submit,
         }
         parsed = urlparse(self.path)
         handler = routes.get(parsed.path)
@@ -102,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capability-manifest", type=Path, default=DEFAULT_CAPABILITY_MANIFEST)
     parser.add_argument("--legacy-retirement-report", type=Path, default=DEFAULT_LEGACY_REPORT)
     parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
+    parser.add_argument("--db-path", type=Path, default=Path("bhiksha.db"))
     parser.add_argument("--update-mala-log", action="store_true")
     args = parser.parse_args(argv)
 
@@ -112,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             capability_manifest=args.capability_manifest,
             legacy_retirement_report=args.legacy_retirement_report,
             artifact_root=args.artifact_root,
+            db_path=args.db_path,
             update_mala_log=args.update_mala_log,
         )
     )
