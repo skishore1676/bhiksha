@@ -23,7 +23,7 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert snapshot["session"] == {"live": False, "max_bars": 5}
     assert snapshot["app"]["app_name"] == "bhiksha"
     assert snapshot["providers"]["underlying_live_primary"] == "public"
-    assert snapshot["providers"]["underlying_backfill_primary"] == "polygon"
+    assert snapshot["providers"]["underlying_backfill_primary"] == "schwab"
     assert snapshot["providers"]["execution_broker_primary"] == "public"
     assert {entry["strategy_id"] for entry in snapshot["strategy_catalog"]}.isdisjoint(
         {

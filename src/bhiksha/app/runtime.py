@@ -336,8 +336,10 @@ class BhikshaRuntime:
                 reason="startup",
             )
 
+            warmup_provider = self.provider_config.underlying_backfill_primary
+
             # PRE-WARMUP TOKEN HEALTH CHECK (near-term fix)
-            if self.provider_config.underlying_live_primary == "schwab":
+            if "schwab" in {self.provider_config.underlying_live_primary, warmup_provider}:
                 settings = SchwabSettings.from_env()
                 tokens = read_tokens(settings.token_file)
                 if not tokens or refresh_token_is_expired(tokens):
@@ -349,7 +351,6 @@ class BhikshaRuntime:
                 output("TOKEN_HEALTH Schwab tokens are valid")
 
             warmup_days_by_symbol = self.warmup_trading_days_by_symbol()
-            warmup_provider = self.provider_config.underlying_backfill_primary
             for symbol in symbols:
                 warmup_days = warmup_days_by_symbol.get(symbol, legacy_effective_warmup_trading_days(self.app_config))
                 warmed = await self.warm_start_symbol(

@@ -18,20 +18,24 @@ Completed:
 - Re-promoted Public to the default live and execution provider after a fresh
   no-order smoke confirmed account auth, underlying quotes, option chains,
   option quotes, greeks, and single-leg preflight.
-- Kept Polygon as the warmup/backfill provider because Public still rejects
-  multi-day `ONE_MINUTE` history such as `WEEK/ONE_MINUTE`.
+- Switched warmup/backfill from Polygon to Schwab after the degraded Polygon
+  plan introduced 65-second retry waits during Monday dry startup. Public still
+  rejects multi-day `ONE_MINUTE` history such as `WEEK/ONE_MINUTE`; Schwab
+  warmed the full active-plan symbol set quickly on oldmac.
 - Changed runtime warmup to use `underlying_backfill_primary` instead of the
   live provider, so Public live polling no longer has to satisfy multi-day
   feature warmup.
+- Extended the Schwab token preflight to cover Schwab-as-backfill, not only
+  Schwab-as-live-provider.
 - Changed default option-chain discovery from Schwab to Public. Schwab remains
   available as an explicit fallback/diagnostic integration, not a startup
   dependency.
 
 Key decisions:
 
-- Default provider posture is now Public live bars, Polygon warmup/backfill,
-  and Public execution. Schwab should not be on the critical Monday startup
-  path unless we intentionally select it for comparison or fallback.
+- Default provider posture is now Public live bars, Schwab warmup/backfill,
+  and Public execution. Polygon remains a research/backfill fallback, but it
+  should not block Monday startup under the degraded plan.
 
 ### 2026-05-14
 
