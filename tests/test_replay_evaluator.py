@@ -3,9 +3,9 @@ from datetime import datetime
 import polars as pl
 
 from bhiksha.app.replay import ReplaySignalEvaluator
-from bhiksha.config.loader import load_deployments
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.strategy.registry import default_strategy_registry
+from historical_config import load_historical_deployments
 
 
 class CountingFeatureService(FeatureService):
@@ -24,7 +24,7 @@ class CountingFeatureService(FeatureService):
 
 
 def test_replay_evaluator_reuses_enrichment_for_same_feature_set() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = load_historical_deployments()
     qqq = next(d for d in deployments if d.deployment_id == "market_impulse_qqq_short_v1")
     sibling = qqq.model_copy(update={"deployment_id": "market_impulse_qqq_short_v2"})
     service = CountingFeatureService()
@@ -52,7 +52,7 @@ def test_replay_evaluator_reuses_enrichment_for_same_feature_set() -> None:
 
 
 def test_replay_evaluator_can_scan_historical_signals_on_enriched_frame() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = load_historical_deployments()
     tsla = next(d for d in deployments if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1")
     evaluator = ReplaySignalEvaluator(FeatureService(), default_strategy_registry())
     frame = pl.DataFrame(
@@ -77,7 +77,7 @@ def test_replay_evaluator_can_scan_historical_signals_on_enriched_frame() -> Non
 
 
 def test_replay_evaluator_can_return_historical_signal_indexes() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = load_historical_deployments()
     tsla = next(d for d in deployments if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1")
     evaluator = ReplaySignalEvaluator(FeatureService(), default_strategy_registry())
     frame = pl.DataFrame(
@@ -103,7 +103,7 @@ def test_replay_evaluator_can_return_historical_signal_indexes() -> None:
 
 
 def test_replay_evaluator_can_pair_entry_with_strategy_exit() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = load_historical_deployments()
     qqq = next(d for d in deployments if d.deployment_id == "market_impulse_qqq_short_v1")
     evaluator = ReplaySignalEvaluator(FeatureService(), default_strategy_registry())
     frame = pl.DataFrame(
@@ -135,7 +135,7 @@ def test_replay_evaluator_can_pair_entry_with_strategy_exit() -> None:
 
 
 def test_replay_evaluator_can_pair_entry_with_time_exit() -> None:
-    deployments = load_deployments("config/deployments")
+    deployments = load_historical_deployments()
     qqq = next(d for d in deployments if d.deployment_id == "market_impulse_qqq_short_v1")
     qqq = qqq.model_copy(update={"exit": qqq.exit.model_copy(update={"use_algorithmic_exit": False})})
     evaluator = ReplaySignalEvaluator(FeatureService(), default_strategy_registry())

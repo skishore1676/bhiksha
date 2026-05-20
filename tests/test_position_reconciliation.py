@@ -1,16 +1,16 @@
 from datetime import UTC, datetime
 
-from bhiksha.config.loader import load_deployments
 from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import TradeRecord
 from bhiksha.state.reconciliation import reconcile_public_positions
+from historical_config import historical_deployment, load_historical_deployments
 
 
 def _historical_enabled_deployments():
     ids = {"market_impulse_qqq_short_v1", "market_impulse_spy_short_v1"}
     return [
         deployment.model_copy(update={"enabled": True})
-        for deployment in load_deployments("config/deployments")
+        for deployment in load_historical_deployments()
         if deployment.deployment_id in ids
     ]
 
@@ -110,8 +110,8 @@ def test_reconcile_public_positions_attaches_entry_and_target_metadata() -> None
 
 
 def test_reconcile_public_positions_prefers_known_trade_identity_over_symbol_match() -> None:
-    deployments = load_deployments("config/deployments")
-    qqq = next(d for d in deployments if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployments = load_historical_deployments()
+    qqq = historical_deployment("market_impulse_qqq_short_v1")
     sibling = qqq.model_copy(update={"deployment_id": "market_impulse_qqq_short_v2"})
     positions = [
         {
@@ -205,8 +205,8 @@ def test_reconcile_public_positions_maps_live_limit_as_exit_when_trade_is_exit_p
 
 
 def test_reconcile_public_positions_skips_ambiguous_same_contract_trade_identity() -> None:
-    deployments = load_deployments("config/deployments")
-    qqq = next(d for d in deployments if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployments = load_historical_deployments()
+    qqq = historical_deployment("market_impulse_qqq_short_v1")
     sibling = qqq.model_copy(update={"deployment_id": "market_impulse_qqq_short_v2"})
     positions = [
         {
@@ -242,8 +242,8 @@ def test_reconcile_public_positions_skips_ambiguous_same_contract_trade_identity
 
 
 def test_reconcile_public_positions_matches_recent_closed_trade_by_opened_at_and_price() -> None:
-    deployments = load_deployments("config/deployments")
-    qqq = next(d for d in deployments if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployments = load_historical_deployments()
+    qqq = historical_deployment("market_impulse_qqq_short_v1")
     positions = [
         {
             "instrument": {

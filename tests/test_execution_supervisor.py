@@ -3,7 +3,6 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 
-from bhiksha.config.loader import load_deployments
 from bhiksha.config.models import AppConfig
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
@@ -14,12 +13,11 @@ from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.lifecycle import TradeLifecycleStore
 from bhiksha.state.position_tracker import PositionTracker
+from historical_config import historical_deployment
 
 
 def _enabled_deployment(deployment_id: str):
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == deployment_id
-    )
+    deployment = historical_deployment(deployment_id)
     return deployment.model_copy(update={"enabled": True})
 
 

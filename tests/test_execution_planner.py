@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime
 
-from bhiksha.config.loader import load_deployments
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionContractSnapshot, SignalDecision
 from bhiksha.execution.order_manager import PublicQuote, PreflightCheck
@@ -9,12 +8,11 @@ from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import PositionTracker
+from historical_config import historical_deployment
 
 
 def _enabled_deployment(deployment_id: str):
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == deployment_id
-    )
+    deployment = historical_deployment(deployment_id)
     return deployment.model_copy(update={"enabled": True})
 
 
@@ -187,9 +185,7 @@ def test_execution_planner_creates_dry_run_trade_plan():
 
 
 def test_execution_planner_blocks_trade_outside_execution_window() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService()
     planner = ExecutionPlanner(
         chain_service=chain_service,
@@ -216,9 +212,7 @@ def test_execution_planner_blocks_trade_outside_execution_window() -> None:
 
 
 def test_execution_planner_can_simulate_without_tracking_position() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     planner = ExecutionPlanner(
@@ -247,9 +241,7 @@ def test_execution_planner_can_simulate_without_tracking_position() -> None:
 
 
 def test_execution_planner_shadow_ignores_book_position_caps() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="SHADOW-IWM", option_symbol="IWM260417C00210000")
@@ -279,9 +271,7 @@ def test_execution_planner_shadow_ignores_book_position_caps() -> None:
 
 
 def test_execution_planner_dry_run_still_honors_book_position_caps() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="DRY-IWM", option_symbol="IWM260417C00210000")
@@ -333,6 +323,40 @@ def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
     assert plan.quantity == 0
     assert plan.option_symbol == "QQQ260330P00558000"
     assert plan.risk_reasons == ["public_quote_unavailable"]
+
+
+def test_execution_planner_blocks_contract_already_owned_by_other_deployment() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    tracker = PositionTracker()
+    tracker.open_position(
+        "QQQ",
+        "market_impulse_qqq_short_v2",
+        trade_id="TRADE-OTHER",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=StubOrderManager(),
+        position_tracker=tracker,
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.quantity == 0
+    assert plan.option_symbol == "QQQ260330P00558000"
+    assert plan.risk_reasons == ["option_contract_already_owned_by_other_deployment"]
+    assert tracker.deployment_open_positions(deployment.deployment_id) == 0
 
 
 def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None:

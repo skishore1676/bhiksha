@@ -2,16 +2,12 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
-from bhiksha.config.loader import load_deployments
 from bhiksha.strategy.jerk_pivot_momentum import JerkPivotMomentumStrategy
+from historical_config import historical_deployment
 
 
 def _tsla_deployment():
-    return next(
-        deployment
-        for deployment in load_deployments("config/deployments")
-        if deployment.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    return historical_deployment("jerk_pivot_momentum_tsla_short_v1")
 
 
 def _base_frame(*, latest_timestamp: datetime, latest_volume: float = 1500.0) -> pl.DataFrame:

@@ -13,10 +13,11 @@ from bhiksha.config.loader import (
     load_runtime_deployments,
     load_strategy_catalog,
 )
+from historical_config import HISTORICAL_DEPLOYMENTS_DIR, HISTORICAL_STRATEGY_CATALOG_DIR
 
 
 def test_load_deployments_from_config_directory() -> None:
-    deployments = load_deployments(Path("config/deployments"))
+    deployments = load_deployments(HISTORICAL_DEPLOYMENTS_DIR)
     ids = {deployment.deployment_id for deployment in deployments}
     assert ids >= {
         "jerk_pivot_momentum_tsla_short_v1",
@@ -182,7 +183,7 @@ def test_load_active_plan_rejects_legacy_contracts(tmp_path: Path) -> None:
 
 
 def test_load_strategy_catalog_from_config_directory() -> None:
-    catalog = load_strategy_catalog(Path("config/strategy_catalog"))
+    catalog = load_strategy_catalog(HISTORICAL_STRATEGY_CATALOG_DIR)
 
     ids = {entry.strategy_id for entry in catalog}
     assert ids >= {
