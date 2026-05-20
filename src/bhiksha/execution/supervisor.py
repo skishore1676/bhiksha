@@ -509,6 +509,25 @@ class ExecutionSupervisor:
                     ),
                 },
             )
+            if (
+                reference_price is not None
+                and updated.stop_price is not None
+                and reference_price <= updated.stop_price
+            ):
+                decision = ExitDecision(
+                    deployment_id=deployment.deployment_id,
+                    symbol=updated.symbol,
+                    timestamp=datetime.now(UTC),
+                    exit=True,
+                    action="square_off",
+                    reason=["shadow_option_stop_loss"],
+                    features={
+                        "option_mark_price": reference_price,
+                        "option_stop_price": updated.stop_price,
+                    },
+                )
+                await self._handle_exit_locked(deployment, updated, decision, dry_run=True)
+                return None
         if (
             _profit_target_configured(deployment)
             and updated.target_order_id is None

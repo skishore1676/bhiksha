@@ -935,6 +935,68 @@ def test_execution_supervisor_forces_shadow_management_to_dry_run(tmp_path) -> N
     assert stop_payload["stop_order_id"] == "DRY_RUN_STOP"
 
 
+def test_execution_supervisor_closes_shadow_trade_when_option_stop_is_breached(tmp_path) -> None:
+    order_manager = RecordingOrderManager(quote_bid=1.0)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "trades.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="SHADOW_STOP",
+        option_symbol="QQQ260522P00703000",
+        quantity=1,
+        entry_price=2.0,
+        source="shadow",
+        order_id="SHADOW_ENTRY",
+        stop_order_id="DRY_RUN_STOP",
+        stop_price=1.3,
+        entry_timestamp=datetime(2026, 5, 20, 13, 38, tzinfo=UTC),
+    )
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="SHADOW_STOP",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                option_symbol="QQQ260522P00703000",
+                quantity=1,
+                entry_price=2.0,
+                entry_timestamp=datetime(2026, 5, 20, 13, 38, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="SHADOW_ENTRY",
+                stop_order_id="DRY_RUN_STOP",
+                stop_price=1.3,
+            )
+        )
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+
+    managed = asyncio.run(supervisor.manage_open_position(deployment, position, dry_run=False))
+
+    assert managed is None
+    assert supervisor.planner.position_tracker.active_positions() == []
+    recent = asyncio.run(trade_repo.get_recent_trades(limit=1))
+    assert recent[0].status == "closed"
+    assert recent[0].exit_price == 1.0
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
+    event_types = [row[0] for row in rows]
+    assert "shadow_mark" in event_types
+    assert "exit_decision" in event_types
+    assert "shadow_exit_assumed" in event_types
+    shadow_exit_payload = next(json.loads(row[1]) for row in rows if row[0] == "shadow_exit_assumed")
+    assert shadow_exit_payload["reason"] == ["shadow_option_stop_loss"]
+    assert shadow_exit_payload["exit_price"] == 1.0
+    assert shadow_exit_payload["realized_stop_r"] <= -1.0
+
+
 def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:
     class UnfilledOrderManager(StubOrderManager):
         async def wait_for_fill(self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2):
