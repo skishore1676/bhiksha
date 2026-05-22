@@ -159,8 +159,8 @@ class BhikshaRuntime:
         provider: str | None = None,
         warmup_trading_days: int | None = None,
     ) -> list[Bar]:
-        """Warm start bars for a symbol using the configured provider."""
-        provider = provider or self.provider_config.underlying_live_primary
+        """Warm start bars for a symbol using the configured backfill provider."""
+        provider = provider or self.provider_config.underlying_backfill_primary
         end = datetime.now(UTC)
         days = warmup_trading_days if warmup_trading_days is not None else self.warmup_trading_days_for_symbol(symbol)
         start = trading_window_start(end, days)

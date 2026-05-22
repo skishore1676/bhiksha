@@ -22,7 +22,7 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert len(snapshot["config_fingerprint"]) == 16
     assert snapshot["session"] == {"live": False, "max_bars": 5}
     assert snapshot["app"]["app_name"] == "bhiksha"
-    assert snapshot["providers"]["underlying_live_primary"] == "public"
+    assert snapshot["providers"]["underlying_live_primary"] == "schwab"
     assert snapshot["providers"]["underlying_backfill_primary"] == "schwab"
     assert snapshot["providers"]["execution_broker_primary"] == "public"
     assert {entry["strategy_id"] for entry in snapshot["strategy_catalog"]}.isdisjoint(
@@ -54,6 +54,46 @@ def test_runtime_warmup_expands_for_hourly_market_impulse() -> None:
     }
 
     assert runtime.warmup_trading_days_for_symbol("MU") == 9
+
+
+def test_warm_start_symbol_defaults_to_backfill_provider(monkeypatch) -> None:
+    runtime = build_runtime()
+    runtime.provider_config.underlying_live_primary = "public"
+    runtime.provider_config.underlying_backfill_primary = "schwab"
+    calls: list[str] = []
+
+    class StubSchwabBarSource:
+        async def warm_start(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
+            calls.append(f"schwab:{symbol}")
+            return [
+                Bar(
+                    symbol=symbol,
+                    timestamp=datetime(2026, 5, 21, 14, 30, tzinfo=UTC),
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.5,
+                    volume=1000.0,
+                )
+            ]
+
+        async def close(self) -> None:
+            calls.append("schwab:close")
+
+    class ExplodingPublicBarSource:
+        async def warm_start(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
+            raise AssertionError("warm_start_symbol must not default to live Public")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("bhiksha.app.runtime.SchwabBarSource", StubSchwabBarSource)
+    monkeypatch.setattr("bhiksha.app.runtime.PublicBarSource", ExplodingPublicBarSource)
+
+    bars = asyncio.run(runtime.warm_start_symbol("QQQ", warmup_trading_days=1))
+
+    assert [bar.symbol for bar in bars] == ["QQQ"]
+    assert calls == ["schwab:QQQ", "schwab:close"]
 
 
 def test_build_runtime_respects_configured_bias_inputs_path(tmp_path: Path) -> None:
