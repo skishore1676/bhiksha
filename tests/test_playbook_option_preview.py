@@ -28,11 +28,19 @@ from mala_bhiksha_kernel import (  # noqa: E402
 
 
 class StubChainService:
-    def __init__(self, *, bid: float = 2.70, ask: float = 2.90, open_interest: int = 500) -> None:
+    def __init__(
+        self,
+        *,
+        bid: float = 2.70,
+        ask: float = 2.90,
+        open_interest: int = 500,
+        strike: float = 210.0,
+    ) -> None:
         self.calls = 0
         self.bid = bid
         self.ask = ask
         self.open_interest = open_interest
+        self.strike = strike
 
     async def get_chain(self, symbol: str, **kwargs):
         self.calls += 1
@@ -43,7 +51,7 @@ class StubChainService:
                 contract_type="PUT",
                 expiration_date="2026-03-30",
                 dte=0,
-                strike=558.0,
+                strike=self.strike,
                 delta=-0.31,
                 bid=self.bid,
                 ask=self.ask,

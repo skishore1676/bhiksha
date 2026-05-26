@@ -87,7 +87,7 @@ def test_trader_desk_simulated_option_preview(tmp_path: Path) -> None:
 
     assert payload["preview_mode"] == "simulated"
     assert payload["status"] == "option_preview_ready"
-    assert payload["option_symbol"] == "IWM260515P00475000"
+    assert payload["option_symbol"] == "IWM260515P00286000"
     assert payload["order_submission_allowed"] is False
 
 

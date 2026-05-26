@@ -141,6 +141,33 @@ class ExecutionPlanner:
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
             )
+        intrinsic_value = _intrinsic_value(
+            contract_type=selection.contract_type,
+            strike=selection.strike,
+            underlying_price=underlying_entry_price,
+        )
+        if intrinsic_value is not None and entry_price + 0.05 < intrinsic_value:
+            return TradePlan(
+                trade_id=trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                direction=decision.direction,
+                option_symbol=selection.option_symbol,
+                quantity=0,
+                estimated_entry_price=entry_price,
+                risk_reasons=["underlying_option_price_inconsistent"],
+                dry_run=dry_run,
+                order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
+                risk_details={
+                    "underlying_entry_price": underlying_entry_price,
+                    "contract_type": selection.contract_type,
+                    "strike": selection.strike,
+                    "entry_price": entry_price,
+                    "intrinsic_value": intrinsic_value,
+                },
+            )
         if quote.open_interest is not None and quote.open_interest < deployment.execution.min_open_interest:
             return TradePlan(
                 trade_id=trade_id,
@@ -388,6 +415,22 @@ def _underlying_entry_price(decision: SignalDecision) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _intrinsic_value(
+    *,
+    contract_type: str | None,
+    strike: float | None,
+    underlying_price: float | None,
+) -> float | None:
+    if strike is None or underlying_price is None:
+        return None
+    normalized = str(contract_type or "").upper()
+    if normalized == "CALL":
+        return max(float(underlying_price) - float(strike), 0.0)
+    if normalized == "PUT":
+        return max(float(strike) - float(underlying_price), 0.0)
+    return None
 
 
 def _parse_optional_et_time(value: str | None) -> time | None:

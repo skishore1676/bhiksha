@@ -635,12 +635,12 @@ class _SimulatedChainService:
     async def get_chain(self, symbol: str, **kwargs):
         return [
             OptionContractSnapshot(
-                option_symbol=f"{symbol}260515{self.contract_type[0]}00475000",
+                option_symbol=f"{symbol}260515{self.contract_type[0]}00286000",
                 underlying_symbol=symbol,
                 contract_type=self.contract_type,
                 expiration_date="2026-05-15",
                 dte=0,
-                strike=475.0,
+                strike=286.0,
                 delta=-0.31 if self.contract_type == "PUT" else 0.31,
                 bid=2.70,
                 ask=2.90,
