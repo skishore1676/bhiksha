@@ -3,19 +3,15 @@ from datetime import datetime
 import polars as pl
 
 from bhiksha.app.replay import ReplaySignalEvaluator
-from bhiksha.config.loader import load_deployments
 from bhiksha.execution.position_monitor import PositionMonitor
 from bhiksha.market_data.feature_service import FeatureService
 from bhiksha.state.position_tracker import PositionTracker, TrackedPosition
 from bhiksha.strategy.registry import default_strategy_registry
+from historical_config import historical_deployment
 
 
 def test_position_monitor_emits_exit_for_vma_reclaim() -> None:
-    deployment = next(
-        deployment
-        for deployment in load_deployments("config/deployments")
-        if deployment.deployment_id == "market_impulse_qqq_short_v1"
-    )
+    deployment = historical_deployment("market_impulse_qqq_short_v1")
     tracker = PositionTracker()
     tracker.open_position(
         "QQQ",
@@ -52,11 +48,7 @@ def test_position_monitor_emits_exit_for_vma_reclaim() -> None:
 
 
 def test_position_monitor_can_use_supplied_position_snapshot() -> None:
-    deployment = next(
-        deployment
-        for deployment in load_deployments("config/deployments")
-        if deployment.deployment_id == "market_impulse_qqq_short_v1"
-    )
+    deployment = historical_deployment("market_impulse_qqq_short_v1")
     tracker = PositionTracker()
     monitor = PositionMonitor(
         ReplaySignalEvaluator(FeatureService(), default_strategy_registry()),
@@ -98,17 +90,10 @@ def test_position_monitor_can_use_supplied_position_snapshot() -> None:
 
 
 def test_position_monitor_emits_fixed_rr_underlying_exit() -> None:
-    deployment = next(
-        deployment
-        for deployment in load_deployments("config/deployments")
-        if deployment.deployment_id == "market_impulse_qqq_short_v1"
-    ).model_copy(
+    base = historical_deployment("market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
         update={
-            "exit": next(
-                deployment
-                for deployment in load_deployments("config/deployments")
-                if deployment.deployment_id == "market_impulse_qqq_short_v1"
-            ).exit.model_copy(
+            "exit": base.exit.model_copy(
                 update={
                     "use_algorithmic_exit": False,
                     "thesis_exit_anchor": "underlying",
@@ -154,11 +139,7 @@ def test_position_monitor_emits_fixed_rr_underlying_exit() -> None:
 
 
 def test_position_monitor_emits_trailing_vma_underlying_exit() -> None:
-    base = next(
-        deployment
-        for deployment in load_deployments("config/deployments")
-        if deployment.deployment_id == "market_impulse_qqq_short_v1"
-    )
+    base = historical_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
         update={
             "exit": base.exit.model_copy(

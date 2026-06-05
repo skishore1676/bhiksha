@@ -2,18 +2,14 @@ from datetime import datetime
 
 import polars as pl
 
-from bhiksha.config.loader import load_deployments
 from bhiksha.market_data.newton.engine import PhysicsEngine
 from bhiksha.strategy.market_impulse import MarketImpulseStrategy
 from bhiksha.state.position_tracker import TrackedPosition
+from historical_config import historical_deployment
 
 
 def test_market_impulse_short_signal_on_latest_bar() -> None:
-    deployment = next(
-        deployment
-        for deployment in load_deployments("config/deployments")
-        if deployment.deployment_id == "market_impulse_qqq_short_v1"
-    )
+    deployment = historical_deployment("market_impulse_qqq_short_v1")
     strategy = MarketImpulseStrategy()
     frame = pl.DataFrame(
         {
@@ -80,11 +76,7 @@ def test_newton_engine_builds_parametric_kinematic_features() -> None:
 
 
 def test_market_impulse_short_exit_on_vma_reclaim() -> None:
-    deployment = next(
-        deployment
-        for deployment in load_deployments("config/deployments")
-        if deployment.deployment_id == "market_impulse_qqq_short_v1"
-    )
+    deployment = historical_deployment("market_impulse_qqq_short_v1")
     strategy = MarketImpulseStrategy()
     frame = pl.DataFrame(
         {

@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bhiksha Trader Desk</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Bhiksha Live-Gated Playbook</p>
+      <h1>Trader Desk</h1>
+    </div>
+    <div id="clock" class="clock">Loading</div>
+  </header>
+
+  <main class="shell">
+    <section id="readiness" class="readiness"></section>
+
+    <section class="grid">
+      <article class="panel trade-card">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Trade</p>
+            <h2 id="playbookTitle">IWM/QQQ Mean Reversion</h2>
+          </div>
+          <button id="refreshBtn" class="icon-btn" title="Refresh">Refresh</button>
+        </div>
+
+        <div class="compact-row">
+          <label>Symbol
+            <select id="symbol">
+              <option value="QQQ">QQQ</option>
+              <option value="IWM">IWM</option>
+            </select>
+          </label>
+          <label>Direction
+            <select id="direction">
+              <option value="short">Short</option>
+              <option value="long">Long</option>
+            </select>
+          </label>
+        </div>
+
+        <label>Chart Read
+          <textarea id="chartRead" rows="4" placeholder="What do you see before Mala speaks?"></textarea>
+        </label>
+
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <label>Timestamp Override
+            <input id="timestamp" placeholder="Defaults to market now">
+          </label>
+        </details>
+
+        <button id="consultBtn" class="primary">Consult Mala Now</button>
+        <div id="consultationSummary" class="summary empty">No consultation yet.</div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Preview</p>
+            <h2>Option & Risk</h2>
+          </div>
+          <span id="quoteBadge" class="badge">No quote</span>
+        </div>
+
+        <label>Management
+          <select id="managementPolicy"></select>
+        </label>
+        <label>Stop / Invalidation
+          <input id="underlyingStop" type="number" step="0.01" placeholder="Required if Mala cannot infer it">
+        </label>
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <label>Underlying Price Override
+            <input id="underlyingPrice" type="number" step="0.01" placeholder="Defaults to live quote">
+          </label>
+          <label>Preview Mode
+            <select id="previewMode">
+              <option value="live">Live Provider</option>
+              <option value="simulated">Rehearsal</option>
+            </select>
+          </label>
+        </details>
+
+        <button id="takePreviewBtn" class="primary">Take & Preview</button>
+        <div id="previewSummary" class="summary empty">No option preview yet.</div>
+      </article>
+
+      <article class="panel submit-card">
+        <p class="eyebrow">Submit</p>
+        <h2>Approve+Submit</h2>
+        <div id="orderSummary" class="order-summary empty">Preview a trade first.</div>
+        <label>Submit Note
+          <textarea id="submitNote" rows="3" placeholder="One-contract pilot. Stop/invalidation is clear."></textarea>
+        </label>
+        <button id="approveSubmitBtn" class="danger" disabled>Hold To Submit Live Order</button>
+        <div id="submitSummary" class="summary empty">No live order submitted.</div>
+      </article>
+
+      <article class="panel live-card">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Live State</p>
+            <h2>Lifecycle</h2>
+          </div>
+          <button id="liveStateBtn" class="icon-btn" title="Refresh live state">State</button>
+        </div>
+        <div id="liveState" class="summary empty">No lifecycle yet.</div>
+        <pre id="eventLog"></pre>
+      </article>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

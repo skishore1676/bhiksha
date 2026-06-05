@@ -37,3 +37,7 @@ def et_time_expr(column: str = "timestamp") -> pl.Expr:
     """Return ET time-of-day as a Polars expression."""
     return et_timestamp_expr(column).dt.time()
 
+
+def et_date_expr(column: str = "timestamp") -> pl.Expr:
+    """Return ET calendar date as a Polars expression."""
+    return et_timestamp_expr(column).dt.date()

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
-from bhiksha.loop.observation import write_observation_reports
+from bhiksha.domain.models import Bar
+from bhiksha.loop.observation import _replay_summary, write_observation_reports
 from bhiksha.persistence.sqlite import SQLiteEventRepository
 
 
@@ -207,6 +210,53 @@ def test_observation_report_summarizes_runtime_issues_and_blocked_reasons(tmp_pa
 
     written = json.loads((tmp_path / "reports" / "market_impulse_qqq_short_shadow_1234abcd.json").read_text(encoding="utf-8"))
     assert written["candidate_id"] == "market_candidate"
+
+
+def test_replay_summary_defaults_to_backfill_provider() -> None:
+    class RuntimeStub:
+        provider_config = SimpleNamespace(underlying_backfill_primary="schwab")
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        async def warm_start_symbol(self, symbol: str, *, provider: str | None = None) -> list[Bar]:
+            self.calls.append((symbol, provider))
+            return [
+                Bar(
+                    symbol=symbol,
+                    timestamp=datetime(2026, 5, 21, 14, 30, tzinfo=UTC),
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.5,
+                    volume=1000.0,
+                )
+            ]
+
+    class EvaluatorStub:
+        def prepare_enriched_frames(self, frame, deployments):
+            return {deployments[0].deployment_id: frame}
+
+        def scan_trade_history_on_enriched(self, deployment, enriched, *, start_at: int):
+            return []
+
+    runtime = RuntimeStub()
+    deployment = SimpleNamespace(symbol="QQQ", deployment_id="qqq_shadow")
+
+    summary = asyncio.run(
+        _replay_summary(
+            runtime=runtime,
+            evaluator=EvaluatorStub(),
+            deployment=deployment,
+            trading_days=1,
+            provider=None,
+            include_replay=True,
+        )
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["provider"] == "schwab"
+    assert runtime.calls == [("QQQ", "schwab")]
 
 
 def test_observation_report_scopes_counts_to_latest_startup(tmp_path: Path) -> None:

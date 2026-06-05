@@ -492,7 +492,7 @@ def test_compile_active_plan_from_google_sheets_suppresses_non_ready_catalog_row
 
     assert compiled.plan.deployments == []
     assert compiled.plan.summary["suppressed_count"] == 1
-    assert "not bhiksha_ready" in compiled.plan.suppressed[0]["reason"]
+    assert "not Bhiksha runtime-ready" in compiled.plan.suppressed[0]["reason"]
 
 
 def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(tmp_path: Path) -> None:
@@ -712,6 +712,11 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
                     }
                 ),
                 "thesis_exit_metrics_json": json.dumps({"expectancy": 0.56, "profit_factor": 2.0}),
+                "option_trade_ready": "TRUE",
+                "option_adjusted_expectancy_pct": "0.18",
+                "option_exit_quality": "fast_intraday",
+                "recommended_dte_min": "3",
+                "recommended_dte_max": "7",
                 "exit_reliability": "thin",
                 "warnings": "legacy_m5_execution_mapping_ignored:entry_window_et",
             }
@@ -727,6 +732,8 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "option_stop_pct", "value": "0.35"},
             {"section": "default", "key": "option_profit_target_enabled", "value": "TRUE"},
             {"section": "default", "key": "option_profit_target_pct", "value": "0.35"},
+            {"section": "default", "key": "target_approach_offset_pct", "value": "0.10"},
+            {"section": "default", "key": "target_pullback_restore_progress_pct", "value": "0.75"},
             {"section": "default", "key": "min_open_interest", "value": "25"},
             {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
             {"section": "default", "key": "dte_min", "value": "5"},
@@ -767,8 +774,8 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     deployment = compiled.plan.deployments[0]
     assert deployment.strategy.params["entry_buffer_minutes"] == 5
     assert deployment.strategy.params["direction"] == "long"
-    assert deployment.execution.dte_min == 5
-    assert deployment.execution.dte_max == 21
+    assert deployment.execution.dte_min == 3
+    assert deployment.execution.dte_max == 7
     assert deployment.execution.target_abs_delta_min == 0.15
     assert deployment.execution.target_abs_delta_max == 0.40
     assert deployment.execution.min_open_interest == 25
@@ -780,6 +787,8 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.exit.use_algorithmic_exit is False
     assert deployment.exit.use_profit_target is True
     assert deployment.exit.option_profit_target_pct == 0.35
+    assert deployment.exit.target_approach_offset_pct == 0.10
+    assert deployment.exit.target_pullback_restore_progress_pct == 0.75
     assert deployment.exit.profit_target_multiple is None
     assert deployment.exit.thesis_exit_params == {
         "stop_loss_underlying_pct": 0.005,
@@ -789,6 +798,10 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.source.metadata["strategy_variant"] == "cross_reclaim"
     assert deployment.source.metadata["bhiksha_capability_status"] == "supported"
     assert deployment.source.metadata["signal_window_et"] == "09:35-10:15"
+    assert deployment.source.metadata["option_trade_ready"] is True
+    assert deployment.source.metadata["option_adjusted_expectancy_pct"] == 0.18
+    assert deployment.source.metadata["recommended_dte_min"] == 3
+    assert deployment.source.metadata["recommended_dte_max"] == 7
 
 
 def test_mala_evidence_preserves_explicit_bhiksha_ready_when_provider_columns_are_advisory(tmp_path: Path) -> None:
@@ -820,6 +833,15 @@ def test_mala_evidence_preserves_explicit_bhiksha_ready_when_provider_columns_ar
                 "bhiksha_capability_reason": "runtime_verified",
                 "provider_validation_status": "provider_watch",
                 "provider_feature_risk": "yellow",
+                "provider_signal_overlap": "0.97",
+                "bhiksha_runtime_supported": "TRUE",
+                "mala_evidence_ready": "TRUE",
+                "activation_candidate": "TRUE",
+                "m7_status": "provider_watch",
+                "m7_feature_risk": "yellow",
+                "m7_signal_overlap": "0.97",
+                "triage_verdict": "CLEAN",
+                "triage_blocking_checks": "none",
                 "thesis_exit_tested": "TRUE",
                 "thesis_exit_policy": "fixed_rr_underlying",
                 "thesis_exit_params_json": json.dumps(
@@ -861,7 +883,224 @@ def test_mala_evidence_preserves_explicit_bhiksha_ready_when_provider_columns_ar
     assert [deployment.deployment_id for deployment in compiled.plan.deployments] == [
         "strategy_market_impulse_all_basket_discovery_amd_short_shadow_row_2"
     ]
-    assert compiled.plan.deployments[0].source.metadata["bhiksha_ready"] is True
+    metadata = compiled.plan.deployments[0].source.metadata
+    assert metadata["bhiksha_ready"] is True
+    assert metadata["provider_validation_status"] == "provider_watch"
+    assert metadata["provider_signal_overlap"] == 0.97
+    assert metadata["activation_candidate"] is True
+    assert metadata["triage_verdict"] == "CLEAN"
+
+
+def test_compile_active_plan_suppresses_mala_evidence_when_activation_candidate_false(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "mi_amd.yaml",
+        strategy_id="market-impulse-all-basket-discovery__amd_short",
+        symbol="AMD",
+    )
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Mala_Evidence_v1",
+        rows=[
+            {
+                "mala_handoff_version": "1",
+                "catalog_key": "market-impulse-all-basket-discovery__amd_short",
+                "hypothesis_id": "market-impulse-all-basket-discovery",
+                "symbol": "AMD",
+                "direction": "short",
+                "strategy_key": "market_impulse",
+                "strategy_name": "Market Impulse (Cross & Reclaim)",
+                "strategy_variant": "cross_reclaim",
+                "strategy_params_json": json.dumps({"direction": "short"}),
+                "recommendation_tier": "shadow",
+                "bhiksha_ready": "TRUE",
+                "bhiksha_capability_status": "supported",
+                "bhiksha_capability_reason": "runtime_verified",
+                "activation_candidate": "FALSE",
+                "activation_blocking_checks": "m7_signal_overlap=0.875; required>=0.95_for_activation",
+                "thesis_exit_tested": "TRUE",
+                "thesis_exit_policy": "fixed_rr_underlying",
+                "thesis_exit_params_json": json.dumps(
+                    {
+                        "stop_loss_underlying_pct": 0.005,
+                        "take_profit_underlying_r_multiple": 2.0,
+                    }
+                ),
+                "thesis_exit_metrics_json": json.dumps({"expectancy": 0.56, "profit_factor": 2.0}),
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "authorization_mode": "shadow",
+                "strategy_id": "market-impulse-all-basket-discovery__amd_short",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "not activation_candidate" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_mala_evidence_watch_only_runtime_supported_fails_on_activation_not_runtime_readiness(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "mi_iwm.yaml",
+        strategy_id="market-impulse-all-basket-discovery__iwm_long",
+        symbol="IWM",
+    )
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Mala_Evidence_v1",
+        rows=[
+            {
+                "mala_handoff_version": "1",
+                "catalog_key": "market-impulse-all-basket-discovery__iwm_long",
+                "hypothesis_id": "market-impulse-all-basket-discovery",
+                "symbol": "IWM",
+                "direction": "long",
+                "strategy_key": "market_impulse",
+                "strategy_name": "Market Impulse (Cross & Reclaim)",
+                "strategy_variant": "cross_reclaim",
+                "strategy_params_json": json.dumps({"direction": "long"}),
+                "recommendation_tier": "watch_only",
+                "bhiksha_ready": "FALSE",
+                "bhiksha_runtime_supported": "TRUE",
+                "bhiksha_capability_status": "supported",
+                "activation_candidate": "FALSE",
+                "activation_blocking_checks": "mala_recommendation_tier=watch_only",
+                "thesis_exit_tested": "TRUE",
+                "thesis_exit_policy": "fixed_rr_underlying",
+                "thesis_exit_params_json": json.dumps(
+                    {
+                        "stop_loss_underlying_pct": 0.005,
+                        "take_profit_underlying_r_multiple": 2.0,
+                    }
+                ),
+                "thesis_exit_metrics_json": json.dumps({"expectancy": 0.56, "profit_factor": 2.0}),
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "authorization_mode": "shadow",
+                "strategy_id": "market-impulse-all-basket-discovery__iwm_long",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "not activation_candidate" in compiled.plan.suppressed[0]["reason"]
+    assert "not Bhiksha runtime-ready" not in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_suppresses_mala_evidence_when_option_trade_not_ready(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "mi_amd.yaml",
+        strategy_id="market-impulse-all-basket-discovery__amd_short",
+        symbol="AMD",
+    )
+
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Mala_Evidence_v1",
+        rows=[
+            {
+                "mala_handoff_version": "1",
+                "catalog_key": "market-impulse-all-basket-discovery__amd_short",
+                "hypothesis_id": "market-impulse-all-basket-discovery",
+                "symbol": "AMD",
+                "direction": "short",
+                "strategy_key": "market_impulse",
+                "strategy_name": "Market Impulse (Cross & Reclaim)",
+                "strategy_variant": "cross_reclaim",
+                "strategy_params_json": json.dumps({"direction": "short"}),
+                "recommendation_tier": "shadow",
+                "bhiksha_ready": "TRUE",
+                "activation_candidate": "TRUE",
+                "option_trade_ready": "FALSE",
+                "thesis_exit_tested": "TRUE",
+                "thesis_exit_policy": "fixed_rr_underlying",
+                "thesis_exit_params_json": json.dumps(
+                    {
+                        "stop_loss_underlying_pct": 0.005,
+                        "take_profit_underlying_r_multiple": 2.0,
+                    }
+                ),
+                "thesis_exit_metrics_json": json.dumps({"expectancy": 0.56, "profit_factor": 2.0}),
+            }
+        ],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "authorization_mode": "shadow",
+                "strategy_id": "market-impulse-all-basket-discovery__amd_short",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "not option_trade_ready" in compiled.plan.suppressed[0]["reason"]
 
 
 def test_compile_active_plan_suppresses_mala_evidence_without_thesis_exit(tmp_path: Path) -> None:

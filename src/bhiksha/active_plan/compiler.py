@@ -60,13 +60,53 @@ class StrategyCatalogSheetRow(BaseModel):
     signal_window_et: str | None = None
     signal_window_derivation: str | None = None
     recommendation_tier: str | None = None
+    recommendation_tier_reason: str | None = None
+    recommendation_checks_json: dict[str, Any] | list[Any] | str | None = None
+    m5_execution_profile: str | None = None
+    m5_stress_profile: str | None = None
     thesis_exit_tested: bool | None = None
     thesis_exit_params_json: dict[str, Any] | list[Any] | str | None = None
     thesis_exit_metrics_json: dict[str, Any] | list[Any] | str | None = None
+    option_trade_ready: bool | None = None
+    option_adjusted_expectancy_pct: float | None = None
+    option_exit_quality: str | None = None
+    recommended_dte_min: int | None = None
+    recommended_dte_max: int | None = None
+    theta_penalty_pct: float | None = None
+    expectancy_pct: float | None = None
+    avg_win_pct: float | None = None
+    avg_loss_pct_abs: float | None = None
+    pnl_pct_per_minute: float | None = None
+    pnl_pct_per_bar: float | None = None
+    median_minutes_held: float | None = None
+    avg_minutes_held: float | None = None
+    target_hit_rate: float | None = None
+    stop_loss_rate: float | None = None
+    target_hit_within_15_minutes: float | None = None
+    target_hit_within_30_minutes: float | None = None
+    stop_loss_within_15_minutes: float | None = None
     exit_reliability: str | None = None
     exit_trade_count: int | None = None
     bhiksha_capability_status: str | None = None
     bhiksha_capability_reason: str | None = None
+    provider_validation_status: str | None = None
+    provider_feature_risk: str | None = None
+    provider_signal_overlap: float | None = None
+    provider_validation_report: str | None = None
+    bhiksha_runtime_supported: bool | None = None
+    bhiksha_runtime_reason: str | None = None
+    mala_evidence_ready: bool | None = None
+    mala_evidence_blocking_checks: str | None = None
+    activation_candidate: bool | None = None
+    activation_blocking_checks: str | None = None
+    m7_status: str | None = None
+    m7_feature_risk: str | None = None
+    m7_signal_overlap: float | None = None
+    triage_verdict: str | None = None
+    triage_verdict_reason: str | None = None
+    triage_blocking_checks: str | None = None
+    triage_advisory_notes: str | None = None
+    triage_artifact: str | None = None
     warnings: str | None = None
     row_index: int | None = None
 
@@ -867,6 +907,12 @@ def _google_catalog_entry_payload(
     default_option_profit_target_pct = (
         _coerce_float(defaults.get("option_profit_target_pct")) if use_defaults else None
     )
+    default_target_approach_offset_pct = (
+        _coerce_float(defaults.get("target_approach_offset_pct")) if use_defaults else None
+    )
+    default_target_pullback_restore_progress_pct = (
+        _coerce_float(defaults.get("target_pullback_restore_progress_pct")) if use_defaults else None
+    )
     use_profit_target = _coerce_bool(catastrophe_exit_params.get("use_profit_target"))
     if use_profit_target is None:
         use_profit_target = bool(default_profit_target_enabled and default_option_profit_target_pct is not None)
@@ -902,9 +948,26 @@ def _google_catalog_entry_payload(
     if dte_range is not None:
         execution_payload["dte"] = dte_range
     else:
+        evidence_dte_min = _first_not_none(
+            _coerce_int(entry.recommended_dte_min),
+            _coerce_int(
+                entry.thesis_exit_metrics_json.get("recommended_dte_min")
+                if isinstance(entry.thesis_exit_metrics_json, dict)
+                else None
+            ),
+        )
+        evidence_dte_max = _first_not_none(
+            _coerce_int(entry.recommended_dte_max),
+            _coerce_int(
+                entry.thesis_exit_metrics_json.get("recommended_dte_max")
+                if isinstance(entry.thesis_exit_metrics_json, dict)
+                else None
+            ),
+        )
         execution_payload["dte_min"] = (
             _first_not_none(
                 _coerce_int(vehicle_mapping.get("dte_min")),
+                evidence_dte_min,
                 _coerce_int(defaults.get("dte_min")) if use_defaults else None,
                 0,
             )
@@ -912,6 +975,7 @@ def _google_catalog_entry_payload(
         execution_payload["dte_max"] = (
             _first_not_none(
                 _coerce_int(vehicle_mapping.get("dte_max")),
+                evidence_dte_max,
                 _coerce_int(defaults.get("dte_max")) if use_defaults else None,
                 7,
             )
@@ -932,10 +996,12 @@ def _google_catalog_entry_payload(
     if entry_window is not None:
         execution_payload["entry_window_et"] = entry_window
     elif use_defaults:
+        signal_start, _signal_end = _split_signal_window(entry.signal_window_et)
         start = normalize_time_text(str(defaults.get("execution_window_start_et") or ""))
         end = normalize_time_text(str(defaults.get("execution_window_end_et") or ""))
-        if start:
-            execution_payload["entry_window_start_et"] = start
+        execution_start = signal_start or start
+        if execution_start:
+            execution_payload["entry_window_start_et"] = execution_start
         if end:
             execution_payload["entry_window_end_et"] = end
 
@@ -963,6 +1029,14 @@ def _google_catalog_entry_payload(
             "use_profit_target": use_profit_target,
             "profit_target_multiple": profit_target_multiple,
             "option_profit_target_pct": option_profit_target_pct,
+            "target_approach_offset_pct": _first_not_none(
+                _coerce_float(catastrophe_exit_params.get("target_approach_offset_pct")),
+                default_target_approach_offset_pct,
+            ),
+            "target_pullback_restore_progress_pct": _first_not_none(
+                _coerce_float(catastrophe_exit_params.get("target_pullback_restore_progress_pct")),
+                default_target_pullback_restore_progress_pct,
+            ),
             "stop_loss_pct": stop_loss_pct,
             "stop_to_breakeven_after_r_multiple": stop_to_breakeven_after_r_multiple,
             "hard_flat_time_et": hard_flat_time_et,
@@ -1071,8 +1145,14 @@ def _normalize_mala_evidence_row(normalized: dict[str, Any]) -> dict[str, Any]:
     row["bhiksha_capability_status"] = capability.status
     row["bhiksha_capability_reason"] = capability.reason
     explicit_bhiksha_ready = _coerce_bool(row.get("bhiksha_ready"))
-    readiness_asserted = bool(explicit_bhiksha_ready or thesis_exit_tested)
-    row["bhiksha_ready"] = bool(readiness_asserted and recommendation_tier != "watch_only" and capability.supported)
+    explicit_runtime_supported = _coerce_bool(row.get("bhiksha_runtime_supported"))
+    if explicit_runtime_supported is not None:
+        runtime_ready_asserted = explicit_runtime_supported
+    elif explicit_bhiksha_ready is not None:
+        runtime_ready_asserted = explicit_bhiksha_ready
+    else:
+        runtime_ready_asserted = True
+    row["bhiksha_ready"] = bool(runtime_ready_asserted and capability.supported)
     row["validation_count"] = row.get("validation_count") or row.get("signal_count")
     row["last_validated_date"] = row.get("last_validated_date") or _run_date_from_path(row.get("run_dir"))
     if row.get("playbook_summary_json") is None:
@@ -1092,6 +1172,8 @@ def _normalize_mala_evidence_row(normalized: dict[str, Any]) -> dict[str, Any]:
                 "signal_window_et": row.get("signal_window_et"),
                 "signal_window_derivation": row.get("signal_window_derivation"),
                 "recommendation_tier": row.get("recommendation_tier"),
+                "recommendation_tier_reason": row.get("recommendation_tier_reason"),
+                "recommendation_checks": row.get("recommendation_checks_json"),
                 "thesis_exit_tested": thesis_exit_tested,
                 "thesis_exit_metrics": thesis_exit_metrics,
                 "exit_reliability": row.get("exit_reliability"),
@@ -1131,6 +1213,18 @@ def _compact_numeric_range_text(value: Any) -> str | None:
     start = match.group("start")
     end = match.group("end")
     return f"{start}-{end}" if end is not None else start
+
+
+def _split_signal_window(value: Any) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    text = str(value).strip()
+    if not text:
+        return None, None
+    if "-" not in text:
+        return normalize_time_text(text), None
+    start, end = text.split("-", 1)
+    return normalize_time_text(start), normalize_time_text(end)
 
 
 def _apply_execution_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:
@@ -1363,10 +1457,50 @@ def _google_catalog_metadata(entry: StrategyCatalogSheetRow | None) -> dict[str,
         "strategy_variant": entry.strategy_variant,
         "bhiksha_capability_status": entry.bhiksha_capability_status,
         "bhiksha_capability_reason": entry.bhiksha_capability_reason,
+        "provider_validation_status": entry.provider_validation_status,
+        "provider_feature_risk": entry.provider_feature_risk,
+        "provider_signal_overlap": entry.provider_signal_overlap,
+        "provider_validation_report": entry.provider_validation_report,
+        "bhiksha_runtime_supported": entry.bhiksha_runtime_supported,
+        "bhiksha_runtime_reason": entry.bhiksha_runtime_reason,
+        "mala_evidence_ready": entry.mala_evidence_ready,
+        "mala_evidence_blocking_checks": entry.mala_evidence_blocking_checks,
+        "activation_candidate": entry.activation_candidate,
+        "activation_blocking_checks": entry.activation_blocking_checks,
+        "m7_status": entry.m7_status,
+        "m7_feature_risk": entry.m7_feature_risk,
+        "m7_signal_overlap": entry.m7_signal_overlap,
+        "triage_verdict": entry.triage_verdict,
+        "triage_verdict_reason": entry.triage_verdict_reason,
+        "triage_blocking_checks": entry.triage_blocking_checks,
+        "triage_advisory_notes": entry.triage_advisory_notes,
+        "triage_artifact": entry.triage_artifact,
         "signal_window_et": entry.signal_window_et,
         "signal_window_derivation": entry.signal_window_derivation,
         "recommendation_tier": entry.recommendation_tier,
+        "recommendation_tier_reason": entry.recommendation_tier_reason,
+        "recommendation_checks": entry.recommendation_checks_json,
+        "m5_execution_profile": entry.m5_execution_profile,
+        "m5_stress_profile": entry.m5_stress_profile,
         "thesis_exit_tested": entry.thesis_exit_tested,
+        "option_trade_ready": entry.option_trade_ready,
+        "option_adjusted_expectancy_pct": entry.option_adjusted_expectancy_pct,
+        "option_exit_quality": entry.option_exit_quality,
+        "recommended_dte_min": entry.recommended_dte_min,
+        "recommended_dte_max": entry.recommended_dte_max,
+        "theta_penalty_pct": entry.theta_penalty_pct,
+        "expectancy_pct": entry.expectancy_pct,
+        "avg_win_pct": entry.avg_win_pct,
+        "avg_loss_pct_abs": entry.avg_loss_pct_abs,
+        "pnl_pct_per_minute": entry.pnl_pct_per_minute,
+        "pnl_pct_per_bar": entry.pnl_pct_per_bar,
+        "median_minutes_held": entry.median_minutes_held,
+        "avg_minutes_held": entry.avg_minutes_held,
+        "target_hit_rate": entry.target_hit_rate,
+        "stop_loss_rate": entry.stop_loss_rate,
+        "target_hit_within_15_minutes": entry.target_hit_within_15_minutes,
+        "target_hit_within_30_minutes": entry.target_hit_within_30_minutes,
+        "stop_loss_within_15_minutes": entry.stop_loss_within_15_minutes,
         "exit_reliability": entry.exit_reliability,
         "exit_trade_count": entry.exit_trade_count,
         "exit_contract_status": "ok" if _uses_bhiksha_capability_contract(entry) else None,
@@ -1417,7 +1551,20 @@ def _validate_google_catalog_alignment(
                 f"unsupported_strategy_variant: {capability.strategy_key}.{capability.strategy_variant} {capability.reason}"
             )
     if not google_entry.bhiksha_ready:
-        raise ValueError(f"Strategy {strategy_id!r} is not bhiksha_ready in the Google strategy catalog")
+        raise ValueError(f"Strategy {strategy_id!r} is not Bhiksha runtime-ready in Mala_Evidence_v1")
+    if google_entry.mala_evidence_ready is False:
+        reason = google_entry.mala_evidence_blocking_checks or "mala_evidence_ready=false"
+        raise ValueError(f"Strategy {strategy_id!r} is not mala_evidence_ready in Mala_Evidence_v1: {reason}")
+    if google_entry.activation_candidate is False:
+        reason = google_entry.activation_blocking_checks or google_entry.triage_blocking_checks or "activation_candidate=false"
+        raise ValueError(f"Strategy {strategy_id!r} is not activation_candidate in Mala_Evidence_v1: {reason}")
+    if google_entry.option_trade_ready is False:
+        raise ValueError(f"Strategy {strategy_id!r} is not option_trade_ready in Mala_Evidence_v1")
+    if str(google_entry.m7_status or "").strip().lower() == "block":
+        raise ValueError(f"Strategy {strategy_id!r} has m7_status=block in Mala_Evidence_v1")
+    if str(google_entry.triage_verdict or "").strip().lower() == "kill":
+        reason = google_entry.triage_verdict_reason or google_entry.triage_blocking_checks or "triage_verdict=KILL"
+        raise ValueError(f"Strategy {strategy_id!r} has triage_verdict=KILL in Mala_Evidence_v1: {reason}")
     if google_entry.lifecycle_status == "retired":
         raise ValueError(f"Strategy {strategy_id!r} is retired in Google strategy catalog")
     if google_entry.symbol and google_entry.symbol != local_entry.symbol:

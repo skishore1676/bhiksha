@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime
 
-from bhiksha.config.loader import load_deployments
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionContractSnapshot, SignalDecision
 from bhiksha.execution.order_manager import PublicQuote, PreflightCheck
@@ -9,6 +8,12 @@ from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import PositionTracker
+from historical_config import historical_deployment
+
+
+def _enabled_deployment(deployment_id: str):
+    deployment = historical_deployment(deployment_id)
+    return deployment.model_copy(update={"enabled": True})
 
 
 class StubChainService:
@@ -17,6 +22,8 @@ class StubChainService:
         *,
         symbol: str = "QQQ",
         option_symbol: str | None = None,
+        contract_type: str = "PUT",
+        strike: float = 250.0,
         dte: int = 0,
         delta: float = -0.31,
         bid: float | None = 3.00,
@@ -24,7 +31,9 @@ class StubChainService:
     ) -> None:
         self.calls = 0
         self.symbol = symbol
-        self.option_symbol = option_symbol or f"{symbol}260330P00558000"
+        self.option_symbol = option_symbol or f"{symbol}260330{contract_type[0].upper()}00558000"
+        self.contract_type = contract_type
+        self.strike = strike
         self.dte = dte
         self.delta = delta
         self.bid = bid
@@ -36,10 +45,10 @@ class StubChainService:
             OptionContractSnapshot(
                 option_symbol=self.option_symbol,
                 underlying_symbol=self.symbol,
-                contract_type="PUT",
+                contract_type=self.contract_type,
                 expiration_date="2026-03-30",
                 dte=self.dte,
-                strike=558.0,
+                strike=self.strike,
                 delta=self.delta,
                 bid=self.bid,
                 ask=self.ask,
@@ -153,7 +162,7 @@ def _cash_guard(order_manager, tmp_path) -> CashGuard:
 
 
 def test_execution_planner_creates_dry_run_trade_plan():
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
     planner = ExecutionPlanner(
         chain_service=chain_service,
@@ -175,14 +184,15 @@ def test_execution_planner_creates_dry_run_trade_plan():
     assert plan is not None
     assert plan.option_symbol == "QQQ260330P00558000"
     assert plan.order_id == "DRY_RUN"
-    assert plan.estimated_entry_price == 2.90
+    assert plan.estimated_entry_price == 2.85
+    assert plan.risk_details["entry_pricing"]["bid"] == 2.70
+    assert plan.risk_details["entry_pricing"]["ask"] == 2.90
+    assert plan.risk_details["entry_pricing"]["mid"] == 2.80
     assert chain_service.calls == 1
 
 
 def test_execution_planner_blocks_trade_outside_execution_window() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService()
     planner = ExecutionPlanner(
         chain_service=chain_service,
@@ -209,9 +219,7 @@ def test_execution_planner_blocks_trade_outside_execution_window() -> None:
 
 
 def test_execution_planner_can_simulate_without_tracking_position() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     planner = ExecutionPlanner(
@@ -240,9 +248,7 @@ def test_execution_planner_can_simulate_without_tracking_position() -> None:
 
 
 def test_execution_planner_shadow_ignores_book_position_caps() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="SHADOW-IWM", option_symbol="IWM260417C00210000")
@@ -272,9 +278,7 @@ def test_execution_planner_shadow_ignores_book_position_caps() -> None:
 
 
 def test_execution_planner_dry_run_still_honors_book_position_caps() -> None:
-    deployment = next(
-        d for d in load_deployments("config/deployments") if d.deployment_id == "jerk_pivot_momentum_tsla_short_v1"
-    )
+    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="DRY-IWM", option_symbol="IWM260417C00210000")
@@ -304,7 +308,7 @@ def test_execution_planner_dry_run_still_honors_book_position_caps() -> None:
 
 
 def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
         order_manager=QuoteErrorOrderManager(),
@@ -328,8 +332,83 @@ def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
     assert plan.risk_reasons == ["public_quote_unavailable"]
 
 
+def test_execution_planner_blocks_contract_already_owned_by_other_deployment() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    tracker = PositionTracker()
+    tracker.open_position(
+        "QQQ",
+        "market_impulse_qqq_short_v2",
+        trade_id="TRADE-OTHER",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=StubOrderManager(),
+        position_tracker=tracker,
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.quantity == 0
+    assert plan.option_symbol == "QQQ260330P00558000"
+    assert plan.risk_reasons == ["option_contract_already_owned_by_other_deployment"]
+    assert tracker.deployment_open_positions(deployment.deployment_id) == 0
+
+
+def test_execution_planner_blocks_intrinsic_mismatch_from_bad_underlying_bar() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1").model_copy(update={"symbol": "MU"})
+    deployment = deployment.model_copy(
+        update={
+            "strategy": deployment.strategy.model_copy(
+                update={"params": {**deployment.strategy.params, "direction": "long"}}
+            )
+        }
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="MU",
+            option_symbol="MU260605C00097000",
+            contract_type="CALL",
+            strike=97.0,
+            dte=7,
+            delta=0.25,
+            bid=19.50,
+            ask=19.85,
+        ),
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="MU",
+        timestamp=datetime(2026, 5, 26, 14, 6),
+        signal=True,
+        direction=SignalDirection.LONG,
+        reason=["time_window_ok"],
+        features={"close": 849.885},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=True, simulate_only=True))
+
+    assert plan is not None
+    assert plan.quantity == 0
+    assert plan.risk_reasons == ["underlying_option_price_inconsistent"]
+    assert plan.risk_details["intrinsic_value"] > 700.0
+
+
 def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None:
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = deployment.model_copy(
         update={
             "execution": deployment.execution.model_copy(
@@ -364,11 +443,11 @@ def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None
     assert plan is not None
     assert plan.quantity == 0
     assert plan.option_symbol == "QQQ260330P00558000"
-    assert plan.risk_reasons == ["public_quote_missing_price"]
+    assert plan.risk_reasons == ["public_quote_missing_bid_ask"]
 
 
 def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> None:
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
         order_manager=ExpensiveQuoteOrderManager(),
@@ -394,13 +473,15 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
         "max_premium": 300.0,
         "entry_price": 9.1,
         "min_contract_cost": 910.0,
+        "entry_pricing": plan.risk_details["entry_pricing"],
     }
+    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 9.1
 
 
 def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insufficient(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "on")
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     order_manager = LowCashOrderManager()
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
@@ -427,6 +508,7 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
         "required_cash": 290.04,
         "buying_power_requirement": 290.04,
         "estimated_cost": 289.98,
+        "entry_pricing": plan.risk_details["entry_pricing"],
         "remaining_budget": 142.5,
         "usable_budget": 142.5,
         "broker_cash_only_buying_power": 150.0,
@@ -434,13 +516,14 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
         "account_type": "CASH",
         "cash_guard_mode": "on",
     }
+    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.85
     assert order_manager.place_entry_order_calls == 0
 
 
 def test_execution_planner_auto_guard_skips_margin_accounts(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "auto")
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
-    deployment = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     order_manager = MarginOrderManager()
     planner = ExecutionPlanner(
         chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),

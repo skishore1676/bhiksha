@@ -79,6 +79,10 @@ def test_server_session_start_status_stop_round_trip(tmp_path: Path, monkeypatch
     metadata = json.loads(pid_path.read_text(encoding="utf-8"))
     assert metadata["pid"] == 43210
     assert metadata["live"] is True
+    assert Path(metadata["log_path"]).name.startswith("trade_session_")
+    assert Path(metadata["log_path"]).name.endswith(".log")
+    assert Path(metadata["err_log_path"]).name.startswith("trade_session_")
+    assert Path(metadata["err_log_path"]).name.endswith(".err.log")
     assert popen_calls == [[
         "/tmp/python",
         "-u",
@@ -161,6 +165,7 @@ def test_server_session_restart_syncs_stops_and_restarts(tmp_path: Path, monkeyp
     assert pid_path.exists()
     metadata = json.loads(pid_path.read_text(encoding="utf-8"))
     assert metadata["pid"] == 22222
+    assert "err_log_path" in metadata
     assert started_commands == [[
         "/tmp/python",
         "-u",

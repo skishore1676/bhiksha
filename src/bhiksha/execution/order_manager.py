@@ -44,7 +44,20 @@ class PublicQuote:
     ask: float | None = None
     last: float | None = None
     open_interest: int | None = None
+    quote_timestamp: str | None = None
     outcome: str | None = None
+
+    @property
+    def mid(self) -> float | None:
+        if self.bid is None or self.ask is None:
+            return None
+        return round_price((self.bid + self.ask) / 2)
+
+    @property
+    def spread_abs(self) -> float | None:
+        if self.bid is None or self.ask is None:
+            return None
+        return round_price(self.ask - self.bid)
 
     @property
     def spread_pct(self) -> float | None:
@@ -107,6 +120,7 @@ class OrderManager:
             ask=_maybe_float(quote.get("ask")),
             last=_maybe_float(quote.get("last")),
             open_interest=_maybe_int(quote.get("openInterest")),
+            quote_timestamp=_quote_timestamp(quote),
             outcome=quote.get("outcome"),
         )
 
@@ -401,6 +415,14 @@ def _maybe_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _quote_timestamp(quote: dict[str, Any]) -> str | None:
+    for key in ("timestamp", "quoteTimestamp", "lastTradeTime", "updatedAt", "asOf"):
+        value = quote.get(key)
+        if value is not None:
+            return str(value)
+    return None
 
 
 _PRICE_INCREMENT_RE = re.compile(r"(?:increment|increments)[^\$]*\$(?P<increment>\d+(?:\.\d+)?)", re.IGNORECASE)

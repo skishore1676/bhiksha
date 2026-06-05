@@ -218,12 +218,13 @@ async def _replay_summary(
 ) -> dict[str, Any]:
     if not include_replay:
         return {"status": "skipped"}
+    replay_provider = provider or runtime.provider_config.underlying_backfill_primary
     try:
-        bars = await runtime.warm_start_symbol(deployment.symbol, provider=provider)
+        bars = await runtime.warm_start_symbol(deployment.symbol, provider=replay_provider)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "provider": replay_provider, "error": str(exc)}
     if not bars:
-        return {"status": "no_bars"}
+        return {"status": "no_bars", "provider": replay_provider}
     frame = pl.DataFrame(
         {
             "symbol": [bar.symbol for bar in bars],
@@ -242,6 +243,7 @@ async def _replay_summary(
     exit_categories = Counter(trade.exit_category for trade in trades)
     return {
         "status": "ok",
+        "provider": replay_provider,
         "trade_count": len(trades),
         "exit_categories": dict(exit_categories),
         "open_trade_count": sum(1 for trade in trades if trade.exit_decision is None),

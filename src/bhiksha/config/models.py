@@ -142,6 +142,10 @@ class AppConfig(BaseModel):
     reconciliation_max_staleness_seconds: int = 60
     order_fill_poll_seconds: int = 2
     order_fill_timeout_seconds: int = 20
+    entry_reprice_enabled: bool = False
+    entry_reprice_checkpoints_seconds: list[int] = Field(default_factory=lambda: [30, 90])
+    entry_reprice_cancel_after_seconds: int = 180
+    entry_reprice_spread_pcts: list[float] = Field(default_factory=lambda: [0.50, 1.00])
     generated_deployments_dir: str = "config/deployments/generated"
     strategy_catalog_dir: str = "config/strategy_catalog"
     deployment_selection_mode: Literal["all", "manual_only", "generated_only", "prefer_generated"] = "all"
@@ -152,7 +156,7 @@ class AppConfig(BaseModel):
 
 class ProviderConfig(BaseModel):
     underlying_live_primary: str = "schwab"
-    underlying_backfill_primary: str = "polygon"
+    underlying_backfill_primary: str = "schwab"
     execution_broker_primary: str = "public"
 
 
@@ -171,6 +175,12 @@ class ExecutionSpec(BaseModel):
     target_abs_delta_max: float | None = None
     min_open_interest: int = 0
     max_bid_ask_spread_pct: float | None = None
+    entry_pricing_mode: Literal["passive", "balanced", "urgent", "cross"] = "urgent"
+    entry_pricing_urgent_spread_pct: float = 0.25
+    entry_pricing_passive_spread_pct: float = 0.25
+    entry_pricing_cross_tight_spread_pct: float = 0.03
+    entry_pricing_require_two_sided_quote: bool = True
+    entry_pricing_require_open_interest: bool = True
     entry_window_start_et: str | None = None
     entry_window_end_et: str | None = None
     shadow_only: bool = False

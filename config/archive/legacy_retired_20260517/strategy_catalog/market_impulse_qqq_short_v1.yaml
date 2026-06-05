@@ -1,5 +1,5 @@
 strategy_id: market_impulse_qqq_short_v1
-enabled: true
+enabled: false
 symbol: QQQ
 
 strategy:
@@ -48,7 +48,7 @@ source:
   metadata:
     promoted_from: "market_impulse_qqq_short_v1"
 
-approval_status: approved
+approval_status: retired
 tags:
   - mala_promoted
   - intraday

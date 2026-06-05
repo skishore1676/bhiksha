@@ -36,6 +36,7 @@ atr_trailing_underlying
 
 from __future__ import annotations
 
+from datetime import datetime as dt_datetime
 from datetime import time as dt_time
 from typing import Any
 
@@ -43,6 +44,7 @@ import polars as pl
 
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.models import ExitDecision
+from bhiksha.market_data.session import as_et_time
 from bhiksha.state.position_tracker import TrackedPosition
 
 # Default EOD flat time used by hold_to_eod_underlying when no explicit time is set.
@@ -238,12 +240,7 @@ def _evaluate_time_stop_underlying(
             reason=["time_stop_underlying_no_timestamp"],
         )
 
-    # timestamp may be a datetime object or an ISO string
-    if hasattr(ts, "time"):
-        bar_time = ts.time()
-    else:
-        from datetime import datetime as _dt
-        bar_time = _dt.fromisoformat(str(ts)).time()
+    bar_time = _bar_time_et(ts)
 
     if bar_time >= exit_time:
         return _square_off(
@@ -284,11 +281,7 @@ def _evaluate_hold_to_eod_underlying(
             reason=["hold_to_eod_underlying_no_timestamp"],
         )
 
-    if hasattr(ts, "time"):
-        bar_time = ts.time()
-    else:
-        from datetime import datetime as _dt
-        bar_time = _dt.fromisoformat(str(ts)).time()
+    bar_time = _bar_time_et(ts)
 
     if bar_time >= eod_time:
         return _square_off(
@@ -495,3 +488,11 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _bar_time_et(value: Any) -> dt_time:
+    if isinstance(value, dt_datetime):
+        timestamp = value
+    else:
+        timestamp = dt_datetime.fromisoformat(str(value))
+    return as_et_time(timestamp)

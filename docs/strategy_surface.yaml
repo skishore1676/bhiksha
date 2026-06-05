@@ -120,11 +120,11 @@ shared_parameters:
     - id: target_approach_offset_pct
       bhiksha_path: exit.target_approach_offset_pct
       type: float
-      description: Allows target logic to arm before the full target price is touched.
+      description: Allows target logic to arm before the full target price is touched. Strategy rows inherit this from Operator_Defaults_v1 when the row leaves it blank.
     - id: target_pullback_restore_progress_pct
       bhiksha_path: exit.target_pullback_restore_progress_pct
       type: float
-      description: Restores stop protection after target progress retraces past this threshold.
+      description: Restores stop protection after target progress retraces past this threshold. Strategy rows inherit this from Operator_Defaults_v1 when the row leaves it blank.
     - id: exit_stop_loss_pct
       bhiksha_path: exit.stop_loss_pct
       type: float

@@ -1,11 +1,11 @@
 import asyncio
 
-from bhiksha.config.loader import load_deployments
 from bhiksha.config.models import AppConfig
 from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.persistence.repository import NullEventRepository
 from bhiksha.state.position_tracker import PositionTracker
+from historical_config import historical_deployment
 
 
 class SequenceOrderManager:
@@ -63,7 +63,7 @@ class SequencePlanner:
 
 
 def _target_enabled_deployment():
-    base = next(d for d in load_deployments("config/deployments") if d.deployment_id == "market_impulse_qqq_short_v1")
+    base = historical_deployment("market_impulse_qqq_short_v1")
     return base.model_copy(
         update={
             "exit": base.exit.model_copy(

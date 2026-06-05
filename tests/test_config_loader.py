@@ -8,15 +8,17 @@ import json
 
 from bhiksha.config.loader import (
     load_active_plan,
+    load_app_config,
     load_bias_inputs,
     load_deployments,
     load_runtime_deployments,
     load_strategy_catalog,
 )
+from historical_config import HISTORICAL_DEPLOYMENTS_DIR, HISTORICAL_STRATEGY_CATALOG_DIR
 
 
 def test_load_deployments_from_config_directory() -> None:
-    deployments = load_deployments(Path("config/deployments"))
+    deployments = load_deployments(HISTORICAL_DEPLOYMENTS_DIR)
     ids = {deployment.deployment_id for deployment in deployments}
     assert ids >= {
         "jerk_pivot_momentum_tsla_short_v1",
@@ -24,7 +26,7 @@ def test_load_deployments_from_config_directory() -> None:
         "market_impulse_spy_short_v1",
     }
     tsla = next(deployment for deployment in deployments if deployment.deployment_id == "jerk_pivot_momentum_tsla_short_v1")
-    assert tsla.enabled is True
+    assert tsla.enabled is False
     assert tsla.execution.shadow_only is True
     assert tsla.execution.dte_min == 7
     assert tsla.execution.dte_max == 21
@@ -117,6 +119,22 @@ def test_load_bias_inputs_accepts_reserved_emergency_controls(tmp_path: Path) ->
     assert selections[0].symbol == "IWM"
 
 
+def test_load_app_config_allows_entry_reprice_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "app.yaml"
+    path.write_text(yaml.safe_dump({"app_name": "bhiksha"}), encoding="utf-8")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_ENABLED", "true")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CHECKPOINTS_SECONDS", "15,45,120")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CANCEL_AFTER_SECONDS", "240")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_SPREAD_PCTS", "0.4,0.75,1.0")
+
+    config = load_app_config(path)
+
+    assert config.entry_reprice_enabled is True
+    assert config.entry_reprice_checkpoints_seconds == [15, 45, 120]
+    assert config.entry_reprice_cancel_after_seconds == 240
+    assert config.entry_reprice_spread_pcts == [0.4, 0.75, 1.0]
+
+
 def test_load_active_plan_allows_duplicate_symbols_but_rejects_duplicate_ids(tmp_path: Path) -> None:
     payload_path = tmp_path / "active_plan.json"
     payload_path.write_text(
@@ -182,7 +200,7 @@ def test_load_active_plan_rejects_legacy_contracts(tmp_path: Path) -> None:
 
 
 def test_load_strategy_catalog_from_config_directory() -> None:
-    catalog = load_strategy_catalog(Path("config/strategy_catalog"))
+    catalog = load_strategy_catalog(HISTORICAL_STRATEGY_CATALOG_DIR)
 
     ids = {entry.strategy_id for entry in catalog}
     assert ids >= {
@@ -191,7 +209,8 @@ def test_load_strategy_catalog_from_config_directory() -> None:
         "market_impulse_spy_short_v1",
     }
     tsla = next(entry for entry in catalog if entry.strategy_id == "jerk_pivot_momentum_tsla_short_v1")
-    assert tsla.approval_status == "approved"
+    assert tsla.enabled is False
+    assert tsla.approval_status == "retired"
     assert tsla.execution.target_abs_delta_min == 0.35
     assert "mala_promoted" in tsla.tags
 

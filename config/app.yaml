@@ -8,4 +8,12 @@ rolling_bar_capacity: 20000
 bar_poll_interval_seconds: 15
 order_fill_poll_seconds: 2
 order_fill_timeout_seconds: 20
+entry_reprice_enabled: true
+entry_reprice_checkpoints_seconds:
+  - 30
+  - 90
+entry_reprice_cancel_after_seconds: 180
+entry_reprice_spread_pcts:
+  - 0.50
+  - 1.00
 deployment_selection_mode: prefer_generated

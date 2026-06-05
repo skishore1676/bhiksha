@@ -1,5 +1,5 @@
 strategy_id: jerk_pivot_momentum_tsla_short_v1
-enabled: true
+enabled: false
 symbol: TSLA
 
 strategy:
@@ -52,7 +52,7 @@ source:
     single_option_stressed_median_exp_r: 0.7433
     promoted_from: "jerk_pivot_momentum_tsla_short_v1"
 
-approval_status: approved
+approval_status: retired
 tags:
   - mala_promoted
   - intraday

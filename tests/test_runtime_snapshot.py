@@ -10,7 +10,7 @@ import yaml
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.app.runtime import ReconciliationSnapshot, _frame_with_live_price
 from bhiksha.domain.models import Bar
-from bhiksha.state.position_tracker import PositionTracker
+from bhiksha.state.position_tracker import PositionTracker, TrackedPosition
 
 
 def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments() -> None:
@@ -22,26 +22,30 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert len(snapshot["config_fingerprint"]) == 16
     assert snapshot["session"] == {"live": False, "max_bars": 5}
     assert snapshot["app"]["app_name"] == "bhiksha"
+    assert snapshot["providers"]["underlying_live_primary"] == "schwab"
+    assert snapshot["providers"]["underlying_backfill_primary"] == "schwab"
     assert snapshot["providers"]["execution_broker_primary"] == "public"
-    assert {entry["strategy_id"] for entry in snapshot["strategy_catalog"]} >= {
-        "market_impulse_qqq_short_v1",
-        "market_impulse_spy_short_v1",
-    }
+    assert {entry["strategy_id"] for entry in snapshot["strategy_catalog"]}.isdisjoint(
+        {
+            "market_impulse_qqq_short_v1",
+            "market_impulse_spy_short_v1",
+        }
+    )
     assert {selection["symbol"] for selection in snapshot["bias_inputs"]} >= {"IWM", "TSLA"}
     assert snapshot["emergency_controls"] == {"halt_and_flatten": False}
     assert snapshot["deployment_selection"]["mode"] == "prefer_generated"
     deployment_ids = {deployment["deployment_id"] for deployment in snapshot["deployments"]}
-    deployment_symbols = {deployment["symbol"] for deployment in snapshot["deployments"]}
-    assert "market_impulse_qqq_short_v1" in deployment_ids
-    assert "SPY" in deployment_symbols
+    assert "market_impulse_qqq_short_v1" not in deployment_ids
+    assert "market_impulse_spy_short_v1" not in deployment_ids
     assert snapshot["warmup"]["policy"] == "feature_contract_v1"
     assert snapshot["warmup"]["legacy_effective_trading_days"] == 5
     assert snapshot["warmup"]["effective_trading_days"] >= 5
-    assert snapshot["warmup"]["by_symbol"]
+    assert snapshot["warmup"]["by_symbol"] == {}
 
 
 def test_runtime_warmup_expands_for_hourly_market_impulse() -> None:
     runtime = build_runtime()
+    runtime.deployments[0].enabled = True
     runtime.deployments[0].symbol = "MU"
     runtime.deployments[0].strategy.key = "market_impulse"
     runtime.deployments[0].strategy.params = {
@@ -50,6 +54,46 @@ def test_runtime_warmup_expands_for_hourly_market_impulse() -> None:
     }
 
     assert runtime.warmup_trading_days_for_symbol("MU") == 9
+
+
+def test_warm_start_symbol_defaults_to_backfill_provider(monkeypatch) -> None:
+    runtime = build_runtime()
+    runtime.provider_config.underlying_live_primary = "public"
+    runtime.provider_config.underlying_backfill_primary = "schwab"
+    calls: list[str] = []
+
+    class StubSchwabBarSource:
+        async def warm_start(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
+            calls.append(f"schwab:{symbol}")
+            return [
+                Bar(
+                    symbol=symbol,
+                    timestamp=datetime(2026, 5, 21, 14, 30, tzinfo=UTC),
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.5,
+                    volume=1000.0,
+                )
+            ]
+
+        async def close(self) -> None:
+            calls.append("schwab:close")
+
+    class ExplodingPublicBarSource:
+        async def warm_start(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
+            raise AssertionError("warm_start_symbol must not default to live Public")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("bhiksha.app.runtime.SchwabBarSource", StubSchwabBarSource)
+    monkeypatch.setattr("bhiksha.app.runtime.PublicBarSource", ExplodingPublicBarSource)
+
+    bars = asyncio.run(runtime.warm_start_symbol("QQQ", warmup_trading_days=1))
+
+    assert [bar.symbol for bar in bars] == ["QQQ"]
+    assert calls == ["schwab:QQQ", "schwab:close"]
 
 
 def test_build_runtime_respects_configured_bias_inputs_path(tmp_path: Path) -> None:
@@ -334,6 +378,8 @@ def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> Non
 
 def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
     runtime = build_runtime()
+    deployment = next(deployment for deployment in runtime.deployments if deployment.symbol == "SPY")
+    deployment.enabled = True
     snapshot = ReconciliationSnapshot()
 
     class StubBroker:
@@ -346,11 +392,11 @@ def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
                 raise httpx.TimeoutException("timed out")
             return {
                 "positions": [
-                    {
-                        "instrument": {
-                            "symbol": "QQQ260401P00556000",
-                            "type": "OPTION",
-                        },
+                        {
+                            "instrument": {
+                                "symbol": "SPY260401P00556000",
+                                "type": "OPTION",
+                            },
                         "quantity": "1.0",
                     }
                 ],
@@ -419,6 +465,129 @@ def test_runtime_reconciliation_staleness_blocks_live_entries() -> None:
     reason = runtime._reconciliation_live_entry_block_reason(snapshot, now=datetime.now(UTC))
 
     assert reason == "reconciliation_too_stale"
+
+
+def test_runtime_reconciliation_single_periodic_failure_is_warning_only() -> None:
+    runtime = build_runtime()
+    snapshot = ReconciliationSnapshot(last_success_at=datetime.now(UTC))
+    output_lines: list[str] = []
+
+    class StubBroker:
+        async def get_portfolio(self) -> dict:
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=httpx.Request("GET", "https://example.test/portfolio"),
+                response=httpx.Response(400, request=httpx.Request("GET", "https://example.test/portfolio")),
+            )
+
+    class StubRepo:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+
+        async def append(self, event_type: str, payload: dict) -> None:
+            self.events.append((event_type, payload))
+
+    class StubTradeStateRepository:
+        async def get_recent_trades(self, *, limit: int = 100) -> list:
+            del limit
+            return []
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.event_repository = StubRepo()
+            self.trade_state_repository = StubTradeStateRepository()
+            self.planner = type("Planner", (), {"position_tracker": PositionTracker()})()
+
+        async def sync_lifecycle(self) -> None:
+            return None
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position, dry_run
+            return None
+
+    supervisor = StubSupervisor()
+
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=StubBroker(),
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=output_lines.append,
+            reason="periodic",
+        )
+    )
+
+    assert [event_type for event_type, _ in supervisor.event_repository.events] == ["reconciliation_health"]
+    assert supervisor.event_repository.events[0][1]["severity"] == "warning"
+    assert output_lines[0].startswith("RECONCILIATION_WARNING ")
+
+
+def test_runtime_reconciliation_failure_with_live_position_is_blocking_runtime_issue() -> None:
+    runtime = build_runtime()
+    snapshot = ReconciliationSnapshot(
+        positions=[
+            TrackedPosition(
+                symbol="IWM",
+                deployment_id="iwm_live",
+                option_symbol="IWM260609C00296000",
+                quantity=1,
+                source="broker_sync",
+            )
+        ],
+        last_success_at=datetime.now(UTC) - timedelta(seconds=120),
+        consecutive_failures=2,
+    )
+    output_lines: list[str] = []
+
+    class StubBroker:
+        async def get_portfolio(self) -> dict:
+            raise TimeoutError("portfolio timed out")
+
+    class StubRepo:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+
+        async def append(self, event_type: str, payload: dict) -> None:
+            self.events.append((event_type, payload))
+
+    class StubTradeStateRepository:
+        async def get_recent_trades(self, *, limit: int = 100) -> list:
+            del limit
+            return []
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.event_repository = StubRepo()
+            self.trade_state_repository = StubTradeStateRepository()
+            self.planner = type("Planner", (), {"position_tracker": PositionTracker()})()
+
+        async def sync_lifecycle(self) -> None:
+            return None
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position, dry_run
+            return None
+
+    supervisor = StubSupervisor()
+
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=StubBroker(),
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=output_lines.append,
+            reason="periodic",
+        )
+    )
+
+    assert [event_type for event_type, _ in supervisor.event_repository.events] == [
+        "reconciliation_health",
+        "runtime_issue",
+    ]
+    assert supervisor.event_repository.events[-1][1]["severity"] == "blocking"
+    assert output_lines[0].startswith("RECONCILIATION_BLOCKING ")
 
 
 def test_frame_with_live_price_appends_synthetic_quote_row() -> None:
