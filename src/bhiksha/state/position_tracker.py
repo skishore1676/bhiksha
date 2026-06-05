@@ -8,6 +8,8 @@ from datetime import datetime
 
 from bhiksha.domain.enums import ExitMode
 
+NON_LIVE_POSITION_SOURCES = {"shadow", "dry_run"}
+
 
 @dataclass(slots=True)
 class TrackedPosition:
@@ -47,11 +49,25 @@ class PositionTracker:
     def total_open_positions(self) -> int:
         return len(self._positions)
 
+    @property
+    def total_live_open_positions(self) -> int:
+        return sum(1 for position in self._positions if _is_live_position(position))
+
     def symbol_open_positions(self, symbol: str) -> int:
         return self._by_symbol[symbol]
 
+    def live_symbol_open_positions(self, symbol: str) -> int:
+        return sum(1 for position in self._positions if position.symbol == symbol and _is_live_position(position))
+
     def deployment_open_positions(self, deployment_id: str) -> int:
         return self._by_deployment[deployment_id]
+
+    def live_deployment_open_positions(self, deployment_id: str) -> int:
+        return sum(
+            1
+            for position in self._positions
+            if position.deployment_id == deployment_id and _is_live_position(position)
+        )
 
     def active_positions(self) -> list[TrackedPosition]:
         return list(self._positions)
@@ -172,3 +188,7 @@ class PositionTracker:
     def _rebuild_counters(self) -> None:
         self._by_symbol = Counter(position.symbol for position in self._positions)
         self._by_deployment = Counter(position.deployment_id for position in self._positions)
+
+
+def _is_live_position(position: TrackedPosition) -> bool:
+    return position.source not in NON_LIVE_POSITION_SOURCES

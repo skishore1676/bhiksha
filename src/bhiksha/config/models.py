@@ -218,6 +218,9 @@ class ExecutionSpec(BaseModel):
 
 class RiskSpec(BaseModel):
     profile: str
+    max_open_positions_total: int | None = None
+    max_open_positions_per_symbol: int | None = None
+    max_open_positions_per_deployment: int | None = None
     max_trade_premium_usd: float | None = None
     hard_flat_time_et: str | None = None
     stop_loss_pct: float = 0.45

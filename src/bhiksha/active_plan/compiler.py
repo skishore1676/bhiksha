@@ -1006,6 +1006,20 @@ def _google_catalog_entry_payload(
             execution_payload["entry_window_end_et"] = end
 
     default_max_premium = _coerce_float(defaults.get("max_trade_premium_usd")) if use_defaults else None
+    risk_payload: dict[str, Any] = {
+        "profile": f"{strategy_key}_risk_v1" if strategy_key else "catalog_promoted_v1",
+        "max_trade_premium_usd": _first_not_none(default_max_premium, 300.0),
+        "hard_flat_time_et": hard_flat_time_et,
+        "stop_loss_pct": stop_loss_pct,
+    }
+    for default_key in (
+        "max_open_positions_total",
+        "max_open_positions_per_symbol",
+        "max_open_positions_per_deployment",
+    ):
+        value = _coerce_int(defaults.get(default_key)) if use_defaults else None
+        if value is not None:
+            risk_payload[default_key] = value
 
     return {
         "strategy_id": entry.catalog_key,
@@ -1017,12 +1031,7 @@ def _google_catalog_entry_payload(
             "params": entry_params,
         },
         "execution": execution_payload,
-        "risk": {
-            "profile": f"{strategy_key}_risk_v1" if strategy_key else "catalog_promoted_v1",
-            "max_trade_premium_usd": _first_not_none(default_max_premium, 300.0),
-            "hard_flat_time_et": hard_flat_time_et,
-            "stop_loss_pct": stop_loss_pct,
-        },
+        "risk": risk_payload,
         "exit": {
             "profile": f"{strategy_key}_exit_v1" if strategy_key else "catalog_promoted_exit_v1",
             "use_algorithmic_exit": use_algorithmic_exit,

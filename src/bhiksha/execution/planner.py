@@ -216,15 +216,19 @@ class ExecutionPlanner:
                     "entry_pricing": pricing_evidence,
                 },
             )
-        risk_profile = ConservativeRiskProfile(
-            profile=deployment.risk.profile,
-            max_trade_premium_usd=max_trade_premium,
-            hard_flat_time_et=deployment.risk.hard_flat_time_et or "15:55",
-        )
+        risk_profile = _risk_profile_for_deployment(deployment, max_trade_premium=max_trade_premium)
+        if dry_run:
+            total_open_positions = self.position_tracker.total_open_positions
+            symbol_open_positions = self.position_tracker.symbol_open_positions(deployment.symbol)
+            deployment_open_positions = self.position_tracker.deployment_open_positions(deployment.deployment_id)
+        else:
+            total_open_positions = self.position_tracker.total_live_open_positions
+            symbol_open_positions = self.position_tracker.live_symbol_open_positions(deployment.symbol)
+            deployment_open_positions = self.position_tracker.live_deployment_open_positions(deployment.deployment_id)
         risk = RiskGovernor(risk_profile).check_entry(
-            total_open_positions=self.position_tracker.total_open_positions,
-            symbol_open_positions=self.position_tracker.symbol_open_positions(deployment.symbol),
-            deployment_open_positions=self.position_tracker.deployment_open_positions(deployment.deployment_id),
+            total_open_positions=total_open_positions,
+            symbol_open_positions=symbol_open_positions,
+            deployment_open_positions=deployment_open_positions,
             proposed_trade_premium_usd=entry_price * quantity * 100,
             enforce_total_position_limit=not simulate_only,
             enforce_symbol_position_limit=not simulate_only,
@@ -407,6 +411,27 @@ def _entry_window_allows(deployment: DeploymentManifest, timestamp) -> bool:
     if end is not None and current > end:
         return False
     return True
+
+
+def _risk_profile_for_deployment(
+    deployment: DeploymentManifest,
+    *,
+    max_trade_premium: float,
+) -> ConservativeRiskProfile:
+    payload = {
+        "profile": deployment.risk.profile,
+        "max_trade_premium_usd": max_trade_premium,
+        "hard_flat_time_et": deployment.risk.hard_flat_time_et or "15:55",
+    }
+    for field_name in (
+        "max_open_positions_total",
+        "max_open_positions_per_symbol",
+        "max_open_positions_per_deployment",
+    ):
+        value = getattr(deployment.risk, field_name)
+        if value is not None:
+            payload[field_name] = value
+    return ConservativeRiskProfile(**payload)
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:

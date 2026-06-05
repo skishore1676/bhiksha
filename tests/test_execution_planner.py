@@ -307,6 +307,96 @@ def test_execution_planner_dry_run_still_honors_book_position_caps() -> None:
     assert len(tracker.active_positions()) == 2
 
 
+def test_execution_planner_live_ignores_shadow_positions_for_capacity() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
+    tracker = PositionTracker()
+    tracker.open_position(
+        "AMD",
+        "amd_shadow",
+        trade_id="SHADOW-AMD",
+        option_symbol="AMD260417P00460000",
+        source="shadow",
+        order_id="SHADOW_ENTRY",
+    )
+    tracker.open_position(
+        "SMH",
+        "smh_shadow",
+        trade_id="SHADOW-SMH",
+        option_symbol="SMH260417P00580000",
+        source="shadow",
+        order_id="SHADOW_ENTRY",
+    )
+    order_manager = StubOrderManager()
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=order_manager,
+        position_tracker=tracker,
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 558.0},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.risk_reasons == ["approved"]
+    assert plan.order_id == "OID123"
+    assert order_manager.place_entry_order_calls == 1
+    assert tracker.total_open_positions == 3
+    assert tracker.total_live_open_positions == 1
+
+
+def test_execution_planner_live_honors_live_position_capacity() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
+    tracker = PositionTracker()
+    tracker.open_position(
+        "IWM",
+        "iwm_live",
+        trade_id="LIVE-IWM",
+        option_symbol="IWM260417C00210000",
+        source="live_pending",
+        order_id="LIVE-IWM",
+    )
+    tracker.open_position(
+        "NVDA",
+        "nvda_live",
+        trade_id="LIVE-NVDA",
+        option_symbol="NVDA260417P00200000",
+        source="live_pending",
+        order_id="LIVE-NVDA",
+    )
+    order_manager = StubOrderManager()
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=order_manager,
+        position_tracker=tracker,
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 558.0},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.risk_reasons == ["max_open_positions_total_reached"]
+    assert plan.order_id is None
+    assert order_manager.place_entry_order_calls == 0
+
+
 def test_execution_planner_blocks_trade_when_quote_lookup_fails() -> None:
     deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     planner = ExecutionPlanner(

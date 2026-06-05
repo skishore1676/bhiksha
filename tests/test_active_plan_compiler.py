@@ -736,6 +736,9 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "target_pullback_restore_progress_pct", "value": "0.75"},
             {"section": "default", "key": "min_open_interest", "value": "25"},
             {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
+            {"section": "default", "key": "max_open_positions_total", "value": "4"},
+            {"section": "default", "key": "max_open_positions_per_symbol", "value": "2"},
+            {"section": "default", "key": "max_open_positions_per_deployment", "value": "1"},
             {"section": "default", "key": "dte_min", "value": "5"},
             {"section": "default", "key": "dte_max", "value": "21"},
             {"section": "default", "key": "delta_min", "value": "0.15"},
@@ -783,6 +786,9 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.execution.entry_window_start_et == "09:30"
     assert deployment.execution.entry_window_end_et == "16:00"
     assert deployment.risk.max_trade_premium_usd == 1000
+    assert deployment.risk.max_open_positions_total == 4
+    assert deployment.risk.max_open_positions_per_symbol == 2
+    assert deployment.risk.max_open_positions_per_deployment == 1
     assert deployment.risk.stop_loss_pct == 0.35
     assert deployment.exit.use_algorithmic_exit is False
     assert deployment.exit.use_profit_target is True
