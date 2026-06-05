@@ -29,6 +29,7 @@ class PlaybookLiveTicketResult:
     option_symbol: str
     quantity: int
     limit_price: float
+    pricing_evidence: dict[str, Any]
     underlying_entry_price: float | None
     underlying_stop_price: float | None
     operator: str
@@ -86,6 +87,7 @@ def create_playbook_live_ticket(
         option_symbol=str(preview.get("option_symbol", "")),
         quantity=int(preview.get("quantity", 0) or 0),
         limit_price=float(preview.get("estimated_entry_price", 0.0) or 0.0),
+        pricing_evidence=dict(preview.get("pricing_evidence", {}) or {}),
         underlying_entry_price=_optional_float(preview.get("underlying_entry_price")),
         underlying_stop_price=_optional_float(preview.get("underlying_stop_price")),
         operator=actor,
@@ -181,6 +183,11 @@ def _ticket_markdown(payload: dict[str, Any]) -> str:
             f"- option_symbol: `{payload['option_symbol']}`",
             f"- quantity: `{payload['quantity']}`",
             f"- limit_price: `{payload['limit_price']}`",
+            f"- pricing_mode: `{payload['pricing_evidence'].get('pricing_mode', '')}`",
+            f"- quote_bid: `{payload['pricing_evidence'].get('bid', '')}`",
+            f"- quote_ask: `{payload['pricing_evidence'].get('ask', '')}`",
+            f"- quote_mid: `{payload['pricing_evidence'].get('mid', '')}`",
+            f"- quote_spread_pct: `{payload['pricing_evidence'].get('spread_pct', '')}`",
             f"- underlying_entry_price: `{payload['underlying_entry_price']}`",
             f"- underlying_stop_price: `{payload['underlying_stop_price']}`",
             f"- operator: `{payload['operator']}`",

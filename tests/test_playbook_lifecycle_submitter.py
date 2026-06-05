@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from bhiksha.domain.models import TradeRecord
-from bhiksha.execution.order_manager import OrderResult, PreflightCheck
+from bhiksha.execution.order_manager import OrderResult, PreflightCheck, PublicQuote
 from bhiksha.packets.playbook_lifecycle import submit_playbook_live_ticket
 from bhiksha.shared_kernel import ensure_kernel_on_path
 from bhiksha.state.lifecycle import LifecycleState, TradeLifecycleStore
@@ -36,6 +36,8 @@ class StubOrderManager:
         supports_targets: bool = False,
         stop_order_id: str | None = "STOP123",
         close_order_id: str | None = "EXIT123",
+        quote_bid: float = 2.70,
+        quote_ask: float = 2.90,
     ) -> None:
         self.supports_concurrent_exit_orders = supports_targets
         self.preflight_calls = 0
@@ -46,6 +48,18 @@ class StubOrderManager:
         self.filled = filled
         self.stop_order_id = stop_order_id
         self.close_order_id = close_order_id
+        self.quote_bid = quote_bid
+        self.quote_ask = quote_ask
+
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=self.quote_bid,
+            ask=self.quote_ask,
+            last=(self.quote_bid + self.quote_ask) / 2,
+            open_interest=500,
+            outcome="SUCCESS",
+        )
 
     async def preflight_entry(self, option_symbol: str, limit_price: float, quantity: int):
         self.preflight_calls += 1
@@ -178,6 +192,8 @@ def test_playbook_lifecycle_submits_entry_and_arms_virtual_target(tmp_path: Path
     assert result.management_spec["target_r"] == 1.0
     assert result.management_spec["stop_anchor"] == "underlying_reversal_extreme"
     assert result.management_spec["source"] == "packet_runtime_controls"
+    assert result.pricing_evidence["selected_limit_price"] == 2.85
+    assert result.pricing_evidence["preflight_limit_price"] == 2.85
     assert order_manager.preflight_calls == 1
     assert order_manager.entry_calls == 1
     assert order_manager.stop_calls == 1
@@ -235,6 +251,29 @@ def test_playbook_lifecycle_records_reconciliation_when_entry_does_not_fill(tmp_
     assert result.trade_state == "pending_entry_reconcile"
     assert result.stop_order_id is None
     assert trades.records[-1].status == "pending_entry_reconcile"
+
+
+def test_playbook_lifecycle_blocks_when_submit_quote_is_too_wide(tmp_path: Path) -> None:
+    ticket_path = _write_live_ticket(tmp_path)
+    packet_path = write_packet(tmp_path, _execution_packet())
+    order_manager = StubOrderManager(quote_bid=2.00, quote_ask=2.90)
+
+    result = asyncio.run(
+        submit_playbook_live_ticket(
+            live_ticket_artifact=ticket_path,
+            packet_path=packet_path,
+            order_manager=order_manager,
+            event_repository=RecordingEvents(),
+            trade_state_repository=RecordingTrades(),
+            lifecycle_store=TradeLifecycleStore(),
+            out_root=tmp_path / "lifecycle",
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.block_reasons == ["public_spread_above_maximum"]
+    assert order_manager.preflight_calls == 0
+    assert order_manager.entry_calls == 0
 
 
 def test_playbook_lifecycle_stop_arm_failure_emergency_flattens_and_blocks(tmp_path: Path) -> None:

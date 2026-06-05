@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from typing import Any, TypeVar
 
 import yaml
@@ -37,7 +38,9 @@ def _load_model(path: Path, model_cls: type[ConfigModelT]) -> ConfigModelT:
 
 
 def load_app_config(path: str | Path) -> AppConfig:
-    return _load_model(Path(path), AppConfig)
+    payload = _load_yaml(Path(path))
+    _apply_app_env_overrides(payload)
+    return AppConfig.model_validate(payload)
 
 
 def load_provider_config(path: str | Path) -> ProviderConfig:
@@ -246,3 +249,46 @@ def _enabled_generated_counts_by_symbol(deployments: list[DeploymentManifest]) -
             continue
         counts[manifest.symbol] = counts.get(manifest.symbol, 0) + 1
     return counts
+
+
+def _apply_app_env_overrides(payload: dict[str, Any]) -> None:
+    bool_value = _env_bool("BHIKSHA_ENTRY_REPRICE_ENABLED")
+    if bool_value is not None:
+        payload["entry_reprice_enabled"] = bool_value
+    int_list = _env_int_list("BHIKSHA_ENTRY_REPRICE_CHECKPOINTS_SECONDS")
+    if int_list is not None:
+        payload["entry_reprice_checkpoints_seconds"] = int_list
+    cancel_after = _env_int("BHIKSHA_ENTRY_REPRICE_CANCEL_AFTER_SECONDS")
+    if cancel_after is not None:
+        payload["entry_reprice_cancel_after_seconds"] = cancel_after
+    float_list = _env_float_list("BHIKSHA_ENTRY_REPRICE_SPREAD_PCTS")
+    if float_list is not None:
+        payload["entry_reprice_spread_pcts"] = float_list
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return int(raw)
+
+
+def _env_int_list(name: str) -> list[int] | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def _env_float_list(name: str) -> list[float] | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return [float(part.strip()) for part in raw.split(",") if part.strip()]

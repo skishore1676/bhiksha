@@ -8,6 +8,7 @@ import uuid
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import OrderManager, OrderResult
+from bhiksha.execution.pricing import select_entry_limit
 from bhiksha.market_data.session import as_et_time
 from bhiksha.options.chain_service import OptionChainService
 from bhiksha.options.public_chain import PublicOptionChainService
@@ -125,7 +126,26 @@ class ExecutionPlanner:
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
             )
-        entry_price = quote.entry_reference_price or selection.estimated_entry_price
+        execution_params = deployment.execution.model_dump()
+        pricing = select_entry_limit(quote, execution_params)
+        pricing_evidence = pricing.evidence()
+        entry_price = pricing.limit_price
+        if pricing.block_reasons:
+            return TradePlan(
+                trade_id=trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                direction=decision.direction,
+                option_symbol=selection.option_symbol,
+                quantity=0,
+                estimated_entry_price=selection.estimated_entry_price or 0.0,
+                risk_reasons=pricing.block_reasons,
+                dry_run=dry_run,
+                order_id=None,
+                underlying_entry_price=underlying_entry_price,
+                entry_timestamp=decision.timestamp,
+                risk_details={"entry_pricing": pricing_evidence},
+            )
         if entry_price is None:
             return TradePlan(
                 trade_id=trade_id,
@@ -140,6 +160,7 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
+                risk_details={"entry_pricing": pricing_evidence},
             )
         intrinsic_value = _intrinsic_value(
             contract_type=selection.contract_type,
@@ -166,41 +187,8 @@ class ExecutionPlanner:
                     "strike": selection.strike,
                     "entry_price": entry_price,
                     "intrinsic_value": intrinsic_value,
+                    "entry_pricing": pricing_evidence,
                 },
-            )
-        if quote.open_interest is not None and quote.open_interest < deployment.execution.min_open_interest:
-            return TradePlan(
-                trade_id=trade_id,
-                deployment_id=deployment.deployment_id,
-                symbol=deployment.symbol,
-                direction=decision.direction,
-                option_symbol=selection.option_symbol,
-                quantity=0,
-                estimated_entry_price=entry_price,
-                risk_reasons=["public_open_interest_below_minimum"],
-                dry_run=dry_run,
-                order_id=None,
-                underlying_entry_price=underlying_entry_price,
-                entry_timestamp=decision.timestamp,
-            )
-        if (
-            deployment.execution.max_bid_ask_spread_pct is not None
-            and quote.spread_pct is not None
-            and quote.spread_pct > deployment.execution.max_bid_ask_spread_pct
-        ):
-            return TradePlan(
-                trade_id=trade_id,
-                deployment_id=deployment.deployment_id,
-                symbol=deployment.symbol,
-                direction=decision.direction,
-                option_symbol=selection.option_symbol,
-                quantity=0,
-                estimated_entry_price=entry_price,
-                risk_reasons=["public_spread_above_maximum"],
-                dry_run=dry_run,
-                order_id=None,
-                underlying_entry_price=underlying_entry_price,
-                entry_timestamp=decision.timestamp,
             )
 
         max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
@@ -225,6 +213,7 @@ class ExecutionPlanner:
                     "max_premium": max_trade_premium,
                     "entry_price": entry_price,
                     "min_contract_cost": min_contract_cost,
+                    "entry_pricing": pricing_evidence,
                 },
             )
         risk_profile = ConservativeRiskProfile(
@@ -255,6 +244,7 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
+                risk_details={"entry_pricing": pricing_evidence},
             )
 
         if dry_run:
@@ -272,6 +262,7 @@ class ExecutionPlanner:
                     order_id=None,
                     underlying_entry_price=underlying_entry_price,
                     entry_timestamp=decision.timestamp,
+                    risk_details={"entry_pricing": pricing_evidence},
                 )
             self.position_tracker.open_position(
                 deployment.symbol,
@@ -297,6 +288,7 @@ class ExecutionPlanner:
                 order_id="DRY_RUN",
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
+                risk_details={"entry_pricing": pricing_evidence},
             )
 
         try:
@@ -315,9 +307,17 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
+                risk_details={"entry_pricing": pricing_evidence},
             )
 
         final_limit_price = float(preflight.payload["limitPrice"])
+        pricing_evidence = {
+            **pricing_evidence,
+            "preflight_limit_price": final_limit_price,
+            "preflight_increment": preflight.current_increment,
+            "preflight_buying_power_requirement": preflight.buying_power_requirement,
+            "preflight_estimated_cost": preflight.estimated_cost,
+        }
         required_cash = max(
             preflight.buying_power_requirement or 0.0,
             preflight.estimated_cost or 0.0,
@@ -349,6 +349,7 @@ class ExecutionPlanner:
                         "required_cash": required_cash,
                         "buying_power_requirement": preflight.buying_power_requirement,
                         "estimated_cost": preflight.estimated_cost,
+                        "entry_pricing": pricing_evidence,
                         **cash_guard_details,
                     },
                 )
@@ -389,6 +390,7 @@ class ExecutionPlanner:
                 "required_cash": required_cash,
                 "buying_power_requirement": preflight.buying_power_requirement,
                 "estimated_cost": preflight.estimated_cost,
+                "entry_pricing": pricing_evidence,
                 **cash_guard_details,
             },
         )

@@ -25,6 +25,9 @@ class TrackedPosition:
     stop_price: float | None = None
     target_order_id: str | None = None
     target_price: float | None = None
+    target_activation_price: float | None = None
+    target_activation_high_price: float | None = None
+    target_activated_at: datetime | None = None
     exit_order_id: str | None = None
     exit_limit_price: float | None = None
     exit_submitted_at: datetime | None = None
@@ -77,6 +80,9 @@ class PositionTracker:
         stop_price: float | None = None,
         target_order_id: str | None = None,
         target_price: float | None = None,
+        target_activation_price: float | None = None,
+        target_activation_high_price: float | None = None,
+        target_activated_at: datetime | None = None,
         exit_order_id: str | None = None,
         exit_limit_price: float | None = None,
         exit_submitted_at: datetime | None = None,
@@ -101,6 +107,9 @@ class PositionTracker:
                 existing.stop_price = stop_price
                 existing.target_order_id = target_order_id
                 existing.target_price = target_price
+                existing.target_activation_price = target_activation_price
+                existing.target_activation_high_price = target_activation_high_price
+                existing.target_activated_at = target_activated_at
                 existing.exit_order_id = exit_order_id
                 existing.exit_limit_price = exit_limit_price
                 existing.exit_submitted_at = exit_submitted_at
@@ -125,6 +134,9 @@ class PositionTracker:
                 stop_price=stop_price,
                 target_order_id=target_order_id,
                 target_price=target_price,
+                target_activation_price=target_activation_price,
+                target_activation_high_price=target_activation_high_price,
+                target_activated_at=target_activated_at,
                 exit_order_id=exit_order_id,
                 exit_limit_price=exit_limit_price,
                 exit_submitted_at=exit_submitted_at,

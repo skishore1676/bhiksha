@@ -13,7 +13,7 @@ import pytest
 from bhiksha.tools.trader_desk import TraderDeskHandler
 import bhiksha.trader_desk.service as service_module
 from bhiksha.trader_desk.service import TraderDeskConfig, TraderDeskService
-from bhiksha.execution.order_manager import OrderResult, PreflightCheck
+from bhiksha.execution.order_manager import OrderResult, PreflightCheck, PublicQuote
 from bhiksha.packets.consultation_bridge import ConsultationBridgeResult
 from bhiksha.packets.option_preview import PlaybookOptionPreviewResult
 from tests.test_playbook_option_preview import (
@@ -149,6 +149,7 @@ def test_trader_desk_option_preview_fetches_underlying_when_omitted(tmp_path: Pa
             option_symbol="IWM260330P00558000",
             quantity=1,
             estimated_entry_price=2.9,
+            pricing_evidence={},
             underlying_entry_price=kwargs["underlying_price"],
             underlying_stop_price=kwargs["underlying_stop_price"],
             risk_reasons=["approved"],
@@ -329,6 +330,9 @@ class StubLifecycleOrderManager:
 
     async def preflight_entry(self, option_symbol: str, limit_price: float, quantity: int):
         return PreflightCheck(payload={"limitPrice": f"{limit_price:.2f}"})
+
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(symbol=option_symbol, bid=2.70, ask=2.90, last=2.80, open_interest=500)
 
     async def place_entry_order(self, option_symbol: str, limit_price: float, quantity: int, *, order_id: str | None = None):
         self.entry_calls += 1

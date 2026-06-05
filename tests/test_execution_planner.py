@@ -184,7 +184,10 @@ def test_execution_planner_creates_dry_run_trade_plan():
     assert plan is not None
     assert plan.option_symbol == "QQQ260330P00558000"
     assert plan.order_id == "DRY_RUN"
-    assert plan.estimated_entry_price == 2.90
+    assert plan.estimated_entry_price == 2.85
+    assert plan.risk_details["entry_pricing"]["bid"] == 2.70
+    assert plan.risk_details["entry_pricing"]["ask"] == 2.90
+    assert plan.risk_details["entry_pricing"]["mid"] == 2.80
     assert chain_service.calls == 1
 
 
@@ -440,7 +443,7 @@ def test_execution_planner_blocks_trade_when_quote_has_no_usable_price() -> None
     assert plan is not None
     assert plan.quantity == 0
     assert plan.option_symbol == "QQQ260330P00558000"
-    assert plan.risk_reasons == ["public_quote_missing_price"]
+    assert plan.risk_reasons == ["public_quote_missing_bid_ask"]
 
 
 def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> None:
@@ -470,7 +473,9 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
         "max_premium": 300.0,
         "entry_price": 9.1,
         "min_contract_cost": 910.0,
+        "entry_pricing": plan.risk_details["entry_pricing"],
     }
+    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 9.1
 
 
 def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insufficient(monkeypatch, tmp_path) -> None:
@@ -503,6 +508,7 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
         "required_cash": 290.04,
         "buying_power_requirement": 290.04,
         "estimated_cost": 289.98,
+        "entry_pricing": plan.risk_details["entry_pricing"],
         "remaining_budget": 142.5,
         "usable_budget": 142.5,
         "broker_cash_only_buying_power": 150.0,
@@ -510,6 +516,7 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
         "account_type": "CASH",
         "cash_guard_mode": "on",
     }
+    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.85
     assert order_manager.place_entry_order_calls == 0
 
 

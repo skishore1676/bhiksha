@@ -11,6 +11,39 @@ Purpose: keep a simple running record of what we changed, what we decided, and w
 
 ## Session Log
 
+### 2026-06-03
+
+Completed:
+
+- Replaced the old cron runtime fork with the `server_session restart --live`
+  path so scheduled starts use the same pid and runtime launch contract as
+  manual starts.
+- Changed `server_session` to write date-stamped stdout and stderr files:
+  `trade_session_YYYY-MM-DD.log` and `trade_session_YYYY-MM-DD.err.log`.
+- Added date-scoped daily report generation from SQLite `events` and
+  `trade_sessions`, including live/shadow P&L, lifecycle counts, provider
+  reconciliation severity, and option/underlying data-quality warnings.
+- Added a concise Telegram summary renderer for the daily report and wired
+  oldmac/OpenClaw launchd to send it through Jarvis Receipts at 15:08 CT on
+  market weekdays.
+- Scheduled the existing trading-systems watch Telegram triage for 10:00 CT
+  and 15:15 CT on market weekdays.
+- Hardened reconciliation severity: an isolated periodic portfolio failure is
+  warning-only, repeated failures degrade provider health, and sustained
+  failure with live broker-backed exposure becomes blocking.
+
+Verification:
+
+- `347` tests passing locally.
+- oldmac dry startup with `--live --max-bars 0` passed and wrote
+  `artifacts/playbook/runtime/trade_session_2026-06-03.log` plus an empty
+  `.err.log`.
+- Regenerated the June 3 report at
+  `artifacts/playbook/reports/trade_session_report_2026-06-03.md`; it shows
+  `$0` live P&L, `$412` shadow P&L, and a data-quality warning for MU scaling.
+- Dry-ran `bhiksha-eod-receipt` on oldmac; the message body rendered correctly
+  and no Telegram message was sent during setup.
+
 ### 2026-05-17
 
 Completed:

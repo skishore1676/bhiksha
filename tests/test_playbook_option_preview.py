@@ -129,7 +129,10 @@ def test_option_preview_writes_ready_preview_without_order_submission(tmp_path: 
     assert result.preview_ready is True
     assert result.option_symbol == "IWM260330P00558000"
     assert result.quantity == 1
-    assert result.estimated_entry_price == 2.90
+    assert result.estimated_entry_price == 2.85
+    assert result.pricing_evidence["bid"] == 2.70
+    assert result.pricing_evidence["ask"] == 2.90
+    assert result.pricing_evidence["selected_limit_price"] == 2.85
     assert result.underlying_entry_price == 210.25
     assert result.risk_reasons == ["approved"]
     assert result.order_submission_allowed is False

@@ -907,6 +907,12 @@ def _google_catalog_entry_payload(
     default_option_profit_target_pct = (
         _coerce_float(defaults.get("option_profit_target_pct")) if use_defaults else None
     )
+    default_target_approach_offset_pct = (
+        _coerce_float(defaults.get("target_approach_offset_pct")) if use_defaults else None
+    )
+    default_target_pullback_restore_progress_pct = (
+        _coerce_float(defaults.get("target_pullback_restore_progress_pct")) if use_defaults else None
+    )
     use_profit_target = _coerce_bool(catastrophe_exit_params.get("use_profit_target"))
     if use_profit_target is None:
         use_profit_target = bool(default_profit_target_enabled and default_option_profit_target_pct is not None)
@@ -1023,6 +1029,14 @@ def _google_catalog_entry_payload(
             "use_profit_target": use_profit_target,
             "profit_target_multiple": profit_target_multiple,
             "option_profit_target_pct": option_profit_target_pct,
+            "target_approach_offset_pct": _first_not_none(
+                _coerce_float(catastrophe_exit_params.get("target_approach_offset_pct")),
+                default_target_approach_offset_pct,
+            ),
+            "target_pullback_restore_progress_pct": _first_not_none(
+                _coerce_float(catastrophe_exit_params.get("target_pullback_restore_progress_pct")),
+                default_target_pullback_restore_progress_pct,
+            ),
             "stop_loss_pct": stop_loss_pct,
             "stop_to_breakeven_after_r_multiple": stop_to_breakeven_after_r_multiple,
             "hard_flat_time_et": hard_flat_time_et,
@@ -1537,7 +1551,7 @@ def _validate_google_catalog_alignment(
                 f"unsupported_strategy_variant: {capability.strategy_key}.{capability.strategy_variant} {capability.reason}"
             )
     if not google_entry.bhiksha_ready:
-        raise ValueError(f"Strategy {strategy_id!r} is not bhiksha_ready in the Google strategy catalog")
+        raise ValueError(f"Strategy {strategy_id!r} is not Bhiksha runtime-ready in Mala_Evidence_v1")
     if google_entry.mala_evidence_ready is False:
         reason = google_entry.mala_evidence_blocking_checks or "mala_evidence_ready=false"
         raise ValueError(f"Strategy {strategy_id!r} is not mala_evidence_ready in Mala_Evidence_v1: {reason}")

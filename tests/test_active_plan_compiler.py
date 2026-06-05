@@ -492,7 +492,7 @@ def test_compile_active_plan_from_google_sheets_suppresses_non_ready_catalog_row
 
     assert compiled.plan.deployments == []
     assert compiled.plan.summary["suppressed_count"] == 1
-    assert "not bhiksha_ready" in compiled.plan.suppressed[0]["reason"]
+    assert "not Bhiksha runtime-ready" in compiled.plan.suppressed[0]["reason"]
 
 
 def test_compile_active_plan_from_google_sheets_promotes_google_catalog_entries(tmp_path: Path) -> None:
@@ -732,6 +732,8 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "option_stop_pct", "value": "0.35"},
             {"section": "default", "key": "option_profit_target_enabled", "value": "TRUE"},
             {"section": "default", "key": "option_profit_target_pct", "value": "0.35"},
+            {"section": "default", "key": "target_approach_offset_pct", "value": "0.10"},
+            {"section": "default", "key": "target_pullback_restore_progress_pct", "value": "0.75"},
             {"section": "default", "key": "min_open_interest", "value": "25"},
             {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
             {"section": "default", "key": "dte_min", "value": "5"},
@@ -785,6 +787,8 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.exit.use_algorithmic_exit is False
     assert deployment.exit.use_profit_target is True
     assert deployment.exit.option_profit_target_pct == 0.35
+    assert deployment.exit.target_approach_offset_pct == 0.10
+    assert deployment.exit.target_pullback_restore_progress_pct == 0.75
     assert deployment.exit.profit_target_multiple is None
     assert deployment.exit.thesis_exit_params == {
         "stop_loss_underlying_pct": 0.005,
@@ -958,7 +962,7 @@ def test_compile_active_plan_suppresses_mala_evidence_when_activation_candidate_
     assert "not activation_candidate" in compiled.plan.suppressed[0]["reason"]
 
 
-def test_mala_evidence_watch_only_runtime_supported_fails_on_activation_not_bhiksha_ready(tmp_path: Path) -> None:
+def test_mala_evidence_watch_only_runtime_supported_fails_on_activation_not_runtime_readiness(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
     _write_catalog_entry(
@@ -1027,7 +1031,7 @@ def test_mala_evidence_watch_only_runtime_supported_fails_on_activation_not_bhik
     assert compiled.plan.deployments == []
     assert compiled.plan.summary["suppressed_count"] == 1
     assert "not activation_candidate" in compiled.plan.suppressed[0]["reason"]
-    assert "not bhiksha_ready" not in compiled.plan.suppressed[0]["reason"]
+    assert "not Bhiksha runtime-ready" not in compiled.plan.suppressed[0]["reason"]
 
 
 def test_compile_active_plan_suppresses_mala_evidence_when_option_trade_not_ready(tmp_path: Path) -> None:

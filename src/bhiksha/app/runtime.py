@@ -47,6 +47,7 @@ from bhiksha.market_data.warmup import (
 )
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup, check_schwab_token_health
 from bhiksha.ops.issues import classify_runtime_issue_category
+from bhiksha.ops.daily_report import write_daily_report
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import TrackedPosition
@@ -528,6 +529,15 @@ class BhikshaRuntime:
             await execution_dispatcher.stop()
             await supervisor.close()
             await source.close()
+            try:
+                report_dir = Path(self.app_config.playbook_artifacts_dir) / "reports"
+                result = write_daily_report(
+                    self.app_config.sqlite_path,
+                    output_dir=report_dir,
+                )
+                output(f"DAILY_REPORT json={result.json_path} markdown={result.markdown_path}")
+            except Exception as exc:
+                output(f"RUNTIME_ISSUE ALL stage=daily_report error={exc}")
             self.stop()
 
     def startup_snapshot(self, *, live: bool, max_bars: int | None) -> dict:
@@ -1235,23 +1245,55 @@ class BhikshaRuntime:
             )
             tracker_positions = _merge_tracked_positions(tracker_positions, paper_positions)
         except Exception as exc:
+            now = datetime.now(UTC)
             async with sync_lock:
                 reconciliation_snapshot.last_error = str(exc)
                 reconciliation_snapshot.consecutive_failures += 1
+                consecutive_failures = reconciliation_snapshot.consecutive_failures
+                last_success_at = reconciliation_snapshot.last_success_at
+                live_position_count = _live_reconciliation_position_count(reconciliation_snapshot.positions)
+            severity = _reconciliation_failure_severity(
+                reason=reason,
+                consecutive_failures=consecutive_failures,
+                live_position_count=live_position_count,
+                last_success_at=last_success_at,
+                now=now,
+                max_staleness_seconds=self.app_config.reconciliation_max_staleness_seconds,
+            )
+            payload = {
+                "category": classify_runtime_issue_category(error=str(exc), event_type="reconciliation"),
+                "symbol": "ALL",
+                "error": str(exc),
+                "stage": "reconciliation",
+                "reason": reason,
+                "severity": severity,
+                "consecutive_failures": consecutive_failures,
+                "live_position_count": live_position_count,
+                "last_success_at": last_success_at.isoformat() if last_success_at is not None else None,
+            }
             await _append_event_best_effort(
                 supervisor.event_repository,
-                "runtime_issue",
-                {
-                    "category": classify_runtime_issue_category(error=str(exc), event_type="reconciliation"),
-                    "symbol": "ALL",
-                    "error": str(exc),
-                    "stage": "reconciliation",
-                    "reason": reason,
-                },
+                "reconciliation_health",
+                payload,
                 output=output,
             )
-            output(f"RUNTIME_ISSUE ALL stage=reconciliation reason={reason} error={exc}")
-            output(f"RECONCILIATION_DEGRADED reason={reason} error={exc}")
+            if severity != "warning":
+                await _append_event_best_effort(
+                    supervisor.event_repository,
+                    "runtime_issue",
+                    payload,
+                    output=output,
+                )
+            if severity == "blocking":
+                output(
+                    "RECONCILIATION_BLOCKING "
+                    f"reason={reason} failures={consecutive_failures} "
+                    f"live_positions={live_position_count} error={exc}"
+                )
+            elif severity == "degraded":
+                output(f"RECONCILIATION_DEGRADED reason={reason} failures={consecutive_failures} error={exc}")
+            else:
+                output(f"RECONCILIATION_WARNING reason={reason} failures={consecutive_failures} error={exc}")
             return
         async with sync_lock:
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
@@ -1557,6 +1599,30 @@ def _is_retryable_reconciliation_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
     return False
+
+
+def _reconciliation_failure_severity(
+    *,
+    reason: str,
+    consecutive_failures: int,
+    live_position_count: int,
+    last_success_at: datetime | None,
+    now: datetime,
+    max_staleness_seconds: int,
+) -> str:
+    if live_position_count > 0 and (
+        consecutive_failures >= 3
+        or last_success_at is None
+        or (now - last_success_at).total_seconds() > max_staleness_seconds
+    ):
+        return "blocking"
+    if reason == "startup" or consecutive_failures >= 2:
+        return "degraded"
+    return "warning"
+
+
+def _live_reconciliation_position_count(positions: list[TrackedPosition]) -> int:
+    return sum(1 for position in positions if position.source not in {"shadow", "dry_run"})
 
 
 def _frame_from_bars(symbol: str, bars) -> pl.DataFrame:

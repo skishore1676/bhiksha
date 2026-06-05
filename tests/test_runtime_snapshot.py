@@ -10,7 +10,7 @@ import yaml
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.app.runtime import ReconciliationSnapshot, _frame_with_live_price
 from bhiksha.domain.models import Bar
-from bhiksha.state.position_tracker import PositionTracker
+from bhiksha.state.position_tracker import PositionTracker, TrackedPosition
 
 
 def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments() -> None:
@@ -465,6 +465,129 @@ def test_runtime_reconciliation_staleness_blocks_live_entries() -> None:
     reason = runtime._reconciliation_live_entry_block_reason(snapshot, now=datetime.now(UTC))
 
     assert reason == "reconciliation_too_stale"
+
+
+def test_runtime_reconciliation_single_periodic_failure_is_warning_only() -> None:
+    runtime = build_runtime()
+    snapshot = ReconciliationSnapshot(last_success_at=datetime.now(UTC))
+    output_lines: list[str] = []
+
+    class StubBroker:
+        async def get_portfolio(self) -> dict:
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=httpx.Request("GET", "https://example.test/portfolio"),
+                response=httpx.Response(400, request=httpx.Request("GET", "https://example.test/portfolio")),
+            )
+
+    class StubRepo:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+
+        async def append(self, event_type: str, payload: dict) -> None:
+            self.events.append((event_type, payload))
+
+    class StubTradeStateRepository:
+        async def get_recent_trades(self, *, limit: int = 100) -> list:
+            del limit
+            return []
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.event_repository = StubRepo()
+            self.trade_state_repository = StubTradeStateRepository()
+            self.planner = type("Planner", (), {"position_tracker": PositionTracker()})()
+
+        async def sync_lifecycle(self) -> None:
+            return None
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position, dry_run
+            return None
+
+    supervisor = StubSupervisor()
+
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=StubBroker(),
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=output_lines.append,
+            reason="periodic",
+        )
+    )
+
+    assert [event_type for event_type, _ in supervisor.event_repository.events] == ["reconciliation_health"]
+    assert supervisor.event_repository.events[0][1]["severity"] == "warning"
+    assert output_lines[0].startswith("RECONCILIATION_WARNING ")
+
+
+def test_runtime_reconciliation_failure_with_live_position_is_blocking_runtime_issue() -> None:
+    runtime = build_runtime()
+    snapshot = ReconciliationSnapshot(
+        positions=[
+            TrackedPosition(
+                symbol="IWM",
+                deployment_id="iwm_live",
+                option_symbol="IWM260609C00296000",
+                quantity=1,
+                source="broker_sync",
+            )
+        ],
+        last_success_at=datetime.now(UTC) - timedelta(seconds=120),
+        consecutive_failures=2,
+    )
+    output_lines: list[str] = []
+
+    class StubBroker:
+        async def get_portfolio(self) -> dict:
+            raise TimeoutError("portfolio timed out")
+
+    class StubRepo:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+
+        async def append(self, event_type: str, payload: dict) -> None:
+            self.events.append((event_type, payload))
+
+    class StubTradeStateRepository:
+        async def get_recent_trades(self, *, limit: int = 100) -> list:
+            del limit
+            return []
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.event_repository = StubRepo()
+            self.trade_state_repository = StubTradeStateRepository()
+            self.planner = type("Planner", (), {"position_tracker": PositionTracker()})()
+
+        async def sync_lifecycle(self) -> None:
+            return None
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position, dry_run
+            return None
+
+    supervisor = StubSupervisor()
+
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=StubBroker(),
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=output_lines.append,
+            reason="periodic",
+        )
+    )
+
+    assert [event_type for event_type, _ in supervisor.event_repository.events] == [
+        "reconciliation_health",
+        "runtime_issue",
+    ]
+    assert supervisor.event_repository.events[-1][1]["severity"] == "blocking"
+    assert output_lines[0].startswith("RECONCILIATION_BLOCKING ")
 
 
 def test_frame_with_live_price_appends_synthetic_quote_row() -> None:

@@ -11,6 +11,7 @@ from bhiksha.app.bootstrap import build_runtime
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionSelectionRequest
 from bhiksha.execution.order_manager import OrderManager
+from bhiksha.execution.pricing import select_entry_limit
 from bhiksha.options.public_chain import PublicOptionChainService
 from bhiksha.options.vehicle_resolver import VehicleResolver
 from bhiksha.persistence.sqlite import SQLiteEventRepository
@@ -50,9 +51,10 @@ async def _run(symbol: str, quantity: int, live: bool, confirm_live: str | None)
         )
         selection = resolver.resolve(selection_request, contracts)
         quote = await order_manager.get_option_quote(selection.option_symbol)
-        entry_price = quote.entry_reference_price
-        if entry_price is None:
-            raise ValueError(f"No usable Public quote for {selection.option_symbol}")
+        pricing = select_entry_limit(quote, deployment.execution.model_dump())
+        if pricing.block_reasons or pricing.limit_price is None:
+            raise ValueError(f"No usable Public entry price for {selection.option_symbol}: {pricing.block_reasons}")
+        entry_price = pricing.limit_price
         preflight = await order_manager.preflight_entry(selection.option_symbol, entry_price, quantity)
 
         await repo.append(
@@ -68,6 +70,11 @@ async def _run(symbol: str, quantity: int, live: bool, confirm_live: str | None)
                 "quote_last": quote.last,
                 "quote_open_interest": quote.open_interest,
                 "quote_spread_pct": quote.spread_pct,
+                "pricing_evidence": {
+                    **pricing.evidence(),
+                    "preflight_limit_price": preflight.payload["limitPrice"],
+                    "preflight_increment": preflight.current_increment,
+                },
                 "preflight_limit_price": preflight.payload["limitPrice"],
                 "preflight_buying_power_requirement": preflight.buying_power_requirement,
                 "preflight_estimated_cost": preflight.estimated_cost,
@@ -87,6 +94,8 @@ async def _run(symbol: str, quantity: int, live: bool, confirm_live: str | None)
         print(f"quote_last={quote.last}")
         print(f"quote_open_interest={quote.open_interest}")
         print(f"quote_spread_pct={quote.spread_pct}")
+        print(f"pricing_mode={pricing.policy.mode}")
+        print(f"selected_limit_price={pricing.limit_price}")
         print(f"preflight_limit_price={preflight.payload['limitPrice']}")
         print(f"preflight_buying_power_requirement={preflight.buying_power_requirement}")
         print(f"preflight_estimated_cost={preflight.estimated_cost}")
@@ -139,8 +148,9 @@ async def _run(symbol: str, quantity: int, live: bool, confirm_live: str | None)
         if not filled:
             return 1
 
+        fill_price = _filled_entry_price(payload, fallback=submit_price)
         stop_loss_pct = deployment.exit.stop_loss_pct or deployment.risk.stop_loss_pct
-        stop_price = submit_price * (1.0 - stop_loss_pct)
+        stop_price = fill_price * (1.0 - stop_loss_pct)
         stop_result = await order_manager.place_stop_loss_order(selection.option_symbol, stop_price, quantity)
         await repo.append(
             "manual_trade_stop_submission",
@@ -149,6 +159,7 @@ async def _run(symbol: str, quantity: int, live: bool, confirm_live: str | None)
                 "symbol": deployment.symbol,
                 "option_symbol": selection.option_symbol,
                 "stop_price": stop_price,
+                "fill_price": fill_price,
                 "stop_order_id": stop_result.order_id,
                 "stop_error": stop_result.error,
             },
@@ -170,6 +181,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--confirm-live", default=None, help='Required exact value: "YES"')
     args = parser.parse_args(argv)
     return asyncio.run(_run(args.symbol.upper(), args.quantity, args.live, args.confirm_live))
+
+
+def _filled_entry_price(payload: dict | None, *, fallback: float) -> float:
+    if not payload:
+        return fallback
+    for key in ("averageFillPrice", "averagePrice", "filledPrice", "price"):
+        try:
+            value = payload.get(key)
+            if value is not None:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return fallback
 
 
 if __name__ == "__main__":

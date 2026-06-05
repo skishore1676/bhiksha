@@ -8,6 +8,7 @@ import json
 
 from bhiksha.config.loader import (
     load_active_plan,
+    load_app_config,
     load_bias_inputs,
     load_deployments,
     load_runtime_deployments,
@@ -116,6 +117,22 @@ def test_load_bias_inputs_accepts_reserved_emergency_controls(tmp_path: Path) ->
     selections = load_bias_inputs(path)
     assert len(selections) == 1
     assert selections[0].symbol == "IWM"
+
+
+def test_load_app_config_allows_entry_reprice_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "app.yaml"
+    path.write_text(yaml.safe_dump({"app_name": "bhiksha"}), encoding="utf-8")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_ENABLED", "true")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CHECKPOINTS_SECONDS", "15,45,120")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CANCEL_AFTER_SECONDS", "240")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_SPREAD_PCTS", "0.4,0.75,1.0")
+
+    config = load_app_config(path)
+
+    assert config.entry_reprice_enabled is True
+    assert config.entry_reprice_checkpoints_seconds == [15, 45, 120]
+    assert config.entry_reprice_cancel_after_seconds == 240
+    assert config.entry_reprice_spread_pcts == [0.4, 0.75, 1.0]
 
 
 def test_load_active_plan_allows_duplicate_symbols_but_rejects_duplicate_ids(tmp_path: Path) -> None:

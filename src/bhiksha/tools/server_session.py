@@ -178,7 +178,9 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
 
     runtime_log_dir = Path(args.runtime_log_dir).resolve()
     runtime_log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = runtime_log_dir / f"trade_session_{datetime.now(UTC).date().isoformat()}.log"
+    log_date = datetime.now(UTC).date().isoformat()
+    log_path = runtime_log_dir / f"trade_session_{log_date}.log"
+    err_log_path = runtime_log_dir / f"trade_session_{log_date}.err.log"
     repo_root = Path(args.repo_root).resolve()
     active_plan = Path(args.active_plan).resolve()
     command = [args.python_executable, "-u", "-m", "bhiksha.tools.trade_session", "--active-plan", str(active_plan)]
@@ -189,12 +191,12 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    with log_path.open("a", encoding="utf-8") as handle:
+    with log_path.open("a", encoding="utf-8") as stdout_handle, err_log_path.open("a", encoding="utf-8") as stderr_handle:
         process = subprocess.Popen(  # noqa: S603
             command,
             cwd=str(repo_root),
-            stdout=handle,
-            stderr=subprocess.STDOUT,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
             start_new_session=True,
             env=env,
         )
@@ -203,6 +205,7 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
         "pid": process.pid,
         "started_at": datetime.now(UTC).isoformat(),
         "log_path": str(log_path),
+        "err_log_path": str(err_log_path),
         "active_plan_path": str(active_plan),
         "live": bool(args.live),
         "max_bars": args.max_bars,

@@ -38,6 +38,7 @@ class PlaybookOptionPreviewResult:
     option_symbol: str
     quantity: int
     estimated_entry_price: float
+    pricing_evidence: dict[str, Any]
     underlying_entry_price: float | None
     underlying_stop_price: float | None
     risk_reasons: list[str]
@@ -131,6 +132,7 @@ async def build_playbook_option_preview(
         option_symbol=plan.option_symbol if plan is not None else "",
         quantity=plan.quantity if plan is not None else 0,
         estimated_entry_price=plan.estimated_entry_price if plan is not None else 0.0,
+        pricing_evidence=_pricing_evidence(plan),
         underlying_entry_price=plan.underlying_entry_price if plan is not None else underlying_price,
         underlying_stop_price=underlying_stop_price,
         risk_reasons=plan.risk_reasons if plan is not None else [],
@@ -290,6 +292,13 @@ def _has_blocking_risk(reasons: list[str]) -> bool:
     return any(reason != "approved" for reason in reasons)
 
 
+def _pricing_evidence(plan: TradePlan | None) -> dict[str, Any]:
+    if plan is None:
+        return {}
+    evidence = plan.risk_details.get("entry_pricing")
+    return dict(evidence) if isinstance(evidence, dict) else {}
+
+
 def _preview_id(intent: dict[str, Any]) -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     timestamp = re.sub(r"[^A-Za-z0-9]+", "_", str(intent.get("timestamp", ""))).strip("_")[:48]
@@ -334,6 +343,11 @@ def _preview_markdown(payload: dict[str, Any]) -> str:
             f"- option_symbol: `{payload['option_symbol']}`",
             f"- quantity: `{payload['quantity']}`",
             f"- estimated_entry_price: `{payload['estimated_entry_price']}`",
+            f"- pricing_mode: `{payload['pricing_evidence'].get('pricing_mode', '')}`",
+            f"- quote_bid: `{payload['pricing_evidence'].get('bid', '')}`",
+            f"- quote_ask: `{payload['pricing_evidence'].get('ask', '')}`",
+            f"- quote_mid: `{payload['pricing_evidence'].get('mid', '')}`",
+            f"- quote_spread_pct: `{payload['pricing_evidence'].get('spread_pct', '')}`",
             f"- underlying_stop_price: `{payload['underlying_stop_price']}`",
             f"- risk_reasons: `{', '.join(payload['risk_reasons'])}`",
             f"- block_reasons: `{', '.join(payload['block_reasons'])}`",

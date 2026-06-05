@@ -13,6 +13,7 @@ from typing import Any
 from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import TradeRecord
 from bhiksha.execution.order_manager import OrderManager, PreflightCheck, round_price
+from bhiksha.execution.pricing import select_entry_limit
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
 from bhiksha.shared_kernel import ensure_kernel_on_path
 from bhiksha.state.lifecycle import TradeLifecycleStore
@@ -55,6 +56,7 @@ class PlaybookLifecycleSubmitResult:
     quantity: int
     limit_price: float
     entry_price: float
+    pricing_evidence: dict[str, Any]
     underlying_entry_price: float | None
     underlying_stop_price: float | None
     trade_id: str
@@ -107,6 +109,7 @@ async def submit_playbook_live_ticket(
     stop_price: float | None = None
     target_price: float | None = None
     entry_price = 0.0
+    pricing_evidence: dict[str, Any] = dict(ticket.get("pricing_evidence", {}) or {})
     trade_state = "blocked"
     lifecycle_started = False
 
@@ -116,8 +119,32 @@ async def submit_playbook_live_ticket(
         requested_limit = float(ticket["limit_price"])
         underlying_entry_price = _optional_float(ticket.get("underlying_entry_price"))
         underlying_stop_price = _optional_float(ticket.get("underlying_stop_price"))
+        try:
+            quote = await order_manager.get_option_quote(option_symbol)
+            pricing = select_entry_limit(quote, _ticket_pricing_params(ticket))
+            pricing_evidence = pricing.evidence()
+            if pricing.block_reasons:
+                blocks.extend(pricing.block_reasons)
+            elif pricing.limit_price is not None:
+                requested_limit = pricing.limit_price
+        except Exception as exc:
+            blocks.append(f"public_quote_unavailable_at_submit:{exc}")
+
+    if not blocks and management_spec is not None:
+        option_symbol = str(ticket["option_symbol"])
+        quantity = int(ticket["quantity"])
+        requested_limit = float(requested_limit)
+        underlying_entry_price = _optional_float(ticket.get("underlying_entry_price"))
+        underlying_stop_price = _optional_float(ticket.get("underlying_stop_price"))
         preflight = await order_manager.preflight_entry(option_symbol, requested_limit, quantity)
         entry_price = _preflight_limit_price(preflight, fallback=requested_limit)
+        pricing_evidence = {
+            **pricing_evidence,
+            "preflight_limit_price": entry_price,
+            "preflight_increment": preflight.current_increment,
+            "preflight_buying_power_requirement": preflight.buying_power_requirement,
+            "preflight_estimated_cost": preflight.estimated_cost,
+        }
         result = await order_manager.place_entry_order(
             option_symbol,
             entry_price,
@@ -139,6 +166,7 @@ async def submit_playbook_live_ticket(
                     "option_symbol": option_symbol,
                     "quantity": quantity,
                     "limit_price": entry_price,
+                    "pricing_evidence": pricing_evidence,
                     "management_policy_id": management_spec.policy_id,
                 },
             )
@@ -169,6 +197,7 @@ async def submit_playbook_live_ticket(
                     "entry_order_id": entry_order_id,
                     "filled": filled,
                     "error": fill_error,
+                    "average_fill_price": _filled_entry_price(fill_payload, fallback=entry_price) if filled else None,
                     "payload": fill_payload or {},
                 },
             )
@@ -299,6 +328,7 @@ async def submit_playbook_live_ticket(
                             "management_policy_id": management_spec.policy_id,
                             "underlying_entry_price": underlying_entry_price,
                             "underlying_stop_price": underlying_stop_price,
+                            "pricing_evidence": pricing_evidence,
                         },
                     )
                     lifecycle_started = True
@@ -318,6 +348,7 @@ async def submit_playbook_live_ticket(
         quantity=int(ticket.get("quantity", 0) or 0),
         limit_price=float(ticket.get("limit_price", 0.0) or 0.0),
         entry_price=entry_price,
+        pricing_evidence=pricing_evidence,
         underlying_entry_price=_optional_float(ticket.get("underlying_entry_price")),
         underlying_stop_price=_optional_float(ticket.get("underlying_stop_price")),
         trade_id=trade_id,
@@ -360,6 +391,14 @@ def _ticket_blocks(ticket: dict[str, Any]) -> list[str]:
     if ticket.get("underlying_stop_price") is None:
         blocks.append("underlying_stop_price_missing")
     return blocks
+
+
+def _ticket_pricing_params(ticket: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "max_bid_ask_spread_pct": _optional_float(ticket.get("max_bid_ask_spread_pct")) or 0.20,
+        "min_open_interest": _optional_float(ticket.get("min_open_interest")) or 1,
+        "entry_pricing_mode": str(ticket.get("entry_pricing_mode") or "urgent"),
+    }
 
 
 def _packet_blocks(ticket: dict[str, Any], packet: ExecutionPacket) -> list[str]:
@@ -505,6 +544,13 @@ def _lifecycle_markdown(payload: dict[str, Any]) -> str:
             f"- direction: `{payload['direction']}`",
             f"- option_symbol: `{payload['option_symbol']}`",
             f"- quantity: `{payload['quantity']}`",
+            f"- limit_price: `{payload['limit_price']}`",
+            f"- entry_price: `{payload['entry_price']}`",
+            f"- pricing_mode: `{payload['pricing_evidence'].get('pricing_mode', '')}`",
+            f"- quote_bid: `{payload['pricing_evidence'].get('bid', '')}`",
+            f"- quote_ask: `{payload['pricing_evidence'].get('ask', '')}`",
+            f"- quote_mid: `{payload['pricing_evidence'].get('mid', '')}`",
+            f"- quote_spread_pct: `{payload['pricing_evidence'].get('spread_pct', '')}`",
             f"- entry_order_id: `{payload['entry_order_id']}`",
             f"- stop_order_id: `{payload['stop_order_id']}`",
             f"- stop_price: `{payload['stop_price']}`",

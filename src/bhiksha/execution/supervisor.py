@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import UTC
@@ -20,12 +20,46 @@ from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
+from bhiksha.execution.pricing import select_entry_limit
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
 from bhiksha.state.lifecycle import LifecycleTransition, TradeLifecycleStore
 from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.time_utils import parse_time_text
+
+ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryWaitResult:
+    plan: TradePlan
+    filled: bool
+    payload: dict | None
+    error: str | None
+    cancelled_without_fill: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryRepriceResult:
+    plan: TradePlan
+    error: str | None = None
+    filled: bool = False
+    payload: dict | None = None
+    cancelled_without_fill: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryCancelResult:
+    cancel_ok: bool
+    cancel_error: str | None
+    status: str | None = None
+    payload: dict | None = None
+    status_error: str | None = None
+
+    @property
+    def filled(self) -> bool:
+        return str(self.status or "").upper() == "FILLED"
 
 
 class ExecutionSupervisor:
@@ -284,22 +318,24 @@ class ExecutionSupervisor:
         return True
 
     async def _protect_live_entry(self, plan: TradePlan, deployment: DeploymentManifest) -> TradePlan:
-        filled, payload, error = await self.planner.order_manager.wait_for_fill(
-            plan.order_id,
-            timeout_seconds=self.app_config.order_fill_timeout_seconds,
-            poll_seconds=self.app_config.order_fill_poll_seconds,
-        )
-        await self.event_repository.append(
-            "entry_fill_check",
-            {
-                "deployment_id": plan.deployment_id,
-                "order_id": plan.order_id,
-                "filled": filled,
-                "error": error,
-                "payload": payload or {},
-            },
-        )
+        wait_result = await self._wait_for_entry_fill_or_cancel(plan, deployment)
+        plan = wait_result.plan
+        filled = wait_result.filled
+        payload = wait_result.payload
+        error = wait_result.error
         if not filled:
+            if wait_result.cancelled_without_fill:
+                await self._release_cash_guard_reservation(plan.trade_id)
+                self.planner.position_tracker.close_position(
+                    deployment.symbol,
+                    deployment.deployment_id,
+                    option_symbol=plan.option_symbol,
+                    order_id=plan.order_id,
+                )
+                await self.trade_state_repository.mark_closed(plan.trade_id)
+                transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
+                await self._emit_lifecycle_transition(transition, reason="entry_reprice_no_fill_cancelled")
+                return plan
             normalized_error = (error or "").upper()
             if normalized_error in {"REJECTED", "CANCELED", "EXPIRED"}:
                 await self._release_cash_guard_reservation(plan.trade_id)
@@ -359,6 +395,13 @@ class ExecutionSupervisor:
             return plan
 
         await self._finalize_cash_guard_reservation(plan.trade_id)
+        filled_entry_price = _filled_entry_price(payload, fallback=plan.estimated_entry_price)
+        risk_details = {
+            **dict(plan.risk_details),
+            "submitted_entry_limit_price": plan.estimated_entry_price,
+            "broker_average_fill_price": filled_entry_price,
+        }
+        plan = replace(plan, estimated_entry_price=filled_entry_price, risk_details=risk_details)
         stop_result, stop_price, target_order_id, target_price = await self._arm_position_protection(
             deployment,
             option_symbol=plan.option_symbol,
@@ -442,10 +485,397 @@ class ExecutionSupervisor:
                 transition,
                 reason="entry_filled_open_protected" if stop_result.order_id else "entry_filled_open_unprotected",
             )
-        risk_details = dict(plan.risk_details)
         if protection_error is not None:
             risk_details["protection_error"] = protection_error
         return replace(plan, stop_order_id=stop_result.order_id, target_order_id=target_order_id, risk_details=risk_details)
+
+    async def _wait_for_entry_fill_or_cancel(
+        self,
+        plan: TradePlan,
+        deployment: DeploymentManifest,
+    ) -> "_EntryWaitResult":
+        if not self.app_config.entry_reprice_enabled:
+            return await self._wait_for_entry_fill_once(
+                plan,
+                timeout_seconds=self.app_config.order_fill_timeout_seconds,
+                reprice_attempt=0,
+            )
+
+        started_at = datetime.now(UTC)
+        active_plan = plan
+        checkpoints = _entry_reprice_checkpoints(self.app_config)
+        for attempt, checkpoint_seconds in enumerate(checkpoints, start=1):
+            wait_seconds = _remaining_seconds(started_at, checkpoint_seconds)
+            result = await self._wait_for_entry_fill_once(
+                active_plan,
+                timeout_seconds=wait_seconds,
+                reprice_attempt=attempt - 1,
+            )
+            if result.filled or _terminal_entry_error(result.error):
+                return result
+            reprice = await self._reprice_live_entry(active_plan, deployment, attempt=attempt)
+            if reprice.filled:
+                return _EntryWaitResult(
+                    plan=reprice.plan,
+                    filled=True,
+                    payload=reprice.payload,
+                    error=None,
+                )
+            if reprice.error is not None:
+                return _EntryWaitResult(
+                    plan=reprice.plan,
+                    filled=False,
+                    payload=reprice.payload or result.payload,
+                    error=reprice.error,
+                    cancelled_without_fill=reprice.cancelled_without_fill,
+                )
+            active_plan = reprice.plan
+
+        result = await self._wait_for_entry_fill_once(
+            active_plan,
+            timeout_seconds=_remaining_seconds(started_at, self.app_config.entry_reprice_cancel_after_seconds),
+            reprice_attempt=len(checkpoints),
+        )
+        if result.filled or _terminal_entry_error(result.error):
+            return result
+
+        cancel_result = await self._cancel_entry_order_and_check_fill(active_plan)
+        if cancel_result.filled:
+            await self.event_repository.append(
+                "entry_reprice_cancel_race_filled",
+                {
+                    "deployment_id": active_plan.deployment_id,
+                    "trade_id": active_plan.trade_id,
+                    "order_id": active_plan.order_id,
+                    "cancel_after_seconds": self.app_config.entry_reprice_cancel_after_seconds,
+                    "cancel_ok": cancel_result.cancel_ok,
+                    "cancel_error": cancel_result.cancel_error,
+                    "payload": cancel_result.payload or {},
+                },
+            )
+            return _EntryWaitResult(
+                plan=active_plan,
+                filled=True,
+                payload=cancel_result.payload,
+                error=None,
+            )
+        await self.event_repository.append(
+            "entry_reprice_cancel_after_timeout",
+            {
+                "deployment_id": active_plan.deployment_id,
+                "trade_id": active_plan.trade_id,
+                "order_id": active_plan.order_id,
+                "cancel_after_seconds": self.app_config.entry_reprice_cancel_after_seconds,
+                "cancel_ok": cancel_result.cancel_ok,
+                "cancel_error": cancel_result.cancel_error,
+                "status": cancel_result.status,
+                "status_error": cancel_result.status_error,
+                "payload": result.payload or {},
+            },
+        )
+        return _EntryWaitResult(
+            plan=active_plan,
+            filled=False,
+            payload=result.payload,
+            error="entry_reprice_cancel_after_timeout" if cancel_result.cancel_ok else f"entry_reprice_final_cancel_failed:{cancel_result.cancel_error}",
+            cancelled_without_fill=cancel_result.cancel_ok,
+        )
+
+    async def _wait_for_entry_fill_once(
+        self,
+        plan: TradePlan,
+        *,
+        timeout_seconds: int,
+        reprice_attempt: int,
+    ) -> "_EntryWaitResult":
+        filled, payload, error = await self.planner.order_manager.wait_for_fill(
+            plan.order_id,
+            timeout_seconds=max(int(timeout_seconds), 0),
+            poll_seconds=self.app_config.order_fill_poll_seconds,
+        )
+        await self.event_repository.append(
+            "entry_fill_check",
+            {
+                "deployment_id": plan.deployment_id,
+                "order_id": plan.order_id,
+                "filled": filled,
+                "error": error,
+                "reprice_attempt": reprice_attempt,
+                "average_fill_price": _filled_entry_price(payload, fallback=plan.estimated_entry_price) if filled else None,
+                "payload": payload or {},
+            },
+        )
+        return _EntryWaitResult(plan=plan, filled=filled, payload=payload, error=error)
+
+    async def _reprice_live_entry(
+        self,
+        plan: TradePlan,
+        deployment: DeploymentManifest,
+        *,
+        attempt: int,
+    ) -> "_EntryRepriceResult":
+        pricing_params = deployment.execution.model_dump()
+        pricing_params["entry_pricing_urgent_spread_pct"] = _entry_reprice_spread_pct(self.app_config, attempt)
+        try:
+            quote = await self.planner.order_manager.get_option_quote(plan.option_symbol)
+            pricing = select_entry_limit(quote, pricing_params)
+        except Exception as exc:
+            return await self._cancel_entry_for_reprice_block(
+                plan,
+                attempt=attempt,
+                reason=f"entry_reprice_quote_unavailable:{exc}",
+            )
+        if pricing.block_reasons or pricing.limit_price is None:
+            return await self._cancel_entry_for_reprice_block(
+                plan,
+                attempt=attempt,
+                reason="entry_reprice_quote_blocked:" + ",".join(pricing.block_reasons or ["missing_limit"]),
+                pricing_evidence=pricing.evidence(),
+            )
+
+        try:
+            preflight = await self.planner.order_manager.preflight_entry(plan.option_symbol, pricing.limit_price, plan.quantity)
+        except Exception as exc:
+            return await self._cancel_entry_for_reprice_block(
+                plan,
+                attempt=attempt,
+                reason=f"entry_reprice_preflight_failed:{exc}",
+                pricing_evidence=pricing.evidence(),
+            )
+        final_limit_price = float(preflight.payload["limitPrice"])
+        required_cash = max(
+            preflight.buying_power_requirement or 0.0,
+            preflight.estimated_cost or 0.0,
+            final_limit_price * plan.quantity * 100,
+        )
+        cancel_result = await self._cancel_entry_order_and_check_fill(plan)
+        if cancel_result.filled:
+            filled_price = _filled_entry_price(cancel_result.payload, fallback=plan.estimated_entry_price)
+            filled_plan = replace(
+                plan,
+                estimated_entry_price=filled_price,
+                risk_details={
+                    **dict(plan.risk_details),
+                    "entry_reprice_cancel_race_filled": True,
+                    "broker_average_fill_price": filled_price,
+                },
+            )
+            await self.event_repository.append(
+                "entry_reprice_cancel_race_filled",
+                {
+                    "deployment_id": plan.deployment_id,
+                    "trade_id": plan.trade_id,
+                    "order_id": plan.order_id,
+                    "attempt": attempt,
+                    "cancel_ok": cancel_result.cancel_ok,
+                    "cancel_error": cancel_result.cancel_error,
+                    "pricing_evidence": pricing.evidence(),
+                    "payload": cancel_result.payload or {},
+                },
+            )
+            return _EntryRepriceResult(plan=filled_plan, filled=True, payload=cancel_result.payload)
+        if not cancel_result.cancel_ok:
+            await self.event_repository.append(
+                "entry_reprice_cancel_failed",
+                {
+                    "deployment_id": plan.deployment_id,
+                    "trade_id": plan.trade_id,
+                    "order_id": plan.order_id,
+                    "attempt": attempt,
+                    "error": cancel_result.cancel_error,
+                    "status": cancel_result.status,
+                    "status_error": cancel_result.status_error,
+                    "pricing_evidence": pricing.evidence(),
+                },
+            )
+            return _EntryRepriceResult(plan=plan, error=f"entry_reprice_cancel_failed:{cancel_result.cancel_error}")
+
+        cash_guard_details: dict[str, object] = {}
+        if getattr(self.planner, "cash_guard", None) is not None:
+            await self.planner.cash_guard.release_entry(plan.trade_id)
+            cash_result = await self.planner.cash_guard.reserve_entry(
+                trade_id=plan.trade_id,
+                required_cash=required_cash,
+                timestamp=plan.entry_timestamp or datetime.now(UTC),
+            )
+            cash_guard_details = dict(cash_result.details)
+            if cash_result.blocked:
+                await self.event_repository.append(
+                    "entry_reprice_cash_guard_blocked",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "trade_id": plan.trade_id,
+                        "attempt": attempt,
+                        "required_cash": required_cash,
+                        "reason": cash_result.reason,
+                        **cash_guard_details,
+                    },
+                )
+                return _EntryRepriceResult(
+                    plan=plan,
+                    error=cash_result.reason or "entry_reprice_cash_guard_blocked",
+                    cancelled_without_fill=True,
+                )
+
+        replacement_order_id = str(uuid.uuid4())
+        result = await self.planner.order_manager.place_entry_order(
+            plan.option_symbol,
+            final_limit_price,
+            plan.quantity,
+            order_id=replacement_order_id,
+        )
+        if result.order_id is None:
+            if getattr(self.planner, "cash_guard", None) is not None:
+                await self.planner.cash_guard.release_entry(plan.trade_id)
+            return _EntryRepriceResult(
+                plan=plan,
+                error=result.error or "entry_reprice_order_submit_failed",
+                cancelled_without_fill=True,
+            )
+
+        pricing_evidence = {
+            **pricing.evidence(),
+            "preflight_limit_price": final_limit_price,
+            "preflight_increment": preflight.current_increment,
+            "preflight_buying_power_requirement": preflight.buying_power_requirement,
+            "preflight_estimated_cost": preflight.estimated_cost,
+        }
+        risk_details = {
+            **dict(plan.risk_details),
+            "entry_pricing": pricing_evidence,
+            "entry_reprice_attempt": attempt,
+            "previous_entry_order_id": plan.order_id,
+            "required_cash": required_cash,
+            "buying_power_requirement": preflight.buying_power_requirement,
+            "estimated_cost": preflight.estimated_cost,
+            **cash_guard_details,
+        }
+        repriced_plan = replace(
+            plan,
+            order_id=result.order_id,
+            estimated_entry_price=final_limit_price,
+            risk_details=risk_details,
+        )
+        self.planner.position_tracker.open_position(
+            deployment.symbol,
+            deployment.deployment_id,
+            trade_id=repriced_plan.trade_id,
+            option_symbol=repriced_plan.option_symbol,
+            quantity=repriced_plan.quantity,
+            entry_price=repriced_plan.estimated_entry_price,
+            underlying_entry_price=repriced_plan.underlying_entry_price,
+            entry_timestamp=repriced_plan.entry_timestamp,
+            source="live_pending",
+            order_id=repriced_plan.order_id,
+        )
+        await self._upsert_trade_record(
+            TradeRecord(
+                trade_id=repriced_plan.trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                option_symbol=repriced_plan.option_symbol,
+                quantity=repriced_plan.quantity,
+                entry_price=repriced_plan.estimated_entry_price,
+                underlying_entry_price=repriced_plan.underlying_entry_price,
+                entry_timestamp=repriced_plan.entry_timestamp,
+                status="pending_entry",
+                entry_order_id=repriced_plan.order_id,
+            )
+        )
+        transition = self.lifecycle_store.begin_entry(
+            deployment.symbol,
+            deployment.deployment_id,
+            option_symbol=repriced_plan.option_symbol,
+            order_id=repriced_plan.order_id,
+        )
+        await self._emit_lifecycle_transition(transition, reason="entry_repriced")
+        await self.event_repository.append(
+            "entry_order_repriced",
+            {
+                "deployment_id": repriced_plan.deployment_id,
+                "trade_id": repriced_plan.trade_id,
+                "attempt": attempt,
+                "previous_order_id": plan.order_id,
+                "replacement_order_id": repriced_plan.order_id,
+                "previous_limit_price": plan.estimated_entry_price,
+                "replacement_limit_price": final_limit_price,
+                "pricing_evidence": pricing_evidence,
+            },
+        )
+        return _EntryRepriceResult(plan=repriced_plan)
+
+    async def _cancel_entry_for_reprice_block(
+        self,
+        plan: TradePlan,
+        *,
+        attempt: int,
+        reason: str,
+        pricing_evidence: dict[str, Any] | None = None,
+    ) -> "_EntryRepriceResult":
+        cancel_result = await self._cancel_entry_order_and_check_fill(plan)
+        if cancel_result.filled:
+            filled_price = _filled_entry_price(cancel_result.payload, fallback=plan.estimated_entry_price)
+            filled_plan = replace(
+                plan,
+                estimated_entry_price=filled_price,
+                risk_details={
+                    **dict(plan.risk_details),
+                    "entry_reprice_cancel_race_filled": True,
+                    "broker_average_fill_price": filled_price,
+                },
+            )
+            await self.event_repository.append(
+                "entry_reprice_cancel_race_filled",
+                {
+                    "deployment_id": plan.deployment_id,
+                    "trade_id": plan.trade_id,
+                    "order_id": plan.order_id,
+                    "attempt": attempt,
+                    "reason": reason,
+                    "cancel_ok": cancel_result.cancel_ok,
+                    "cancel_error": cancel_result.cancel_error,
+                    "pricing_evidence": pricing_evidence or {},
+                    "payload": cancel_result.payload or {},
+                },
+            )
+            return _EntryRepriceResult(plan=filled_plan, filled=True, payload=cancel_result.payload)
+        await self.event_repository.append(
+            "entry_reprice_blocked",
+            {
+                "deployment_id": plan.deployment_id,
+                "trade_id": plan.trade_id,
+                "order_id": plan.order_id,
+                "attempt": attempt,
+                "reason": reason,
+                "cancel_ok": cancel_result.cancel_ok,
+                "cancel_error": cancel_result.cancel_error,
+                "status": cancel_result.status,
+                "status_error": cancel_result.status_error,
+                "pricing_evidence": pricing_evidence or {},
+            },
+        )
+        return _EntryRepriceResult(
+            plan=plan,
+            error=reason if cancel_result.cancel_ok else f"entry_reprice_block_cancel_failed:{cancel_result.cancel_error}",
+            cancelled_without_fill=cancel_result.cancel_ok,
+        )
+
+    async def _cancel_entry_order_and_check_fill(self, plan: TradePlan) -> "_EntryCancelResult":
+        cancel_ok, cancel_error = await self.planner.order_manager.cancel_order(plan.order_id)
+        try:
+            status, payload, status_error = await asyncio.wait_for(
+                self.planner.order_manager.get_order_status(plan.order_id),
+                timeout=ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            status, payload, status_error = None, None, "cancel_status_readback_timeout"
+        return _EntryCancelResult(
+            cancel_ok=cancel_ok,
+            cancel_error=cancel_error,
+            status=status,
+            payload=payload,
+            status_error=status_error,
+        )
 
     async def manage_open_position(
         self,
@@ -570,16 +1000,31 @@ class ExecutionSupervisor:
                 )
                 updated = _replace_position(updated, target_order_id=None, target_price=target_price)
 
+        target_approach_offset_pct = deployment.exit.target_approach_offset_pct
         if (
             not self._supports_concurrent_exit_orders()
             and updated.target_price is not None
-            and deployment.exit.target_approach_offset_pct is not None
+            and target_approach_offset_pct is not None
             and updated.target_order_id is None
         ):
             current_quote = await ensure_quote()
             reference_price = current_quote.exit_reference_price
-            activation_price = updated.target_price * (1.0 - deployment.exit.target_approach_offset_pct)
+            activation_price = updated.target_price * (1.0 - target_approach_offset_pct)
             if reference_price is not None and reference_price >= activation_price:
+                await self.event_repository.append(
+                    "target_approach_detected",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": updated.symbol,
+                        "option_symbol": updated.option_symbol,
+                        "reference_price": reference_price,
+                        "activation_price": activation_price,
+                        "target_price": updated.target_price,
+                        "target_approach_offset_pct": target_approach_offset_pct,
+                        "stop_order_id": updated.stop_order_id,
+                        "reason": "single_resting_exit_order_broker",
+                    },
+                )
                 cancel_ok = True
                 cancel_error = None
                 canceled_stop_order_id = updated.stop_order_id
@@ -624,10 +1069,14 @@ class ExecutionSupervisor:
                         },
                     )
                     if target_order_id is not None:
+                        target_activated_at = datetime.now(UTC)
                         updated = _replace_position(
                             updated,
                             stop_order_id=None,
                             target_order_id=target_order_id,
+                            target_activation_price=reference_price,
+                            target_activation_high_price=reference_price,
+                            target_activated_at=target_activated_at,
                         )
                         transition = self.lifecycle_store.mark_target_active(
                             updated.symbol,
@@ -637,19 +1086,39 @@ class ExecutionSupervisor:
                         )
                         await self._emit_lifecycle_transition(transition, reason="virtual_target_activation")
 
+        target_pullback_restore_progress_pct = deployment.exit.target_pullback_restore_progress_pct
         if (
             not self._supports_concurrent_exit_orders()
             and updated.target_order_id is not None
             and updated.target_price is not None
-            and deployment.exit.target_pullback_restore_progress_pct is not None
+            and target_pullback_restore_progress_pct is not None
         ):
             current_quote = await ensure_quote()
             reference_price = current_quote.exit_reference_price
-            restore_threshold = _restore_threshold_price(
-                updated.entry_price,
-                updated.target_price,
-                deployment.exit.target_pullback_restore_progress_pct,
-            )
+            restore_threshold = None
+            if reference_price is not None:
+                target_high_price = _target_handoff_high_price(
+                    updated,
+                    reference_price,
+                    target_approach_offset_pct=deployment.exit.target_approach_offset_pct,
+                )
+                restore_threshold = _target_handoff_restore_threshold_price(
+                    updated.entry_price,
+                    target_high_price,
+                    target_pullback_restore_progress_pct,
+                )
+                if _material_exit_price_change(updated.target_activation_high_price, target_high_price):
+                    updated = _replace_position(
+                        updated,
+                        target_activation_price=updated.target_activation_price
+                        or _target_handoff_activation_floor(
+                            updated,
+                            target_approach_offset_pct=deployment.exit.target_approach_offset_pct,
+                        )
+                        or reference_price,
+                        target_activation_high_price=target_high_price,
+                        target_activated_at=updated.target_activated_at or datetime.now(UTC),
+                    )
             if reference_price is not None and reference_price <= restore_threshold:
                 cancel_ok = True
                 cancel_error = None
@@ -689,6 +1158,12 @@ class ExecutionSupervisor:
                             "option_symbol": updated.option_symbol,
                             "reference_price": reference_price,
                             "restore_threshold": restore_threshold,
+                            "target_pullback_restore_progress_pct": target_pullback_restore_progress_pct,
+                            "target_activation_price": updated.target_activation_price,
+                            "target_activation_high_price": updated.target_activation_high_price,
+                            "target_activated_at": updated.target_activated_at.isoformat()
+                            if updated.target_activated_at is not None
+                            else None,
                             "canceled_target_order_id": canceled_target_order_id,
                             "restored_stop_order_id": stop_order_id,
                             "restored_stop_price": restored_stop_price,
@@ -701,6 +1176,9 @@ class ExecutionSupervisor:
                             stop_order_id=stop_order_id,
                             stop_price=restored_stop_price,
                             target_order_id=None,
+                            target_activation_price=None,
+                            target_activation_high_price=None,
+                            target_activated_at=None,
                         )
                         transition = self.lifecycle_store.mark_open(
                             updated.symbol,
@@ -2346,6 +2824,39 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
     return round_price(candidate)
 
 
+def _entry_reprice_checkpoints(app_config: AppConfig) -> list[int]:
+    cancel_after = max(int(app_config.entry_reprice_cancel_after_seconds), 0)
+    checkpoints = sorted({max(int(value), 0) for value in app_config.entry_reprice_checkpoints_seconds})
+    return [value for value in checkpoints if value < cancel_after]
+
+
+def _entry_reprice_spread_pct(app_config: AppConfig, attempt: int) -> float:
+    values = [float(value) for value in app_config.entry_reprice_spread_pcts if float(value) >= 0]
+    if not values:
+        return 1.0
+    index = max(attempt - 1, 0)
+    return values[index] if index < len(values) else values[-1]
+
+
+def _remaining_seconds(started_at: datetime, target_elapsed_seconds: int) -> int:
+    elapsed = (datetime.now(UTC) - started_at).total_seconds()
+    return max(int(target_elapsed_seconds - elapsed), 0)
+
+
+def _terminal_entry_error(error: str | None) -> bool:
+    return str(error or "").upper() in {"REJECTED", "CANCELED", "EXPIRED"}
+
+
+def _filled_entry_price(payload: dict | None, *, fallback: float) -> float:
+    if not payload:
+        return fallback
+    for key in ("averageFillPrice", "averagePrice", "filledPrice", "price"):
+        parsed = _maybe_float(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return fallback
+
+
 def _maybe_float(value) -> float | None:
     if value is None:
         return None
@@ -2442,9 +2953,39 @@ def _entry_plan_approved(plan: TradePlan) -> bool:
     return plan.risk_reasons == ["approved"]
 
 
-def _restore_threshold_price(entry_price: float, target_price: float, progress_pct: float) -> float:
+def _target_handoff_activation_floor(
+    position: TrackedPosition,
+    *,
+    target_approach_offset_pct: float | None,
+) -> float | None:
+    if position.target_price is None or target_approach_offset_pct is None:
+        return None
+    return position.target_price * (1.0 - target_approach_offset_pct)
+
+
+def _target_handoff_high_price(
+    position: TrackedPosition,
+    reference_price: float,
+    *,
+    target_approach_offset_pct: float | None,
+) -> float:
+    candidates = [
+        reference_price,
+        position.target_activation_price,
+        position.target_activation_high_price,
+        _target_handoff_activation_floor(position, target_approach_offset_pct=target_approach_offset_pct),
+    ]
+    return max(float(value) for value in candidates if value is not None)
+
+
+def _target_handoff_restore_threshold_price(entry_price: float, high_price: float, progress_pct: float) -> float:
     progress = max(0.0, min(1.0, progress_pct))
-    return entry_price + ((target_price - entry_price) * progress)
+    high = max(entry_price, high_price)
+    return entry_price + ((high - entry_price) * progress)
+
+
+def _restore_threshold_price(entry_price: float, target_price: float, progress_pct: float) -> float:
+    return _target_handoff_restore_threshold_price(entry_price, target_price, progress_pct)
 
 
 def _tracked_trade_status(position: TrackedPosition) -> str:

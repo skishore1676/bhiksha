@@ -8,7 +8,7 @@ from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, SignalDecision, TradePlan, TradeRecord
-from bhiksha.execution.order_manager import PublicQuote
+from bhiksha.execution.order_manager import OrderResult, PreflightCheck, PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.lifecycle import TradeLifecycleStore
@@ -147,6 +147,66 @@ class FailingStopOrderManager(RecordingOrderManager):
         return Result()
 
 
+class RepricingOrderManager(StubOrderManager):
+    def __init__(
+        self,
+        *,
+        fill_after_orders: int = 2,
+        quote_bid: float = 2.70,
+        quote_ask: float = 2.90,
+        replacement_fill_price: float = 2.88,
+        cancel_status_after_cancel: str = "CANCELED",
+    ) -> None:
+        self.fill_after_orders = fill_after_orders
+        self.quote_bid = quote_bid
+        self.quote_ask = quote_ask
+        self.replacement_fill_price = replacement_fill_price
+        self.cancel_status_after_cancel = cancel_status_after_cancel
+        self.wait_calls = 0
+        self.entry_calls: list[tuple[str, float]] = []
+        self.cancel_calls: list[str] = []
+
+    async def wait_for_fill(self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2):
+        self.wait_calls += 1
+        if self.wait_calls >= self.fill_after_orders:
+            return True, {"status": "FILLED", "averageFillPrice": str(self.replacement_fill_price)}, None
+        return False, {"status": "NEW"}, "fill_timeout"
+
+    async def get_option_quote(self, option_symbol: str):
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=self.quote_bid,
+            ask=self.quote_ask,
+            last=(self.quote_bid + self.quote_ask) / 2,
+            open_interest=500,
+            outcome="SUCCESS",
+        )
+
+    async def preflight_entry(self, option_symbol: str, limit_price: float, quantity: int):
+        return PreflightCheck(
+            payload={"limitPrice": f"{limit_price:.2f}"},
+            current_increment=0.05,
+            buying_power_requirement=limit_price * quantity * 100,
+            estimated_cost=limit_price * quantity * 100,
+        )
+
+    async def cancel_order(self, order_id: str):
+        self.cancel_calls.append(order_id)
+        return True, None
+
+    async def get_order_status(self, order_id: str):
+        if order_id in self.cancel_calls:
+            payload = {"status": self.cancel_status_after_cancel}
+            if self.cancel_status_after_cancel == "FILLED":
+                payload["averageFillPrice"] = str(self.replacement_fill_price)
+            return self.cancel_status_after_cancel, payload, None
+        return "NEW", {"status": "NEW"}, None
+
+    async def place_entry_order(self, option_symbol: str, limit_price: float, quantity: int, *, order_id: str | None = None):
+        self.entry_calls.append((order_id or "", limit_price))
+        return OrderResult(order_id=order_id or "REPRICE123")
+
+
 class StatusMapOrderManager(RecordingOrderManager):
     def __init__(self, statuses: dict[str, tuple[str | None, dict | None, str | None]]):
         super().__init__()
@@ -227,6 +287,237 @@ def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()
     assert [row[0] for row in rows] == ["entry_fill_check", "protective_stop_submission", "lifecycle_transition"]
+
+
+def test_execution_supervisor_reprices_unfilled_entry_before_protection(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RepricingOrderManager(fill_after_orders=2, replacement_fill_price=2.88)
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(
+            order_fill_poll_seconds=0,
+            order_fill_timeout_seconds=1,
+            entry_reprice_enabled=True,
+            entry_reprice_checkpoints_seconds=[0],
+            entry_reprice_cancel_after_seconds=1,
+            entry_reprice_spread_pcts=[0.50],
+        ),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_REPRICE",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.85,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert protected.order_id != "ENTRY123"
+    assert protected.estimated_entry_price == 2.88
+    assert protected.risk_details["broker_average_fill_price"] == 2.88
+    assert order_manager.cancel_calls == ["ENTRY123"]
+    assert order_manager.entry_calls[0][1] == 2.90
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "entry_order_repriced" in event_types
+    assert "protective_stop_submission" in event_types
+
+
+def test_execution_supervisor_protects_entry_if_cancel_race_fills_old_order(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RepricingOrderManager(
+        fill_after_orders=99,
+        replacement_fill_price=2.87,
+        cancel_status_after_cancel="FILLED",
+    )
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(
+            order_fill_poll_seconds=0,
+            order_fill_timeout_seconds=1,
+            entry_reprice_enabled=True,
+            entry_reprice_checkpoints_seconds=[0],
+            entry_reprice_cancel_after_seconds=1,
+            entry_reprice_spread_pcts=[0.50],
+        ),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_CANCEL_RACE",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.85,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert protected.order_id == "ENTRY123"
+    assert protected.estimated_entry_price == 2.87
+    assert protected.stop_order_id == "STOP123"
+    assert order_manager.cancel_calls == ["ENTRY123"]
+    assert order_manager.entry_calls == []
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "entry_reprice_cancel_race_filled" in event_types
+    assert "protective_stop_submission" in event_types
+
+
+def test_execution_supervisor_reprices_when_cancel_status_receipt_is_delayed(tmp_path) -> None:
+    class SlowCancelReceiptOrderManager(RepricingOrderManager):
+        async def get_order_status(self, order_id: str):
+            await asyncio.sleep(2)
+            return await super().get_order_status(order_id)
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = SlowCancelReceiptOrderManager(fill_after_orders=2, replacement_fill_price=2.88)
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(
+            order_fill_poll_seconds=0,
+            order_fill_timeout_seconds=1,
+            entry_reprice_enabled=True,
+            entry_reprice_checkpoints_seconds=[0],
+            entry_reprice_cancel_after_seconds=1,
+            entry_reprice_spread_pcts=[0.50],
+        ),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_CANCEL_RECEIPT_DELAY",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.85,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert protected.order_id != "ENTRY123"
+    assert protected.stop_order_id == "STOP123"
+    assert order_manager.cancel_calls == ["ENTRY123"]
+    assert len(order_manager.entry_calls) == 1
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        payload = next(
+            json.loads(row[0])
+            for row in conn.execute("SELECT payload FROM events WHERE event_type = 'entry_order_repriced'")
+        )
+    assert payload["replacement_order_id"] == protected.order_id
+
+
+def test_execution_supervisor_cancels_unfilled_entry_after_reprice_ceiling(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RepricingOrderManager(fill_after_orders=99)
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(
+            order_fill_poll_seconds=0,
+            order_fill_timeout_seconds=1,
+            entry_reprice_enabled=True,
+            entry_reprice_checkpoints_seconds=[],
+            entry_reprice_cancel_after_seconds=0,
+        ),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_CANCEL",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        source="live_pending",
+        order_id="ENTRY123",
+    )
+    plan = TradePlan(
+        trade_id="TRADE_CANCEL",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.85,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert order_manager.cancel_calls == ["ENTRY123"]
+    assert supervisor.planner.position_tracker.active_positions() == []
+    assert supervisor.lifecycle_store.get("QQQ", deployment.deployment_id).state.value == "closed"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "entry_reprice_cancel_after_timeout" in event_types
+
+
+def test_execution_supervisor_cancels_when_reprice_quote_is_too_wide(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=2.00, quote_ask=2.90)
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(
+            order_fill_poll_seconds=0,
+            order_fill_timeout_seconds=1,
+            entry_reprice_enabled=True,
+            entry_reprice_checkpoints_seconds=[0],
+            entry_reprice_cancel_after_seconds=1,
+        ),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_WIDE",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        source="live_pending",
+        order_id="ENTRY123",
+    )
+    plan = TradePlan(
+        trade_id="TRADE_WIDE",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.85,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+
+    asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert order_manager.cancel_calls == ["ENTRY123"]
+    assert order_manager.entry_calls == []
+    assert supervisor.planner.position_tracker.active_positions() == []
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
+    blocked_payload = next(json.loads(row[1]) for row in rows if row[0] == "entry_reprice_blocked")
+    assert "public_spread_above_maximum" in blocked_payload["reason"]
 
 
 def test_execution_supervisor_records_live_entry_unprotected_when_initial_stop_fails(tmp_path) -> None:
@@ -1903,6 +2194,13 @@ def test_execution_supervisor_activates_virtual_target_for_public(tmp_path) -> N
     assert managed.target_order_id == "TARGET123"
     assert ("cancel", "STOP123") in order_manager.calls
     assert ("place_target", 3.35) in order_manager.calls
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
+    event_types = [row[0] for row in rows]
+    assert "target_approach_detected" in event_types
+    approach_payload = json.loads(next(row[1] for row in rows if row[0] == "target_approach_detected"))
+    assert approach_payload["target_approach_offset_pct"] == 0.02
+    assert approach_payload["activation_price"] == 3.35 * 0.98
 
 
 def test_execution_supervisor_virtual_target_activation_allows_ambiguous_cancel(tmp_path) -> None:
@@ -1981,6 +2279,8 @@ def test_execution_supervisor_restores_stop_after_virtual_target_pullback(tmp_pa
         stop_price=1.1,
         target_order_id="TARGET123",
         target_price=3.35,
+        target_activation_price=3.25,
+        target_activation_high_price=3.25,
     )
     position = supervisor.planner.position_tracker.active_positions()[0]
 

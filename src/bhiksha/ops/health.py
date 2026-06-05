@@ -68,8 +68,8 @@ async def check_schwab_setup() -> tuple[bool, str]:
         settings.validate_credentials()
         if settings.callback_needs_attention:
             return False, "callback_pending_approval:https://127.0.0.1:8182/callback"
-        url = build_authorize_url(settings)
-        return True, f"authorize_url_ready:{url}"
+        build_authorize_url(settings)
+        return True, "authorize_url_ready"
     except Exception as exc:
         return False, str(exc)
 
