@@ -118,8 +118,24 @@ class PublicApiClient:
                 return {}
             return response.json()
         except httpx.HTTPStatusError:
-            logger.error("Public API {} {} failed with status {}", method, endpoint, response.status_code)
+            logger.error(
+                "Public API {} {} failed with status {} body={}",
+                method,
+                endpoint,
+                response.status_code,
+                self._response_body_excerpt(response),
+            )
             raise
+
+    @staticmethod
+    def _response_body_excerpt(response: httpx.Response, limit: int = 500) -> str:
+        try:
+            body = response.text.strip()
+        except Exception:
+            return "<unreadable>"
+        if not body:
+            return "<empty>"
+        return body[:limit]
 
     async def _log_retry(self, exc: Exception, attempt: int, delay: float) -> None:
         logger.warning(

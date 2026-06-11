@@ -62,23 +62,29 @@ def build_daily_report(
     live_trades = [trade for trade in trades if trade["lane"] == "live"]
     shadow_trades = [trade for trade in trades if trade["lane"] == "shadow"]
     data_quality_warnings = _data_quality_warnings(trades)
+    code_version = None
+    for event in events:
+        if event["event_type"] == "startup_config":
+            code_version = (event["payload"] or {}).get("code_version") or code_version
+    runtime_issue_counts = dict(
+        sorted(
+            Counter(
+                str((event["payload"] or {}).get("category") or "exception")
+                for event in events
+                if event["event_type"] == "runtime_issue"
+            ).items()
+        )
+    )
 
     return {
         "trading_date": day.isoformat(),
         "db_path": str(path),
+        "code_version": code_version,
         "total_events": len(events),
         "event_type_counts": dict(sorted(event_counts.items())),
         "provider_health": {
             "reconciliation": provider_events,
-            "runtime_issue_counts": dict(
-                sorted(
-                    Counter(
-                        str((event["payload"] or {}).get("category") or "exception")
-                        for event in events
-                        if event["event_type"] == "runtime_issue"
-                    ).items()
-                )
-            ),
+            "runtime_issue_counts": runtime_issue_counts,
         },
         "trade_summary": {
             "live_count": len(live_trades),
@@ -90,7 +96,11 @@ def build_daily_report(
         "trades": trades,
         "lifecycle": lifecycle_events,
         "data_quality_warnings": data_quality_warnings,
-        "status": _report_status(provider_events=provider_events, data_quality_warnings=data_quality_warnings),
+        "status": _report_status(
+            provider_events=provider_events,
+            data_quality_warnings=data_quality_warnings,
+            runtime_issue_counts=runtime_issue_counts,
+        ),
     }
 
 
@@ -114,6 +124,10 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
     ]
     if status.get("reason"):
         lines.append(f"- reason: `{status['reason']}`")
+    code_version = report.get("code_version") or {}
+    if code_version.get("git_commit"):
+        dirty_suffix = " (dirty)" if code_version.get("git_dirty") else ""
+        lines.append(f"- code: `{str(code_version['git_commit'])[:12]}{dirty_suffix}`")
 
     trades = report.get("trades") or []
     if trades:
@@ -390,7 +404,14 @@ def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]
     return warnings
 
 
-def _report_status(*, provider_events: dict[str, Any], data_quality_warnings: list[dict[str, Any]]) -> dict[str, str]:
+def _report_status(
+    *,
+    provider_events: dict[str, Any],
+    data_quality_warnings: list[dict[str, Any]],
+    runtime_issue_counts: dict[str, int] | None = None,
+) -> dict[str, str]:
+    if (runtime_issue_counts or {}).get("dead_lane", 0) > 0:
+        return {"level": "RED", "reason": "dead_live_lane"}
     if provider_events.get("blocking_count", 0) > 0:
         return {"level": "RED", "reason": "blocking_reconciliation_failure"}
     if provider_events.get("degraded_count", 0) > 0:

@@ -41,6 +41,8 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
     assert snapshot["warmup"]["legacy_effective_trading_days"] == 5
     assert snapshot["warmup"]["effective_trading_days"] >= 5
     assert snapshot["warmup"]["by_symbol"] == {}
+    assert "code_version" in snapshot
+    assert snapshot["code_version"]["git_commit"]
 
 
 def test_runtime_warmup_expands_for_hourly_market_impulse() -> None:

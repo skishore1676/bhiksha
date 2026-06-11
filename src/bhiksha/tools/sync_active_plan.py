@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
 import os
@@ -28,6 +28,72 @@ class SyncActivePlanResult:
     changed: bool
     log_path: Path
     attempt: int
+    lane_config: dict[str, dict[str, object]] = field(default_factory=dict)
+    lane_config_changes: list[dict[str, object]] = field(default_factory=list)
+
+
+# Per-lane fields that change trade economics; a silent change to any of these
+# must show up in the sync log and stdout.
+_LANE_CONFIG_FIELDS: tuple[tuple[str, str], ...] = (
+    ("exit", "stop_loss_pct"),
+    ("exit", "option_profit_target_pct"),
+    ("exit", "profit_target_multiple"),
+    ("exit", "use_profit_target"),
+    ("exit", "hard_flat_time_et"),
+    ("risk", "max_trade_premium_usd"),
+    ("execution", "shadow_only"),
+)
+
+
+def lane_config_snapshot(plan: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Extract the per-lane economic config from an active-plan payload."""
+    lanes: dict[str, dict[str, object]] = {}
+    for deployment in plan.get("deployments") or []:
+        if not isinstance(deployment, dict):
+            continue
+        deployment_id = str(deployment.get("deployment_id") or "")
+        if not deployment_id:
+            continue
+        lane: dict[str, object] = {"symbol": deployment.get("symbol")}
+        for domain, field in _LANE_CONFIG_FIELDS:
+            payload = deployment.get(domain)
+            lane[field] = payload.get(field) if isinstance(payload, dict) else None
+        lanes[deployment_id] = lane
+    return lanes
+
+
+def diff_lane_configs(
+    previous: dict[str, dict[str, object]],
+    current: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return per-lane changes between two lane-config snapshots."""
+    changes: list[dict[str, object]] = []
+    for deployment_id in sorted(previous.keys() | current.keys()):
+        before = previous.get(deployment_id)
+        after = current.get(deployment_id)
+        if before is None:
+            changes.append({"deployment_id": deployment_id, "change": "added", "config": after})
+            continue
+        if after is None:
+            changes.append({"deployment_id": deployment_id, "change": "removed", "config": before})
+            continue
+        changed_fields = {
+            field: {"before": before.get(field), "after": after.get(field)}
+            for field in after
+            if before.get(field) != after.get(field)
+        }
+        if changed_fields:
+            changes.append({"deployment_id": deployment_id, "change": "modified", "fields": changed_fields})
+    return changes
+
+
+def _read_previous_lane_config(path: Path) -> dict[str, dict[str, object]]:
+    if not path.exists():
+        return {}
+    try:
+        return lane_config_snapshot(json.loads(path.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -117,6 +183,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ACTIVE_PLAN_UPDATED={'1' if result.changed else '0'}")
             print(f"SYNC_LOG={result.log_path}")
             print(f"SYNC_ATTEMPT={attempt}")
+            for deployment_id, lane in sorted(result.lane_config.items()):
+                print(
+                    f"LANE_CONFIG {deployment_id} symbol={lane.get('symbol')}"
+                    f" mode={'shadow' if lane.get('shadow_only') else 'live'}"
+                    f" stop_loss_pct={lane.get('stop_loss_pct')}"
+                    f" profit_target_pct={lane.get('option_profit_target_pct')}"
+                    f" use_profit_target={lane.get('use_profit_target')}"
+                    f" max_trade_premium_usd={lane.get('max_trade_premium_usd')}"
+                )
+            print(f"LANE_CONFIG_CHANGE_COUNT={len(result.lane_config_changes)}")
+            for change in result.lane_config_changes:
+                print("LANE_CONFIG_CHANGED " + json.dumps(change, sort_keys=True))
         except Exception as exc:
             log_path = _append_sync_log(
                 log_dir=log_dir,
@@ -181,7 +259,11 @@ def sync_active_plan_once(
             trading_date=trading_date,
             source_name=source_name,
         )
-    payload = json.dumps(compiled.plan.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+    plan_payload = compiled.plan.model_dump(mode="json")
+    previous_lane_config = _read_previous_lane_config(resolved_output)
+    lane_config = lane_config_snapshot(plan_payload)
+    lane_config_changes = diff_lane_configs(previous_lane_config, lane_config)
+    payload = json.dumps(plan_payload, indent=2, sort_keys=True) + "\n"
     changed = _write_if_changed(resolved_output, payload)
     log_path = _append_sync_log(
         log_dir=resolved_log_dir,
@@ -193,6 +275,8 @@ def sync_active_plan_once(
         summary=compiled.plan.summary,
         suppressed=compiled.plan.suppressed,
         error=None,
+        lane_config=lane_config,
+        lane_config_changes=lane_config_changes,
     )
     return SyncActivePlanResult(
         active_plan_path=resolved_output,
@@ -202,6 +286,8 @@ def sync_active_plan_once(
         changed=changed,
         log_path=log_path,
         attempt=attempt,
+        lane_config=lane_config,
+        lane_config_changes=lane_config_changes,
     )
 
 
@@ -252,6 +338,8 @@ def _append_sync_log(
     summary: dict | None,
     suppressed: list[dict],
     error: str | None,
+    lane_config: dict[str, dict[str, object]] | None = None,
+    lane_config_changes: list[dict[str, object]] | None = None,
 ) -> Path:
     log_path = log_dir / f"active_plan_sync_{started_at.date().isoformat()}.jsonl"
     entry = {
@@ -264,6 +352,8 @@ def _append_sync_log(
         "summary": summary or {},
         "suppressed": suppressed,
         "error": error,
+        "lane_config": lane_config or {},
+        "lane_config_changes": lane_config_changes or [],
     }
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
