@@ -37,3 +37,8 @@ def get_mala_evidence_sheet_name(default: str = "strategy catalog") -> str:
         or os.getenv("STRATEGY_CATALOG_SHEET_NAME")
         or default
     )
+
+
+def get_operator_defaults_sheet_name(default: str = "Operator_Defaults_v1") -> str:
+    """Return the operator-owned defaults worksheet name."""
+    return os.getenv("OPERATOR_DEFAULTS_SHEET_NAME") or default

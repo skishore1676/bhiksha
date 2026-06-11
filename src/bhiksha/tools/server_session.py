@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from bhiksha.config.environment import get_mala_evidence_sheet_name, load_dotenv
+from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
 from bhiksha.tools.sync_active_plan import sync_active_plan_once
 
 
@@ -85,7 +85,7 @@ def _defaults() -> dict[str, str | None]:
         "google_sheet_id": os.getenv("GOOGLE_SHEET_ID"),
         "credentials_path": os.getenv("GOOGLE_API_CREDENTIALS_PATH"),
         "catalog_sheet_name": get_mala_evidence_sheet_name(),
-        "defaults_sheet_name": os.getenv("OPERATOR_DEFAULTS_SHEET_NAME"),
+        "defaults_sheet_name": get_operator_defaults_sheet_name(),
         "strategy_sheet_name": os.getenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategies"),
         "manual_sheet_name": os.getenv("MANUAL_ENTRY_SHEET_NAME") or os.getenv("MANNUAL_ENTRY_SHEET_NAME") or "manual_entry",
         "strategy_catalog_path": os.getenv("BHIKSHA_STRATEGY_CATALOG_PATH", "config/strategy_catalog"),
@@ -107,7 +107,7 @@ def _add_sync_args(parser: argparse.ArgumentParser, defaults: dict[str, str | No
     parser.add_argument("--google-sheet-id", default=defaults["google_sheet_id"], help="Google spreadsheet URL or ID")
     parser.add_argument("--credentials-path", default=defaults["credentials_path"], help="Google service-account credentials JSON path")
     parser.add_argument("--catalog-sheet-name", default=defaults["catalog_sheet_name"], help="Mala evidence sheet name")
-    parser.add_argument("--defaults-sheet-name", default=defaults["defaults_sheet_name"], help="Optional operator defaults sheet name")
+    parser.add_argument("--defaults-sheet-name", default=defaults["defaults_sheet_name"], help="Operator defaults sheet name")
     parser.add_argument("--strategy-sheet-name", default=defaults["strategy_sheet_name"], help="Active strategy sheet name")
     parser.add_argument("--manual-sheet-name", default=defaults["manual_sheet_name"], help="Manual entry sheet name")
     parser.add_argument("--strategy-catalog", default=defaults["strategy_catalog_path"], help="Local Bhiksha strategy catalog path")

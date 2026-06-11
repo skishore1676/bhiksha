@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from bhiksha.config.environment import get_mala_evidence_sheet_name, load_dotenv
+from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
 from bhiksha.execution.brokers.public.settings import PublicBrokerSettings
 
 
@@ -30,3 +30,15 @@ def test_get_mala_evidence_sheet_name_supports_legacy_alias(monkeypatch) -> None
     monkeypatch.setenv("STRATEGY_CATALOG_SHEET_NAME", "Mala_Evidence_v1")
 
     assert get_mala_evidence_sheet_name() == "Mala_Evidence_v1"
+
+
+def test_get_operator_defaults_sheet_name_defaults_to_control_plane_tab(monkeypatch) -> None:
+    monkeypatch.delenv("OPERATOR_DEFAULTS_SHEET_NAME", raising=False)
+
+    assert get_operator_defaults_sheet_name() == "Operator_Defaults_v1"
+
+
+def test_get_operator_defaults_sheet_name_allows_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("OPERATOR_DEFAULTS_SHEET_NAME", "Operator_Defaults_Test")
+
+    assert get_operator_defaults_sheet_name() == "Operator_Defaults_Test"

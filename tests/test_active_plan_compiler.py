@@ -1446,6 +1446,7 @@ def test_compile_active_plan_cli_supports_google_sheets_path(tmp_path: Path, mon
     output_path = tmp_path / "artifacts" / "playbook" / "active_plan.json"
 
     def _fake_compile(**kwargs):
+        assert kwargs["defaults_sheet_name"] == "Operator_Defaults_v1"
         return compile_active_plan_from_google_sheets(
             spreadsheet_id="spreadsheet123",
             credentials_path=tmp_path / "credentials.json",

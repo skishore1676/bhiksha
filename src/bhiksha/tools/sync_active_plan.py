@@ -14,7 +14,7 @@ import time
 from typing import Iterator
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets
-from bhiksha.config.environment import get_mala_evidence_sheet_name, load_dotenv
+from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
 from bhiksha.strategy.capabilities import CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST_PATH
 from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
 
@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     default_google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
     default_credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_PATH")
     default_catalog_sheet_name = get_mala_evidence_sheet_name()
-    default_defaults_sheet_name = os.getenv("OPERATOR_DEFAULTS_SHEET_NAME")
+    default_defaults_sheet_name = get_operator_defaults_sheet_name()
     default_strategy_sheet_name = os.getenv("ACTIVE_STRATEGIES_SHEET_NAME", "active_strategies")
     default_manual_sheet_name = os.getenv("MANUAL_ENTRY_SHEET_NAME") or os.getenv("MANNUAL_ENTRY_SHEET_NAME") or "manual_entry"
     default_strategy_catalog_path = os.getenv("BHIKSHA_STRATEGY_CATALOG_PATH", "config/strategy_catalog")

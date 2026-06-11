@@ -20,6 +20,7 @@ def test_server_session_sync_uses_env_defaults(tmp_path: Path, monkeypatch: pyte
     def _fake_sync(**kwargs):
         assert kwargs["spreadsheet_id"] == "spreadsheet123"
         assert kwargs["catalog_sheet_name"] == "Mala_Evidence_v1"
+        assert kwargs["defaults_sheet_name"] == "Operator_Defaults_v1"
         return _sync_result(active_plan_path, sync_log_dir / "active_plan_sync_2026-04-09.jsonl")
 
     monkeypatch.setattr("bhiksha.tools.server_session.sync_active_plan_once", _fake_sync)

@@ -24,6 +24,7 @@ def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.
     def _fake_compile(**kwargs):
         assert kwargs["spreadsheet_id"] == "spreadsheet123"
         assert kwargs["catalog_sheet_name"] == "Mala_Evidence_v1"
+        assert kwargs["defaults_sheet_name"] == "Operator_Defaults_v1"
         assert kwargs["strategy_sheet_name"] == "active_strategy"
         assert kwargs["manual_sheet_name"] == "manual_entry"
         return _compiled_plan("active_plan_2026-04-09")
