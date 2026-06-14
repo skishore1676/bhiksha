@@ -40,6 +40,19 @@ from bhiksha.execution.profile_exit import (
 UTC = timezone.utc
 
 
+class ProfileExitDispatchError(Exception):
+    """An ARMED profile-exit dispatch (the routed exit/stop action) failed.
+
+    Distinct from a benign shadow-RECORD failure: the dispatch may have already
+    cancelled the protective stop before failing to place the close, so the
+    position can be unprotected. The supervisor surfaces this as a
+    ``protective_stop_failure`` runtime_issue and PROPAGATES it (never swallows it
+    as a shadow error, never returns the stale position as "managed") so an armed
+    dispatch failure behaves like a native exit failure: loud, not silent. Never
+    raised with the operator flag OFF (the gate never opens, so nothing dispatches).
+    """
+
+
 class EventSink(Protocol):
     """Subset of the event repository the recorder needs (async append)."""
 
@@ -55,6 +68,14 @@ class ProfileExitShadowOutcome:
     dispatched: bool
     # The mapped domain ExitDecision when dispatch is allowed; None in shadow.
     exit_decision: Any | None = None
+    # Whether the fail-closed dispatch ALLOWLIST is open for this position this
+    # tick (``profile_exit_dispatch_allowed`` returned True). This is the
+    # AUTHORITY signal, distinct from ``dispatched``: the gate can be open on a
+    # HOLD tick (where ``dispatched`` is False because the profile took no action)
+    # yet the profile route is still the exit authority for the position. The
+    # supervisor uses this to make the native exit path yield while the profile
+    # route owns the position (see the authority handoff in supervisor.py).
+    dispatch_allowed: bool = False
 
 
 async def evaluate_and_record_profile_exit(
@@ -145,6 +166,7 @@ async def evaluate_and_record_profile_exit(
         recorded=True,
         dispatched=dispatched,
         exit_decision=exit_decision,
+        dispatch_allowed=dispatch_allowed,
     )
 
 

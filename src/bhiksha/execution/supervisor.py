@@ -22,8 +22,13 @@ from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradeP
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
 from bhiksha.execution.pricing import select_entry_limit
-from bhiksha.execution.profile_exit import ProfileExitFields, ProfileExitState, ProfileMarketView
-from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit
+from bhiksha.execution.profile_exit import (
+    ProfileExitFields,
+    ProfileExitState,
+    ProfileMarketView,
+    profile_exit_dispatch_allowed,
+)
+from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit, ProfileExitDispatchError
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -141,6 +146,26 @@ class ExecutionSupervisor:
         """Drop a position's persisted ladder state (call on close/flatten)."""
         self._profile_exit_states.pop(self._profile_state_key(position), None)
 
+    def _tracked_position_like(self, position: TrackedPosition) -> TrackedPosition | None:
+        """Return the CURRENT tracked position matching ``position``'s identity.
+
+        After the armed profile route applies a partial scale or a stop move via the
+        locked handlers, the tracker holds the updated (residual / re-stopped)
+        position while the caller's local ``position`` is stale. This re-reads the
+        tracker so the managed-position return reflects the route's effect. Matches
+        on (deployment_id, symbol, option_symbol) — the within-deployment position
+        identity — and returns ``None`` when the tracker no longer lists it (e.g. a
+        full close already removed it).
+        """
+        for tracked in self.planner.position_tracker.active_positions():
+            if (
+                tracked.deployment_id == position.deployment_id
+                and tracked.symbol == position.symbol
+                and tracked.option_symbol == position.option_symbol
+            ):
+                return tracked
+        return None
+
     def _clear_profile_exit_state_for_identity(
         self,
         *,
@@ -224,36 +249,100 @@ class ExecutionSupervisor:
             normalized = str(normalized)
         return normalized
 
+    def _profile_exit_is_authoritative(
+        self, deployment: DeploymentManifest, position: TrackedPosition
+    ) -> bool:
+        """Is the PROFILE-EXIT route the sole exit authority for this position?
+
+        THE DOUBLE-EXIT / AUTHORITY INVARIANT (the #1 risk), evaluated STATELESSLY
+        from the SAME fail-closed dispatch gate the armed profile route uses. Returns
+        True iff the deployment carries an exit profile AND
+        ``profile_exit_dispatch_allowed`` would open for this (deployment, position):
+        the operator flag is ON, the deployment's REAL runtime mode is
+        ``live_approval_gated``, it is not shadow-only, and the position source is an
+        explicit live entry. In that and only that state the profile route owns the
+        position's exit and the native exit path (``handle_exit``) YIELDS.
+
+        Why stateless (not a mutable claim set): the native exit task runs with a
+        STALE pre-manage position snapshot, but the only gate input it reads from the
+        position is ``source``, which is fixed at entry and identical in the stale and
+        post-manage snapshots; ``deployment`` is the same object. So this predicate
+        returns the SAME verdict whether evaluated inside ``manage`` (where the
+        profile route acts) or in the trailing native ``exit`` task (where it yields)
+        — they are guaranteed consistent, with no lifecycle/leak/ordering hazard.
+
+        With the operator flag OFF (its default and the only state shipped) this is
+        ALWAYS False, so the native path is the sole authority and production
+        behavior is unchanged.
+        """
+        if not self._deployment_carries_exit_profile(deployment):
+            return False
+        drives_live = self._profile_exit_drives_live(deployment)
+        return profile_exit_dispatch_allowed(
+            live=drives_live,
+            deployment_shadow_only=not drives_live,
+            position_source=position.source,
+            runtime_mode=self._resolved_runtime_mode(deployment),
+        )
+
     async def _record_profile_exit_shadow(
         self,
         deployment: DeploymentManifest,
         position: TrackedPosition,
         quote: Any,
         *,
+        dry_run: bool = True,
         now: datetime | None = None,
-    ) -> None:
-        """SHADOW-RECORD the profile-exit ladder decision for this tick (PART A).
+    ) -> TrackedPosition | None:
+        """RECORD (always) + DISPATCH-WHEN-GATED the profile-exit decision (PART A).
 
         Runs the operator's exit profile against the live option quote ALREADY
         fetched this tick and RECORDS the decision to the shadow event sink (a
         ``profile_exit_shadow`` event). State persists across ticks via the
         supervisor-owned ``ProfileExitState`` store and is cleared on close.
 
-        NON-NEGOTIABLE INVARIANT (this wave): the existing exit path remains the
-        SOLE authority over the position. With ``profile_exit_drives_live`` OFF
-        (its default, the only state shipped) the recorder is told ``live=False``,
-        so the fail-closed dispatch gate (``profile_exit_dispatch_allowed``) cannot
-        open and ``outcome.dispatched`` is always False — the profile decision is
-        recorded ONLY and NEVER routed into ``handle_exit``/the order path. This
-        method places no orders and mutates no position; it only appends an event
-        and advances the (separate) ladder state object.
+        Returns the position to treat as the managed position after this tick:
+          * the (possibly stop-adjusted) ``position`` when nothing was dispatched
+            or only a stop move was applied;
+          * ``None`` when the armed route fully closed the position this tick.
+
+        DEFAULT (operator flag OFF) — production behavior, unchanged:
+        ``profile_exit_drives_live`` is OFF (its default and the only state
+        shipped) so the recorder is told ``live=False``; the fail-closed dispatch
+        gate (``profile_exit_dispatch_allowed``) cannot open and
+        ``outcome.dispatched`` is always False. The profile decision is RECORDED
+        ONLY and NEVER routed into the exit/order path; this method places no orders
+        and returns ``position`` unchanged. The native exit path remains the SOLE
+        authority (``_profile_exit_is_authoritative`` is always False).
+
+        ARMED route (Phase 2, dormant by default) — only when the gate is OPEN:
+        the mapped domain ``ExitDecision`` (``outcome.exit_decision``) is dispatched
+        through the EXISTING ``_handle_exit_locked`` dispatcher (NOT a new order
+        path), so a profile exit inherits the SAME locking, idempotency, dry_run
+        and order-placement safety as a native exit. dry_run is respected
+        end-to-end (a dry-run square_off books a paper close, places NO real order).
+
+        DOUBLE-EXIT / AUTHORITY INVARIANT (the #1 risk): this method runs at the
+        END of ``_manage_open_position_locked`` — INSIDE ``self._symbol_locks
+        [symbol]`` and, per the serial per-symbol execution dispatcher, BEFORE the
+        same tick's native ``exit`` task runs. When the gate is OPEN for a position
+        the profile route is its SOLE exit authority; the native ``handle_exit``
+        consults the SAME fail-closed gate via ``_profile_exit_is_authoritative`` and
+        YIELDS for that position. The verdict is computed STATELESSLY (it depends only
+        on the deployment and ``position.source``, fixed at entry), so it is identical
+        whether evaluated here or in the trailing native task that carries a stale
+        pre-route snapshot — the two authorities can NEVER act on the same position
+        conflictingly (no double close, no fighting stops), with no claim-set
+        lifecycle to leak or race. The route reaches the dispatcher via
+        ``_handle_exit_locked`` (lock already held), never ``handle_exit``, so it is
+        never blocked by its own guard.
         """
         if not self._deployment_carries_exit_profile(deployment):
-            return
+            return position
         if position.option_symbol is None or position.quantity <= 0 or position.entry_price is None:
-            return
+            return position
         if quote is None:
-            return
+            return position
 
         now = now or datetime.now(UTC)
         fields = ProfileExitFields.from_exit_spec(deployment.exit)
@@ -327,15 +416,37 @@ class ExecutionSupervisor:
             require_bar_time_for_eod=False,
         )
 
-        # HARD GUARD (this wave): a recorded profile decision must NOT reach the
-        # broker/order path. With the flag OFF ``outcome.dispatched`` is always
-        # False and ``outcome.exit_decision`` is None, so this branch is DORMANT.
-        # It is the documented place the operator wires the live route AFTER the
-        # flag flip; in this wave it deliberately makes NO call into the exit/order
-        # path — it only records an audit event so a (future) gate-open is visible.
+        # ARMED DISPATCH ROUTE. ``outcome.dispatched`` is True ONLY when the
+        # fail-closed gate is OPEN for this position AND the profile decision would
+        # act (an exit, or a STOP_TO_BREAKEVEN stop move). With the operator flag OFF
+        # (its default and the only state shipped) the gate cannot open, so this is
+        # ALWAYS False and we return the (unchanged) position — the DORMANT default,
+        # production behavior untouched. When armed, route the ALREADY-mapped domain
+        # ``ExitDecision`` through the EXISTING ``_handle_exit_locked`` dispatcher
+        # (NOT a new order path; we are inside ``self._symbol_locks[symbol]`` here, so
+        # the public lock-acquiring ``handle_exit`` would deadlock on the non-reentrant
+        # lock — hence the locked entry directly, mirroring the existing shadow-stop
+        # path in this same method). Per-fsm_action the dispatcher already routes
+        # correctly:
+        #   * STOP_TO_BREAKEVEN -> action="hold" + replacement_stop_price -> the
+        #     ``_apply_replacement_stop`` branch tightens the stop (NOT an exit order).
+        #   * PARTIAL_SCALE     -> action="square_off" + features[exit_quantity]/
+        #     [partial_scale] -> ``_handle_partial_scale_locked`` closes only that
+        #     quantity and re-arms the residual stop.
+        #   * SQUARE_OFF/HARD_FLAT -> action="square_off" full close.
+        # dry_run is threaded through unchanged, so a dry-run dispatch books a paper
+        # exit and places NO real order. An audit event records the routed dispatch.
+        #
+        # DOUBLE-EXIT SAFETY: the native exit path is held off STATELESSLY by
+        # ``_profile_exit_is_authoritative`` (consulted in ``handle_exit``), which
+        # opens on exactly the same fail-closed gate as this route — so whenever this
+        # route can act, the same tick's native exit task yields. No conflicting
+        # double action is possible. (The profile route reaches the dispatcher via
+        # ``_handle_exit_locked``, never ``handle_exit``, so it is never blocked by
+        # that guard.)
         if outcome.dispatched and outcome.exit_decision is not None:
             await self.event_repository.append(
-                "profile_exit_dispatch_ready",
+                "profile_exit_dispatch_routed",
                 {
                     "deployment_id": deployment.deployment_id,
                     "symbol": position.symbol,
@@ -343,10 +454,62 @@ class ExecutionSupervisor:
                     "trade_id": position.trade_id,
                     "rule": outcome.decision.rule.value,
                     "fsm_action": outcome.decision.fsm_action.value,
-                    "note": "profile_exit_live_routing_not_enabled_this_wave",
+                    "action": outcome.exit_decision.action,
+                    "dry_run": dry_run,
                 },
             )
-            # INTENTIONALLY NOT ROUTED in this wave (no handle_exit / order call).
+            # Route through the EXISTING locked dispatcher (lock already held here).
+            # An ARMED dispatch is a REAL exit action: unlike the benign shadow
+            # RECORD above, a failure here may leave the position unprotected (the
+            # dispatcher can cancel the resting stop before placing the close). So we
+            # must NOT let the broad PART A "never break management" guard swallow it
+            # as a shadow error and return the stale position as managed — that is the
+            # silent-naked footgun. Surface it as a protective_stop_failure
+            # runtime_issue and re-raise (ProfileExitDispatchError) so it propagates
+            # exactly like a native exit failure: loud, never false-managed. Dormant
+            # with the flag OFF (the gate never opens, so this never runs).
+            try:
+                plan = await self._handle_exit_locked(
+                    deployment, position, outcome.exit_decision, dry_run=dry_run
+                )
+            except Exception as exc:
+                await self.event_repository.append(
+                    "runtime_issue",
+                    {
+                        "category": "protective_stop_failure",
+                        "source": "profile_exit_armed_dispatch",
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "trade_id": position.trade_id,
+                        "fsm_action": outcome.decision.fsm_action.value,
+                        "dry_run": dry_run,
+                        "error": str(exc),
+                    },
+                )
+                raise ProfileExitDispatchError(
+                    f"armed profile-exit dispatch failed for {deployment.deployment_id}"
+                    f"/{position.option_symbol}: {exc}"
+                ) from exc
+            # A full square_off/hard_flat returns a terminal ExitPlan (paper close in
+            # dry_run, live submission otherwise) AND closes the tracker/ladder state
+            # -> report the position as closed for this tick. A partial scale also
+            # returns an ExitPlan but leaves the residual runner OPEN (re-armed). A
+            # hold-class STOP_TO_BREAKEVEN returns None (no ExitPlan) but moved the
+            # stop. Decide closed-vs-open from the ACTION (not merely the plan) so a
+            # partial is never mistaken for a full close.
+            if (
+                plan is not None
+                and outcome.exit_decision.action == "square_off"
+                and not _decision_is_partial_scale(outcome.exit_decision)
+            ):
+                return None
+            # Partial or stop-move: the position remains open. Re-read the tracked
+            # position so the managed-position return reflects the residual/stop move
+            # the locked handlers persisted; fall back to the input position.
+            return self._tracked_position_like(position) or position
+
+        return position
 
     async def handle_signal(
         self,
@@ -1573,18 +1736,43 @@ class ExecutionSupervisor:
                     )
                 )
 
-        # PART A: SHADOW-RECORD DUAL-RUN. After the EXISTING exit-management path
-        # has fully run (and remains the sole authority over the position), record
-        # the operator exit profile's decision for this tick against the live quote
-        # already fetched above. This is record-only with the operator flag OFF
-        # (this wave); it never alters ``updated``, places no orders, and never
-        # routes into the exit/order path. Failures here are isolated so the shadow
-        # recorder can never disrupt the real management path.
+        # PART A: SHADOW-RECORD DUAL-RUN + ARMED DISPATCH ROUTE. After the EXISTING
+        # exit-management path has fully run, evaluate the operator exit profile for
+        # this tick against the live quote already fetched above and RECORD it.
+        #
+        # With the operator flag ``profile_exit_drives_live`` OFF (its default and
+        # the only state shipped) the fail-closed dispatch gate stays SHUT, so this
+        # is record-only: it never alters ``updated``, places no orders, and never
+        # routes into the exit/order path. When (and only when) the gate is open
+        # the recorder DISPATCHES the mapped decision through the SAME
+        # ``_handle_exit_locked`` dispatcher native exits use (Phase 2), inheriting
+        # its idempotency / dry_run / order-placement safety. We are ALREADY inside
+        # ``self._symbol_locks[symbol]`` here (acquired in ``manage_open_position``),
+        # so the route uses ``_handle_exit_locked`` directly — calling the
+        # lock-acquiring ``handle_exit`` would deadlock on the non-reentrant lock.
+        # The route may close/modify the position, so propagate its result back as
+        # the managed position. Failures here are isolated so the recorder/route can
+        # never disrupt the real management path.
         if self._deployment_carries_exit_profile(deployment):
             try:
                 shadow_quote = await ensure_quote()
-                await self._record_profile_exit_shadow(deployment, updated, shadow_quote)
-            except Exception as exc:  # never let shadow recording break management
+                routed = await self._record_profile_exit_shadow(
+                    deployment, updated, shadow_quote, dry_run=dry_run
+                )
+                # ``routed`` is None when the profile route fully closed the
+                # position this tick; otherwise it is the (possibly stop-adjusted)
+                # post-route position. Either way it supersedes ``updated``.
+                if routed is None:
+                    return None
+                updated = routed
+            except ProfileExitDispatchError:
+                # An ARMED dispatch failure is a real exit failure, already surfaced
+                # as a protective_stop_failure runtime_issue. PROPAGATE it (do NOT
+                # swallow as a benign shadow error, do NOT return the stale position
+                # as managed) so it behaves like a native exit failure. Unreachable
+                # with the operator flag OFF (the gate never opens).
+                raise
+            except Exception as exc:  # never let shadow RECORDING break management
                 await self.event_repository.append(
                     "profile_exit_shadow_error",
                     {
@@ -1613,6 +1801,34 @@ class ExecutionSupervisor:
         dry_run: bool,
     ) -> ExitPlan | None:
         async with self._symbol_locks[position.symbol]:
+            # DOUBLE-EXIT / AUTHORITY INVARIANT (the #1 risk). ``handle_exit`` is the
+            # NATIVE exit entry (the runtime ``exit`` task / position-monitor
+            # decisions). When the profile-exit dispatch gate is OPEN for this
+            # position the PROFILE route is its sole exit authority and acts on it
+            # within the same tick's ``manage`` (which runs BEFORE this serially-
+            # queued ``exit`` task per the per-symbol dispatcher) — so the native
+            # path must YIELD to avoid a double close or fighting stops. The verdict
+            # is computed STATELESSLY from the same fail-closed gate the profile route
+            # uses; it depends only on the deployment and ``position.source`` (fixed
+            # at entry), so it is identical even though this native task carries a
+            # stale pre-route position snapshot. The armed profile route reaches the
+            # dispatcher via ``_handle_exit_locked`` (below), NOT this method, so it is
+            # never blocked by this guard. With the operator flag OFF (the only state
+            # shipped) the gate is always shut, so this guard never fires and native
+            # exit authority is unchanged.
+            if self._profile_exit_is_authoritative(deployment, position):
+                await self.event_repository.append(
+                    "native_exit_yielded_to_profile",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "trade_id": position.trade_id,
+                        "action": decision.action,
+                        "reason": decision.reason,
+                    },
+                )
+                return None
             return await self._handle_exit_locked(deployment, position, decision, dry_run=dry_run)
 
     async def _handle_exit_locked(

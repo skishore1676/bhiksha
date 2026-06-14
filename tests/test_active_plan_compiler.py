@@ -352,6 +352,320 @@ def test_compile_active_plan_suppresses_manual_row_with_invalid_after_time(tmp_p
     assert "Invalid time value" in compiled.plan.suppressed[0]["reason"]
 
 
+# --- exit-profile config bridge -------------------------------------------------
+#
+# A Sheet/row can carry an assigned exit profile as a single JSON cell holding
+# the kernel ``ManagementPolicySpec`` (model_dump). Column name:
+# ``management_policy_spec`` (alias ``exit_profile_spec``). The compiler maps its
+# v2 fields onto the compiled ``DeploymentManifest.exit`` (ExitSpec) so the live
+# profile-exit evaluator sees the operator's exit DNA. Below proves: (a) every
+# mapped field lands with the right value incl. the giveback enum, (b) bad bounds
+# / bad enum are rejected (row suppressed, not crashed), (c) a row WITHOUT a
+# profile compiles to the default ExitSpec for that path (back-compat).
+
+
+def _exit_profile_spec(**overrides) -> dict[str, object]:
+    """A representative kernel ManagementPolicySpec payload (staged-R scalp)."""
+    payload: dict[str, object] = {
+        "policy_id": "opening_drive_scalp_v1",
+        "stop_family": "premium_pct",
+        "stop_anchor": "option_premium",
+        "exit_family": "staged_r",
+        "target_model": "staged_r",
+        "target_r": 2.0,
+        "target_1_r": 1.0,
+        "target_2_r": 2.0,
+        "target_1_quantity": 0.5,
+        "initial_stop_pct": 0.30,
+        "premium_disaster_stop_pct": 0.50,
+        "no_progress_seconds": 600,
+        "max_hold_seconds": 5400,
+        "high_water_giveback_policy": "MODERATE",
+        "breakeven_after_t1": False,
+        "eod_flat": False,
+        "hard_flat_time_et": "15:50",
+        "option_stop_fallback_pct": 0.40,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_compile_active_plan_carries_exit_profile_spec_onto_manual_exit(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_profile",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "management_policy_spec": json.dumps(_exit_profile_spec()),
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.suppressed == []
+    assert len(compiled.plan.deployments) == 1
+    exit_spec = compiled.plan.deployments[0].exit
+
+    # Every mapped v2 field carried with the right value.
+    assert exit_spec.profile_exit_id == "opening_drive_scalp_v1"
+    assert exit_spec.target_1_r == 1.0
+    assert exit_spec.target_2_r == 2.0
+    assert exit_spec.target_1_quantity == 0.5
+    assert exit_spec.initial_stop_pct == 0.30
+    assert exit_spec.premium_disaster_stop_pct == 0.50
+    assert exit_spec.no_progress_seconds == 600
+    assert exit_spec.max_hold_seconds == 5400
+    # giveback enum carried verbatim (validated by the kernel spec).
+    assert exit_spec.high_water_giveback_policy == "MODERATE"
+    assert exit_spec.breakeven_after_t1 is False
+    assert exit_spec.eod_flat is False
+    # option_stop_fallback_pct -> exit.stop_loss_pct (the resolvable recovery stop)
+    # and hard_flat_time_et carried + normalized.
+    assert exit_spec.stop_loss_pct == 0.40
+    assert exit_spec.hard_flat_time_et == "15:50"
+
+    # HARD BOUNDARY: the bridge never flips live enablement. drives_live stays
+    # default False (record-only / shadow); the legacy shadow flag stays True.
+    assert exit_spec.profile_exit_drives_live is False
+    assert exit_spec.profile_exit_shadow_only is True
+
+
+def test_compile_active_plan_carries_exit_profile_spec_onto_strategy_exit(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_jerk.yaml", strategy_id="spy_jerk_pivot_short_v1", symbol="SPY")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_jerk_profile_lane",
+                "row_type": "strategy",
+                "strategy_id": "spy_jerk_pivot_short_v1",
+                "authorization_mode": "shadow",
+                # alias column name also resolves to exit_profile_spec
+                "exit_profile_spec": json.dumps(
+                    _exit_profile_spec(policy_id="jerk_scalp_v1", high_water_giveback_policy="STRICT")
+                ),
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.suppressed == []
+    exit_spec = compiled.plan.deployments[0].exit
+    assert exit_spec.profile_exit_id == "jerk_scalp_v1"
+    assert exit_spec.high_water_giveback_policy == "STRICT"
+    assert exit_spec.target_1_quantity == 0.5
+    assert exit_spec.initial_stop_pct == 0.30
+    assert exit_spec.profile_exit_drives_live is False
+
+
+def test_exit_profile_spec_does_not_clobber_operator_dedicated_columns(tmp_path: Path) -> None:
+    """The operator's dedicated typed columns win over the published spec.
+
+    Regression: the spec's stop_loss_pct / hard_flat_time_et (which the kernel
+    ManagementPolicySpec always emits, defaulting them non-None) must NOT
+    overwrite the values the operator typed into the dedicated Sheet columns.
+    Non-conflicting spec fields still carry.
+    """
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_profile_plus_columns",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                # spec carries option_stop_fallback_pct=0.40, hard_flat_time_et="15:50"
+                "management_policy_spec": json.dumps(_exit_profile_spec()),
+                # operator's dedicated typed columns differ from the spec values
+                "stop_loss_pct": "0.60",
+                "hard_flat_time_et": "15:40",
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.suppressed == []
+    exit_spec = compiled.plan.deployments[0].exit
+    # The operator's dedicated columns win over the spec (not 0.40 / "15:50").
+    assert exit_spec.stop_loss_pct == 0.60
+    assert exit_spec.hard_flat_time_et == "15:40"
+    # Non-conflicting spec fields still carry.
+    assert exit_spec.profile_exit_id == "opening_drive_scalp_v1"
+    assert exit_spec.target_1_r == 1.0
+    assert exit_spec.initial_stop_pct == 0.30
+    assert exit_spec.profile_exit_drives_live is False
+
+
+def test_compile_active_plan_suppresses_exit_profile_spec_with_out_of_bounds_quantity(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_bad_qty",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                # target_1_quantity must be in [0, 1]; 1.5 is rejected by the
+                # kernel ManagementPolicySpec validator.
+                "management_policy_spec": json.dumps(_exit_profile_spec(target_1_quantity=1.5)),
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert compiled.plan.suppressed[0]["row_id"] == "spy_manual_bad_qty"
+    assert "target_1_quantity" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_suppresses_exit_profile_spec_with_bad_giveback_enum(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_bad_giveback",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "management_policy_spec": json.dumps(
+                    _exit_profile_spec(high_water_giveback_policy="AGGRESSIVE")
+                ),
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert compiled.plan.suppressed[0]["row_id"] == "spy_manual_bad_giveback"
+    assert "high_water_giveback_policy" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_without_exit_profile_keeps_default_exit_spec(tmp_path: Path) -> None:
+    """Back-compat: a row WITHOUT a profile sets NO v2 fields (all defaults).
+
+    The compiled ExitSpec carries the exact pre-bridge v2 defaults, so existing
+    active_plan compilation is unchanged when no profile is present.
+    """
+    from bhiksha.config.models import ExitSpec
+
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_no_profile",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "profit_target_multiple": "2.0",
+                "stop_loss_pct": "0.35",
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.suppressed == []
+    exit_spec = compiled.plan.deployments[0].exit
+
+    # Every v2 profile dial is at its ExitSpec default (i.e. unset by the bridge).
+    defaults = ExitSpec()
+    for field_name in (
+        "profile_exit_id",
+        "profile_exit_drives_live",
+        "profile_exit_shadow_only",
+        "target_1_r",
+        "target_2_r",
+        "target_1_quantity",
+        "initial_stop_pct",
+        "premium_disaster_stop_pct",
+        "no_progress_seconds",
+        "max_hold_seconds",
+        "high_water_giveback_policy",
+        "breakeven_after_t1",
+        "eod_flat",
+        "no_progress_favorable_floor_r",
+    ):
+        assert getattr(exit_spec, field_name) == getattr(defaults, field_name), field_name
+
+
 def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_tabs(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
