@@ -701,7 +701,17 @@ def profile_exit_dispatch_allowed(
     """
     if live is not True:
         return False
-    if runtime_mode not in DISPATCH_ALLOWED_RUNTIME_MODES:
+    # NEW-5: normalize ``runtime_mode`` to its plain string before the allowlist
+    # check. A caller may pass a kernel ``RuntimeMode`` enum (whose repr/str is
+    # e.g. ``RuntimeMode.LIVE_APPROVAL_GATED`` and whose ``.value`` is
+    # ``"live_approval_gated"``). Comparing the enum object directly against the
+    # string allowlist would ALWAYS miss and silently fail closed — which is safe,
+    # but it would also make a correctly-configured live deployment never dispatch.
+    # Prefer ``.value`` (the canonical wire string), else ``str(...)``.
+    normalized_mode = getattr(runtime_mode, "value", runtime_mode)
+    if normalized_mode is not None and not isinstance(normalized_mode, str):
+        normalized_mode = str(normalized_mode)
+    if normalized_mode not in DISPATCH_ALLOWED_RUNTIME_MODES:
         return False
     if deployment_shadow_only:
         return False

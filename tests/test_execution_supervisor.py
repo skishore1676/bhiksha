@@ -2636,3 +2636,285 @@ def test_profile_state_cleared_on_close(tmp_path) -> None:
     # A fresh get after clear starts clean (peak == entry again).
     fresh = supervisor.get_or_create_profile_exit_state(position, entry_premium=1.0)
     assert fresh.peak_premium == 1.0
+
+
+# =========================================================================== #
+# Adversarial re-audit fixes: NEW-1..NEW-6 (residual protection, naked windows,
+# state leak, runtime-mode enum). Each test proves one fix.
+# =========================================================================== #
+
+
+def _profile_partial_decision(deployment_id, *, exit_quantity, entry_premium, risk_per_contract,
+                              cancel_protection_orders=True, symbol="QQQ"):
+    """A profile target-1 partial carrying the evaluator's diagnostics.
+
+    The real evaluator stamps ``entry_premium`` and ``risk_per_contract`` into
+    ``features`` (via ``_diag``); the supervisor derives the residual stop from
+    them when no prior resting stop exists (NEW-1).
+    """
+    return ExitDecision(
+        deployment_id=deployment_id,
+        symbol=symbol,
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_target_1_partial"],
+        cancel_protection_orders=cancel_protection_orders,
+        features={
+            "exit_quantity": exit_quantity,
+            "partial_scale": True,
+            "profile_id": "FLASH_REVERSAL",
+            "entry_premium": entry_premium,
+            "risk_per_contract": risk_per_contract,
+        },
+    )
+
+
+def test_new1_partial_on_stopless_position_leaves_residual_protected(tmp_path) -> None:
+    # NEW-1: a profile partial on a position with NO prior resting stop
+    # (stop_price=None, stop_order_id=None) must still leave the residual
+    # PROTECTED — a residual stop derived from the profile (entry - risk).
+    supervisor, om = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=2.0,
+        source="live_open",
+        # NO stop in place at all:
+        stop_order_id=None,
+        stop_price=None,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    # entry 2.0, risk 0.5 -> derived residual stop = 1.5
+    decision = _profile_partial_decision(
+        deployment.deployment_id, exit_quantity=3, entry_premium=2.0, risk_per_contract=0.5
+    )
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    assert plan is not None and plan.quantity == 3
+    residual = supervisor.planner.position_tracker.active_positions()[0]
+    assert residual.quantity == 1
+    # The residual is NOT naked: a stop was placed and recorded.
+    assert residual.stop_order_id == "STOP_RESIDUAL"
+    assert residual.stop_price == 1.5  # derived entry(2.0) - risk(0.5)
+    assert om.stop_calls == [("QQQ260401P00556000", 1.5, 1)]
+
+
+def test_new2_partial_no_cancel_with_live_stop_avoids_double_stop(tmp_path) -> None:
+    # NEW-2: cancel_protection_orders=False but a live full-size stop exists. The
+    # handler must cancel-then-replace (drop the stale full-size stop) so the
+    # residual ends with EXACTLY ONE stop, never two.
+    supervisor, om = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_FULL",  # live full-size stop
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = _profile_partial_decision(
+        deployment.deployment_id,
+        exit_quantity=3,
+        entry_premium=2.0,
+        risk_per_contract=0.5,
+        cancel_protection_orders=False,  # decision did NOT request a cancel
+    )
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    assert plan is not None and plan.quantity == 3
+    # The stale full-size stop was cancelled before the residual stop was placed.
+    assert "STOP_FULL" in om.cancel_calls
+    # EXACTLY ONE residual stop placed (no double stop on the residual).
+    assert om.stop_calls == [("QQQ260401P00556000", 1.5, 1)]
+    residual = supervisor.planner.position_tracker.active_positions()[0]
+    assert residual.quantity == 1
+    assert residual.stop_order_id == "STOP_RESIDUAL"
+
+
+class _StopPlaceFailingOrderManager(StubOrderManager):
+    """Cancels OK; every place_stop_loss_order FAILS (order_id=None)."""
+
+    def __init__(self) -> None:
+        self.cancel_calls: list[str] = []
+        self.stop_calls: list[tuple[str, float, int]] = []
+
+    async def cancel_order(self, order_id):
+        self.cancel_calls.append(order_id)
+        return True, None  # cancel succeeds
+
+    async def place_stop_loss_order(self, option_symbol, stop_price, quantity, *, order_id=None):
+        self.stop_calls.append((option_symbol, round(stop_price, 2), int(quantity)))
+        return OrderResult(order_id=None, error="stop_rejected")  # place FAILS
+
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        return OrderResult(order_id="CLOSE_OK")
+
+
+def _failing_stop_supervisor(tmp_path):
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    om = _StopPlaceFailingOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    return supervisor, om, repo
+
+
+def _events_of_type(repo, event_type):
+    with sqlite3.connect(repo.db_path) as conn:
+        rows = conn.execute(
+            "SELECT payload FROM events WHERE event_type = ? ORDER BY id", (event_type,)
+        ).fetchall()
+    return [json.loads(r[0]) for r in rows]
+
+
+def test_new3_replacement_stop_cancel_ok_place_fail_marks_for_reprotection(tmp_path) -> None:
+    # NEW-3: STOP_TO_BREAKEVEN where cancel succeeds but the new stop placement
+    # fails (and the retry also fails). The position must NOT be left silently
+    # naked: it is marked for reprotection (stop_order_id=None so the monitor
+    # re-arms next tick) and the unprotected state is recorded.
+    supervisor, om, repo = _failing_stop_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_OLD",
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=False,
+        action="hold",
+        reason=["profile_stop_to_breakeven"],
+        replacement_stop_price=2.0,
+    )
+
+    asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    # Old stop was cancelled; placement attempted twice (initial + one retry).
+    assert "STOP_OLD" in om.cancel_calls
+    assert len(om.stop_calls) == 2  # retry-once on place-fail
+    updated = supervisor.planner.position_tracker.active_positions()[0]
+    # Marked for reprotection: no stale stop id, and (NEW-6) no stale stop price.
+    assert updated.stop_order_id is None
+    assert updated.stop_price is None
+    # The monitor re-arms exactly this condition (no stop, no target).
+    assert updated.target_order_id is None
+    # Unprotected state recorded, not just ridden.
+    issues = _events_of_type(repo, "runtime_issue")
+    assert any(
+        i.get("category") == "protective_stop_failure" and i.get("stage") == "profile_replacement_stop"
+        for i in issues
+    )
+    repl = _events_of_type(repo, "profile_replacement_stop")
+    assert repl and repl[-1]["unprotected"] is True
+    assert repl[-1]["new_stop_price"] is None  # NEW-6: not the failed price
+
+
+def test_new6_replacement_stop_does_not_persist_price_on_failure(tmp_path) -> None:
+    # NEW-6 (focused): a failed replacement stop must leave stop_price=None so a
+    # downstream `stop_price is not None` protected-check is not fooled.
+    supervisor, om, _ = _failing_stop_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_OLD",
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=False,
+        action="hold",
+        reason=["profile_stop_to_breakeven"],
+        replacement_stop_price=2.0,
+    )
+    updated = asyncio.run(supervisor._apply_replacement_stop(deployment, position, decision, dry_run=False))
+    assert updated.stop_order_id is None
+    assert updated.stop_price is None  # NOT 2.0
+
+
+def test_new4_eod_sweep_clears_profile_exit_state(tmp_path) -> None:
+    # NEW-4: the EOD hard-flat sweep (close_due_positions) is terminal -> clear.
+    supervisor, _ = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="shadow",  # dry-run close path
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    supervisor.get_or_create_profile_exit_state(position, entry_premium=2.0)
+    key = supervisor._profile_state_key(position)
+    assert key in supervisor._profile_exit_states
+
+    # now well past hard-flat -> sweep closes the position
+    asyncio.run(
+        supervisor.close_due_positions(
+            {deployment.deployment_id: deployment},
+            now=datetime(2026, 3, 30, 20, 30, tzinfo=UTC),
+            dry_run=True,
+        )
+    )
+    assert supervisor.planner.position_tracker.active_positions() == []
+    assert key not in supervisor._profile_exit_states  # state cleared
+
+
+def test_new4_halt_and_flatten_clears_profile_exit_state(tmp_path) -> None:
+    # NEW-4: halt_and_flatten (dry-run flat) is terminal -> clear.
+    supervisor, _ = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="shadow",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    supervisor.get_or_create_profile_exit_state(position, entry_premium=2.0)
+    key = supervisor._profile_state_key(position)
+    assert key in supervisor._profile_exit_states
+
+    asyncio.run(
+        supervisor.halt_and_flatten_positions(
+            {deployment.deployment_id: deployment}, dry_run=True
+        )
+    )
+    assert supervisor.planner.position_tracker.active_positions() == []
+    assert key not in supervisor._profile_exit_states

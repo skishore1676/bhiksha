@@ -665,6 +665,51 @@ def test_dispatch_gate_open_only_when_all_live_preconditions_hold() -> None:
     )
 
 
+def test_dispatch_gate_normalizes_runtime_mode_enum() -> None:
+    # NEW-5: a kernel-style RuntimeMode ENUM (not the plain string) whose .value is
+    # "live_approval_gated" must be normalized so a correctly-configured live
+    # deployment can dispatch, instead of silently failing closed on enum-vs-str.
+    from enum import Enum
+
+    class RuntimeMode(str, Enum):
+        LIVE_APPROVAL_GATED = "live_approval_gated"
+        LIVE_AUTOMATED = "live_automated"
+        SHADOW = "shadow"
+
+    assert (
+        profile_exit_dispatch_allowed(
+            live=True,
+            deployment_shadow_only=False,
+            position_source="live_open",
+            runtime_mode=RuntimeMode.LIVE_APPROVAL_GATED,
+        )
+        is True
+    )
+    # A non-str Enum carrying the same .value also normalizes (defensive).
+    class PlainRuntimeMode(Enum):
+        LIVE_APPROVAL_GATED = "live_approval_gated"
+
+    assert (
+        profile_exit_dispatch_allowed(
+            live=True,
+            deployment_shadow_only=False,
+            position_source="live_open",
+            runtime_mode=PlainRuntimeMode.LIVE_APPROVAL_GATED,
+        )
+        is True
+    )
+    # The forbidden enum still fails closed after normalization.
+    assert (
+        profile_exit_dispatch_allowed(
+            live=True,
+            deployment_shadow_only=False,
+            position_source="live_open",
+            runtime_mode=RuntimeMode.LIVE_AUTOMATED,
+        )
+        is False
+    )
+
+
 # --- H1: strict fail-closed allowlist (C2 forbids live_automated) ---
 
 
