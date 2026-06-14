@@ -175,6 +175,13 @@ class ActivePlanSheetRow(BaseModel):
     execution_overrides: dict[str, Any] = Field(default_factory=dict)
     risk_overrides: dict[str, Any] = Field(default_factory=dict)
     exit_overrides: dict[str, Any] = Field(default_factory=dict)
+    # Single JSON cell carrying the kernel ``ManagementPolicySpec`` (model_dump)
+    # that mala publishes for an assigned exit profile. Sheet column name:
+    # ``management_policy_spec`` (alias ``exit_profile_spec``). When present the
+    # compiler maps its v2 fields onto the deployment ``ExitSpec`` so the live
+    # profile-exit evaluator sees the operator's named exit DNA. ``None`` (the
+    # default) reproduces pre-bridge behavior exactly: no v2 fields are set.
+    exit_profile_spec: dict[str, Any] | None = None
     source_metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -1271,6 +1278,93 @@ def _apply_exit_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> d
         updated["hard_flat_time_et"] = row.hard_flat_time_et
     if row.stop_to_breakeven_after_r_multiple is not None:
         updated["stop_to_breakeven_after_r_multiple"] = row.stop_to_breakeven_after_r_multiple
+    updated = _apply_exit_profile_spec(updated, row)
+    return updated
+
+
+# Field map: kernel ``ManagementPolicySpec`` attribute -> Bhiksha ``ExitSpec``
+# field. These are the v2 operator exit-profile dials that the live
+# ``bhiksha.execution.profile_exit`` evaluator reads off ``deployment.exit``.
+# Mirrors ``ProfileExitFields.from_management_spec`` (the runtime adapter) so the
+# config bridge and the evaluator agree on the contract. ``policy_id`` lands on
+# ``profile_exit_id`` (which is what arms the profile-exit path), and
+# ``option_stop_fallback_pct`` lands on ``exit.stop_loss_pct`` (the resolvable
+# recovery-stop the DeploymentManifest profile-stop validator requires).
+_EXIT_PROFILE_SPEC_FIELD_MAP: dict[str, str] = {
+    "policy_id": "profile_exit_id",
+    "target_1_r": "target_1_r",
+    "target_2_r": "target_2_r",
+    "target_1_quantity": "target_1_quantity",
+    "initial_stop_pct": "initial_stop_pct",
+    "premium_disaster_stop_pct": "premium_disaster_stop_pct",
+    "no_progress_seconds": "no_progress_seconds",
+    "max_hold_seconds": "max_hold_seconds",
+    "high_water_giveback_policy": "high_water_giveback_policy",
+    "breakeven_after_t1": "breakeven_after_t1",
+    "eod_flat": "eod_flat",
+    "no_progress_favorable_floor_r": "no_progress_favorable_floor_r",
+    "option_stop_fallback_pct": "stop_loss_pct",
+    "hard_flat_time_et": "hard_flat_time_et",
+}
+
+
+def _exit_spec_fields_from_management_policy_spec(spec_payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate a kernel ``ManagementPolicySpec`` cell and map it onto ExitSpec.
+
+    The raw JSON cell is round-tripped through the canonical kernel
+    ``ManagementPolicySpec`` model so the giveback enum and the numeric bounds
+    (e.g. ``target_1_quantity`` in [0, 1], stop pcts in [0, 1]) are enforced by
+    the kernel's own validators before anything reaches the Bhiksha config. The
+    returned dict is shaped for ``ExitSpec`` and merged into the compiled exit
+    payload; ``ExitSpec``'s own validators (disaster>=initial stop ordering) and
+    the ``DeploymentManifest`` profile-recovery-stop check then run on top.
+
+    NB: ``profile_exit_drives_live`` is intentionally NOT mapped here. The bridge
+    only carries the profile into the config in SHADOW (record-only) form; live
+    enablement stays the operator's separate, explicit switch.
+    """
+    from bhiksha.shared_kernel import ensure_kernel_on_path
+
+    ensure_kernel_on_path()
+    from mala_bhiksha_kernel import ManagementPolicySpec  # noqa: PLC0415
+
+    spec = ManagementPolicySpec.model_validate(spec_payload)
+    mapped: dict[str, Any] = {}
+    for spec_field, exit_field in _EXIT_PROFILE_SPEC_FIELD_MAP.items():
+        value = getattr(spec, spec_field, None)
+        if value is None:
+            continue
+        mapped[exit_field] = value
+    return mapped
+
+
+def _apply_exit_profile_spec(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:
+    """Carry an assigned exit-profile (kernel ``ManagementPolicySpec`` cell) onto ExitSpec.
+
+    Back-compat: a row WITHOUT ``exit_profile_spec`` is returned untouched, so
+    its compiled ExitSpec is byte-identical to pre-bridge output. A row WITH a
+    spec gets the mapped v2 fields layered onto the exit payload. An explicit
+    per-row ``exit_overrides`` entry for the same key still wins (it is the
+    operator's deliberate last-mile knob), so a key already supplied via
+    ``exit_overrides`` is left as the override set it.
+    """
+    spec_payload = row.exit_profile_spec
+    if not spec_payload:
+        return section
+    if not isinstance(spec_payload, dict):
+        raise ValueError(
+            "exit_profile_spec must be a JSON object carrying a kernel "
+            f"ManagementPolicySpec, got {type(spec_payload).__name__}"
+        )
+    mapped = _exit_spec_fields_from_management_policy_spec(spec_payload)
+    # An explicit per-row exit_overrides key is the operator's deliberate
+    # last-mile knob and takes precedence over the published profile spec.
+    override_keys = set(row.exit_overrides or {})
+    updated = dict(section)
+    for key, value in mapped.items():
+        if key in override_keys:
+            continue
+        updated[key] = value
     return updated
 
 
@@ -1789,5 +1883,8 @@ _COLUMN_ALIASES = {
     "execution": "execution_overrides",
     "risk": "risk_overrides",
     "exit": "exit_overrides",
+    "management_policy_spec": "exit_profile_spec",
+    "exit_profile": "exit_profile_spec",
+    "exit_profile_spec": "exit_profile_spec",
     "metadata": "source_metadata",
 }
