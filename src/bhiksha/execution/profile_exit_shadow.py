@@ -40,6 +40,19 @@ from bhiksha.execution.profile_exit import (
 UTC = timezone.utc
 
 
+class ProfileExitDispatchError(Exception):
+    """An ARMED profile-exit dispatch (the routed exit/stop action) failed.
+
+    Distinct from a benign shadow-RECORD failure: the dispatch may have already
+    cancelled the protective stop before failing to place the close, so the
+    position can be unprotected. The supervisor surfaces this as a
+    ``protective_stop_failure`` runtime_issue and PROPAGATES it (never swallows it
+    as a shadow error, never returns the stale position as "managed") so an armed
+    dispatch failure behaves like a native exit failure: loud, not silent. Never
+    raised with the operator flag OFF (the gate never opens, so nothing dispatches).
+    """
+
+
 class EventSink(Protocol):
     """Subset of the event repository the recorder needs (async append)."""
 

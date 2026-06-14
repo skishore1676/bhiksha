@@ -1344,7 +1344,25 @@ class BhikshaRuntime:
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None:
                 continue
-            await supervisor.manage_open_position(deployment, position, dry_run=False)
+            # Resilient per-position reprotection sweep: one position's manage
+            # failure (a transient broker error, or an armed profile-exit dispatch
+            # failure surfaced as ProfileExitDispatchError) must NOT abort
+            # reprotecting the remaining naked positions. Log it and continue.
+            try:
+                await supervisor.manage_open_position(deployment, position, dry_run=False)
+            except Exception as exc:
+                await _append_event_best_effort(
+                    supervisor.event_repository,
+                    "runtime_issue",
+                    {
+                        "category": "reconciliation_reprotect_failed",
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "error": str(exc),
+                    },
+                    output=output,
+                )
         await supervisor.event_repository.append(
             "runtime_metric",
             {

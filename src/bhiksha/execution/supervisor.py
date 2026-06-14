@@ -28,7 +28,7 @@ from bhiksha.execution.profile_exit import (
     ProfileMarketView,
     profile_exit_dispatch_allowed,
 )
-from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit
+from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit, ProfileExitDispatchError
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -459,9 +459,38 @@ class ExecutionSupervisor:
                 },
             )
             # Route through the EXISTING locked dispatcher (lock already held here).
-            plan = await self._handle_exit_locked(
-                deployment, position, outcome.exit_decision, dry_run=dry_run
-            )
+            # An ARMED dispatch is a REAL exit action: unlike the benign shadow
+            # RECORD above, a failure here may leave the position unprotected (the
+            # dispatcher can cancel the resting stop before placing the close). So we
+            # must NOT let the broad PART A "never break management" guard swallow it
+            # as a shadow error and return the stale position as managed — that is the
+            # silent-naked footgun. Surface it as a protective_stop_failure
+            # runtime_issue and re-raise (ProfileExitDispatchError) so it propagates
+            # exactly like a native exit failure: loud, never false-managed. Dormant
+            # with the flag OFF (the gate never opens, so this never runs).
+            try:
+                plan = await self._handle_exit_locked(
+                    deployment, position, outcome.exit_decision, dry_run=dry_run
+                )
+            except Exception as exc:
+                await self.event_repository.append(
+                    "runtime_issue",
+                    {
+                        "category": "protective_stop_failure",
+                        "source": "profile_exit_armed_dispatch",
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "trade_id": position.trade_id,
+                        "fsm_action": outcome.decision.fsm_action.value,
+                        "dry_run": dry_run,
+                        "error": str(exc),
+                    },
+                )
+                raise ProfileExitDispatchError(
+                    f"armed profile-exit dispatch failed for {deployment.deployment_id}"
+                    f"/{position.option_symbol}: {exc}"
+                ) from exc
             # A full square_off/hard_flat returns a terminal ExitPlan (paper close in
             # dry_run, live submission otherwise) AND closes the tracker/ladder state
             # -> report the position as closed for this tick. A partial scale also
@@ -1736,7 +1765,14 @@ class ExecutionSupervisor:
                 if routed is None:
                     return None
                 updated = routed
-            except Exception as exc:  # never let shadow recording break management
+            except ProfileExitDispatchError:
+                # An ARMED dispatch failure is a real exit failure, already surfaced
+                # as a protective_stop_failure runtime_issue. PROPAGATE it (do NOT
+                # swallow as a benign shadow error, do NOT return the stale position
+                # as managed) so it behaves like a native exit failure. Unreachable
+                # with the operator flag OFF (the gate never opens).
+                raise
+            except Exception as exc:  # never let shadow RECORDING break management
                 await self.event_repository.append(
                     "profile_exit_shadow_error",
                     {

@@ -23,6 +23,7 @@ from bhiksha.config.models import AppConfig, DeploymentManifest, ExitSpec
 from bhiksha.domain.models import ExitDecision
 from bhiksha.execution.order_manager import OrderResult, PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
+from bhiksha.execution.profile_exit_shadow import ProfileExitDispatchError
 from bhiksha.persistence.sqlite import SQLiteEventRepository
 
 from test_execution_supervisor import (
@@ -435,3 +436,61 @@ def test_native_breakeven_deployment_yields_to_profile_when_authoritative(tmp_pa
     assert seen["replacement_stop"] == 0
     assert _events_of_type(repo, "profile_replacement_stop") == []
     assert len(_events_of_type(repo, "native_exit_yielded_to_profile")) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 4. LIVE (dry_run=False) armed submission path + dispatch-failure handling.
+#    Restores the coverage the dry_run-only tests don't exercise (audit H-1) and
+#    pins the fixed silent-swallow behavior (audit C-1).
+# --------------------------------------------------------------------------- #
+
+
+def test_armed_live_full_close_places_exactly_one_real_order(tmp_path) -> None:
+    """LIVE armed path (dry_run=False): a SQUARE_OFF dispatches a REAL close through
+    the existing handler — exactly one broker close order plus the resting stop
+    cancel. This is the live-submission path the dry_run tests deliberately avoid."""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated", target_1_quantity=1.0)
+    pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0, quantity=2)
+
+    asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+
+    routed = _events_of_type(repo, "profile_exit_dispatch_routed")
+    assert len(routed) == 1 and routed[0]["action"] == "square_off" and routed[0]["dry_run"] is False
+    # Exactly ONE real broker close, and the resting stop was cancelled (live path).
+    closes = [c for c in om.calls if c[0] in {"place_close", "place_square_off"}]
+    assert len(closes) == 1
+    assert ("cancel", "STOP_OLD") in om.calls
+    exit_plans = _events_of_type(repo, "exit_plan")
+    assert len(exit_plans) == 1 and exit_plans[0]["dry_run"] is False and exit_plans[0]["action"] == "square_off"
+
+
+def test_armed_dispatch_failure_surfaces_runtime_issue_and_does_not_false_manage(tmp_path, monkeypatch) -> None:
+    """C-1 regression. When an ARMED dispatch raises, the route must NOT swallow it
+    as a benign shadow error and must NOT return the stale position as 'managed': it
+    surfaces a protective_stop_failure runtime_issue and propagates a
+    ProfileExitDispatchError (loud, like a native exit failure)."""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated", target_1_quantity=1.0)
+    pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0, quantity=2)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("broker close rejected")
+
+    monkeypatch.setattr(sup, "_handle_exit_locked", boom)
+
+    with pytest.raises(ProfileExitDispatchError):
+        asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+
+    # Surfaced as an operator-visible protective_stop_failure runtime_issue...
+    issues = _events_of_type(repo, "runtime_issue")
+    assert any(
+        i.get("category") == "protective_stop_failure" and i.get("source") == "profile_exit_armed_dispatch"
+        for i in issues
+    )
+    # ...and NOT silently swallowed as a benign shadow-record error.
+    assert _events_of_type(repo, "profile_exit_shadow_error") == []
+    # The position was NOT falsely closed/managed: it is still tracked.
+    assert len(sup.planner.position_tracker.active_positions()) == 1
