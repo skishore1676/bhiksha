@@ -47,7 +47,9 @@ from bhiksha.market_data.warmup import (
 )
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup, check_schwab_token_health
 from bhiksha.ops.issues import classify_runtime_issue_category
+from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.ops.daily_report import write_daily_report
+from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import TrackedPosition
@@ -55,6 +57,13 @@ from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
 
 MANUAL_INTRABAR_STRATEGY_KEYS = frozenset({"manual_breakout", "manual_trigger"})
+
+# Persist at most one entry_selector_empty event per lane per window; the
+# operator log line still prints on every occurrence.
+_SELECTOR_EMPTY_EVENT_THROTTLE_SECONDS = 900.0
+# A broker-live lane that fails this many entry attempts without one
+# successful submission is escalated as a dead lane.
+_DEAD_LANE_FAILURE_THRESHOLD = 3
 
 
 async def record_signal_evaluation(event_repository, decision: SignalDecision) -> None:
@@ -102,6 +111,10 @@ class BhikshaRuntime:
     active_plan: dict | None = None
     started: bool = field(default=False, init=False)
     event_bus: InMemoryEventBus = field(default_factory=InMemoryEventBus, init=False)
+    _selector_empty_emitted_at: dict[str, float] = field(default_factory=dict, init=False)
+    _live_entry_failure_counts: dict[str, int] = field(default_factory=dict, init=False)
+    _live_entry_success_ids: set[str] = field(default_factory=set, init=False)
+    _dead_lane_alerted_ids: set[str] = field(default_factory=set, init=False)
 
     @property
     def enabled_deployments(self) -> list[DeploymentManifest]:
@@ -583,6 +596,7 @@ class BhikshaRuntime:
         payload["config_fingerprint"] = hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
+        payload["code_version"] = code_version_snapshot()
         return payload
 
     async def _symbol_worker(
@@ -729,6 +743,7 @@ class BhikshaRuntime:
                     deployment_id=None,
                     reconcile_trigger=reconcile_trigger,
                     action="emergency_flat",
+                    output=output,
                     inner=self._make_emergency_flat_runner(
                         supervisor,
                         deployments_by_id,
@@ -760,6 +775,7 @@ class BhikshaRuntime:
                 deployment_id=None,
                 reconcile_trigger=reconcile_trigger,
                 action="hard_flat",
+                output=output,
                 inner=self._make_hard_flat_runner(
                 supervisor,
                 deployments_by_id,
@@ -809,6 +825,7 @@ class BhikshaRuntime:
                     deployment_id=deployment.deployment_id,
                     reconcile_trigger=reconcile_trigger,
                     action="manage",
+                    output=output,
                     inner=self._make_manage_position_runner(
                     supervisor,
                     deployment,
@@ -851,6 +868,7 @@ class BhikshaRuntime:
                         deployment_id=evaluation.deployment.deployment_id,
                         reconcile_trigger=reconcile_trigger,
                         action="exit",
+                        output=output,
                         inner=self._make_exit_runner(
                         supervisor,
                         evaluation.deployment,
@@ -900,6 +918,7 @@ class BhikshaRuntime:
                         deployment_id=deployment.deployment_id,
                         reconcile_trigger=reconcile_trigger,
                         action="entry",
+                        output=output,
                         inner=self._make_entry_runner(
                         supervisor,
                         deployment,
@@ -949,6 +968,7 @@ class BhikshaRuntime:
         reconcile_trigger: asyncio.Event,
         action: str,
         inner,
+        output: callable = print,
     ):
         queued_at = time.perf_counter()
 
@@ -967,17 +987,26 @@ class BhikshaRuntime:
             try:
                 await inner()
             except Exception as exc:
-                await supervisor.event_repository.append(
-                    "runtime_issue",
-                    {
-                        "category": classify_runtime_issue_category(error=str(exc), event_type=action),
-                        "deployment_id": deployment_id,
-                        "symbol": symbol,
-                        "action": action,
-                        "error": str(exc),
-                        "stage": "execution_runner",
-                    },
-                )
+                payload = {
+                    "category": classify_runtime_issue_category(error=str(exc), event_type=action),
+                    "deployment_id": deployment_id,
+                    "symbol": symbol,
+                    "action": action,
+                    "error": str(exc),
+                    "stage": "execution_runner",
+                }
+                throttled = False
+                if isinstance(exc, SelectorEmptyError):
+                    payload["category"] = "entry_selector_empty"
+                    payload["selector_breakdown"] = exc.breakdown
+                    throttle_key = deployment_id or symbol
+                    last_emitted = self._selector_empty_emitted_at.get(throttle_key)
+                    now = time.monotonic()
+                    throttled = last_emitted is not None and (now - last_emitted) < _SELECTOR_EMPTY_EVENT_THROTTLE_SECONDS
+                    if not throttled:
+                        self._selector_empty_emitted_at[throttle_key] = now
+                if not throttled:
+                    await supervisor.event_repository.append("runtime_issue", payload)
                 output(f"RUNTIME_ISSUE {symbol} action={action} error={exc}")
             finally:
                 reconcile_trigger.set()
@@ -1202,6 +1231,7 @@ class BhikshaRuntime:
                     deployment_id=deployment.deployment_id,
                     reconcile_trigger=reconcile_trigger,
                     action="entry",
+                    output=output,
                     inner=self._make_entry_runner(
                         supervisor,
                         deployment,
@@ -1358,6 +1388,43 @@ class BhikshaRuntime:
             raise last_error
         raise RuntimeError("reconciliation_portfolio_fetch_failed_without_error")
 
+    async def _record_live_entry_failure(
+        self,
+        supervisor: ExecutionSupervisor,
+        deployment: DeploymentManifest,
+        *,
+        live: bool,
+        output: callable,
+    ) -> None:
+        """Escalate once when a broker-live lane keeps failing entries without ever submitting one."""
+        if not live or deployment.execution.shadow_only:
+            return
+        deployment_id = deployment.deployment_id
+        if deployment_id in self._live_entry_success_ids or deployment_id in self._dead_lane_alerted_ids:
+            return
+        failures = self._live_entry_failure_counts.get(deployment_id, 0) + 1
+        self._live_entry_failure_counts[deployment_id] = failures
+        if failures < _DEAD_LANE_FAILURE_THRESHOLD:
+            return
+        self._dead_lane_alerted_ids.add(deployment_id)
+        await supervisor.event_repository.append(
+            "runtime_issue",
+            {
+                "category": "dead_lane",
+                "deployment_id": deployment_id,
+                "symbol": deployment.symbol,
+                "action": "entry",
+                "error": f"live lane failed {failures} entry attempts with no successful submission",
+                "stage": "execution_runner",
+            },
+        )
+        output(
+            "DEAD_LANE "
+            f"deployment={deployment_id} "
+            f"symbol={deployment.symbol} "
+            f"failed_entry_attempts={failures}"
+        )
+
     def _make_entry_runner(
         self,
         supervisor: ExecutionSupervisor,
@@ -1379,11 +1446,12 @@ class BhikshaRuntime:
                     live_entry_block_reason=live_entry_block_reason,
                 )
             except Exception as exc:
-                if "No contracts matched the execution profile" in str(exc):
+                if isinstance(exc, SelectorEmptyError):
                     output(
                         "ENTRY_SELECTOR_EMPTY "
                         f"deployment={deployment.deployment_id} "
                         f"symbol={deployment.symbol} "
+                        f"breakdown={exc.breakdown} "
                         f"error={exc}"
                     )
                 else:
@@ -1393,6 +1461,7 @@ class BhikshaRuntime:
                         f"symbol={deployment.symbol} "
                         f"error={exc}"
                     )
+                await self._record_live_entry_failure(supervisor, deployment, live=live, output=output)
                 if supervisor.manual_status_writer is not None:
                     error = await supervisor.manual_status_writer.mark_entry_error(
                         deployment,
@@ -1416,6 +1485,8 @@ class BhikshaRuntime:
             if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):
                 mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")
                 label = "ENTRY_SUBMITTED" if mode == "live" else "ENTRY_PLANNED"
+                if mode == "live":
+                    self._live_entry_success_ids.add(deployment.deployment_id)
                 cash_summary = _cash_guard_reservation_summary(plan)
                 output(
                     f"{label} "

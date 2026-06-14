@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from bhiksha.config.loader import load_active_plan
-from bhiksha.tools.sync_active_plan import _write_if_changed, main as sync_active_plan_main
+from bhiksha.tools.sync_active_plan import (
+    _write_if_changed,
+    diff_lane_configs,
+    lane_config_snapshot,
+    main as sync_active_plan_main,
+)
 
 
 def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,6 +90,80 @@ def test_sync_active_plan_repeats_without_rewriting_when_unchanged(tmp_path: Pat
     log_files = sorted(log_dir.glob("active_plan_sync_*.jsonl"))
     assert len(log_files) == 1
     assert len(log_files[0].read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_sync_active_plan_records_lane_config_and_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output_path = tmp_path / "active_plan.json"
+    log_dir = tmp_path / "logs"
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "spreadsheet123")
+    monkeypatch.setenv("GOOGLE_API_CREDENTIALS_PATH", str(tmp_path / "credentials.json"))
+    monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_LOG_DIR", str(log_dir))
+
+    previous_plan = {
+        "deployments": [
+            {
+                "deployment_id": "spy_lane",
+                "symbol": "SPY",
+                "execution": {"shadow_only": True},
+                "risk": {"max_trade_premium_usd": 300},
+                "exit": {
+                    "stop_loss_pct": 0.35,
+                    "option_profit_target_pct": 0.35,
+                    "use_profit_target": True,
+                    "hard_flat_time_et": "15:55",
+                },
+            },
+            {
+                "deployment_id": "retired_lane",
+                "symbol": "IWM",
+                "execution": {"shadow_only": False},
+                "risk": {},
+                "exit": {},
+            },
+        ]
+    }
+    output_path.write_text(json.dumps(previous_plan), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "bhiksha.tools.sync_active_plan.compile_active_plan_from_google_sheets",
+        lambda **kwargs: _compiled_plan("active_plan_2026-04-09"),
+    )
+
+    exit_code = sync_active_plan_main(["--out", str(output_path)])
+
+    assert exit_code == 0
+    log_entry = json.loads(sorted(log_dir.glob("active_plan_sync_*.jsonl"))[0].read_text(encoding="utf-8").splitlines()[0])
+    assert log_entry["lane_config"]["spy_lane"]["stop_loss_pct"] == 0.45
+    changes = {change["deployment_id"]: change for change in log_entry["lane_config_changes"]}
+    assert changes["retired_lane"]["change"] == "removed"
+    spy_fields = changes["spy_lane"]["fields"]
+    assert spy_fields["stop_loss_pct"] == {"before": 0.35, "after": 0.45}
+    assert spy_fields["option_profit_target_pct"] == {"before": 0.35, "after": None}
+    assert spy_fields["use_profit_target"] == {"before": True, "after": False}
+
+
+def test_lane_config_diff_reports_added_and_unchanged_lanes() -> None:
+    before = {"a": {"symbol": "SPY", "stop_loss_pct": 0.35}}
+    after = {
+        "a": {"symbol": "SPY", "stop_loss_pct": 0.35},
+        "b": {"symbol": "QQQ", "stop_loss_pct": 0.45},
+    }
+    changes = diff_lane_configs(before, after)
+    assert changes == [{"deployment_id": "b", "change": "added", "config": after["b"]}]
+
+
+def test_lane_config_snapshot_skips_malformed_deployments() -> None:
+    plan = {
+        "deployments": [
+            {"deployment_id": "ok_lane", "symbol": "SPY", "exit": {"stop_loss_pct": 0.4}},
+            {"symbol": "missing_id"},
+            "not_a_dict",
+        ]
+    }
+    snapshot = lane_config_snapshot(plan)
+    assert set(snapshot) == {"ok_lane"}
+    assert snapshot["ok_lane"]["stop_loss_pct"] == 0.4
+    assert snapshot["ok_lane"]["max_trade_premium_usd"] is None
 
 
 def test_sync_active_plan_logs_compile_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

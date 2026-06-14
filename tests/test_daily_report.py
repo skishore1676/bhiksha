@@ -122,3 +122,21 @@ def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
     assert "Data quality: 1 warning(s); first=MU" in body
     assert str(tmp_path / "report.md") in body
     assert len(body.splitlines()) <= 8
+
+
+def test_report_status_escalates_dead_lane_to_red() -> None:
+    from bhiksha.ops.daily_report import _report_status
+
+    status = _report_status(
+        provider_events={"blocking_count": 0, "degraded_count": 0, "warning_count": 0},
+        data_quality_warnings=[],
+        runtime_issue_counts={"dead_lane": 1, "entry_selector_empty": 4},
+    )
+    assert status == {"level": "RED", "reason": "dead_live_lane"}
+
+    ok_status = _report_status(
+        provider_events={"blocking_count": 0, "degraded_count": 0, "warning_count": 0},
+        data_quality_warnings=[],
+        runtime_issue_counts={},
+    )
+    assert ok_status == {"level": "GREEN", "reason": "ok"}
