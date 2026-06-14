@@ -252,6 +252,25 @@ class ExitSpec(BaseModel):
     catastrophe_exit_anchor: str | None = "option_premium"
     catastrophe_exit_params: dict[str, Any] = Field(default_factory=dict)
 
+    # --- v2 operator exit-profile dials (premium-anchored, evaluated by
+    # bhiksha.execution.profile_exit). All optional + back-compatible: the
+    # defaults reproduce pre-v2 behavior (no staged targets, no partial, no
+    # giveback, EOD flat on). Mirrors the kernel ManagementPolicySpec v2 fields.
+    # When ``profile_exit_id`` is set the deployment carries a frozen named
+    # operator exit profile; the evaluator runs it SHADOW-FIRST. ---
+    profile_exit_id: str | None = None
+    profile_exit_shadow_only: bool = True
+    target_1_r: float | None = None
+    target_2_r: float | None = None
+    target_1_quantity: float = 1.0
+    initial_stop_pct: float | None = None
+    premium_disaster_stop_pct: float | None = None
+    no_progress_seconds: int | None = None
+    max_hold_seconds: int | None = None
+    high_water_giveback_policy: str = "OFF"
+    breakeven_after_t1: bool = True
+    eod_flat: bool = True
+
     @model_validator(mode="before")
     @classmethod
     def normalize_input(cls, data: Any) -> Any:
