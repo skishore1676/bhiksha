@@ -365,6 +365,129 @@ def test_zero_entry_premium_holds() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# M1: EOD robustness — must not silently skip when bar_time_et is absent
+# --------------------------------------------------------------------------- #
+
+
+def test_eod_required_but_missing_bar_time_raises() -> None:
+    # eod_flat enabled + require_bar_time_for_eod + no bar clock -> fail loud,
+    # never silently let the position ride past hard-flat.
+    fields = ProfileExitFields(profile_id="E", initial_stop_pct=0.25, eod_flat=True)
+    with pytest.raises(ValueError, match="eod_flat is enabled but no bar_time_et"):
+        evaluate_profile_exit(
+            fields=fields,
+            entry_premium=1.00,
+            quantity=1,
+            market=ProfileMarketView(current_premium=1.05, bar_time_et=None),
+            entry_time=ENTRY_TIME,
+            now=ENTRY_TIME.replace(minute=1),
+            state=ProfileExitState.new(1.00),
+            require_bar_time_for_eod=True,
+        )
+
+
+def test_eod_with_bar_time_supplied_fires_even_when_required() -> None:
+    # When the supervisor supplies the bar clock (its _bar_time_et helper), EOD
+    # fires normally under the strict flag.
+    fields = ProfileExitFields(profile_id="E", initial_stop_pct=0.25, eod_flat=True, hard_flat_time_et="15:55")
+    decision = evaluate_profile_exit(
+        fields=fields,
+        entry_premium=1.00,
+        quantity=2,
+        market=_market(1.10, bar_time=dt_time(15, 56)),
+        entry_time=ENTRY_TIME,
+        now=datetime(2026, 6, 13, 19, 56, tzinfo=UTC),
+        state=ProfileExitState.new(1.00),
+        require_bar_time_for_eod=True,
+    )
+    assert decision.rule is ProfileLadderRule.EOD_FLAT
+
+
+def test_eod_missing_bar_time_does_not_raise_when_not_required() -> None:
+    # Back-compat: pure-unit callers (require flag default False) still skip EOD
+    # gracefully when no bar clock is present.
+    fields = ProfileExitFields(profile_id="E", initial_stop_pct=0.25, eod_flat=True, target_2_r=10.0)
+    decision = evaluate_profile_exit(
+        fields=fields,
+        entry_premium=1.00,
+        quantity=1,
+        market=ProfileMarketView(current_premium=1.05, bar_time_et=None),
+        entry_time=ENTRY_TIME,
+        now=ENTRY_TIME.replace(minute=1),
+        state=ProfileExitState.new(1.00),
+    )
+    assert decision.rule is ProfileLadderRule.HOLD
+
+
+# --------------------------------------------------------------------------- #
+# M2: reject inverted stop config (disaster tighter than initial)
+# --------------------------------------------------------------------------- #
+
+
+def test_inverted_stop_config_rejected_at_construction() -> None:
+    with pytest.raises(ValueError, match="tighter than initial_stop_pct"):
+        ProfileExitFields(
+            profile_id="BAD",
+            initial_stop_pct=0.30,
+            premium_disaster_stop_pct=0.20,  # tighter than initial -> invalid
+        )
+
+
+def test_disaster_equal_or_wider_than_initial_is_accepted() -> None:
+    # Equal is allowed (>=). Wider is the normal operator config.
+    ProfileExitFields(profile_id="OK1", initial_stop_pct=0.25, premium_disaster_stop_pct=0.25)
+    ProfileExitFields(profile_id="OK2", initial_stop_pct=0.25, premium_disaster_stop_pct=0.30)
+
+
+def test_exit_spec_rejects_inverted_stop_config() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must not be tighter than initial_stop_pct"):
+        ExitSpec(initial_stop_pct=0.30, premium_disaster_stop_pct=0.20)
+
+
+# --------------------------------------------------------------------------- #
+# L1: configurable no-progress favorable floor (default 0.25)
+# --------------------------------------------------------------------------- #
+
+
+def test_no_progress_floor_defaults_to_quarter_r() -> None:
+    fields = ProfileExitFields(profile_id="N", initial_stop_pct=0.25, no_progress_seconds=300, target_2_r=10.0)
+    assert fields.no_progress_favorable_floor_r == 0.25
+
+
+def test_no_progress_floor_is_configurable_and_used() -> None:
+    # With a HIGHER floor (0.9R), a peak that previously cleared the 0.25 default
+    # now counts as "no progress" and the time stop fires.
+    fields = ProfileExitFields(
+        profile_id="N",
+        initial_stop_pct=0.25,
+        no_progress_seconds=300,
+        target_2_r=10.0,
+        no_progress_favorable_floor_r=0.9,
+    )
+    state = ProfileExitState.new(1.00)
+    # Prior tick peaks at 1.10 -> peak_r = 0.4 (< 0.9 floor) so no-progress fires.
+    _eval(fields, 1.10, quantity=1, state=state, minutes=1)
+    decision = evaluate_profile_exit(
+        fields=fields,
+        entry_premium=1.00,
+        quantity=1,
+        market=_market(1.05),
+        entry_time=ENTRY_TIME,
+        now=ENTRY_TIME.replace(minute=6),
+        state=state,
+    )
+    assert decision.rule is ProfileLadderRule.NO_PROGRESS
+
+
+def test_exit_spec_no_progress_floor_flows_into_fields() -> None:
+    spec = ExitSpec(profile_exit_id="P", initial_stop_pct=0.25, no_progress_favorable_floor_r=0.5)
+    fields = ProfileExitFields.from_exit_spec(spec)
+    assert fields.no_progress_favorable_floor_r == 0.5
+
+
+# --------------------------------------------------------------------------- #
 # Adapters: kernel ManagementPolicySpec v2 + Bhiksha ExitSpec + back-compat
 # --------------------------------------------------------------------------- #
 
@@ -526,11 +649,113 @@ def test_dispatch_gate_open_only_when_all_live_preconditions_hold() -> None:
         profile_exit_dispatch_allowed(
             live=True,
             deployment_shadow_only=False,
-            position_source="runtime",
+            position_source="live_open",
             runtime_mode="live_approval_gated",
         )
         is True
     )
+    assert (
+        profile_exit_dispatch_allowed(
+            live=True,
+            deployment_shadow_only=False,
+            position_source="live_pending",
+            runtime_mode="live_approval_gated",
+        )
+        is True
+    )
+
+
+# --- H1: strict fail-closed allowlist (C2 forbids live_automated) ---
+
+
+def test_dispatch_gate_forbids_live_automated_runtime_mode() -> None:
+    # C2: live_automated is NOT an allowed dispatch mode (matches every other
+    # bhiksha gate). Only live_approval_gated may dispatch.
+    assert (
+        profile_exit_dispatch_allowed(
+            live=True,
+            deployment_shadow_only=False,
+            position_source="live_open",
+            runtime_mode="live_automated",
+        )
+        is False
+    )
+
+
+def test_dispatch_gate_fails_closed_when_runtime_mode_missing() -> None:
+    # H1: a None/unset runtime mode must NOT open the gate (no "gate elsewhere"
+    # escape hatch).
+    assert (
+        profile_exit_dispatch_allowed(
+            live=True,
+            deployment_shadow_only=False,
+            position_source="live_open",
+            runtime_mode=None,
+        )
+        is False
+    )
+
+
+def test_dispatch_gate_fails_closed_for_unknown_or_typo_runtime_mode() -> None:
+    for mode in ("LIVE_APPROVAL_GATED", "approval_gated", "advisory", "live", ""):
+        assert (
+            profile_exit_dispatch_allowed(
+                live=True,
+                deployment_shadow_only=False,
+                position_source="live_open",
+                runtime_mode=mode,
+            )
+            is False
+        ), mode
+
+
+def test_dispatch_gate_fails_closed_for_none_position_source() -> None:
+    # H1: None / unknown / non-live-entry sources must all fail closed.
+    assert (
+        profile_exit_dispatch_allowed(
+            live=True,
+            deployment_shadow_only=False,
+            position_source=None,
+            runtime_mode="live_approval_gated",
+        )
+        is False
+    )
+
+
+def test_dispatch_gate_fails_closed_for_each_non_live_position_source() -> None:
+    # Broker-recovered/reconcile sources (true entry premium/ladder state not
+    # originated by us), placeholders, typos -> never dispatch.
+    for source in (
+        "runtime",
+        "broker_sync",
+        "broker_recovered",
+        "packet_runtime_controls",
+        "live_OPEN",  # typo / wrong case
+        "unknown",
+        "",
+    ):
+        assert (
+            profile_exit_dispatch_allowed(
+                live=True,
+                deployment_shadow_only=False,
+                position_source=source,
+                runtime_mode="live_approval_gated",
+            )
+            is False
+        ), source
+
+
+def test_dispatch_gate_allows_only_explicit_live_entry_sources() -> None:
+    for source in ("live_open", "live_pending"):
+        assert (
+            profile_exit_dispatch_allowed(
+                live=True,
+                deployment_shadow_only=False,
+                position_source=source,
+                runtime_mode="live_approval_gated",
+            )
+            is True
+        ), source
 
 
 # --------------------------------------------------------------------------- #
@@ -630,7 +855,7 @@ def test_live_gate_open_returns_exit_decision_for_dispatch() -> None:
             state=ProfileExitState.new(1.00),
             live=True,
             deployment_shadow_only=False,
-            position_source="runtime",
+            position_source="live_open",
             runtime_mode="live_approval_gated",
             now=ENTRY_TIME.replace(minute=1),
         )
@@ -660,7 +885,7 @@ def test_shadow_recorder_never_dispatches_a_hold_even_when_live() -> None:
             state=ProfileExitState.new(1.00),
             live=True,
             deployment_shadow_only=False,
-            position_source="runtime",
+            position_source="live_open",  # gate is open; the HOLD is what blocks dispatch
             runtime_mode="live_approval_gated",
             now=ENTRY_TIME.replace(minute=1),
         )

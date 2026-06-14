@@ -2292,3 +2292,347 @@ def test_execution_supervisor_restores_stop_after_virtual_target_pullback(tmp_pa
     assert managed.stop_price == 1.1
     assert ("cancel", "TARGET123") in order_manager.calls
     assert ("place_stop", 1.1) in order_manager.calls
+
+
+# =========================================================================== #
+# Profile-exit hardening: C1 partial-close, H2 breakeven stop, H3 state persist
+# =========================================================================== #
+
+from bhiksha.execution.profile_exit import (  # noqa: E402
+    ProfileExitFields,
+    ProfileExitState,
+    ProfileFsmAction,
+    ProfileLadderRule,
+    ProfileMarketView,
+    evaluate_profile_exit,
+)
+
+
+class _QtyRecordingOrderManager(StubOrderManager):
+    """Order manager that records the QUANTITY passed to close/stop placements."""
+
+    def __init__(self) -> None:
+        self.close_calls: list[tuple[str, int, str]] = []
+        self.stop_calls: list[tuple[str, float, int]] = []
+        self.cancel_calls: list[str] = []
+
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        self.close_calls.append((option_symbol, int(quantity), exit_mode.value))
+        return OrderResult(order_id="CLOSE_PARTIAL")
+
+    async def place_stop_loss_order(self, option_symbol, stop_price, quantity, *, order_id=None):
+        self.stop_calls.append((option_symbol, round(stop_price, 2), int(quantity)))
+        return OrderResult(order_id="STOP_RESIDUAL")
+
+    async def cancel_order(self, order_id):
+        self.cancel_calls.append(order_id)
+        return True, None
+
+    async def get_option_quote(self, option_symbol):
+        return PublicQuote(symbol=option_symbol, bid=2.0, ask=2.05, last=2.02, open_interest=500, outcome="SUCCESS")
+
+
+def _partial_supervisor(tmp_path):
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    om = _QtyRecordingOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    return supervisor, om
+
+
+def _partial_scale_decision(deployment_id, *, exit_quantity, symbol="QQQ"):
+    return ExitDecision(
+        deployment_id=deployment_id,
+        symbol=symbol,
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_target_1_partial"],
+        cancel_protection_orders=True,
+        features={"exit_quantity": exit_quantity, "partial_scale": True, "profile_id": "FLASH_REVERSAL"},
+    )
+
+
+def test_partial_scale_closes_only_banked_qty_and_keeps_residual_live(tmp_path) -> None:
+    # C1: live partial -> close 3 of 4, keep 1 open with a re-armed stop.
+    supervisor, om = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_FULL",
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = _partial_scale_decision(deployment.deployment_id, exit_quantity=3)
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    # Only 3 contracts were closed.
+    assert om.close_calls == [("QQQ260401P00556000", 3, ExitMode.STRATEGY.value)]
+    assert plan is not None and plan.quantity == 3
+    # The residual (1) remains OPEN, not flattened, with a re-armed stop on 1 qty.
+    survivors = supervisor.planner.position_tracker.active_positions()
+    assert len(survivors) == 1
+    residual = survivors[0]
+    assert residual.quantity == 1
+    assert residual.exit_mode is None and residual.exit_order_id is None
+    assert residual.stop_order_id == "STOP_RESIDUAL"
+    assert om.stop_calls == [("QQQ260401P00556000", 1.5, 1)]
+
+
+def test_partial_scale_dry_run_keeps_residual_and_places_no_orders(tmp_path) -> None:
+    supervisor, om = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=2.0,
+        source="shadow",
+        stop_order_id="STOP_FULL",
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = _partial_scale_decision(deployment.deployment_id, exit_quantity=3)
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=True))
+
+    assert plan is not None and plan.dry_run is True and plan.quantity == 3
+    assert om.close_calls == []  # no broker order in dry-run
+    residual = supervisor.planner.position_tracker.active_positions()[0]
+    assert residual.quantity == 1
+    assert residual.exit_mode is None
+
+
+def test_partial_scale_can_never_close_full_position(tmp_path) -> None:
+    # Hard guard: a partial_scale carrying full (or larger) qty must NOT flatten.
+    supervisor, _ = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_FULL",
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    bad = _partial_scale_decision(deployment.deployment_id, exit_quantity=4)  # == full qty
+
+    import pytest
+
+    with pytest.raises(ValueError, match="must never close the full position"):
+        asyncio.run(supervisor.handle_exit(deployment, position, bad, dry_run=False))
+    # Position untouched (still 4, still open).
+    survivor = supervisor.planner.position_tracker.active_positions()[0]
+    assert survivor.quantity == 4 and survivor.exit_mode is None
+
+
+def test_breakeven_stop_to_breakeven_moves_protective_stop(tmp_path) -> None:
+    # H2: a STOP_TO_BREAKEVEN decision (action="hold", replacement_stop_price set)
+    # must cancel/replace the live stop at the new price.
+    supervisor, om = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_OLD",
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=False,
+        action="hold",
+        reason=["profile_stop_to_breakeven"],
+        replacement_stop_price=2.0,  # entry premium
+    )
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    assert plan is None  # hold-class decision returns no ExitPlan
+    assert "STOP_OLD" in om.cancel_calls  # old stop canceled
+    assert om.stop_calls == [("QQQ260401P00556000", 2.0, 1)]  # new stop at breakeven
+    moved = supervisor.planner.position_tracker.active_positions()[0]
+    assert moved.stop_order_id == "STOP_RESIDUAL"
+    assert moved.stop_price == 2.0
+    assert moved.exit_mode is None  # still open, just better protected
+
+
+def test_breakeven_stop_noop_when_already_at_price(tmp_path) -> None:
+    supervisor, om = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_BE",
+        stop_price=2.0,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        exit=False,
+        action="hold",
+        reason=["profile_stop_to_breakeven"],
+        replacement_stop_price=2.0,
+    )
+    asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+    assert om.stop_calls == []  # already at breakeven -> no churn
+    assert om.cancel_calls == []
+
+
+# --- H3: ProfileExitState persists across monitor ticks (supervisor-owned) ---
+
+
+def _flash_fields():
+    return ProfileExitFields(
+        profile_id="FLASH_REVERSAL",
+        target_1_r=1.0,
+        target_2_r=2.0,
+        target_1_quantity=0.75,
+        initial_stop_pct=0.25,
+        premium_disaster_stop_pct=0.30,
+        high_water_giveback_policy="STRICT",
+        breakeven_after_t1=True,
+        eod_flat=False,
+    )
+
+
+def _tick(supervisor, position, fields, premium, *, entry_premium, now):
+    state = supervisor.get_or_create_profile_exit_state(position, entry_premium=entry_premium)
+    return evaluate_profile_exit(
+        fields=fields,
+        entry_premium=entry_premium,
+        quantity=position.quantity,
+        market=ProfileMarketView(current_premium=premium, bar_time_et=None),
+        entry_time=position.entry_timestamp,
+        now=now,
+        state=state,
+    )
+
+
+def test_profile_state_persists_across_ticks_no_rebanked_partial(tmp_path) -> None:
+    # H3: the same persisted state is reused tick-to-tick, so T1 banks ONCE,
+    # breakeven is emitted ONCE, and the giveback high-water mark is not reset.
+    supervisor, _ = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    entry_ts = datetime(2026, 3, 30, 14, 0, tzinfo=UTC)
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=1.0,
+        entry_timestamp=entry_ts,
+        source="live_open",
+        stop_order_id="STOP_FULL",
+        stop_price=0.75,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+
+    # Tick 1: premium >= T1 (1.25) -> partial bank fires once.
+    d1 = _tick(supervisor, position, _flash_fields(), 1.26, entry_premium=1.0, now=entry_ts.replace(minute=1))
+    assert d1.rule is ProfileLadderRule.TARGET_1_PARTIAL
+    assert d1.fsm_action is ProfileFsmAction.PARTIAL_SCALE
+    assert d1.exit_quantity == 3
+
+    # Tick 2: still elevated -> STOP_TO_BREAKEVEN emitted ONCE (not a re-bank).
+    d2 = _tick(supervisor, position, _flash_fields(), 1.24, entry_premium=1.0, now=entry_ts.replace(minute=2))
+    assert d2.fsm_action is ProfileFsmAction.STOP_TO_BREAKEVEN
+
+    # Tick 3: still elevated -> NOT a partial again, NOT another breakeven emit.
+    d3 = _tick(supervisor, position, _flash_fields(), 1.23, entry_premium=1.0, now=entry_ts.replace(minute=3))
+    assert d3.rule is not ProfileLadderRule.TARGET_1_PARTIAL
+    assert d3.fsm_action is not ProfileFsmAction.STOP_TO_BREAKEVEN
+
+    # The persisted state proves the partial was banked exactly once.
+    state = supervisor.get_or_create_profile_exit_state(position, entry_premium=1.0)
+    assert state.target_1_banked is True
+    assert state.banked_quantity == 3
+    assert state.breakeven_emitted is True
+
+
+def test_profile_state_high_water_not_reset_across_ticks(tmp_path) -> None:
+    # Without persistence the giveback high-water mark would reset each tick and
+    # never arm. With persistence, peak_premium carries forward and giveback fires.
+    supervisor, _ = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    entry_ts = datetime(2026, 3, 30, 14, 0, tzinfo=UTC)
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=1.0,
+        entry_timestamp=entry_ts,
+        source="live_open",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    fields = ProfileExitFields(
+        profile_id="G",
+        initial_stop_pct=0.25,
+        target_1_r=None,
+        target_2_r=10.0,
+        high_water_giveback_policy="STRICT",
+        eod_flat=False,
+    )
+    # Tick 1 sets peak to 1.30 (r=1.2). Tick 2 gives back to 1.15 -> fires.
+    _tick(supervisor, position, fields, 1.30, entry_premium=1.0, now=entry_ts.replace(minute=1))
+    state = supervisor.get_or_create_profile_exit_state(position, entry_premium=1.0)
+    assert state.peak_premium == 1.30  # high-water persisted
+    d2 = _tick(supervisor, position, fields, 1.15, entry_premium=1.0, now=entry_ts.replace(minute=2))
+    assert d2.rule is ProfileLadderRule.HIGH_WATER_GIVEBACK
+
+
+def test_profile_state_cleared_on_close(tmp_path) -> None:
+    supervisor, _ = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=1.0,
+        source="live_open",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    state = supervisor.get_or_create_profile_exit_state(position, entry_premium=1.0)
+    state.peak_premium = 1.50
+    key = supervisor._profile_state_key(position)
+    assert key in supervisor._profile_exit_states
+    supervisor.clear_profile_exit_state(position)
+    assert key not in supervisor._profile_exit_states
+    # A fresh get after clear starts clean (peak == entry again).
+    fresh = supervisor.get_or_create_profile_exit_state(position, entry_premium=1.0)
+    assert fresh.peak_premium == 1.0

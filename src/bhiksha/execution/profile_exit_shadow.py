@@ -71,9 +71,10 @@ async def evaluate_and_record_profile_exit(
     state: ProfileExitState,
     live: bool,
     deployment_shadow_only: bool,
-    position_source: str,
+    position_source: str | None,
     runtime_mode: str | None = None,
     now: datetime | None = None,
+    require_bar_time_for_eod: bool = False,
 ) -> ProfileExitShadowOutcome:
     """Evaluate the profile ladder and record it; dispatch only if gated-open.
 
@@ -94,6 +95,7 @@ async def evaluate_and_record_profile_exit(
         entry_time=entry_time,
         now=now,
         state=state,
+        require_bar_time_for_eod=require_bar_time_for_eod,
     )
 
     dispatch_allowed = profile_exit_dispatch_allowed(

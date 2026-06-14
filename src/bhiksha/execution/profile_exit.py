@@ -123,6 +123,29 @@ class ProfileExitFields:
     breakeven_after_t1: bool = True
     eod_flat: bool = True
     hard_flat_time_et: str = "15:55"
+    # L1: the favorable-excursion floor (in R) below which the no-progress time
+    # stop is allowed to fire. Previously a hardcoded 0.25 literal; now a dial.
+    no_progress_favorable_floor_r: float = 0.25
+
+    def __post_init__(self) -> None:
+        # M2: reject an inverted stop config at construction time. The disaster
+        # stop is a CATASTROPHE backstop and must be at least as wide as the
+        # initial stop; if it were tighter it would pre-empt the initial stop and
+        # silently change the ladder's risk semantics. Fail loud, not silent.
+        initial = self.initial_stop_pct
+        disaster = self.premium_disaster_stop_pct
+        if (
+            initial is not None
+            and disaster is not None
+            and initial > 0
+            and disaster > 0
+            and disaster < initial
+        ):
+            raise ValueError(
+                f"profile {self.profile_id!r}: premium_disaster_stop_pct "
+                f"({disaster}) is tighter than initial_stop_pct ({initial}); the "
+                "disaster stop must be wider (>=) than the initial stop"
+            )
 
     @property
     def stop_pct(self) -> float:
@@ -193,6 +216,7 @@ class ProfileExitFields:
             breakeven_after_t1=bool(get("breakeven_after_t1", True)),
             eod_flat=bool(get("eod_flat", True)),
             hard_flat_time_et=str(get("hard_flat_time_et", "15:55") or "15:55"),
+            no_progress_favorable_floor_r=float(get("no_progress_favorable_floor_r", 0.25) or 0.25),
         )
 
     @classmethod
@@ -220,6 +244,7 @@ class ProfileExitFields:
             breakeven_after_t1=bool(get("breakeven_after_t1", True)),
             eod_flat=bool(get("eod_flat", True)),
             hard_flat_time_et=str(get("hard_flat_time_et", "15:55") or "15:55"),
+            no_progress_favorable_floor_r=float(get("no_progress_favorable_floor_r", 0.25) or 0.25),
         )
 
     @classmethod
@@ -264,6 +289,7 @@ class ProfileExitFields:
             breakeven_after_t1=bool(params.get("breakeven_after_t1", True)),
             eod_flat=bool(params.get("eod_flat", True)),
             hard_flat_time_et=str(params.get("hard_flat_time_et", "15:55") or "15:55"),
+            no_progress_favorable_floor_r=num("no_progress_favorable_floor_r") or 0.25,
         )
 
 
@@ -345,11 +371,18 @@ def evaluate_profile_exit(
     entry_time: datetime | None,
     now: datetime | None = None,
     state: ProfileExitState,
+    require_bar_time_for_eod: bool = False,
 ) -> ProfileExitDecision:
     """Run the deterministic priority ladder on the live option premium.
 
     Returns a :class:`ProfileExitDecision`. ``state`` is mutated in place to
     carry the ladder forward (peak premium, T1-banked flag, breakeven flag).
+
+    ``require_bar_time_for_eod`` (M1): when ``eod_flat`` is enabled, EOD needs a
+    bar clock. If ``True`` and ``market.bar_time_et`` is absent, a clear error is
+    raised instead of silently skipping the hard-flat rung. The live supervisor
+    sets this True and always supplies the bar time (sourced from its
+    ``_bar_time_et`` helper); pure-unit callers may leave it False.
     """
 
     profile_id = fields.profile_id
@@ -365,18 +398,30 @@ def evaluate_profile_exit(
 
     elapsed_seconds = _elapsed_seconds(entry_time, now)
 
-    # 0. EOD hard flat — highest precedence when enabled and we have a bar clock.
-    if fields.eod_flat and market.bar_time_et is not None:
-        eod = _parse_time(fields.hard_flat_time_et)
-        if market.bar_time_et >= eod:
-            return _full_exit(
-                profile_id,
-                rule=ProfileLadderRule.EOD_FLAT,
-                fsm_action=ProfileFsmAction.HARD_FLAT,
-                reason=f"profile_eod_flat:{eod.strftime('%H%M')}",
-                quantity=_remaining_quantity(quantity, state),
-                features=_diag(entry_premium, current, risk, state, elapsed_seconds),
-            )
+    # 0. EOD hard flat — highest precedence when enabled. M1: do NOT silently
+    #    skip when the bar clock is missing. If EOD is required but no bar time
+    #    is available, fail loud so the caller wires the clock (the supervisor
+    #    always supplies it via ``_bar_time_et``); never let a position ride past
+    #    the hard-flat just because the bar time happened to be absent.
+    if fields.eod_flat:
+        if market.bar_time_et is None:
+            if require_bar_time_for_eod:
+                raise ValueError(
+                    f"profile {profile_id!r}: eod_flat is enabled but no bar_time_et "
+                    "was supplied; EOD hard-flat cannot be evaluated without a bar "
+                    "clock (source it from the supervisor's _bar_time_et helper)"
+                )
+        else:
+            eod = _parse_time(fields.hard_flat_time_et)
+            if market.bar_time_et >= eod:
+                return _full_exit(
+                    profile_id,
+                    rule=ProfileLadderRule.EOD_FLAT,
+                    fsm_action=ProfileFsmAction.HARD_FLAT,
+                    reason=f"profile_eod_flat:{eod.strftime('%H%M')}",
+                    quantity=_remaining_quantity(quantity, state),
+                    features=_diag(entry_premium, current, risk, state, elapsed_seconds),
+                )
 
     if current is None:
         # No tradeable premium this tick: only the time/EOD rules above can fire.
@@ -516,7 +561,7 @@ def evaluate_profile_exit(
         if (
             fields.no_progress_seconds is not None
             and elapsed_seconds >= fields.no_progress_seconds
-            and peak_r < 0.25
+            and peak_r < fields.no_progress_favorable_floor_r
         ):
             return _full_exit(
                 profile_id,
@@ -612,33 +657,55 @@ def profile_decision_to_exit_decision(
 # --------------------------------------------------------------------------- #
 
 
+# The ONLY runtime mode permitted to dispatch a profile exit. ``live_automated``
+# is deliberately excluded — every other Bhiksha gate forbids it, and the profile
+# exit path matches that contract: the operator-approval-gated mode is the single
+# live runtime mode the evaluator will ever dispatch under.
+DISPATCH_ALLOWED_RUNTIME_MODES: frozenset[str] = frozenset({"live_approval_gated"})
+
+# The ONLY position sources permitted to dispatch. These are the explicit live
+# entry sources the supervisor assigns when IT opened the position this session
+# (see ``_protect_live_entry`` / ``_reprice_live_entry``). Everything else —
+# ``shadow``/``dry_run`` paper sources, broker-reconciled/recovered sources
+# (``broker_sync``/``broker_recovered``) whose true entry premium/ladder state we
+# did not originate, ``runtime``/``packet_runtime_controls`` placeholders,
+# ``None``/unknown/typo — fails closed.
+DISPATCH_ALLOWED_POSITION_SOURCES: frozenset[str] = frozenset({"live_open", "live_pending"})
+
+
 def profile_exit_dispatch_allowed(
     *,
     live: bool,
     deployment_shadow_only: bool,
-    position_source: str,
+    position_source: str | None,
     runtime_mode: str | None = None,
 ) -> bool:
     """Decide whether a profile exit decision may be DISPATCHED to the broker.
 
-    Returns ``True`` only when *every* live precondition holds. The default is
-    record-only (shadow). This is the single chokepoint that keeps the evaluator
-    shadow-first; the live runtime never bypasses it.
+    Strict fail-closed ALLOWLIST: returns ``True`` ONLY when every live
+    precondition is explicitly satisfied. Any ambiguity — ``None``, unknown
+    value, typo, a non-live/recovered source, or a non-approval-gated runtime
+    mode — returns ``False``. This is the single chokepoint that keeps the
+    evaluator shadow-first; the live runtime never bypasses it, and adding a new
+    source/mode does NOT silently open the gate.
 
-    Live requires ALL of:
-      * ``live`` runtime flag set by the operator,
-      * deployment not flagged ``shadow_only``,
-      * the position is not a shadow/dry-run position,
-      * runtime_mode is the kernel ``live_approval_gated`` mode (or unset for
-        callers that gate elsewhere) — never ``shadow``/``advisory``.
+    Live requires ALL of (any failure => ``False``):
+      * ``live`` is exactly ``True`` (operator runtime flag);
+      * ``runtime_mode`` is exactly ``"live_approval_gated"`` (the lone allowed
+        mode — ``live_automated`` is forbidden, as is ``None``/``shadow``/any
+        other value);
+      * the deployment is NOT flagged ``shadow_only``;
+      * ``position_source`` is an explicit live entry source
+        (``live_open``/``live_pending``) — never ``None``/unknown/``shadow``/
+        ``dry_run``/``broker_sync``/``broker_recovered``/``runtime``.
     """
-    if not live:
+    if live is not True:
+        return False
+    if runtime_mode not in DISPATCH_ALLOWED_RUNTIME_MODES:
         return False
     if deployment_shadow_only:
         return False
-    if position_source in {"shadow", "dry_run"}:
-        return False
-    if runtime_mode is not None and runtime_mode not in {"live_approval_gated", "live_automated"}:
+    if position_source not in DISPATCH_ALLOWED_POSITION_SOURCES:
         return False
     return True
 

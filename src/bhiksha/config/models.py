@@ -270,6 +270,9 @@ class ExitSpec(BaseModel):
     high_water_giveback_policy: str = "OFF"
     breakeven_after_t1: bool = True
     eod_flat: bool = True
+    # L1: configurable favorable-excursion floor (in R) for the no-progress time
+    # stop; the profile evaluator defaults to 0.25 when unset.
+    no_progress_favorable_floor_r: float = 0.25
 
     @model_validator(mode="before")
     @classmethod
@@ -283,6 +286,28 @@ class ExitSpec(BaseModel):
         if isinstance(thesis_exit_policy, str):
             normalized["thesis_exit_policy"] = thesis_exit_policy.strip() or None
         return normalized
+
+    @model_validator(mode="after")
+    def validate_profile_stop_ordering(self) -> "ExitSpec":
+        # M2: reject an inverted profile stop config. The premium disaster stop is
+        # a catastrophe backstop and must be at least as wide as the initial stop;
+        # a tighter disaster stop would silently pre-empt the initial stop and
+        # change the ladder's risk semantics. Fail loud at config time.
+        initial = self.initial_stop_pct
+        disaster = self.premium_disaster_stop_pct
+        if (
+            initial is not None
+            and disaster is not None
+            and initial > 0
+            and disaster > 0
+            and disaster < initial
+        ):
+            raise ValueError(
+                "ExitSpec premium_disaster_stop_pct "
+                f"({disaster}) must not be tighter than initial_stop_pct ({initial}); "
+                "the disaster stop is a catastrophe backstop and must be wider (>=)"
+            )
+        return self
 
 
 class SourceSpec(BaseModel):
