@@ -8,7 +8,10 @@ import pytest
 import yaml
 
 from bhiksha.active_plan.compiler import (
+    ActivePlanSheetRow,
+    StrategyCatalogSheetRow,
     compile_active_plan_from_google_sheets,
+    compile_active_plan_from_rows,
     compile_active_plan_from_sheet,
     sync_google_strategy_catalog,
 )
@@ -481,6 +484,59 @@ def test_compile_active_plan_carries_exit_profile_spec_onto_strategy_exit(tmp_pa
     assert exit_spec.target_1_quantity == 0.5
     assert exit_spec.initial_stop_pct == 0.30
     assert exit_spec.profile_exit_drives_live is False
+
+
+def test_compile_active_plan_carries_mala_evidence_exit_profile_spec_onto_strategy_exit(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_jerk.yaml", strategy_id="spy_jerk_pivot_short_v1", symbol="SPY")
+
+    compiled = compile_active_plan_from_rows(
+        rows=[
+            ActivePlanSheetRow.model_validate(
+                {
+                    "row_id": "spy_jerk_profile_lane",
+                    "row_type": "strategy",
+                    "strategy_id": "spy_jerk_pivot_short_v1",
+                    "authorization_mode": "shadow",
+                }
+            )
+        ],
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+        google_strategy_catalog=[
+            StrategyCatalogSheetRow.model_validate(
+                {
+                    "catalog_key": "spy_jerk_pivot_short_v1",
+                    "symbol": "SPY",
+                    "strategy_key": "jerk_pivot_momentum",
+                    "strategy_name": "Jerk-Pivot Momentum (tight)",
+                    "bhiksha_ready": True,
+                    "mala_evidence_ready": True,
+                    "activation_candidate": True,
+                    "option_trade_ready": True,
+                    "management_policy_spec": json.dumps(
+                        _exit_profile_spec(
+                            policy_id="mala_evidence_profile_v1",
+                            high_water_giveback_policy="STRICT",
+                        )
+                    ),
+                }
+            )
+        ],
+    )
+
+    assert compiled.plan.suppressed == []
+    exit_spec = compiled.plan.deployments[0].exit
+    assert exit_spec.profile_exit_id == "mala_evidence_profile_v1"
+    assert exit_spec.high_water_giveback_policy == "STRICT"
+    assert exit_spec.target_1_r == 1.0
+    assert exit_spec.initial_stop_pct == 0.30
+    assert exit_spec.profile_exit_drives_live is False
+    assert (
+        compiled.plan.deployments[0].source.metadata["exit_profile_spec"]["policy_id"]
+        == "mala_evidence_profile_v1"
+    )
 
 
 def test_exit_profile_spec_does_not_clobber_operator_dedicated_columns(tmp_path: Path) -> None:

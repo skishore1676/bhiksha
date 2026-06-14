@@ -108,6 +108,7 @@ class StrategyCatalogSheetRow(BaseModel):
     triage_advisory_notes: str | None = None
     triage_artifact: str | None = None
     warnings: str | None = None
+    exit_profile_spec: dict[str, Any] | None = None
     row_index: int | None = None
 
     @model_validator(mode="before")
@@ -711,17 +712,20 @@ def _compile_strategy_row(
         )
     if google_catalog_entry is not None:
         _validate_google_catalog_alignment(strategy_id, entry, google_catalog_entry)
+    effective_row = row
+    if row.exit_profile_spec is None and google_catalog_entry is not None and google_catalog_entry.exit_profile_spec:
+        effective_row = row.model_copy(update={"exit_profile_spec": google_catalog_entry.exit_profile_spec})
 
     payload = _catalog_entry_payload(entry)
-    payload["deployment_id"] = row.row_id
-    payload["enabled"] = row.enabled
-    payload["execution"] = _apply_execution_overrides(payload["execution"], row)
-    payload["risk"] = _apply_risk_overrides(payload["risk"], row)
-    payload["exit"] = _apply_exit_overrides(payload["exit"], row)
-    payload["strategy"]["params"] = _deep_merge(payload["strategy"]["params"], row.strategy_params_override)
+    payload["deployment_id"] = effective_row.row_id
+    payload["enabled"] = effective_row.enabled
+    payload["execution"] = _apply_execution_overrides(payload["execution"], effective_row)
+    payload["risk"] = _apply_risk_overrides(payload["risk"], effective_row)
+    payload["exit"] = _apply_exit_overrides(payload["exit"], effective_row)
+    payload["strategy"]["params"] = _deep_merge(payload["strategy"]["params"], effective_row.strategy_params_override)
     payload["source"] = _merge_source_metadata(
         payload["source"],
-        row=row,
+        row=effective_row,
         origin="active_sheet_strategy",
         extra_metadata={
             "strategy_id": strategy_id,
@@ -1628,6 +1632,7 @@ def _google_catalog_metadata(entry: StrategyCatalogSheetRow | None) -> dict[str,
         "exit_contract_status": "ok" if _uses_bhiksha_capability_contract(entry) else None,
         "exit_contract_reason": "mala_thesis_exit_loaded" if _uses_bhiksha_capability_contract(entry) else None,
         "warnings": entry.warnings,
+        "exit_profile_spec": entry.exit_profile_spec,
         "playbook_summary": _normalized_playbook_summary_metadata(entry),
         "catalog_row_index": entry.row_index,
     }
