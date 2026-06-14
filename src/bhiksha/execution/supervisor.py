@@ -21,6 +21,7 @@ from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradeP
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
 from bhiksha.execution.pricing import select_entry_limit
+from bhiksha.execution.profile_exit import ProfileExitState
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -87,9 +88,76 @@ class ExecutionSupervisor:
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._disabled_entry_deployments: set[str] = set()
+        # H3: per-position profile-exit ladder state (peak premium, T1-banked,
+        # banked_quantity, breakeven_emitted). Keyed by a stable position id so it
+        # survives across monitor ticks; the supervisor is the lifecycle owner and
+        # clears it on close. Without this the ladder would reset every tick and
+        # re-bank partials / re-arm giveback / re-emit breakeven.
+        self._profile_exit_states: dict[str, ProfileExitState] = {}
 
     async def close(self) -> None:
         await self.planner.close()
+
+    # ------------------------------------------------------------------ #
+    # H3: profile-exit ladder-state lifecycle (per-position, supervisor-owned)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _profile_state_key(position: TrackedPosition) -> str:
+        """Stable per-position key for the profile-exit ladder state.
+
+        Prefers the trade id (the position's true identity across ticks); falls
+        back to the entry order id, then a (deployment, symbol, option) tuple so
+        the key is well-defined even for reconstructed positions.
+        """
+        identity = position.trade_id or position.order_id
+        if identity:
+            return f"trade:{identity}"
+        return f"pos:{position.deployment_id}:{position.symbol}:{position.option_symbol}"
+
+    def get_or_create_profile_exit_state(
+        self,
+        position: TrackedPosition,
+        *,
+        entry_premium: float,
+    ) -> ProfileExitState:
+        """Return the persisted ladder state for a position, creating it once.
+
+        The state is created the first time a position is evaluated (seeded with
+        the entry premium as the initial peak) and then REUSED across every
+        subsequent monitor tick, so banked partials, the giveback high-water mark
+        and the breakeven-emitted flag all persist.
+        """
+        key = self._profile_state_key(position)
+        state = self._profile_exit_states.get(key)
+        if state is None:
+            state = ProfileExitState.new(entry_premium)
+            self._profile_exit_states[key] = state
+        return state
+
+    def clear_profile_exit_state(self, position: TrackedPosition) -> None:
+        """Drop a position's persisted ladder state (call on close/flatten)."""
+        self._profile_exit_states.pop(self._profile_state_key(position), None)
+
+    def _clear_profile_exit_state_for_identity(
+        self,
+        *,
+        trade_id: str | None,
+        order_id: str | None,
+        deployment_id: str,
+        symbol: str,
+        option_symbol: str | None,
+    ) -> None:
+        """Clear ladder state on a terminal close that only has plan-level identity.
+
+        NEW-4: some terminal close paths (e.g. pre-fill entry cancels) operate on a
+        ``TradePlan``, not a ``TrackedPosition``. Clear by the same key derivation so
+        no ladder state can leak past a terminal close on any path.
+        """
+        identity = trade_id or order_id
+        if identity:
+            self._profile_exit_states.pop(f"trade:{identity}", None)
+        self._profile_exit_states.pop(f"pos:{deployment_id}:{symbol}:{option_symbol}", None)
 
     async def handle_signal(
         self,
@@ -332,6 +400,13 @@ class ExecutionSupervisor:
                     option_symbol=plan.option_symbol,
                     order_id=plan.order_id,
                 )
+                self._clear_profile_exit_state_for_identity(
+                    trade_id=plan.trade_id,
+                    order_id=plan.order_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    option_symbol=plan.option_symbol,
+                )
                 await self.trade_state_repository.mark_closed(plan.trade_id)
                 transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
                 await self._emit_lifecycle_transition(transition, reason="entry_reprice_no_fill_cancelled")
@@ -344,6 +419,13 @@ class ExecutionSupervisor:
                     deployment.deployment_id,
                     option_symbol=plan.option_symbol,
                     order_id=plan.order_id,
+                )
+                self._clear_profile_exit_state_for_identity(
+                    trade_id=plan.trade_id,
+                    order_id=plan.order_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    option_symbol=plan.option_symbol,
                 )
                 await self.trade_state_repository.mark_closed(plan.trade_id)
                 transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
@@ -1345,6 +1427,19 @@ class ExecutionSupervisor:
         if self.event_bus is not None:
             await self.event_bus.publish(ExitEvaluatedEvent(decision=decision))
         if not decision.exit or decision.action == "hold" or position.option_symbol is None or position.quantity <= 0:
+            # H2: a hold-class decision may still carry a stop move
+            # (STOP_TO_BREAKEVEN from the profile evaluator surfaces
+            # replacement_stop_price with action="hold"/exit=False). Consume it so
+            # the protective stop actually ratchets — independent of the unrelated
+            # stop_to_breakeven_after_r_multiple config dial.
+            if (
+                decision.replacement_stop_price is not None
+                and position.option_symbol is not None
+                and position.quantity > 0
+                and position.exit_mode is None
+                and position.exit_order_id is None
+            ):
+                await self._apply_replacement_stop(deployment, position, decision, dry_run=dry_run)
             return None
         if decision.action != "square_off":
             return ExitPlan(
@@ -1375,6 +1470,12 @@ class ExecutionSupervisor:
             )
             return None
 
+        # C1: a partial-scale decision closes only part of the position and keeps
+        # the residual runner open (stop/state intact). Routed to a dedicated
+        # handler so the full-flatten paths below can never run for a partial.
+        if _decision_is_partial_scale(decision):
+            return await self._handle_partial_scale_locked(deployment, position, decision, dry_run=dry_run)
+
         updated_position = position
         canceled_stop_order_id = None
         canceled_target_order_id = None
@@ -1399,6 +1500,7 @@ class ExecutionSupervisor:
                 updated_position.deployment_id,
                 option_symbol=updated_position.option_symbol,
             )
+            self.clear_profile_exit_state(updated_position)
             if updated_position.trade_id is not None:
                 await self.trade_state_repository.mark_closed(updated_position.trade_id, **fill_details)
             transition = self.lifecycle_store.mark_closed(updated_position.symbol, updated_position.deployment_id)
@@ -1455,6 +1557,419 @@ class ExecutionSupervisor:
             else None,
         )
         return plan
+
+    async def _handle_partial_scale_locked(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        decision: ExitDecision,
+        *,
+        dry_run: bool,
+    ) -> ExitPlan | None:
+        """Close a fraction of the position and keep the residual runner open (C1).
+
+        The protective stop/target covers the *whole* position, so a partial bank
+        cancels protection, sells ``close_qty`` contracts, and re-arms the stop on
+        the residual at its prior stop price (the runner stays protected; the
+        breakeven ratchet — if any — arrives as a separate STOP_TO_BREAKEVEN
+        decision on a later tick, handled by ``_apply_replacement_stop``).
+
+        Hard invariant: ``close_qty < position.quantity`` always — a PARTIAL_SCALE
+        can never flatten the position (enforced by ``_resolve_exit_quantity``).
+        """
+        close_qty = _resolve_exit_quantity(decision, position)  # raises if it would flatten
+        residual_qty = position.quantity - close_qty
+        # Defensive: the resolver guarantees this, but never proceed if the math
+        # would not leave a residual.
+        if residual_qty <= 0:
+            raise ValueError(
+                f"partial scale would leave residual {residual_qty}; refusing to flatten on a partial"
+            )
+
+        updated_position = position
+        canceled_stop_order_id = None
+        canceled_target_order_id = None
+        cancel_error = None
+        if decision.cancel_protection_orders:
+            (
+                updated_position,
+                canceled_stop_order_id,
+                canceled_target_order_id,
+                cancel_error,
+            ) = await self._cancel_exit_protection(
+                deployment,
+                updated_position,
+                dry_run=dry_run,
+                reason="strategy_partial_scale",
+            )
+
+        # Size the close to the banked quantity only.
+        partial_to_close = _replace_position(updated_position, quantity=close_qty)
+        order_id: str | None
+        error = cancel_error
+        if dry_run:
+            fill_details = await self._paper_exit_fill_details(partial_to_close, order_id="DRY_RUN_PARTIAL_SCALE")
+            order_id = "DRY_RUN_PARTIAL_SCALE"
+            if updated_position.source == "shadow":
+                await self._emit_shadow_exit_assumed(deployment, partial_to_close, fill_details, reason=decision.reason)
+        else:
+            result = await self.planner.order_manager.place_close_order(
+                updated_position.option_symbol,
+                close_qty,
+                exit_mode=ExitMode.STRATEGY,
+            )
+            order_id = result.order_id
+            error = result.error or error
+            if order_id is None:
+                await self.event_repository.append(
+                    "exit_submission_failure",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": updated_position.symbol,
+                        "option_symbol": updated_position.option_symbol,
+                        "quantity": close_qty,
+                        "exit_mode": ExitMode.STRATEGY.value,
+                        "order_type": "partial_scale",
+                        "error": error,
+                    },
+                )
+
+        # The residual runner stays OPEN and MUST stay protected. A profile partial
+        # cancels protection unconditionally (cancel_protection_orders=True), but
+        # even when it does not we must never end with the residual naked OR with
+        # two stops on it.
+        residual = _replace_position(
+            updated_position,
+            quantity=residual_qty,
+            stop_order_id=None,
+            target_order_id=None,
+            target_price=None,
+            exit_order_id=None,
+            exit_mode=None,
+            exit_limit_price=None,
+            exit_submitted_at=None,
+        )
+
+        # NEW-2 (double stop): if the decision did NOT cancel protection but the
+        # position still carries a live stop, that stop covers the FULL original
+        # quantity and would coexist with the residual stop we are about to place
+        # -> two stops on one position. Cancel-then-replace: drop the stale
+        # full-size stop first so exactly one stop ends up covering the residual.
+        precanceled_residual_stop_id = None
+        if not decision.cancel_protection_orders and updated_position.stop_order_id:
+            precanceled_residual_stop_id = updated_position.stop_order_id
+            if not dry_run:
+                canceled, precancel_error = await self.planner.order_manager.cancel_order(
+                    updated_position.stop_order_id
+                )
+                await self.event_repository.append(
+                    "protection_cancel_attempt",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": updated_position.symbol,
+                        "option_symbol": updated_position.option_symbol,
+                        "stop_order_id": updated_position.stop_order_id,
+                        "canceled": canceled,
+                        "error": precancel_error,
+                        "reason": "partial_scale_replace_full_size_stop",
+                    },
+                )
+                if precancel_error and error is None:
+                    error = precancel_error
+
+        # NEW-1: ALWAYS re-arm a residual stop. Derive a price even when no prior
+        # resting stop existed (from the profile stop in the decision diagnostics,
+        # else the deployment exit spec). Never leave the residual stop_order_id
+        # None after a successful partial.
+        restored_stop_price = _residual_protective_stop_price(updated_position, decision, deployment)
+        restored_stop_order_id = None
+        residual_unprotected = False
+        if restored_stop_price is None:
+            # No entry/stop information anywhere to derive a price from. Record the
+            # unprotected residual so the monitor's missing-protection path re-arms
+            # on the next tick (it re-arms any open position with no stop/target).
+            residual_unprotected = True
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": "protective_stop_failure",
+                    "symbol": residual.symbol,
+                    "deployment_id": deployment.deployment_id,
+                    "trade_id": residual.trade_id,
+                    "option_symbol": residual.option_symbol,
+                    "error": "no_residual_stop_price_derivable",
+                    "stage": "partial_scale_residual_protection",
+                },
+            )
+        else:
+            restored_stop_order_id = "DRY_RUN_PARTIAL_RESIDUAL_STOP"
+            if not dry_run:
+                stop_result = await self.planner.order_manager.place_stop_loss_order(
+                    residual.option_symbol,
+                    restored_stop_price,
+                    residual_qty,
+                )
+                restored_stop_order_id = stop_result.order_id
+                # NEW-3-style: a place-fail must not leave the residual naked with
+                # only a logged error. Retry once; if still failing, mark the
+                # residual for reprotection (stop_order_id/stop_price stay None so
+                # the monitor's missing-protection path re-arms next tick) and
+                # record the unprotected state.
+                if restored_stop_order_id is None:
+                    retry = await self.planner.order_manager.place_stop_loss_order(
+                        residual.option_symbol,
+                        restored_stop_price,
+                        residual_qty,
+                    )
+                    restored_stop_order_id = retry.order_id
+                    if restored_stop_order_id is None:
+                        residual_unprotected = True
+                        if error is None:
+                            error = retry.error or stop_result.error or "residual_stop_place_failed"
+                        await self.event_repository.append(
+                            "runtime_issue",
+                            {
+                                "category": "protective_stop_failure",
+                                "symbol": residual.symbol,
+                                "deployment_id": deployment.deployment_id,
+                                "trade_id": residual.trade_id,
+                                "option_symbol": residual.option_symbol,
+                                "error": retry.error or stop_result.error or "residual_stop_place_failed",
+                                "stage": "partial_scale_residual_protection",
+                            },
+                        )
+        if not residual_unprotected:
+            residual = _replace_position(
+                residual,
+                stop_order_id=restored_stop_order_id,
+                stop_price=restored_stop_price,
+            )
+        # else: residual keeps stop_order_id=None AND stop_price=None (NEW-6
+        # parity) so downstream stop_price-is-not-None checks aren't fooled and the
+        # monitor re-arms it.
+
+        # Persist the residual as the tracked position (same identity, reduced qty).
+        self.planner.position_tracker.open_position(
+            residual.symbol,
+            residual.deployment_id,
+            trade_id=residual.trade_id,
+            option_symbol=residual.option_symbol,
+            quantity=residual.quantity,
+            entry_price=residual.entry_price,
+            underlying_entry_price=residual.underlying_entry_price,
+            entry_timestamp=residual.entry_timestamp,
+            source=residual.source,
+            order_id=residual.order_id,
+            stop_order_id=residual.stop_order_id,
+            stop_price=residual.stop_price,
+            target_order_id=residual.target_order_id,
+            target_price=residual.target_price,
+        )
+        if residual.trade_id is not None and residual.option_symbol is not None:
+            await self._upsert_trade_record(
+                TradeRecord(
+                    trade_id=residual.trade_id,
+                    deployment_id=residual.deployment_id,
+                    symbol=residual.symbol,
+                    option_symbol=residual.option_symbol,
+                    quantity=residual.quantity,
+                    entry_price=residual.entry_price,
+                    underlying_entry_price=residual.underlying_entry_price,
+                    entry_timestamp=residual.entry_timestamp,
+                    status=_tracked_trade_status(residual),
+                    entry_order_id=residual.order_id,
+                    stop_order_id=residual.stop_order_id,
+                    stop_price=residual.stop_price,
+                )
+            )
+        # Reflect the residual's protection state in the lifecycle store so the
+        # monitor's missing-protection path re-arms an unprotected residual and the
+        # desk surfaces it as open_unprotected (not silently open_protected).
+        if residual.option_symbol is not None:
+            transition = self.lifecycle_store.mark_open(
+                residual.symbol,
+                residual.deployment_id,
+                option_symbol=residual.option_symbol,
+                order_id=residual.stop_order_id or residual.order_id,
+                protected=bool(residual.stop_order_id),
+            )
+            await self._emit_lifecycle_transition(
+                transition,
+                reason="partial_scale_residual_protected"
+                if residual.stop_order_id
+                else "partial_scale_residual_unprotected",
+            )
+        await self.event_repository.append(
+            "partial_scale_submission",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": updated_position.symbol,
+                "option_symbol": updated_position.option_symbol,
+                "closed_quantity": close_qty,
+                "residual_quantity": residual_qty,
+                "order_id": order_id,
+                "canceled_stop_order_id": canceled_stop_order_id,
+                "canceled_target_order_id": canceled_target_order_id,
+                "precanceled_residual_stop_order_id": precanceled_residual_stop_id,
+                "restored_stop_order_id": restored_stop_order_id,
+                "restored_stop_price": restored_stop_price if not residual_unprotected else None,
+                "residual_protected": not residual_unprotected,
+                "dry_run": dry_run,
+                "reason": decision.reason,
+                "error": error,
+            },
+        )
+        plan = ExitPlan(
+            trade_id=residual.trade_id or residual.order_id or "UNKNOWN_TRADE",
+            deployment_id=deployment.deployment_id,
+            symbol=updated_position.symbol,
+            option_symbol=updated_position.option_symbol,
+            quantity=close_qty,
+            action="square_off",
+            reasons=decision.reason,
+            dry_run=dry_run,
+            order_id=order_id,
+            canceled_stop_order_id=canceled_stop_order_id,
+            canceled_target_order_id=canceled_target_order_id,
+            error=error,
+        )
+        await self.event_repository.append("exit_plan", asdict(plan))
+        return plan
+
+    async def _apply_replacement_stop(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        decision: ExitDecision,
+        *,
+        dry_run: bool,
+    ) -> TrackedPosition:
+        """Move the protective stop to ``decision.replacement_stop_price`` (H2).
+
+        Consumes the profile evaluator's STOP_TO_BREAKEVEN output: cancel the live
+        stop and place a new one at the requested price via the existing stop
+        primitive. Independent of the unrelated
+        ``stop_to_breakeven_after_r_multiple`` config dial. No-op (returns the
+        position unchanged) when there is nothing to move or the price is already
+        in place.
+        """
+        new_stop_price = decision.replacement_stop_price
+        if new_stop_price is None or position.option_symbol is None or position.quantity <= 0:
+            return position
+        if position.stop_price is not None and round(position.stop_price, 2) == round(new_stop_price, 2):
+            return position  # already there; nothing to do
+
+        canceled_stop_order_id = position.stop_order_id
+        cancel_error = None
+        if position.stop_order_id and not dry_run:
+            canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
+            if not canceled and not self._allows_exit_submission_before_cancel_confirmation():
+                await self.event_repository.append(
+                    "protection_cancel_attempt",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "stop_order_id": position.stop_order_id,
+                        "canceled": canceled,
+                        "error": cancel_error,
+                        "reason": "profile_replacement_stop",
+                    },
+                )
+                return position  # leave the old stop in place; do not go naked
+
+        new_stop_order_id = "DRY_RUN_REPLACEMENT_STOP"
+        new_stop_error = cancel_error
+        if not dry_run:
+            result = await self.planner.order_manager.place_stop_loss_order(
+                position.option_symbol,
+                new_stop_price,
+                position.quantity,
+            )
+            new_stop_order_id = result.order_id
+            new_stop_error = result.error or cancel_error
+            # NEW-3: cancel-OK / place-fail naked window. We have already cancelled
+            # (or ambiguously cancelled) the old stop, so a failed placement leaves
+            # the position NAKED. Don't just log-and-ride: retry the placement once,
+            # and if it still fails mark the position for reprotection so the next
+            # monitor tick re-arms it (the monitor re-arms any open position with no
+            # stop/target). The unprotected state is recorded below.
+            if new_stop_order_id is None:
+                retry = await self.planner.order_manager.place_stop_loss_order(
+                    position.option_symbol,
+                    new_stop_price,
+                    position.quantity,
+                )
+                new_stop_order_id = retry.order_id
+                new_stop_error = retry.error or new_stop_error
+
+        # NEW-6: do NOT persist ``stop_price`` when the placement failed
+        # (``stop_order_id is None``). Keeping a stale ``stop_price`` would fool
+        # downstream ``stop_price is not None`` checks into believing the position
+        # is protected. With both None, the monitor's missing-protection path
+        # (stop_order_id is None and target_order_id is None) re-arms it next tick.
+        persisted_stop_price = new_stop_price if new_stop_order_id is not None else None
+        replacement_unprotected = new_stop_order_id is None and not dry_run
+        updated = _replace_position(
+            position, stop_order_id=new_stop_order_id, stop_price=persisted_stop_price
+        )
+        await self.event_repository.append(
+            "profile_replacement_stop",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": position.symbol,
+                "option_symbol": position.option_symbol,
+                "canceled_stop_order_id": canceled_stop_order_id,
+                "new_stop_order_id": new_stop_order_id,
+                "new_stop_price": persisted_stop_price,
+                "new_stop_error": new_stop_error,
+                "unprotected": replacement_unprotected,
+                "reason": decision.reason,
+                "dry_run": dry_run,
+            },
+        )
+        if replacement_unprotected:
+            # Keep recording the unprotected state so it is visible/auditable and
+            # the desk surfaces it; the position is persisted below with
+            # stop_order_id=None so the monitor re-protects on the next tick.
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": "protective_stop_failure",
+                    "symbol": position.symbol,
+                    "deployment_id": deployment.deployment_id,
+                    "trade_id": position.trade_id,
+                    "option_symbol": position.option_symbol,
+                    "error": new_stop_error or "replacement_stop_place_failed",
+                    "stage": "profile_replacement_stop",
+                },
+            )
+        if updated.trade_id is not None and updated.option_symbol is not None:
+            self.planner.position_tracker.open_position(
+                updated.symbol,
+                updated.deployment_id,
+                trade_id=updated.trade_id,
+                option_symbol=updated.option_symbol,
+                quantity=updated.quantity,
+                entry_price=updated.entry_price,
+                underlying_entry_price=updated.underlying_entry_price,
+                entry_timestamp=updated.entry_timestamp,
+                source=updated.source,
+                order_id=updated.order_id,
+                stop_order_id=updated.stop_order_id,
+                stop_price=updated.stop_price,
+                target_order_id=updated.target_order_id,
+                target_price=updated.target_price,
+            )
+            transition = self.lifecycle_store.mark_open(
+                updated.symbol,
+                updated.deployment_id,
+                option_symbol=updated.option_symbol,
+                order_id=new_stop_order_id or updated.order_id,
+                protected=bool(new_stop_order_id),
+            )
+            await self._emit_lifecycle_transition(transition, reason="profile_replacement_stop")
+        return updated
 
     async def _submit_exit_request(
         self,
@@ -1760,6 +2275,7 @@ class ExecutionSupervisor:
                 position.deployment_id,
                 option_symbol=position.option_symbol,
             )
+            self.clear_profile_exit_state(position)
             if position.trade_id is not None:
                 await self._mark_trade_closed_with_exit_truth(
                     position.trade_id,
@@ -1934,6 +2450,7 @@ class ExecutionSupervisor:
                     position.deployment_id,
                     option_symbol=position.option_symbol,
                 )
+                self.clear_profile_exit_state(position)  # NEW-4: EOD sweep is terminal
                 if position.trade_id is not None:
                     await self.trade_state_repository.mark_closed(position.trade_id, **fill_details)
                 transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
@@ -2063,6 +2580,7 @@ class ExecutionSupervisor:
                     position.deployment_id,
                     option_symbol=position.option_symbol,
                 )
+                self.clear_profile_exit_state(position)  # NEW-4: pending-entry cancel is terminal
                 if position.trade_id is not None:
                     await self.trade_state_repository.mark_closed(position.trade_id, exit_order_id=order_id)
                 transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
@@ -2100,6 +2618,7 @@ class ExecutionSupervisor:
                     position.deployment_id,
                     option_symbol=position.option_symbol,
                 )
+                self.clear_profile_exit_state(position)  # NEW-4: halt-and-flatten is terminal
                 if position.trade_id is not None:
                     await self.trade_state_repository.mark_closed(position.trade_id, **fill_details)
                 transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
@@ -3064,3 +3583,103 @@ def _material_exit_price_change(previous_price: float | None, next_price: float 
 
 def _replace_position(position: TrackedPosition, **changes) -> TrackedPosition:
     return replace(position, **changes)
+
+
+def _decision_is_partial_scale(decision: ExitDecision) -> bool:
+    """True when an exit decision asks for a partial scale (reduce, not flatten)."""
+    return bool(decision.features.get("partial_scale"))
+
+
+def _residual_protective_stop_price(
+    position: TrackedPosition,
+    decision: ExitDecision,
+    deployment: DeploymentManifest,
+) -> float | None:
+    """Resolve a protective stop price for the residual after a profile partial.
+
+    NEW-1: a profile partial must ALWAYS leave the residual protected, even when
+    the position carried no prior resting stop (``stop_price is None``). This
+    derives a residual stop from, in order of preference:
+
+      1. the prior resting stop price (``position.stop_price``) — unchanged
+         behavior when a stop was already in place;
+      2. the profile's own initial premium stop, recovered from the decision's
+         diagnostics (``entry_premium - risk_per_contract`` — i.e. ``entry *
+         (1 - initial_stop_pct)``), so the residual inherits the profile's stop;
+      3. the deployment exit spec's ``initial_stop_pct``/``stop_loss_pct`` applied
+         to the position entry price as a final fallback.
+
+    Returns ``None`` only when no positive entry/stop information exists anywhere,
+    which the caller treats as a hard error rather than going naked.
+    """
+    if position.stop_price is not None and position.stop_price > 0:
+        return float(position.stop_price)
+
+    features = decision.features or {}
+    entry_premium = features.get("entry_premium")
+    risk_per_contract = features.get("risk_per_contract")
+    try:
+        if entry_premium is not None and risk_per_contract is not None:
+            derived = float(entry_premium) - float(risk_per_contract)
+            if derived > 0:
+                return round(derived, 4)
+    except (TypeError, ValueError):
+        pass
+
+    entry_price = position.entry_price
+    if entry_price is not None and entry_price > 0:
+        exit_spec = getattr(deployment, "exit", None)
+        stop_pct = None
+        if exit_spec is not None:
+            stop_pct = getattr(exit_spec, "initial_stop_pct", None)
+            if stop_pct is None or stop_pct <= 0:
+                stop_pct = getattr(exit_spec, "stop_loss_pct", None)
+        if stop_pct and stop_pct > 0:
+            derived = float(entry_price) * (1.0 - float(stop_pct))
+            if derived > 0:
+                return round(derived, 4)
+    return None
+
+
+def _resolve_exit_quantity(decision: ExitDecision, position: TrackedPosition) -> int:
+    """Resolve how many contracts an exit decision should close.
+
+    C1: honor ``features["exit_quantity"]`` when present (the profile evaluator
+    sets it for staged/partial exits). Falls back to the full position quantity
+    for plain full exits that carry no quantity.
+
+    Hard guard: a PARTIAL_SCALE (``features["partial_scale"]``) can NEVER close
+    the full position — the residual runner must stay open. A partial quantity is
+    clamped to ``[1, position.quantity - 1]``; if the evaluator somehow asked a
+    partial to flatten (>= full qty), we raise rather than silently flattening.
+    """
+    requested = decision.features.get("exit_quantity")
+    is_partial = _decision_is_partial_scale(decision)
+    if requested is None:
+        if is_partial:
+            raise ValueError(
+                "partial_scale exit decision carried no exit_quantity; refusing to "
+                "flatten the full position on a partial"
+            )
+        return position.quantity
+    try:
+        qty = int(requested)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid exit_quantity {requested!r}") from exc
+    if qty <= 0:
+        raise ValueError(f"exit_quantity must be positive, got {qty}")
+    if is_partial:
+        if position.quantity <= 1:
+            raise ValueError(
+                "partial_scale requested but position has <= 1 contract; a partial "
+                "cannot leave a residual runner"
+            )
+        if qty >= position.quantity:
+            raise ValueError(
+                f"partial_scale exit_quantity ({qty}) >= position quantity "
+                f"({position.quantity}); a PARTIAL_SCALE must never close the full "
+                "position"
+            )
+        return qty
+    # Full exit: never close more than the position holds.
+    return min(qty, position.quantity)

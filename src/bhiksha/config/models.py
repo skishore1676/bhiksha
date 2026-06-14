@@ -252,6 +252,28 @@ class ExitSpec(BaseModel):
     catastrophe_exit_anchor: str | None = "option_premium"
     catastrophe_exit_params: dict[str, Any] = Field(default_factory=dict)
 
+    # --- v2 operator exit-profile dials (premium-anchored, evaluated by
+    # bhiksha.execution.profile_exit). All optional + back-compatible: the
+    # defaults reproduce pre-v2 behavior (no staged targets, no partial, no
+    # giveback, EOD flat on). Mirrors the kernel ManagementPolicySpec v2 fields.
+    # When ``profile_exit_id`` is set the deployment carries a frozen named
+    # operator exit profile; the evaluator runs it SHADOW-FIRST. ---
+    profile_exit_id: str | None = None
+    profile_exit_shadow_only: bool = True
+    target_1_r: float | None = None
+    target_2_r: float | None = None
+    target_1_quantity: float = 1.0
+    initial_stop_pct: float | None = None
+    premium_disaster_stop_pct: float | None = None
+    no_progress_seconds: int | None = None
+    max_hold_seconds: int | None = None
+    high_water_giveback_policy: str = "OFF"
+    breakeven_after_t1: bool = True
+    eod_flat: bool = True
+    # L1: configurable favorable-excursion floor (in R) for the no-progress time
+    # stop; the profile evaluator defaults to 0.25 when unset.
+    no_progress_favorable_floor_r: float = 0.25
+
     @model_validator(mode="before")
     @classmethod
     def normalize_input(cls, data: Any) -> Any:
@@ -264,6 +286,28 @@ class ExitSpec(BaseModel):
         if isinstance(thesis_exit_policy, str):
             normalized["thesis_exit_policy"] = thesis_exit_policy.strip() or None
         return normalized
+
+    @model_validator(mode="after")
+    def validate_profile_stop_ordering(self) -> "ExitSpec":
+        # M2: reject an inverted profile stop config. The premium disaster stop is
+        # a catastrophe backstop and must be at least as wide as the initial stop;
+        # a tighter disaster stop would silently pre-empt the initial stop and
+        # change the ladder's risk semantics. Fail loud at config time.
+        initial = self.initial_stop_pct
+        disaster = self.premium_disaster_stop_pct
+        if (
+            initial is not None
+            and disaster is not None
+            and initial > 0
+            and disaster > 0
+            and disaster < initial
+        ):
+            raise ValueError(
+                "ExitSpec premium_disaster_stop_pct "
+                f"({disaster}) must not be tighter than initial_stop_pct ({initial}); "
+                "the disaster stop is a catastrophe backstop and must be wider (>=)"
+            )
+        return self
 
 
 class SourceSpec(BaseModel):
