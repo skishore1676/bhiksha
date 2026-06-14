@@ -59,16 +59,20 @@ def _profile_exit_spec(base_exit: ExitSpec, *, drives_live: bool = False, shadow
     )
 
 
-def _profile_deployment(*, drives_live: bool = False):
+def _profile_deployment(*, drives_live: bool = False, runtime_mode: str | None = None):
     base = _enabled_deployment(BASE_DEPLOYMENT_ID)
     exit_spec = _profile_exit_spec(base.exit, drives_live=drives_live)
+    # HIGH-1: the gate now reads the deployment's REAL runtime mode from
+    # ``execution.runtime_mode`` (no hardcoded literal). Default ``None`` fails
+    # closed; a test opts into a genuine live runtime by passing ``runtime_mode``.
+    execution = base.execution.model_copy(update={"runtime_mode": runtime_mode})
     # Re-validate through the model so HIGH-2 / exit-safety validators run.
     return DeploymentManifest(
         deployment_id=base.deployment_id,
         enabled=True,
         symbol=base.symbol,
         strategy=base.strategy,
-        execution=base.execution,
+        execution=execution,
         risk=base.risk,
         exit=exit_spec,
         source=base.source,
@@ -304,10 +308,12 @@ def test_flip_seam_when_flag_on_gate_opens_but_route_is_not_enabled(tmp_path) ->
     om = _CallRecordingOrderManager(bid=2.10)
     sup, repo = _supervisor(tmp_path, om)
     # drives_live=True (the one-line flip) AND shadow_only=False so the gate's
-    # shadow precondition is satisfied; position_source live_open; mode is the
-    # canonical live_approval_gated supplied by the wiring.
-    dep = _profile_deployment(drives_live=True)
+    # shadow precondition is satisfied; position_source live_open; and the
+    # deployment's REAL runtime mode is live_approval_gated (HIGH-1: the gate now
+    # reads execution.runtime_mode, no hardcoded literal).
+    dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
     assert dep.exit.profile_exit_drives_live is True
+    assert dep.execution.runtime_mode == "live_approval_gated"
     pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0)
 
     managed = asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
@@ -330,11 +336,13 @@ def test_flip_seam_when_flag_on_gate_opens_but_route_is_not_enabled(tmp_path) ->
 
 
 def test_flip_seam_stays_closed_for_nonlive_position_source_even_with_flag_on(tmp_path) -> None:
-    """Defense: even with the flag ON, a non-live position source (shadow) keeps
-    the fail-closed allowlist CLOSED — the gate needs a live entry source too."""
+    """Defense: even with the flag ON AND a real live_approval_gated runtime mode,
+    a non-live position source (shadow) keeps the fail-closed allowlist CLOSED —
+    the gate needs a live entry source too. Setting the real runtime mode isolates
+    the position-source check (so this is not merely failing on a None mode)."""
     om = _CallRecordingOrderManager(bid=2.10)
     sup, repo = _supervisor(tmp_path, om)
-    dep = _profile_deployment(drives_live=True)
+    dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
     sup.planner.position_tracker.open_position(
         "QQQ",
         dep.deployment_id,
@@ -374,6 +382,244 @@ def test_shadow_records_for_shadow_source_position_too(tmp_path) -> None:
     shadow = _events_of_type(repo, "profile_exit_shadow")
     assert len(shadow) == 1
     assert shadow[0]["dispatch_allowed"] is False
+
+
+# --------------------------------------------------------------------------- #
+# HIGH-1: the dispatch gate reads the deployment's REAL runtime mode, not a
+# hardcoded ``live_approval_gated`` literal. A deployment running ``live_automated``
+# (or shadow / advisory / unknown / None) can NEVER dispatch a profile exit, even
+# with the operator flag ON and a live position source.
+# --------------------------------------------------------------------------- #
+
+
+def test_high1_live_automated_deployment_gate_stays_closed_even_with_flag_on(tmp_path) -> None:
+    """A deployment whose REAL runtime mode is ``live_automated`` MUST NOT be able
+    to dispatch a profile exit, even with the operator flag ON, a live source, and
+    a profile rung that fires. ``live_automated`` is forbidden by the fail-closed
+    allowlist (``DISPATCH_ALLOWED_RUNTIME_MODES = {live_approval_gated}``)."""
+    om = _CallRecordingOrderManager(bid=2.10)  # below profile stop 2.25 -> would exit
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(drives_live=True, runtime_mode="live_automated")
+    assert dep.exit.profile_exit_drives_live is True
+    assert dep.execution.runtime_mode == "live_automated"
+    pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0)
+
+    managed = asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+
+    shadow = _events_of_type(repo, "profile_exit_shadow")
+    assert len(shadow) == 1
+    # The profile ladder WOULD exit, but the gate is CLOSED on the runtime mode.
+    assert shadow[0]["exit"] is True
+    assert shadow[0]["dispatch_allowed"] is False
+    assert shadow[0]["mode"] == "shadow_record"
+    # No dispatch-ready audit, no order, position untouched.
+    assert _events_of_type(repo, "profile_exit_dispatch_ready") == []
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
+    assert managed is not None and managed.exit_mode is None and managed.exit_order_id is None
+
+
+def test_high1_unset_runtime_mode_fails_closed_even_with_flag_on(tmp_path) -> None:
+    """A deployment that declares NO runtime mode (``None``) fails closed: the gate
+    stays shut even with the flag ON and a live source. The wiring never substitutes
+    a permissive default for a missing mode (the prior hardcoded-literal bug)."""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(drives_live=True, runtime_mode=None)
+    assert dep.execution.runtime_mode is None
+    assert sup._resolved_runtime_mode(dep) is None  # the real source resolves to None
+    pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0)
+
+    asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+
+    shadow = _events_of_type(repo, "profile_exit_shadow")
+    assert len(shadow) == 1
+    assert shadow[0]["dispatch_allowed"] is False
+    assert _events_of_type(repo, "profile_exit_dispatch_ready") == []
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
+
+
+def test_high1_shadow_runtime_mode_fails_closed_even_with_flag_on(tmp_path) -> None:
+    """A deployment whose real runtime mode is ``shadow`` also fails closed (the
+    gate's lone permitted mode is ``live_approval_gated``)."""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(drives_live=True, runtime_mode="shadow")
+    pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0)
+
+    asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+
+    shadow = _events_of_type(repo, "profile_exit_shadow")
+    assert len(shadow) == 1
+    assert shadow[0]["dispatch_allowed"] is False
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
+
+
+def test_high1_live_approval_gated_with_flag_on_and_live_source_opens_gate(tmp_path) -> None:
+    """The positive control for HIGH-1: a deployment whose REAL runtime mode IS
+    ``live_approval_gated`` (the lone permitted mode), flag ON, live source, opens
+    the gate. (The route still stays dormant this wave — proven elsewhere.)"""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
+    pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0)
+
+    asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+
+    shadow = _events_of_type(repo, "profile_exit_shadow")
+    assert len(shadow) == 1
+    assert shadow[0]["dispatch_allowed"] is True
+    assert shadow[0]["mode"] == "live_dispatch"
+
+
+# --------------------------------------------------------------------------- #
+# MEDIUM-1(flip): shadow-advanced state must not corrupt a mid-position flip.
+# With the flag OFF the recorder advances the persisted ladder every tick (banks
+# T1, arms breakeven) without placing anything. If the operator flips the flag ON
+# mid-position the now-live evaluator must NOT inherit that shadow-banked partial
+# (which would under-size the live exit and skip the breakeven): the state is
+# reseeded fresh from the current premium on the first live tick. A position that
+# has only ever run live is unaffected.
+# --------------------------------------------------------------------------- #
+
+
+def _partial_t1_profile_deployment(*, drives_live: bool, runtime_mode: str | None = None):
+    """Profile deployment with a PARTIAL T1 (banks half at T1) so a shadow-advanced
+    state visibly differs from a clean one (banked_quantity 1 vs 0 on a 2-lot, and
+    the active stop is breakeven vs the initial stop)."""
+    base = _enabled_deployment(BASE_DEPLOYMENT_ID)
+    exit_spec = base.exit.model_copy(
+        update={
+            "profile_exit_id": "FLASH_REVERSAL",
+            "profile_exit_shadow_only": True,
+            "profile_exit_drives_live": drives_live,
+            "target_1_r": 1.0,
+            "target_2_r": 5.0,  # far out of reach so T2 never fires in these tests
+            "target_1_quantity": 0.5,  # PARTIAL: bank 1 of 2 at T1
+            "initial_stop_pct": 0.25,
+            "premium_disaster_stop_pct": 0.30,
+            "high_water_giveback_policy": "OFF",
+            "breakeven_after_t1": True,
+            "eod_flat": False,
+        }
+    )
+    execution = base.execution.model_copy(update={"runtime_mode": runtime_mode})
+    return DeploymentManifest(
+        deployment_id=base.deployment_id,
+        enabled=True,
+        symbol=base.symbol,
+        strategy=base.strategy,
+        execution=execution,
+        risk=base.risk,
+        exit=exit_spec,
+        source=base.source,
+    )
+
+
+def test_flip_midposition_reseeds_shadow_banked_state_so_live_exit_is_full_size(tmp_path) -> None:
+    """MEDIUM-1(flip), case (i): the flag flips ON mid-position AFTER a partial T1
+    was banked in shadow. The now-live evaluator must NOT treat the partial as
+    already banked — it reseeds and respects the FULL size, with the breakeven flag
+    cleared.
+
+    Setup (entry 3.0, qty 2, target_1_r 1.0, initial_stop_pct 0.25 -> R=0.75,
+    T1 price 3.75, initial stop price 2.25):
+      * Shadow tick 1 @ bid 4.0 (>=3.75): banks partial T1 -> target_1_banked True,
+        banked_quantity 1, stop_at_breakeven True.
+      * Shadow tick 2 @ bid 4.0: emits STOP_TO_BREAKEVEN -> breakeven_emitted True.
+      * Flip ON (live_approval_gated, live source). Live tick @ bid 2.10:
+        - If state were INHERITED (bug): active stop is BREAKEVEN (entry 3.0); since
+          2.10 <= 3.0 it would square off only the REMAINING 1 lot -> under-sized,
+          and the breakeven was already emitted.
+        - With the RESEED (fix): the ladder is clean, active stop is the INITIAL
+          stop (2.25); 2.10 <= 2.25 -> a FULL 2-lot initial_stop exit.
+    """
+    # --- shadow phase: bank the partial T1 and emit breakeven (flag OFF) ---
+    # The EXISTING resting stop is at 2.00 (below the profile's initial stop 2.25)
+    # so the existing management path never exits in either phase (4.0 > 2.00 and
+    # 2.10 > 2.00), isolating the profile-branch behavior under test.
+    om_shadow = _CallRecordingOrderManager(bid=4.0)
+    sup, repo = _supervisor(tmp_path, om_shadow)
+    dep_shadow = _partial_t1_profile_deployment(drives_live=False)
+    pos = _open_live_position(sup, dep_shadow, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0, quantity=2)
+    key = sup._profile_state_key(pos)
+
+    asyncio.run(sup.manage_open_position(dep_shadow, pos, dry_run=False))
+    pos2 = sup.planner.position_tracker.active_positions()[0]
+    asyncio.run(sup.manage_open_position(dep_shadow, pos2, dry_run=False))
+
+    # The shadow ladder DID advance: partial banked + breakeven emitted, marked
+    # shadow-advanced. (Proves the corruption precondition really exists.)
+    state = sup._profile_exit_states[key]
+    assert state.target_1_banked is True
+    assert state.banked_quantity == 1
+    assert state.breakeven_emitted is True
+    assert state.shadow_advanced is True
+    assert state.target_1_premium == 4.0  # the shadow-banked partial premium
+    # ...but NO order was ever placed in shadow (record-only).
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om_shadow.calls)
+
+    # --- flip ON mid-position: same deployment_id/trade -> same persisted state ---
+    # Swap in a low-premium quote (2.10 < the profile initial stop 2.25 but still
+    # > the existing resting stop 2.00) for the now-live tick.
+    om_live = _CallRecordingOrderManager(bid=2.10)
+    sup.planner.order_manager = om_live
+    dep_live = _partial_t1_profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
+    pos3 = sup.planner.position_tracker.active_positions()[0]
+
+    asyncio.run(sup.manage_open_position(dep_live, pos3, dry_run=False))
+
+    live_shadow = [e for e in _events_of_type(repo, "profile_exit_shadow")][-1]
+    # The gate is OPEN (real live mode + flag + live source)...
+    assert live_shadow["dispatch_allowed"] is True
+    assert live_shadow["mode"] == "live_dispatch"
+    # ...and the live decision is the FULL-size initial stop, NOT an under-sized
+    # breakeven exit of the remaining 1 lot. This is the crux of the fix.
+    assert live_shadow["rule"] == "initial_stop"
+    assert live_shadow["reason"] == "profile_initial_stop"
+    assert live_shadow["exit"] is True
+    assert live_shadow["exit_quantity"] == 2  # FULL size respected (reseed worked)
+
+    # The persisted state was reseeded: the shadow-banked partial / breakeven are
+    # gone and the shadow-advanced flag is cleared (reseed happens once).
+    reseeded = sup._profile_exit_states[key]
+    assert reseeded.banked_quantity == 0
+    assert reseeded.target_1_banked is False
+    assert reseeded.breakeven_emitted is False
+    assert reseeded.shadow_advanced is False
+
+
+def test_live_from_entry_partial_t1_is_unaffected_by_reseed_guard(tmp_path) -> None:
+    """MEDIUM-1(flip), case (ii): a position that has ONLY ever run live (clean from
+    entry) is unaffected by the reseed guard — its partial T1 banks and persists
+    normally across live ticks (no spurious reseed wiping the banked partial)."""
+    om = _CallRecordingOrderManager(bid=4.0)  # >= T1 price 3.75 -> banks partial
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _partial_t1_profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
+    pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.25, entry=3.0, quantity=2)
+    key = sup._profile_state_key(pos)
+
+    # Tick 1 (live): banks the partial T1.
+    asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+    state_after_t1 = sup._profile_exit_states[key]
+    assert state_after_t1.target_1_banked is True
+    assert state_after_t1.banked_quantity == 1
+    # Never shadow-advanced (always live) -> the reseed guard never triggers.
+    assert state_after_t1.shadow_advanced is False
+
+    first = _events_of_type(repo, "profile_exit_shadow")[0]
+    assert first["rule"] == "target_1_partial"
+    assert first["exit_quantity"] == 1  # the genuine live partial
+    assert first["dispatch_allowed"] is True
+
+    # Tick 2 (live, still elevated): the banked partial PERSISTS (no reseed wiped
+    # it); the ladder emits the breakeven ratchet, not a fresh full T1.
+    pos2 = sup.planner.position_tracker.active_positions()[0]
+    asyncio.run(sup.manage_open_position(dep, pos2, dry_run=False))
+    state_after_t2 = sup._profile_exit_states[key]
+    assert state_after_t2.target_1_banked is True  # STILL banked (not reset)
+    assert state_after_t2.banked_quantity == 1
+    assert state_after_t2.breakeven_emitted is True
+    assert state_after_t2.shadow_advanced is False
 
 
 # --------------------------------------------------------------------------- #

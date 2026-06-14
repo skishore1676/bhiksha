@@ -222,6 +222,16 @@ class ExecutionSpec(BaseModel):
     entry_window_start_et: str | None = None
     entry_window_end_et: str | None = None
     shadow_only: bool = False
+    # HIGH-1: the deployment's ACTUAL runtime mode (kernel ``RuntimeMode`` wire
+    # value: ``advisory`` / ``shadow`` / ``live_approval_gated`` / ``live_automated``).
+    # This is the real source the profile-exit dispatch gate consults — NOT a
+    # hardcoded constant. DEFAULT ``None`` and ``None`` FAILS CLOSED: the fail-
+    # closed dispatch allowlist (``profile_exit_dispatch_allowed``) only ever opens
+    # for the lone permitted mode ``live_approval_gated``; any other value
+    # (``live_automated``, ``shadow``, ``advisory``, an unknown string, or ``None``)
+    # keeps the gate shut. A deployment actually running ``live_automated`` therefore
+    # can NEVER dispatch a profile exit, which matches every other Bhiksha gate.
+    runtime_mode: str | None = None
 
     @model_validator(mode="before")
     @classmethod

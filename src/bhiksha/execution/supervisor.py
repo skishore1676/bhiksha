@@ -193,6 +193,37 @@ class ExecutionSupervisor:
             return True
         return False
 
+    @staticmethod
+    def _resolved_runtime_mode(deployment: DeploymentManifest) -> str | None:
+        """The deployment's ACTUAL runtime mode for the profile-exit dispatch gate.
+
+        HIGH-1: the gate must consult the deployment's real runtime mode, NOT a
+        hardcoded ``live_approval_gated`` literal. The real source is the
+        deployment's execution config (``execution.runtime_mode`` — the kernel
+        ``RuntimeMode`` wire value the deployment was compiled/declared with).
+
+        FAILS CLOSED by construction: returns whatever the deployment actually
+        declares, or ``None`` when it declares nothing. The downstream fail-closed
+        allowlist (``profile_exit_dispatch_allowed``) opens ONLY for the exact
+        string ``live_approval_gated``; ``None`` and every other value
+        (``live_automated``/``shadow``/``advisory``/unknown) keep the gate shut.
+        This method never substitutes a permissive default for a missing/unknown
+        mode — a deployment that does not provably run ``live_approval_gated``
+        cannot dispatch a profile exit.
+        """
+        execution_spec = getattr(deployment, "execution", None)
+        mode = getattr(execution_spec, "runtime_mode", None)
+        if mode is None:
+            return None
+        # Normalize a kernel ``RuntimeMode`` enum (or any object) to its wire
+        # string; the allowlist compares against canonical strings. A non-string,
+        # non-enum value normalizes to its ``str(...)`` form, which will simply
+        # miss the allowlist and fail closed.
+        normalized = getattr(mode, "value", mode)
+        if not isinstance(normalized, str):
+            normalized = str(normalized)
+        return normalized
+
     async def _record_profile_exit_shadow(
         self,
         deployment: DeploymentManifest,
@@ -242,6 +273,24 @@ class ExecutionSupervisor:
         # already wired). This wave: ``drives_live`` is False, so ``live=False``.
         drives_live = self._profile_exit_drives_live(deployment)
 
+        # MEDIUM-1(flip): protect a mid-position flag flip. With the flag OFF the
+        # recorder still advances ``state`` every tick (peak ratchets; a T1 touch
+        # sets target_1_banked/banked_quantity/breakeven_emitted) but places
+        # nothing. If the operator flips ``profile_exit_drives_live`` ON while a
+        # position is open, the now-live evaluator would inherit that shadow-
+        # advanced ladder and UNDER-SIZE the live exit (treating a never-placed
+        # partial as banked) and SKIP the breakeven. Guard the transition:
+        #   * shadow tick (drives_live False): mark the state shadow-advanced.
+        #   * first live tick on a shadow-advanced state: RESEED the ladder fresh
+        #     from the current premium before the live evaluation, so the live
+        #     evaluator sees the position as if opening clean.
+        # A position that has only ever run live never sets ``shadow_advanced``,
+        # so a clean-from-entry live ladder is untouched (no reseed).
+        if not drives_live:
+            state.mark_shadow_advanced()
+        elif state.shadow_advanced:
+            state.reseed_for_live(position.entry_price)
+
         outcome = await evaluate_and_record_profile_exit(
             event_sink=self.event_repository,
             fields=fields,
@@ -263,11 +312,15 @@ class ExecutionSupervisor:
             # (the gate still independently requires runtime_mode + a live source).
             deployment_shadow_only=not drives_live,
             position_source=position.source,
-            # The runtime mode the gate requires to ever dispatch. Supplying the
-            # canonical value here means the operator's flag flip is the ONLY change
-            # needed to go live (the mode precondition is already satisfied); the
-            # gate still also requires live=True + a live position source.
-            runtime_mode="live_approval_gated",
+            # HIGH-1: the deployment's ACTUAL runtime mode (never a hardcoded
+            # literal). Resolved from the real execution config; ``None`` when the
+            # deployment does not declare one. The fail-closed dispatch allowlist
+            # opens ONLY for ``live_approval_gated`` — so a deployment running
+            # ``live_automated`` (or shadow/advisory/unknown/None) keeps the gate
+            # SHUT and can never dispatch a profile exit, matching the rest of
+            # Bhiksha. Going live therefore requires BOTH the operator flag flip
+            # AND a deployment whose real mode is ``live_approval_gated``.
+            runtime_mode=self._resolved_runtime_mode(deployment),
             now=now,
             # The supervisor's EOD authority is close_due_positions; do not hard-fail
             # the shadow record when a bar clock is unavailable.
