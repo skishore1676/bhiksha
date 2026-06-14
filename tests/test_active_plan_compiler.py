@@ -483,6 +483,57 @@ def test_compile_active_plan_carries_exit_profile_spec_onto_strategy_exit(tmp_pa
     assert exit_spec.profile_exit_drives_live is False
 
 
+def test_exit_profile_spec_does_not_clobber_operator_dedicated_columns(tmp_path: Path) -> None:
+    """The operator's dedicated typed columns win over the published spec.
+
+    Regression: the spec's stop_loss_pct / hard_flat_time_et (which the kernel
+    ManagementPolicySpec always emits, defaulting them non-None) must NOT
+    overwrite the values the operator typed into the dedicated Sheet columns.
+    Non-conflicting spec fields still carry.
+    """
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_profile_plus_columns",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                # spec carries option_stop_fallback_pct=0.40, hard_flat_time_et="15:50"
+                "management_policy_spec": json.dumps(_exit_profile_spec()),
+                # operator's dedicated typed columns differ from the spec values
+                "stop_loss_pct": "0.60",
+                "hard_flat_time_et": "15:40",
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.suppressed == []
+    exit_spec = compiled.plan.deployments[0].exit
+    # The operator's dedicated columns win over the spec (not 0.40 / "15:50").
+    assert exit_spec.stop_loss_pct == 0.60
+    assert exit_spec.hard_flat_time_et == "15:40"
+    # Non-conflicting spec fields still carry.
+    assert exit_spec.profile_exit_id == "opening_drive_scalp_v1"
+    assert exit_spec.target_1_r == 1.0
+    assert exit_spec.initial_stop_pct == 0.30
+    assert exit_spec.profile_exit_drives_live is False
+
+
 def test_compile_active_plan_suppresses_exit_profile_spec_with_out_of_bounds_quantity(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()

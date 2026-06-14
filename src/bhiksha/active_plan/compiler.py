@@ -1266,19 +1266,30 @@ def _apply_risk_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> d
 
 def _apply_exit_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:
     updated = _deep_merge(section, row.exit_overrides)
+    # Track every ExitSpec key the operator set explicitly — via the
+    # ``exit_overrides`` deep-merge dict OR a dedicated typed column — so the
+    # published profile spec below cannot silently clobber them with its kernel
+    # defaults (e.g. stop_loss_pct=0.45, hard_flat_time_et="15:55").
+    explicit_keys: set[str] = set(row.exit_overrides or {})
     if row.use_profit_target is not None:
         updated["use_profit_target"] = row.use_profit_target
+        explicit_keys.add("use_profit_target")
     if row.profit_target_multiple is not None:
         updated["profit_target_multiple"] = row.profit_target_multiple
+        explicit_keys.add("profit_target_multiple")
     if row.option_profit_target_pct is not None:
         updated["option_profit_target_pct"] = row.option_profit_target_pct
+        explicit_keys.add("option_profit_target_pct")
     if row.stop_loss_pct is not None:
         updated["stop_loss_pct"] = row.stop_loss_pct
+        explicit_keys.add("stop_loss_pct")
     if row.hard_flat_time_et is not None:
         updated["hard_flat_time_et"] = row.hard_flat_time_et
+        explicit_keys.add("hard_flat_time_et")
     if row.stop_to_breakeven_after_r_multiple is not None:
         updated["stop_to_breakeven_after_r_multiple"] = row.stop_to_breakeven_after_r_multiple
-    updated = _apply_exit_profile_spec(updated, row)
+        explicit_keys.add("stop_to_breakeven_after_r_multiple")
+    updated = _apply_exit_profile_spec(updated, row, explicit_keys=explicit_keys)
     return updated
 
 
@@ -1338,15 +1349,21 @@ def _exit_spec_fields_from_management_policy_spec(spec_payload: dict[str, Any]) 
     return mapped
 
 
-def _apply_exit_profile_spec(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:
+def _apply_exit_profile_spec(
+    section: dict[str, Any],
+    row: ActivePlanSheetRow,
+    explicit_keys: set[str] | None = None,
+) -> dict[str, Any]:
     """Carry an assigned exit-profile (kernel ``ManagementPolicySpec`` cell) onto ExitSpec.
 
     Back-compat: a row WITHOUT ``exit_profile_spec`` is returned untouched, so
     its compiled ExitSpec is byte-identical to pre-bridge output. A row WITH a
     spec gets the mapped v2 fields layered onto the exit payload. An explicit
-    per-row ``exit_overrides`` entry for the same key still wins (it is the
-    operator's deliberate last-mile knob), so a key already supplied via
-    ``exit_overrides`` is left as the override set it.
+    per-row knob still wins (it is the operator's deliberate last-mile value), so
+    any ExitSpec key the operator set — either through an ``exit_overrides`` entry
+    or a dedicated typed column (passed in via ``explicit_keys``, e.g.
+    ``stop_loss_pct`` / ``hard_flat_time_et``) — is protected from the published
+    spec, whose kernel DEFAULTS would otherwise silently clobber it.
     """
     spec_payload = row.exit_profile_spec
     if not spec_payload:
@@ -1357,12 +1374,14 @@ def _apply_exit_profile_spec(section: dict[str, Any], row: ActivePlanSheetRow) -
             f"ManagementPolicySpec, got {type(spec_payload).__name__}"
         )
     mapped = _exit_spec_fields_from_management_policy_spec(spec_payload)
-    # An explicit per-row exit_overrides key is the operator's deliberate
-    # last-mile knob and takes precedence over the published profile spec.
-    override_keys = set(row.exit_overrides or {})
+    # The operator's explicit per-row knobs (exit_overrides dict + dedicated
+    # typed columns) take precedence over the published profile spec.
+    protected_keys = set(row.exit_overrides or {})
+    if explicit_keys:
+        protected_keys |= explicit_keys
     updated = dict(section)
     for key, value in mapped.items():
-        if key in override_keys:
+        if key in protected_keys:
             continue
         updated[key] = value
     return updated
