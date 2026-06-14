@@ -2863,6 +2863,50 @@ def test_new6_replacement_stop_does_not_persist_price_on_failure(tmp_path) -> No
     assert updated.stop_price is None  # NOT 2.0
 
 
+def test_medium1_partial_residual_stop_price_cleared_on_place_fail(tmp_path) -> None:
+    # MEDIUM-1: a profile partial cancels the full-size stop, sells the banked qty,
+    # then tries to re-arm a residual stop. When that placement FAILS the residual
+    # must NOT keep a phantom ``stop_price`` (which would fool a downstream
+    # ``stop_price is not None`` protected-check). With ``stop_order_id is None``
+    # the residual ``stop_price`` must also be None so the monitor re-arms it.
+    supervisor, om, repo = _failing_stop_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_FULL",  # live full-size stop @1.5 covering all 4
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = _profile_partial_decision(
+        deployment.deployment_id, exit_quantity=3, entry_premium=2.0, risk_per_contract=0.5
+    )
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    # The banked 3 were closed (CLOSE_OK), the full-size stop was cancelled, and a
+    # residual stop placement was attempted (and failed).
+    assert plan is not None and plan.quantity == 3
+    assert "STOP_FULL" in om.cancel_calls
+    assert om.stop_calls  # a residual stop placement was attempted
+    residual = supervisor.planner.position_tracker.active_positions()[0]
+    assert residual.quantity == 1
+    # The residual is left for reprotection: NO stop order id AND NO phantom price.
+    assert residual.stop_order_id is None
+    assert residual.stop_price is None  # MEDIUM-1: not the stale 1.5
+    # The monitor re-arms exactly this condition (no stop, no target).
+    assert residual.target_order_id is None
+    # The persisted trade record carries no phantom stop price either.
+    records = _events_of_type(repo, "partial_scale_submission")
+    assert records and records[-1]["residual_protected"] is False
+    assert records[-1]["restored_stop_price"] is None
+
+
 def test_new4_eod_sweep_clears_profile_exit_state(tmp_path) -> None:
     # NEW-4: the EOD hard-flat sweep (close_due_positions) is terminal -> clear.
     supervisor, _ = _partial_supervisor(tmp_path)
@@ -2918,3 +2962,123 @@ def test_new4_halt_and_flatten_clears_profile_exit_state(tmp_path) -> None:
     )
     assert supervisor.planner.position_tracker.active_positions() == []
     assert key not in supervisor._profile_exit_states
+
+
+def test_new4_mark_trade_closed_with_exit_truth_clears_profile_exit_state(tmp_path) -> None:
+    # NEW-4: the reconciled-fill terminal close (the common chokepoint for the
+    # pending-exit FILLED path) must clear the profile-exit ladder state by trade id.
+    supervisor, _ = _partial_supervisor(tmp_path)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    supervisor.get_or_create_profile_exit_state(position, entry_premium=2.0)
+    key = supervisor._profile_state_key(position)  # "trade:T1"
+    assert key in supervisor._profile_exit_states
+
+    asyncio.run(
+        supervisor._mark_trade_closed_with_exit_truth(
+            "T1", exit_order_id="EXIT1", status="FILLED", payload={"status": "FILLED"}
+        )
+    )
+    assert key not in supervisor._profile_exit_states  # NEW-4: cleared
+
+
+def test_new4_disappeared_trade_close_clears_profile_exit_state(tmp_path) -> None:
+    # NEW-4: a disappeared (broker-vanished) position close is terminal -> clear.
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(ExplodingStatusOrderManager()),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T1",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    supervisor.get_or_create_profile_exit_state(position, entry_premium=2.0)
+    key = supervisor._profile_state_key(position)
+    assert key in supervisor._profile_exit_states
+
+    trade = TradeRecord(
+        trade_id="T1",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        status="open_protected",
+        entry_order_id="ENTRY1",
+    )
+    asyncio.run(supervisor._mark_disappeared_trade_closed(trade))
+    assert key not in supervisor._profile_exit_states  # NEW-4: cleared
+
+
+def test_new4_reconcile_pending_entry_release_clears_profile_exit_state(tmp_path) -> None:
+    # NEW-4: releasing a terminal reconcile-hold entry (rejected/cancelled/expired)
+    # must clear the profile-exit ladder state by full identity.
+    class CanceledOrderManager(StubOrderManager):
+        async def get_order_status(self, order_id: str):
+            del order_id
+            return "CANCELED", {"status": "CANCELED"}, None
+
+    class ReconcilePlanner(StubPlanner):
+        def __init__(self):
+            super().__init__()
+            self.order_manager = CanceledOrderManager()
+            self.cash_guard = RecordingCashGuard()
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=ReconcilePlanner(),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE123",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_pending",
+        order_id="ENTRY123",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    supervisor.get_or_create_profile_exit_state(position, entry_premium=2.0)
+    key = supervisor._profile_state_key(position)  # "trade:TRADE123"
+    assert key in supervisor._profile_exit_states
+
+    trade = TradeRecord(
+        trade_id="TRADE123",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        status="pending_entry_reconcile",
+        entry_order_id="ENTRY123",
+    )
+    asyncio.run(supervisor._reconcile_pending_entry_release(trade))
+    assert key not in supervisor._profile_exit_states  # NEW-4: cleared

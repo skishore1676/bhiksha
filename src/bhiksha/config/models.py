@@ -104,6 +104,44 @@ def _validate_exit_safety(
     )
 
 
+def _validate_profile_recovery_stop(
+    *,
+    identifier: str,
+    exit_spec: "ExitSpec",
+    risk_spec: "RiskSpec",
+) -> None:
+    """HIGH-2: a profile-exit deployment must have a resolvable recovery stop pct.
+
+    When a deployment pins an exit profile (``profile_exit_id`` set), the live
+    runtime's "re-arm protection next tick" path (``_restore_missing_protection``
+    -> ``_resolved_recovery_stop_loss_pct``) must be able to derive a positive
+    stop %; otherwise it silently NO-OPs and the position rides NAKED. A resolvable
+    stop comes from any of (matching the runtime resolver order): the deployment
+    ``exit.stop_loss_pct``, the global ``risk.stop_loss_pct``, or — since the
+    profile supplies its own floor — the profile ``initial_stop_pct`` / wider
+    ``premium_disaster_stop_pct``. Reject the config when none is positive.
+    """
+    if not getattr(exit_spec, "profile_exit_id", None):
+        return
+
+    def _positive(value: float | None) -> bool:
+        return value is not None and value > 0
+
+    if (
+        _positive(exit_spec.stop_loss_pct)
+        or _positive(risk_spec.stop_loss_pct)
+        or _positive(exit_spec.initial_stop_pct)
+        or _positive(exit_spec.premium_disaster_stop_pct)
+    ):
+        return
+    raise ValueError(
+        f"{identifier} pins exit profile {exit_spec.profile_exit_id!r} but has no "
+        "resolvable recovery stop pct: set a positive exit.stop_loss_pct or "
+        "risk.stop_loss_pct (or a profile initial_stop_pct/premium_disaster_stop_pct). "
+        "Without one the live re-arm path would no-op into a naked ride."
+    )
+
+
 def _validate_optional_time_field(data: Any, field_name: str) -> None:
     if not isinstance(data, dict):
         return
@@ -259,7 +297,18 @@ class ExitSpec(BaseModel):
     # When ``profile_exit_id`` is set the deployment carries a frozen named
     # operator exit profile; the evaluator runs it SHADOW-FIRST. ---
     profile_exit_id: str | None = None
+    # Legacy shadow flag (pre-dates the live-monitor wiring). Retained for the
+    # offline shadow-receipt tool. The LIVE-monitor dispatch gate is driven by
+    # ``profile_exit_drives_live`` below (the single operator switch), not by this.
     profile_exit_shadow_only: bool = True
+    # Operator live-enablement flag for the profile-exit evaluator. DEFAULT FALSE
+    # and the ONLY state this wave ships: when False the profile decision is
+    # RECORD-ONLY (shadow) and can never reach the broker/order path. Flipping it
+    # to True (a deliberate later operator action) is the single switch that lets
+    # a recorded profile decision DRIVE a real exit — and even then the
+    # fail-closed dispatch allowlist (profile_exit_dispatch_allowed) still applies.
+    # An env override (BHIKSHA_PROFILE_EXIT_LIVE) can force it on at runtime.
+    profile_exit_drives_live: bool = False
     target_1_r: float | None = None
     target_2_r: float | None = None
     target_1_quantity: float = 1.0
@@ -336,6 +385,11 @@ class DeploymentManifest(BaseModel):
             strategy_key=self.strategy.key,
             exit_spec=self.exit,
         )
+        _validate_profile_recovery_stop(
+            identifier=f"deployment {self.deployment_id!r}",
+            exit_spec=self.exit,
+            risk_spec=self.risk,
+        )
         return self
 
 
@@ -370,6 +424,11 @@ class StrategyCatalogEntry(BaseModel):
             identifier=f"strategy catalog entry {self.strategy_id!r}",
             strategy_key=self.strategy.key,
             exit_spec=self.exit,
+        )
+        _validate_profile_recovery_stop(
+            identifier=f"strategy catalog entry {self.strategy_id!r}",
+            exit_spec=self.exit,
+            risk_spec=self.risk,
         )
         return self
 
