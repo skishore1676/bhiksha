@@ -310,6 +310,17 @@ class ProfileExitState:
     stop_at_breakeven: bool = False
     banked_quantity: int = 0
     breakeven_emitted: bool = False
+    # MEDIUM-1(flip): True once this state was advanced by at least one evaluation
+    # that ran in SHADOW (``drives_live=False``). The shadow recorder ratchets the
+    # peak and, on a T1 touch, sets ``target_1_banked``/``banked_quantity``/
+    # ``breakeven_emitted`` every tick even though it places nothing. If the
+    # operator later flips ``profile_exit_drives_live`` ON mid-position, the now-
+    # live evaluator must NOT inherit that shadow-advanced ladder (it would under-
+    # size the live exit and skip the breakeven). This flag lets the caller detect
+    # the shadow->live transition and reseed exactly once. A position that has only
+    # ever evaluated live never sets it, so a clean-from-entry live ladder is
+    # unaffected.
+    shadow_advanced: bool = False
 
     @classmethod
     def new(cls, entry_premium: float) -> "ProfileExitState":
@@ -321,6 +332,30 @@ class ProfileExitState:
 
     def mark_breakeven_emitted(self) -> None:
         self.breakeven_emitted = True
+
+    def mark_shadow_advanced(self) -> None:
+        """Record that this state was advanced by a shadow (record-only) tick."""
+        self.shadow_advanced = True
+
+    def reseed_for_live(self, entry_premium: float) -> None:
+        """Reset the ladder to a clean entry-state for a first LIVE evaluation.
+
+        MEDIUM-1(flip): called exactly once when a position whose state was
+        shadow-advanced (``shadow_advanced`` True, flag was OFF) first evaluates
+        with ``drives_live=True``. Drops every shadow-accumulated mutation —
+        banked partial (``target_1_banked``/``banked_quantity``), the emitted
+        breakeven (``breakeven_emitted``/``stop_at_breakeven``) and the ratcheted
+        peak (reset to ``entry_premium``, matching ``new``) — so the live
+        evaluator sees the position as if it were opening clean. ``shadow_advanced``
+        is cleared so the reseed happens only once.
+        """
+        self.peak_premium = entry_premium
+        self.target_1_banked = False
+        self.target_1_premium = None
+        self.stop_at_breakeven = False
+        self.banked_quantity = 0
+        self.breakeven_emitted = False
+        self.shadow_advanced = False
 
 
 @dataclass(slots=True, frozen=True)

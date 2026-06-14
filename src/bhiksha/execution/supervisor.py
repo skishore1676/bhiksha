@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import UTC
 import math
+import os
 import uuid
 from typing import Any
 
@@ -21,7 +22,8 @@ from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradeP
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
 from bhiksha.execution.pricing import select_entry_limit
-from bhiksha.execution.profile_exit import ProfileExitState
+from bhiksha.execution.profile_exit import ProfileExitFields, ProfileExitState, ProfileMarketView
+from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -158,6 +160,193 @@ class ExecutionSupervisor:
         if identity:
             self._profile_exit_states.pop(f"trade:{identity}", None)
         self._profile_exit_states.pop(f"pos:{deployment_id}:{symbol}:{option_symbol}", None)
+
+    # ------------------------------------------------------------------ #
+    # Profile-exit SHADOW-RECORD dual-run (record-only this wave; OFF flag)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _deployment_carries_exit_profile(deployment: DeploymentManifest) -> bool:
+        """True when a deployment pins a v2 operator exit profile."""
+        exit_spec = getattr(deployment, "exit", None)
+        return bool(getattr(exit_spec, "profile_exit_id", None))
+
+    @staticmethod
+    def _profile_exit_drives_live(deployment: DeploymentManifest) -> bool:
+        """Operator live-enablement flag for the profile-exit evaluator.
+
+        DEFAULT FALSE and the ONLY state this wave ships. This is the SINGLE flip
+        seam: when it returns True a recorded profile decision becomes eligible to
+        DRIVE a real exit (still subject to the fail-closed dispatch allowlist in
+        ``profile_exit_dispatch_allowed``); when False the profile decision is
+        record-only and can never reach the broker/order path.
+
+        Resolves from the deployment ``exit.profile_exit_drives_live`` flag, OR an
+        env override ``BHIKSHA_PROFILE_EXIT_LIVE`` (``1``/``true``/``yes``/``on``).
+        Both default to OFF — this wave never enables it.
+        """
+        exit_spec = getattr(deployment, "exit", None)
+        if bool(getattr(exit_spec, "profile_exit_drives_live", False)):
+            return True
+        env = os.environ.get("BHIKSHA_PROFILE_EXIT_LIVE")
+        if env is not None and env.strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+        return False
+
+    @staticmethod
+    def _resolved_runtime_mode(deployment: DeploymentManifest) -> str | None:
+        """The deployment's ACTUAL runtime mode for the profile-exit dispatch gate.
+
+        HIGH-1: the gate must consult the deployment's real runtime mode, NOT a
+        hardcoded ``live_approval_gated`` literal. The real source is the
+        deployment's execution config (``execution.runtime_mode`` — the kernel
+        ``RuntimeMode`` wire value the deployment was compiled/declared with).
+
+        FAILS CLOSED by construction: returns whatever the deployment actually
+        declares, or ``None`` when it declares nothing. The downstream fail-closed
+        allowlist (``profile_exit_dispatch_allowed``) opens ONLY for the exact
+        string ``live_approval_gated``; ``None`` and every other value
+        (``live_automated``/``shadow``/``advisory``/unknown) keep the gate shut.
+        This method never substitutes a permissive default for a missing/unknown
+        mode — a deployment that does not provably run ``live_approval_gated``
+        cannot dispatch a profile exit.
+        """
+        execution_spec = getattr(deployment, "execution", None)
+        mode = getattr(execution_spec, "runtime_mode", None)
+        if mode is None:
+            return None
+        # Normalize a kernel ``RuntimeMode`` enum (or any object) to its wire
+        # string; the allowlist compares against canonical strings. A non-string,
+        # non-enum value normalizes to its ``str(...)`` form, which will simply
+        # miss the allowlist and fail closed.
+        normalized = getattr(mode, "value", mode)
+        if not isinstance(normalized, str):
+            normalized = str(normalized)
+        return normalized
+
+    async def _record_profile_exit_shadow(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        quote: Any,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """SHADOW-RECORD the profile-exit ladder decision for this tick (PART A).
+
+        Runs the operator's exit profile against the live option quote ALREADY
+        fetched this tick and RECORDS the decision to the shadow event sink (a
+        ``profile_exit_shadow`` event). State persists across ticks via the
+        supervisor-owned ``ProfileExitState`` store and is cleared on close.
+
+        NON-NEGOTIABLE INVARIANT (this wave): the existing exit path remains the
+        SOLE authority over the position. With ``profile_exit_drives_live`` OFF
+        (its default, the only state shipped) the recorder is told ``live=False``,
+        so the fail-closed dispatch gate (``profile_exit_dispatch_allowed``) cannot
+        open and ``outcome.dispatched`` is always False — the profile decision is
+        recorded ONLY and NEVER routed into ``handle_exit``/the order path. This
+        method places no orders and mutates no position; it only appends an event
+        and advances the (separate) ladder state object.
+        """
+        if not self._deployment_carries_exit_profile(deployment):
+            return
+        if position.option_symbol is None or position.quantity <= 0 or position.entry_price is None:
+            return
+        if quote is None:
+            return
+
+        now = now or datetime.now(UTC)
+        fields = ProfileExitFields.from_exit_spec(deployment.exit)
+        market = ProfileMarketView(
+            current_premium=quote.exit_reference_price,
+            # Wall-clock ET time-of-day for the EOD rung (best-effort; the
+            # supervisor's own close_due_positions sweep remains the EOD authority).
+            bar_time_et=as_et_time(now),
+            bid=getattr(quote, "bid", None),
+            ask=getattr(quote, "ask", None),
+            last=getattr(quote, "last", None),
+        )
+        state = self.get_or_create_profile_exit_state(position, entry_premium=position.entry_price)
+
+        # FLIP SEAM (the operator's one-line live enablement is the flag inside
+        # ``_profile_exit_drives_live``; everything downstream of ``live`` is
+        # already wired). This wave: ``drives_live`` is False, so ``live=False``.
+        drives_live = self._profile_exit_drives_live(deployment)
+
+        # MEDIUM-1(flip): protect a mid-position flag flip. With the flag OFF the
+        # recorder still advances ``state`` every tick (peak ratchets; a T1 touch
+        # sets target_1_banked/banked_quantity/breakeven_emitted) but places
+        # nothing. If the operator flips ``profile_exit_drives_live`` ON while a
+        # position is open, the now-live evaluator would inherit that shadow-
+        # advanced ladder and UNDER-SIZE the live exit (treating a never-placed
+        # partial as banked) and SKIP the breakeven. Guard the transition:
+        #   * shadow tick (drives_live False): mark the state shadow-advanced.
+        #   * first live tick on a shadow-advanced state: RESEED the ladder fresh
+        #     from the current premium before the live evaluation, so the live
+        #     evaluator sees the position as if opening clean.
+        # A position that has only ever run live never sets ``shadow_advanced``,
+        # so a clean-from-entry live ladder is untouched (no reseed).
+        if not drives_live:
+            state.mark_shadow_advanced()
+        elif state.shadow_advanced:
+            state.reseed_for_live(position.entry_price)
+
+        outcome = await evaluate_and_record_profile_exit(
+            event_sink=self.event_repository,
+            fields=fields,
+            deployment_id=deployment.deployment_id,
+            symbol=position.symbol,
+            option_symbol=position.option_symbol,
+            entry_premium=position.entry_price,
+            quantity=position.quantity,
+            market=market,
+            entry_time=position.entry_timestamp,
+            state=state,
+            # --- DISPATCH GATE INPUTS ---
+            # ``live`` is THE operator flip. OFF this wave => the fail-closed
+            # allowlist returns False => the decision is recorded, never dispatched.
+            live=drives_live,
+            # ``deployment_shadow_only`` is the SINGLE switch's shadow precondition:
+            # it is True (shadow) exactly when the drive flag is OFF, so flipping
+            # ``profile_exit_drives_live`` is sufficient to satisfy THIS precondition
+            # (the gate still independently requires runtime_mode + a live source).
+            deployment_shadow_only=not drives_live,
+            position_source=position.source,
+            # HIGH-1: the deployment's ACTUAL runtime mode (never a hardcoded
+            # literal). Resolved from the real execution config; ``None`` when the
+            # deployment does not declare one. The fail-closed dispatch allowlist
+            # opens ONLY for ``live_approval_gated`` — so a deployment running
+            # ``live_automated`` (or shadow/advisory/unknown/None) keeps the gate
+            # SHUT and can never dispatch a profile exit, matching the rest of
+            # Bhiksha. Going live therefore requires BOTH the operator flag flip
+            # AND a deployment whose real mode is ``live_approval_gated``.
+            runtime_mode=self._resolved_runtime_mode(deployment),
+            now=now,
+            # The supervisor's EOD authority is close_due_positions; do not hard-fail
+            # the shadow record when a bar clock is unavailable.
+            require_bar_time_for_eod=False,
+        )
+
+        # HARD GUARD (this wave): a recorded profile decision must NOT reach the
+        # broker/order path. With the flag OFF ``outcome.dispatched`` is always
+        # False and ``outcome.exit_decision`` is None, so this branch is DORMANT.
+        # It is the documented place the operator wires the live route AFTER the
+        # flag flip; in this wave it deliberately makes NO call into the exit/order
+        # path — it only records an audit event so a (future) gate-open is visible.
+        if outcome.dispatched and outcome.exit_decision is not None:
+            await self.event_repository.append(
+                "profile_exit_dispatch_ready",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "trade_id": position.trade_id,
+                    "rule": outcome.decision.rule.value,
+                    "fsm_action": outcome.decision.fsm_action.value,
+                    "note": "profile_exit_live_routing_not_enabled_this_wave",
+                },
+            )
+            # INTENTIONALLY NOT ROUTED in this wave (no handle_exit / order call).
 
     async def handle_signal(
         self,
@@ -1383,6 +1572,30 @@ class ExecutionSupervisor:
                         exit_mode=updated.exit_mode,
                     )
                 )
+
+        # PART A: SHADOW-RECORD DUAL-RUN. After the EXISTING exit-management path
+        # has fully run (and remains the sole authority over the position), record
+        # the operator exit profile's decision for this tick against the live quote
+        # already fetched above. This is record-only with the operator flag OFF
+        # (this wave); it never alters ``updated``, places no orders, and never
+        # routes into the exit/order path. Failures here are isolated so the shadow
+        # recorder can never disrupt the real management path.
+        if self._deployment_carries_exit_profile(deployment):
+            try:
+                shadow_quote = await ensure_quote()
+                await self._record_profile_exit_shadow(deployment, updated, shadow_quote)
+            except Exception as exc:  # never let shadow recording break management
+                await self.event_repository.append(
+                    "profile_exit_shadow_error",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": updated.symbol,
+                        "option_symbol": updated.option_symbol,
+                        "trade_id": updated.trade_id,
+                        "error": str(exc),
+                    },
+                )
+
         return updated
 
     def _supports_concurrent_exit_orders(self) -> bool:
@@ -1587,6 +1800,12 @@ class ExecutionSupervisor:
             )
 
         updated_position = position
+        # MEDIUM-1: capture the prior resting stop price BEFORE cancelling
+        # protection. ``_cancel_exit_protection`` now clears ``stop_price`` when it
+        # clears ``stop_order_id``, so the residual stop derivation must read the
+        # prior price from here (not from the post-cancel position) to preserve the
+        # "residual inherits the prior stop price" behavior (NEW-1/NEW-2).
+        prior_stop_price = position.stop_price
         canceled_stop_order_id = None
         canceled_target_order_id = None
         cancel_error = None
@@ -1681,7 +1900,9 @@ class ExecutionSupervisor:
         # resting stop existed (from the profile stop in the decision diagnostics,
         # else the deployment exit spec). Never leave the residual stop_order_id
         # None after a successful partial.
-        restored_stop_price = _residual_protective_stop_price(updated_position, decision, deployment)
+        restored_stop_price = _residual_protective_stop_price(
+            updated_position, decision, deployment, prior_stop_price=prior_stop_price
+        )
         restored_stop_order_id = None
         residual_unprotected = False
         if restored_stop_price is None:
@@ -1744,9 +1965,19 @@ class ExecutionSupervisor:
                 stop_order_id=restored_stop_order_id,
                 stop_price=restored_stop_price,
             )
-        # else: residual keeps stop_order_id=None AND stop_price=None (NEW-6
-        # parity) so downstream stop_price-is-not-None checks aren't fooled and the
-        # monitor re-arms it.
+        else:
+            # MEDIUM-1 / NEW-6 parity: when the residual stop could not be placed
+            # the residual must NOT keep a phantom ``stop_price``. ``residual`` was
+            # built from ``updated_position`` with ``stop_order_id=None`` but it
+            # still INHERITED the prior full-size stop's ``stop_price`` (the
+            # ``_replace_position`` above did not touch it, and
+            # ``_cancel_exit_protection`` clears ``stop_order_id`` without clearing
+            # ``stop_price``). Force it to None so ``stop_order_id`` and
+            # ``stop_price`` agree (both None) — otherwise a downstream
+            # ``stop_price is not None`` protected-check is fooled into believing
+            # the naked residual is protected and the monitor's missing-protection
+            # path (stop_order_id is None AND target_order_id is None) skips it.
+            residual = _replace_position(residual, stop_order_id=None, stop_price=None)
 
         # Persist the residual as the tracked position (same identity, reduced qty).
         self.planner.position_tracker.open_position(
@@ -2158,7 +2389,12 @@ class ExecutionSupervisor:
                 canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
             if canceled:
                 canceled_stop_order_id = position.stop_order_id
-                updated = _replace_position(updated, stop_order_id=None)
+                # MEDIUM-1: clear ``stop_price`` alongside ``stop_order_id`` so a
+                # cancelled stop never leaves a phantom price behind. With the
+                # order gone there is no live stop, and a stale ``stop_price``
+                # would fool downstream ``stop_price is not None`` protected-checks.
+                # (Callers that re-arm a new stop overwrite ``stop_price`` after.)
+                updated = _replace_position(updated, stop_order_id=None, stop_price=None)
             elif self._allows_exit_submission_before_cancel_confirmation():
                 await self.event_repository.append(
                     "ambiguous_cancel",
@@ -2797,6 +3033,16 @@ class ExecutionSupervisor:
             status=status,
             payload=payload,
         )
+        # NEW-4: a disappeared (broker-vanished) position is terminal. Clear by full
+        # identity so both the ``trade:{id}`` and the ``pos:`` fallback keys are
+        # dropped — no profile-exit ladder state can survive the close.
+        self._clear_profile_exit_state_for_identity(
+            trade_id=trade.trade_id,
+            order_id=trade.entry_order_id,
+            deployment_id=trade.deployment_id,
+            symbol=trade.symbol,
+            option_symbol=trade.option_symbol,
+        )
         if exit_order_id is not None and payload is not None:
             await self.event_repository.append(
                 "exit_fill_enriched",
@@ -2875,6 +3121,14 @@ class ExecutionSupervisor:
             exit_order_id=exit_order_id,
             **details,
         )
+        # NEW-4: this is a terminal close (reconciled fill truth) and the common
+        # chokepoint for the pending-exit FILLED path and the disappeared-position
+        # reconcile. Drop the profile-exit ladder state so it cannot leak past a
+        # terminal close. The state is keyed primarily by trade id (see
+        # ``_profile_state_key``), so clearing ``trade:{trade_id}`` covers any
+        # position whose identity is its trade id.
+        if trade_id:
+            self._profile_exit_states.pop(f"trade:{trade_id}", None)
 
     async def _reconcile_pending_entry_release(self, trade: TradeRecord) -> None:
         if trade.entry_order_id is None:
@@ -2885,6 +3139,16 @@ class ExecutionSupervisor:
             return
         await self._release_cash_guard_reservation(trade.trade_id)
         await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
+        # NEW-4: releasing a reconcile-hold entry is terminal (the entry never
+        # filled / was rejected-cancelled-expired). Clear any profile-exit ladder
+        # state by full identity so it cannot leak past this close.
+        self._clear_profile_exit_state_for_identity(
+            trade_id=trade.trade_id,
+            order_id=trade.entry_order_id,
+            deployment_id=trade.deployment_id,
+            symbol=trade.symbol,
+            option_symbol=trade.option_symbol,
+        )
         transition = self.lifecycle_store.mark_closed(trade.symbol, trade.deployment_id)
         await self._emit_lifecycle_transition(transition, reason="entry_reconcile_released")
         await self.event_repository.append(
@@ -3540,6 +3804,20 @@ def _resolved_recovery_stop_loss_pct(deployment: DeploymentManifest) -> tuple[fl
         return deployment.exit.stop_loss_pct, "deployment_native"
     if deployment.risk.stop_loss_pct is not None and deployment.risk.stop_loss_pct > 0:
         return deployment.risk.stop_loss_pct, "global_fallback"
+    # HIGH-2: a profile-exit deployment must never no-op the re-arm path into a
+    # naked ride. When neither the deployment nor the global stop pct is set, let
+    # the profile supply its OWN recovery floor from its premium-stop dials
+    # (initial stop, else the wider disaster stop). Config validation
+    # (``_validate_profile_recovery_stop``) also rejects a profile deployment that
+    # leaves all of these unset, so this is belt-and-suspenders for the runtime.
+    exit_spec = deployment.exit
+    if getattr(exit_spec, "profile_exit_id", None):
+        initial = getattr(exit_spec, "initial_stop_pct", None)
+        if initial is not None and initial > 0:
+            return float(initial), "profile_initial_stop"
+        disaster = getattr(exit_spec, "premium_disaster_stop_pct", None)
+        if disaster is not None and disaster > 0:
+            return float(disaster), "profile_disaster_stop"
     return None, "unavailable"
 
 
@@ -3594,6 +3872,8 @@ def _residual_protective_stop_price(
     position: TrackedPosition,
     decision: ExitDecision,
     deployment: DeploymentManifest,
+    *,
+    prior_stop_price: float | None = None,
 ) -> float | None:
     """Resolve a protective stop price for the residual after a profile partial.
 
@@ -3601,8 +3881,12 @@ def _residual_protective_stop_price(
     the position carried no prior resting stop (``stop_price is None``). This
     derives a residual stop from, in order of preference:
 
-      1. the prior resting stop price (``position.stop_price``) — unchanged
-         behavior when a stop was already in place;
+      1. the prior resting stop price — unchanged behavior when a stop was already
+         in place. ``prior_stop_price`` is the price captured by the caller BEFORE
+         it cancelled protection (MEDIUM-1: ``_cancel_exit_protection`` now clears
+         ``stop_price`` when it clears the stop order, so the live ``position``
+         passed here may already have ``stop_price=None``); falls back to
+         ``position.stop_price`` when the caller does not supply it;
       2. the profile's own initial premium stop, recovered from the decision's
          diagnostics (``entry_premium - risk_per_contract`` — i.e. ``entry *
          (1 - initial_stop_pct)``), so the residual inherits the profile's stop;
@@ -3612,8 +3896,9 @@ def _residual_protective_stop_price(
     Returns ``None`` only when no positive entry/stop information exists anywhere,
     which the caller treats as a hard error rather than going naked.
     """
-    if position.stop_price is not None and position.stop_price > 0:
-        return float(position.stop_price)
+    resting_stop = prior_stop_price if prior_stop_price is not None else position.stop_price
+    if resting_stop is not None and resting_stop > 0:
+        return float(resting_stop)
 
     features = decision.features or {}
     entry_premium = features.get("entry_premium")
