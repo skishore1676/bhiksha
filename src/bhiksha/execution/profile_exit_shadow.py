@@ -55,6 +55,14 @@ class ProfileExitShadowOutcome:
     dispatched: bool
     # The mapped domain ExitDecision when dispatch is allowed; None in shadow.
     exit_decision: Any | None = None
+    # Whether the fail-closed dispatch ALLOWLIST is open for this position this
+    # tick (``profile_exit_dispatch_allowed`` returned True). This is the
+    # AUTHORITY signal, distinct from ``dispatched``: the gate can be open on a
+    # HOLD tick (where ``dispatched`` is False because the profile took no action)
+    # yet the profile route is still the exit authority for the position. The
+    # supervisor uses this to make the native exit path yield while the profile
+    # route owns the position (see the authority handoff in supervisor.py).
+    dispatch_allowed: bool = False
 
 
 async def evaluate_and_record_profile_exit(
@@ -145,6 +153,7 @@ async def evaluate_and_record_profile_exit(
         recorded=True,
         dispatched=dispatched,
         exit_decision=exit_decision,
+        dispatch_allowed=dispatch_allowed,
     )
 
 

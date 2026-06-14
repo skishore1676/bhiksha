@@ -224,8 +224,8 @@ def test_invariant_profile_vs_nonprofile_identical_broker_calls_flag_off(tmp_pat
     assert len(shadow) == 1
     assert shadow[0]["mode"] == "shadow_record"
     assert shadow[0]["dispatch_allowed"] is False
-    # No live dispatch / no routing-ready audit event with the flag OFF.
-    assert _events_of_type(repo_prof, "profile_exit_dispatch_ready") == []
+    # No live dispatch with the flag OFF: the armed route never fired.
+    assert _events_of_type(repo_prof, "profile_exit_dispatch_routed") == []
 
 
 def test_invariant_profile_rung_fires_in_shadow_but_no_exit_with_flag_off(tmp_path) -> None:
@@ -296,27 +296,29 @@ def test_nonprofile_deployment_records_no_shadow_event(tmp_path) -> None:
     assert _events_of_type(repo, "profile_exit_shadow") == []
 
 
-def test_flip_seam_when_flag_on_gate_opens_but_route_is_not_enabled(tmp_path) -> None:
-    """FLIP SEAM proof. Forcing the operator flag ON (test-only) with a live
-    position source opens the fail-closed dispatch gate (``outcome.dispatched``
-    True), so the operator's flip is a genuine one-line enablement. THIS WAVE
-    still does NOT route: the supervisor emits an audit event and places NO order.
+def test_armed_route_dispatches_full_close_through_existing_handler_in_dry_run(tmp_path) -> None:
+    """ARMED ROUTE (Phase 2). Forcing the operator flag ON (test-only) with a live
+    position source AND a live_approval_gated runtime mode opens the fail-closed
+    dispatch gate, and the armed route now DISPATCHES the profile decision through
+    the EXISTING ``_handle_exit_locked`` dispatcher. Run in dry_run so a square_off
+    books a PAPER close and places NO real order — the route is proven end-to-end
+    without touching the broker.
 
     Bid 2.10 < profile stop 2.25 (entry 3.0, initial_stop_pct 0.25) so the profile
-    ladder produces a real square_off; with the existing resting stop at 2.00 the
-    EXISTING path does not exit, isolating the seam behavior."""
+    ladder produces a SQUARE_OFF; with the existing resting stop at 2.00 the EXISTING
+    path does not exit, isolating the routed profile dispatch."""
     om = _CallRecordingOrderManager(bid=2.10)
     sup, repo = _supervisor(tmp_path, om)
-    # drives_live=True (the one-line flip) AND shadow_only=False so the gate's
-    # shadow precondition is satisfied; position_source live_open; and the
-    # deployment's REAL runtime mode is live_approval_gated (HIGH-1: the gate now
-    # reads execution.runtime_mode, no hardcoded literal).
+    # drives_live=True (the one-line flip) AND shadow_only=False so the gate's shadow
+    # precondition is satisfied; position_source live_open; REAL runtime mode
+    # live_approval_gated -> the gate OPENS.
     dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
     assert dep.exit.profile_exit_drives_live is True
     assert dep.execution.runtime_mode == "live_approval_gated"
     pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0)
 
-    managed = asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+    # dry_run=True keeps the dispatch on the PAPER path (no real order placed).
+    managed = asyncio.run(sup.manage_open_position(dep, pos, dry_run=True))
 
     shadow = _events_of_type(repo, "profile_exit_shadow")
     assert len(shadow) == 1
@@ -324,15 +326,23 @@ def test_flip_seam_when_flag_on_gate_opens_but_route_is_not_enabled(tmp_path) ->
     assert shadow[0]["dispatch_allowed"] is True
     assert shadow[0]["mode"] == "live_dispatch"
     assert shadow[0]["exit"] is True
-    # The seam emitted its audit marker (the documented place to wire the route).
-    ready = _events_of_type(repo, "profile_exit_dispatch_ready")
-    assert len(ready) == 1
-    assert ready[0]["note"] == "profile_exit_live_routing_not_enabled_this_wave"
-    # CRITICAL: even with the gate open, THIS WAVE places NO order and the position
-    # is NOT exited by the profile branch (route deliberately not enabled).
+    # The route DISPATCHED through the existing handler: a routed audit event + a
+    # real ExitPlan (the existing square_off path), and the position is CLOSED.
+    routed = _events_of_type(repo, "profile_exit_dispatch_routed")
+    assert len(routed) == 1
+    assert routed[0]["fsm_action"] == "square_off"
+    assert routed[0]["action"] == "square_off"
+    assert routed[0]["dry_run"] is True
+    exit_plans = _events_of_type(repo, "exit_plan")
+    assert len(exit_plans) == 1
+    assert exit_plans[0]["dry_run"] is True
+    assert exit_plans[0]["action"] == "square_off"
+    # The position was fully closed by the route (manage returns None; tracker empty).
+    assert managed is None
+    assert sup.planner.position_tracker.active_positions() == []
+    # CRITICAL: NO real broker order was placed (dry_run paper close only).
     assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
-    assert managed is not None and managed.exit_mode is None and managed.exit_order_id is None
-    assert _events_of_type(repo, "exit_plan") == []
+    assert ("place_close", OPTION, 2, "STRATEGY") not in om.calls
 
 
 def test_flip_seam_stays_closed_for_nonlive_position_source_even_with_flag_on(tmp_path) -> None:
@@ -412,8 +422,9 @@ def test_high1_live_automated_deployment_gate_stays_closed_even_with_flag_on(tmp
     assert shadow[0]["exit"] is True
     assert shadow[0]["dispatch_allowed"] is False
     assert shadow[0]["mode"] == "shadow_record"
-    # No dispatch-ready audit, no order, position untouched.
-    assert _events_of_type(repo, "profile_exit_dispatch_ready") == []
+    # Gate shut -> the armed route never fired and the native path did NOT yield.
+    assert _events_of_type(repo, "profile_exit_dispatch_routed") == []
+    assert _events_of_type(repo, "native_exit_yielded_to_profile") == []
     assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
     assert managed is not None and managed.exit_mode is None and managed.exit_order_id is None
 
@@ -434,7 +445,8 @@ def test_high1_unset_runtime_mode_fails_closed_even_with_flag_on(tmp_path) -> No
     shadow = _events_of_type(repo, "profile_exit_shadow")
     assert len(shadow) == 1
     assert shadow[0]["dispatch_allowed"] is False
-    assert _events_of_type(repo, "profile_exit_dispatch_ready") == []
+    assert _events_of_type(repo, "profile_exit_dispatch_routed") == []
+    assert _events_of_type(repo, "native_exit_yielded_to_profile") == []
     assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
 
 
@@ -457,18 +469,21 @@ def test_high1_shadow_runtime_mode_fails_closed_even_with_flag_on(tmp_path) -> N
 def test_high1_live_approval_gated_with_flag_on_and_live_source_opens_gate(tmp_path) -> None:
     """The positive control for HIGH-1: a deployment whose REAL runtime mode IS
     ``live_approval_gated`` (the lone permitted mode), flag ON, live source, opens
-    the gate. (The route still stays dormant this wave — proven elsewhere.)"""
+    the gate. (Run dry_run so the now-armed route dispatches on the paper path; the
+    routed dispatch itself is proven in the armed-route test.)"""
     om = _CallRecordingOrderManager(bid=2.10)
     sup, repo = _supervisor(tmp_path, om)
     dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
     pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.00, entry=3.0)
 
-    asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+    asyncio.run(sup.manage_open_position(dep, pos, dry_run=True))
 
     shadow = _events_of_type(repo, "profile_exit_shadow")
     assert len(shadow) == 1
     assert shadow[0]["dispatch_allowed"] is True
     assert shadow[0]["mode"] == "live_dispatch"
+    # No real broker order (paper dispatch only).
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
 
 
 # --------------------------------------------------------------------------- #
@@ -566,26 +581,34 @@ def test_flip_midposition_reseeds_shadow_banked_state_so_live_exit_is_full_size(
     dep_live = _partial_t1_profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
     pos3 = sup.planner.position_tracker.active_positions()[0]
 
-    asyncio.run(sup.manage_open_position(dep_live, pos3, dry_run=False))
+    # dry_run=True keeps the now-armed live dispatch on the PAPER path (no real
+    # order). The gate ignores dry_run, so it still opens.
+    managed_live = asyncio.run(sup.manage_open_position(dep_live, pos3, dry_run=True))
 
     live_shadow = [e for e in _events_of_type(repo, "profile_exit_shadow")][-1]
     # The gate is OPEN (real live mode + flag + live source)...
     assert live_shadow["dispatch_allowed"] is True
     assert live_shadow["mode"] == "live_dispatch"
     # ...and the live decision is the FULL-size initial stop, NOT an under-sized
-    # breakeven exit of the remaining 1 lot. This is the crux of the fix.
+    # breakeven exit of the remaining 1 lot. This is the crux of the fix: the
+    # reseed wiped the shadow-banked partial so the live exit respects the FULL
+    # size. (Proven via the recorded decision; the armed route then closes the
+    # position, which clears the in-memory ladder state, so the reseed is asserted
+    # here on the emitted decision rather than post-close state.)
     assert live_shadow["rule"] == "initial_stop"
     assert live_shadow["reason"] == "profile_initial_stop"
     assert live_shadow["exit"] is True
     assert live_shadow["exit_quantity"] == 2  # FULL size respected (reseed worked)
 
-    # The persisted state was reseeded: the shadow-banked partial / breakeven are
-    # gone and the shadow-advanced flag is cleared (reseed happens once).
-    reseeded = sup._profile_exit_states[key]
-    assert reseeded.banked_quantity == 0
-    assert reseeded.target_1_banked is False
-    assert reseeded.breakeven_emitted is False
-    assert reseeded.shadow_advanced is False
+    # The armed route DISPATCHED the full-size close through the existing handler
+    # (paper, no real order) and closed the position.
+    routed = _events_of_type(repo, "profile_exit_dispatch_routed")
+    assert len(routed) == 1 and routed[0]["fsm_action"] == "square_off"
+    assert managed_live is None
+    assert sup.planner.position_tracker.active_positions() == []
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om_live.calls)
+    # Ladder state cleared on the terminal close.
+    assert key not in sup._profile_exit_states
 
 
 def test_live_from_entry_partial_t1_is_unaffected_by_reseed_guard(tmp_path) -> None:
@@ -598,8 +621,9 @@ def test_live_from_entry_partial_t1_is_unaffected_by_reseed_guard(tmp_path) -> N
     pos = _open_live_position(sup, dep, stop_order_id="STOP_OLD", stop_price=2.25, entry=3.0, quantity=2)
     key = sup._profile_state_key(pos)
 
-    # Tick 1 (live): banks the partial T1.
-    asyncio.run(sup.manage_open_position(dep, pos, dry_run=False))
+    # Tick 1 (live): banks the partial T1. dry_run=True keeps the now-armed partial
+    # dispatch on the PAPER path (no real order); the gate ignores dry_run.
+    asyncio.run(sup.manage_open_position(dep, pos, dry_run=True))
     state_after_t1 = sup._profile_exit_states[key]
     assert state_after_t1.target_1_banked is True
     assert state_after_t1.banked_quantity == 1
@@ -610,16 +634,23 @@ def test_live_from_entry_partial_t1_is_unaffected_by_reseed_guard(tmp_path) -> N
     assert first["rule"] == "target_1_partial"
     assert first["exit_quantity"] == 1  # the genuine live partial
     assert first["dispatch_allowed"] is True
+    # The armed route dispatched the PARTIAL through the existing partial-scale
+    # handler (paper) and left the residual runner OPEN (quantity 1, not closed).
+    assert _events_of_type(repo, "profile_exit_dispatch_routed")[0]["fsm_action"] == "partial_scale"
+    residual = sup.planner.position_tracker.active_positions()[0]
+    assert residual.quantity == 1
 
     # Tick 2 (live, still elevated): the banked partial PERSISTS (no reseed wiped
     # it); the ladder emits the breakeven ratchet, not a fresh full T1.
     pos2 = sup.planner.position_tracker.active_positions()[0]
-    asyncio.run(sup.manage_open_position(dep, pos2, dry_run=False))
+    asyncio.run(sup.manage_open_position(dep, pos2, dry_run=True))
     state_after_t2 = sup._profile_exit_states[key]
     assert state_after_t2.target_1_banked is True  # STILL banked (not reset)
     assert state_after_t2.banked_quantity == 1
     assert state_after_t2.breakeven_emitted is True
     assert state_after_t2.shadow_advanced is False
+    # No real broker close/square-off order across either tick (paper only).
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
 
 
 # --------------------------------------------------------------------------- #
