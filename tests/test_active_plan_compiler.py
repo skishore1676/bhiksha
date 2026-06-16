@@ -486,6 +486,44 @@ def test_compile_active_plan_carries_exit_profile_spec_onto_strategy_exit(tmp_pa
     assert exit_spec.profile_exit_drives_live is False
 
 
+def test_exit_profile_fallback_does_not_widen_existing_catalog_stop(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    catalog_path = catalog_root / "spy_jerk.yaml"
+    _write_catalog_entry(catalog_path, strategy_id="spy_jerk_pivot_short_v1", symbol="SPY")
+    payload = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    payload["risk"]["stop_loss_pct"] = 0.35
+    payload["exit"]["stop_loss_pct"] = 0.35
+    catalog_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_jerk_profile_lane",
+                "row_type": "strategy",
+                "strategy_id": "spy_jerk_pivot_short_v1",
+                "authorization_mode": "shadow",
+                "exit_profile_spec": json.dumps(_exit_profile_spec(option_stop_fallback_pct=0.40)),
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+    )
+
+    assert compiled.plan.suppressed == []
+    deployment = compiled.plan.deployments[0]
+    assert deployment.risk.stop_loss_pct == 0.35
+    assert deployment.exit.stop_loss_pct == 0.35
+    assert deployment.exit.initial_stop_pct == 0.30
+    assert deployment.exit.profile_exit_id == "opening_drive_scalp_v1"
+
+
 def test_compile_active_plan_carries_mala_evidence_exit_profile_spec_onto_strategy_exit(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()

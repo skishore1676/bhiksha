@@ -348,8 +348,8 @@ def test_armed_route_dispatches_full_close_through_existing_handler_in_dry_run(t
 def test_flip_seam_stays_closed_for_nonlive_position_source_even_with_flag_on(tmp_path) -> None:
     """Defense: even with the flag ON AND a real live_approval_gated runtime mode,
     a non-live position source (shadow) keeps the fail-closed allowlist CLOSED —
-    the gate needs a live entry source too. Setting the real runtime mode isolates
-    the position-source check (so this is not merely failing on a None mode)."""
+    the gate needs a live entry source too. The shadow simulator may still book a
+    PAPER close; this test proves that is not a live dispatch."""
     om = _CallRecordingOrderManager(bid=2.10)
     sup, repo = _supervisor(tmp_path, om)
     dep = _profile_deployment(drives_live=True, runtime_mode="live_approval_gated")
@@ -364,10 +364,16 @@ def test_flip_seam_stays_closed_for_nonlive_position_source_even_with_flag_on(tm
         source="shadow",  # NOT a live entry source
     )
     pos = sup.planner.position_tracker.active_positions()[0]
-    asyncio.run(sup.manage_open_position(dep, pos, dry_run=True))
+    managed = asyncio.run(sup.manage_open_position(dep, pos, dry_run=True))
     shadow = _events_of_type(repo, "profile_exit_shadow")
     assert len(shadow) == 1
     assert shadow[0]["dispatch_allowed"] is False  # source fails the allowlist
+    assert shadow[0]["exit"] is True
+    assert _events_of_type(repo, "profile_exit_dispatch_routed") == []
+    assert len(_events_of_type(repo, "profile_exit_shadow_routed")) == 1
+    assert _events_of_type(repo, "shadow_exit_assumed")[0]["reason"] == ["profile_initial_stop"]
+    assert managed is None
+    assert sup.planner.position_tracker.active_positions() == []
     assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
 
 
@@ -392,6 +398,49 @@ def test_shadow_records_for_shadow_source_position_too(tmp_path) -> None:
     shadow = _events_of_type(repo, "profile_exit_shadow")
     assert len(shadow) == 1
     assert shadow[0]["dispatch_allowed"] is False
+
+
+def test_shadow_profile_exit_closes_shadow_position_without_broker_dispatch(tmp_path) -> None:
+    """A profile exit on a shadow position is terminal for the PAPER ledger, while
+    the live dispatch allowlist stays closed and no broker close order is placed."""
+    om = _CallRecordingOrderManager(bid=2.10)  # below profile stop 2.25
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(drives_live=False)
+    sup.planner.position_tracker.open_position(
+        "QQQ",
+        dep.deployment_id,
+        trade_id="S1",
+        option_symbol=OPTION,
+        quantity=2,
+        entry_price=3.0,
+        entry_timestamp=datetime(2026, 3, 30, 14, 0, tzinfo=UTC),
+        source="shadow",
+        stop_order_id="DRY_RUN_STOP",
+        stop_price=2.0,
+    )
+    pos = sup.planner.position_tracker.active_positions()[0]
+
+    managed = asyncio.run(sup.manage_open_position(dep, pos, dry_run=True))
+
+    shadow = _events_of_type(repo, "profile_exit_shadow")
+    assert len(shadow) == 1
+    assert shadow[0]["exit"] is True
+    assert shadow[0]["reason"] == "profile_initial_stop"
+    assert shadow[0]["dispatch_allowed"] is False
+    assert shadow[0]["mode"] == "shadow_record"
+    assert _events_of_type(repo, "profile_exit_dispatch_routed") == []
+    routed = _events_of_type(repo, "profile_exit_shadow_routed")
+    assert len(routed) == 1
+    assert routed[0]["fsm_action"] == "square_off"
+    exit_plans = _events_of_type(repo, "exit_plan")
+    assert len(exit_plans) == 1
+    assert exit_plans[0]["reasons"] == ["profile_initial_stop"]
+    shadow_exits = _events_of_type(repo, "shadow_exit_assumed")
+    assert len(shadow_exits) == 1
+    assert shadow_exits[0]["reason"] == ["profile_initial_stop"]
+    assert managed is None
+    assert sup.planner.position_tracker.active_positions() == []
+    assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
 
 
 # --------------------------------------------------------------------------- #

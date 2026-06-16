@@ -26,6 +26,7 @@ from bhiksha.execution.profile_exit import (
     ProfileExitFields,
     ProfileExitState,
     ProfileMarketView,
+    profile_decision_to_exit_decision,
     profile_exit_dispatch_allowed,
 )
 from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit, ProfileExitDispatchError
@@ -507,6 +508,35 @@ class ExecutionSupervisor:
             # Partial or stop-move: the position remains open. Re-read the tracked
             # position so the managed-position return reflects the residual/stop move
             # the locked handlers persisted; fall back to the input position.
+            return self._tracked_position_like(position) or position
+
+        if position.source == "shadow" and dry_run and outcome.decision.exit:
+            shadow_decision = profile_decision_to_exit_decision(
+                outcome.decision,
+                deployment_id=deployment.deployment_id,
+                symbol=position.symbol,
+                timestamp=now,
+            )
+            await self.event_repository.append(
+                "profile_exit_shadow_routed",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "trade_id": position.trade_id,
+                    "rule": outcome.decision.rule.value,
+                    "fsm_action": outcome.decision.fsm_action.value,
+                    "action": shadow_decision.action,
+                    "dry_run": True,
+                },
+            )
+            plan = await self._handle_exit_locked(deployment, position, shadow_decision, dry_run=True)
+            if (
+                plan is not None
+                and shadow_decision.action == "square_off"
+                and not _decision_is_partial_scale(shadow_decision)
+            ):
+                return None
             return self._tracked_position_like(position) or position
 
         return position

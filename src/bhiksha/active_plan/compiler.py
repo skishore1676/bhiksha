@@ -1383,6 +1383,18 @@ def _apply_exit_profile_spec(
     protected_keys = set(row.exit_overrides or {})
     if explicit_keys:
         protected_keys |= explicit_keys
+    existing_stop_loss_pct = _coerce_float(section.get("stop_loss_pct"))
+    if (
+        "stop_loss_pct" not in protected_keys
+        and existing_stop_loss_pct is not None
+        and existing_stop_loss_pct > 0
+        and abs(existing_stop_loss_pct - 0.45) > 1e-9
+    ):
+        # Treat option_stop_fallback_pct as a true fallback. If the active section
+        # already resolved a non-default stop from catalog/defaults (for example
+        # Operator_Defaults_v1 option_stop_pct=0.35), the profile spec must not
+        # silently widen that max-risk control.
+        protected_keys.add("stop_loss_pct")
     updated = dict(section)
     for key, value in mapped.items():
         if key in protected_keys:
