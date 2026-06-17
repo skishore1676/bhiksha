@@ -944,6 +944,11 @@ def _google_catalog_entry_payload(
         "profile": str(vehicle_mapping.get("profile") or "single_leg_long_premium_v1"),
         "shadow_only": True,
         "option_mapping": vehicle_mapping.get("option_mapping") or _option_mapping_from_structure(vehicle_mapping.get("structure")),
+        "dte_fallback_policy": _first_not_none(
+            _normalize_dte_fallback_policy(vehicle_mapping.get("dte_fallback_policy")),
+            _normalize_dte_fallback_policy(defaults.get("dte_fallback_policy")) if use_defaults else None,
+            "strict",
+        ),
         "min_open_interest": _first_not_none(
             _coerce_int(vehicle_mapping.get("min_open_interest")),
             _coerce_int(defaults.get("min_open_interest")) if use_defaults else None,
@@ -1780,6 +1785,13 @@ def _normalized_manual_setup_type(value: str | None) -> str:
     if manual_setup in {"breakout", "manual_breakout"}:
         return "breakout"
     return manual_setup
+
+
+def _normalize_dte_fallback_policy(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
 
 
 def _normalize_value(value: Any) -> Any:

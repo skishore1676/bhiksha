@@ -1144,6 +1144,7 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "target_pullback_restore_progress_pct", "value": "0.75"},
             {"section": "default", "key": "min_open_interest", "value": "25"},
             {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
+            {"section": "default", "key": "dte_fallback_policy", "value": "allow_nearest_after"},
             {"section": "default", "key": "max_open_positions_total", "value": "4"},
             {"section": "default", "key": "max_open_positions_per_symbol", "value": "2"},
             {"section": "default", "key": "max_open_positions_per_deployment", "value": "1"},
@@ -1191,6 +1192,7 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.execution.target_abs_delta_max == 0.40
     assert deployment.execution.min_open_interest == 25
     assert deployment.execution.max_bid_ask_spread_pct == 0.10
+    assert deployment.execution.dte_fallback_policy == "allow_nearest_after"
     assert deployment.execution.entry_window_start_et == "09:30"
     assert deployment.execution.entry_window_end_et == "16:00"
     assert deployment.risk.max_trade_premium_usd == 1000

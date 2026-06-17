@@ -209,6 +209,7 @@ class ExecutionSpec(BaseModel):
     option_mapping: dict[str, str] = Field(default_factory=dict)
     dte_min: int = 0
     dte_max: int = 7
+    dte_fallback_policy: Literal["strict", "allow_nearest_after"] = "strict"
     target_abs_delta_min: float | None = None
     target_abs_delta_max: float | None = None
     min_open_interest: int = 0
@@ -449,6 +450,7 @@ class VehicleProfile(BaseModel):
     short_signal_contract_type: str = "PUT"
     dte_min: int = 0
     dte_max: int = 7
+    dte_fallback_policy: Literal["strict", "allow_nearest_after"] = "strict"
     target_abs_delta_min: float | None = None
     target_abs_delta_max: float | None = None
     min_open_interest: int = 0

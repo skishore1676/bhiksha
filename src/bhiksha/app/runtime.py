@@ -999,6 +999,7 @@ class BhikshaRuntime:
                 if isinstance(exc, SelectorEmptyError):
                     payload["category"] = "entry_selector_empty"
                     payload["selector_breakdown"] = exc.breakdown
+                    payload["selector_diagnostics"] = exc.diagnostics
                     throttle_key = deployment_id or symbol
                     last_emitted = self._selector_empty_emitted_at.get(throttle_key)
                     now = time.monotonic()
@@ -1465,11 +1466,13 @@ class BhikshaRuntime:
                 )
             except Exception as exc:
                 if isinstance(exc, SelectorEmptyError):
+                    diagnostics = f" diagnostics={exc.diagnostics} " if exc.diagnostics else ""
                     output(
                         "ENTRY_SELECTOR_EMPTY "
                         f"deployment={deployment.deployment_id} "
                         f"symbol={deployment.symbol} "
                         f"breakdown={exc.breakdown} "
+                        f"{diagnostics}"
                         f"error={exc}"
                     )
                 else:
@@ -1506,6 +1509,7 @@ class BhikshaRuntime:
                 if mode == "live":
                     self._live_entry_success_ids.add(deployment.deployment_id)
                 cash_summary = _cash_guard_reservation_summary(plan)
+                selection_summary = _entry_selection_summary(plan)
                 output(
                     f"{label} "
                     f"deployment={deployment.deployment_id} "
@@ -1516,6 +1520,7 @@ class BhikshaRuntime:
                     f"est={round(plan.estimated_entry_price, 2)} "
                     f"reasons={','.join(plan.risk_reasons)}"
                     f"{cash_summary}"
+                    f"{selection_summary}"
                 )
             else:
                 extra_details = _entry_blocked_extra_details(plan)
@@ -1763,6 +1768,17 @@ def _cash_guard_reservation_summary(plan) -> str:
     return _format_cash_guard_fields(
         details,
         ("reserved_cash", "remaining_budget", "usable_budget"),
+    )
+
+
+def _entry_selection_summary(plan) -> str:
+    details = getattr(plan, "risk_details", None) or {}
+    if not details.get("dte_fallback_policy"):
+        return ""
+    return (
+        f" dte_fallback={details.get('dte_fallback_policy')}"
+        f" requested_dte={details.get('requested_dte_min')}-{details.get('requested_dte_max')}"
+        f" selected_dte={details.get('selected_dte')}"
     )
 
 

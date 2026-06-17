@@ -19,6 +19,9 @@ from bhiksha.state.position_tracker import PositionTracker
 from bhiksha.time_utils import parse_time_text
 
 
+DTE_FALLBACK_LOOKAHEAD_DAYS = 7
+
+
 class ExecutionPlanner:
     """Plan or place a Day 1 single-leg trade from a signal."""
 
@@ -81,13 +84,19 @@ class ExecutionPlanner:
             },
         )
 
+        dte_fallback_policy = str(deployment.execution.dte_fallback_policy or "strict").strip().lower()
+        dte_lookup_padding_days = 1
+        if dte_fallback_policy == "allow_nearest_after":
+            dte_lookup_padding_days += DTE_FALLBACK_LOOKAHEAD_DAYS
+
         contracts = await self.chain_service.get_chain(
             deployment.symbol,
             contract_type="ALL",
             from_date=decision.timestamp.date(),
-            to_date=(decision.timestamp + timedelta(days=deployment.execution.dte_max + 1)).date(),
+            to_date=(decision.timestamp + timedelta(days=deployment.execution.dte_max + dte_lookup_padding_days)).date(),
         )
         selection = self.vehicle_resolver.resolve(selection_request, contracts)
+        selection_details = _selection_details(selection)
         conflicting_positions = [
             position
             for position in self.position_tracker.find_by_option_symbol(selection.option_symbol)
@@ -144,7 +153,7 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence},
+                risk_details={"entry_pricing": pricing_evidence, **selection_details},
             )
         if entry_price is None:
             return TradePlan(
@@ -160,7 +169,7 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence},
+                risk_details={"entry_pricing": pricing_evidence, **selection_details},
             )
         intrinsic_value = _intrinsic_value(
             contract_type=selection.contract_type,
@@ -188,6 +197,7 @@ class ExecutionPlanner:
                     "entry_price": entry_price,
                     "intrinsic_value": intrinsic_value,
                     "entry_pricing": pricing_evidence,
+                    **selection_details,
                 },
             )
 
@@ -214,6 +224,7 @@ class ExecutionPlanner:
                     "entry_price": entry_price,
                     "min_contract_cost": min_contract_cost,
                     "entry_pricing": pricing_evidence,
+                    **selection_details,
                 },
             )
         risk_profile = _risk_profile_for_deployment(deployment, max_trade_premium=max_trade_premium)
@@ -248,7 +259,7 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence},
+                risk_details={"entry_pricing": pricing_evidence, **selection_details},
             )
 
         if dry_run:
@@ -266,7 +277,7 @@ class ExecutionPlanner:
                     order_id=None,
                     underlying_entry_price=underlying_entry_price,
                     entry_timestamp=decision.timestamp,
-                    risk_details={"entry_pricing": pricing_evidence},
+                    risk_details={"entry_pricing": pricing_evidence, **selection_details},
                 )
             self.position_tracker.open_position(
                 deployment.symbol,
@@ -292,7 +303,7 @@ class ExecutionPlanner:
                 order_id="DRY_RUN",
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence},
+                risk_details={"entry_pricing": pricing_evidence, **selection_details},
             )
 
         try:
@@ -311,7 +322,7 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence},
+                risk_details={"entry_pricing": pricing_evidence, **selection_details},
             )
 
         final_limit_price = float(preflight.payload["limitPrice"])
@@ -354,6 +365,7 @@ class ExecutionPlanner:
                         "buying_power_requirement": preflight.buying_power_requirement,
                         "estimated_cost": preflight.estimated_cost,
                         "entry_pricing": pricing_evidence,
+                        **selection_details,
                         **cash_guard_details,
                     },
                 )
@@ -395,6 +407,7 @@ class ExecutionPlanner:
                 "buying_power_requirement": preflight.buying_power_requirement,
                 "estimated_cost": preflight.estimated_cost,
                 "entry_pricing": pricing_evidence,
+                **selection_details,
                 **cash_guard_details,
             },
         )
@@ -432,6 +445,17 @@ def _risk_profile_for_deployment(
         if value is not None:
             payload[field_name] = value
     return ConservativeRiskProfile(**payload)
+
+
+def _selection_details(selection) -> dict:
+    if selection.dte_fallback_policy is None:
+        return {}
+    return {
+        "dte_fallback_policy": selection.dte_fallback_policy,
+        "requested_dte_min": selection.requested_dte_min,
+        "requested_dte_max": selection.requested_dte_max,
+        "selected_dte": selection.dte,
+    }
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:

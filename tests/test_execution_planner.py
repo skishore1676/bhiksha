@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionContractSnapshot, SignalDecision
@@ -38,9 +38,11 @@ class StubChainService:
         self.delta = delta
         self.bid = bid
         self.ask = ask
+        self.last_kwargs = None
 
     async def get_chain(self, symbol: str, **kwargs):
         self.calls += 1
+        self.last_kwargs = kwargs
         return [
             OptionContractSnapshot(
                 option_symbol=self.option_symbol,
@@ -188,6 +190,48 @@ def test_execution_planner_creates_dry_run_trade_plan():
     assert plan.risk_details["entry_pricing"]["bid"] == 2.70
     assert plan.risk_details["entry_pricing"]["ask"] == 2.90
     assert plan.risk_details["entry_pricing"]["mid"] == 2.80
+
+
+def test_execution_planner_allow_nearest_after_extends_chain_lookup_and_records_selection_details():
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = deployment.model_copy(
+        update={
+            "execution": deployment.execution.model_copy(
+                update={
+                    "dte_min": 3,
+                    "dte_max": 7,
+                    "dte_fallback_policy": "allow_nearest_after",
+                    "max_bid_ask_spread_pct": 0.20,
+                }
+            )
+        }
+    )
+    chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260408P00558000", dte=9, delta=-0.31)
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, decision, dry_run=True))
+
+    assert chain_service.last_kwargs is not None
+    assert chain_service.last_kwargs["to_date"] == date(2026, 4, 14)
+    assert plan is not None
+    assert plan.option_symbol == "QQQ260408P00558000"
+    assert plan.risk_details["dte_fallback_policy"] == "allow_nearest_after"
+    assert plan.risk_details["requested_dte_min"] == 3
+    assert plan.risk_details["requested_dte_max"] == 7
+    assert plan.risk_details["selected_dte"] == 9
     assert chain_service.calls == 1
 
 

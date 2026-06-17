@@ -109,6 +109,9 @@ class OptionSelection:
     bid: float | None = None
     ask: float | None = None
     strike: float | None = None
+    dte_fallback_policy: str | None = None
+    requested_dte_min: int | None = None
+    requested_dte_max: int | None = None
 
     @property
     def estimated_entry_price(self) -> float | None:
