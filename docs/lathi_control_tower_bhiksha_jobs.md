@@ -102,6 +102,47 @@ For Bhiksha, that means the clean extension is not "move trading jobs into
 Lathi." The clean extension is "teach Lathi to observe and safely invoke
 Bhiksha-owned jobs through an explicit adapter."
 
+## Status - Lathi
+
+Status on Lathi `main`: the Lathi-side Control Tower contract is implemented,
+pushed, and deployed to the oldmac Lathi checkout. The tower is still reached
+through the Air-side SSH tunnel at `http://127.0.0.1:8788`; oldmac binds
+`ai.lathi.tower` to loopback.
+
+Implemented Lathi pieces:
+
+| Piece | Status | Notes |
+| --- | --- | --- |
+| External observed source adapter | Implemented | `lathi.external_jobs` loads explicit source config or the default Bhiksha source, runs status commands, normalizes external jobs into Tower units, and degrades to a stuck `bhiksha:status` unit instead of crashing when the provider contract is missing. |
+| Control Tower read model | Implemented | `lathi.status_model.snapshot()` now includes pack/kernel units plus external observed jobs. Bhiksha jobs render under Job C / Trading Intel with `source_id="bhiksha"`. |
+| Operator action journal | Implemented | `lathi.control_tower.actions` writes requested/outcome records to `control-tower-actions.jsonl` for external-source actions. This is intentionally called an action journal, not the workflow kernel ledger. |
+| External action endpoint | Implemented | `POST /api/action` accepts external actions with `source_id`, `unit_id`, `action`, optional `action_id`, and `confirmed`. It invokes the owning source's control command and records the result. |
+| Confirmation behavior | Implemented | Lathi enforces provider-declared confirmation requirements before invoking an external action. Bhiksha's `ensure-live-runtime` is therefore blocked until the Tower request is confirmed when the Bhiksha status contract says confirmation is required. |
+| Tower UI cards | Implemented | External-source buttons are real controls; pack/kernel workflow buttons remain disabled until their separate intent path exists. |
+| Default oldmac source | Implemented | `scripts/launchd/run_lathi_tower.sh` defaults `LATHI_EXTERNAL_SOURCES=bhiksha`, so the oldmac tower attempts to render Bhiksha if the runtime checkout has the Bhiksha status/control modules. |
+
+Lathi verification performed:
+
+```bash
+uv run pytest -q
+LATHI_EXTERNAL_SOURCES=bhiksha uv run lathi tower --json
+LATHI_EXTERNAL_SOURCES=bhiksha uv run python - <<'PY'
+from lathi.external_jobs import run_external_action
+print(run_external_action(
+    source_id="bhiksha",
+    unit_id="com.bhiksha.live-watchdog",
+    action="live-status",
+    action_id="tower-smoke-live-status",
+))
+PY
+```
+
+The oldmac Lathi tower has been fast-forwarded to the Lathi implementation. If
+oldmac Bhiksha is not yet on the Bhiksha control contract branch, the Tower
+correctly renders `bhiksha:status` as stuck with a missing
+`bhiksha.tools.launchd_status` finding. That is an observation/deployment gap,
+not a Lathi crash.
+
 ## Desired Feature State
 
 Control Tower should have a Bhiksha section under the trading job family. It
@@ -254,11 +295,11 @@ Bhiksha should continue deciding when to send Lathi Bus alerts. Lathi may expose
 the alert result, but it should not duplicate the same failure alert. Otherwise
 one Schwab token failure could become two noisy Telegram messages.
 
-## Lathi Development Needed
+## Lathi Development Contract
 
-### 1. Add an external observed job source
+### 1. External observed job source
 
-Lathi should gain a small adapter for systems it observes but does not own.
+Lathi has a small adapter for systems it observes but does not own.
 
 Suggested module:
 
@@ -284,10 +325,10 @@ The adapter should be configured with:
 This keeps Lathi generic. It learns how to host external job cards, not how to
 trade.
 
-### 2. Extend Control Tower state
+### 2. Control Tower state
 
-The existing Control Tower snapshot should include external observed jobs next
-to pack/kernel units.
+The Control Tower snapshot includes external observed jobs next to pack/kernel
+units.
 
 Fields should map cleanly onto existing tower ideas:
 
@@ -311,11 +352,10 @@ happened without pretending to be the source of truth. This extension should
 follow that: the tower renders Bhiksha status, but Bhiksha receipts and commands
 remain the evidence.
 
-### 3. Add a Control Tower intent queue before live actions
+### 3. Control Tower action journal before live actions
 
-The current Lathi server returns `501` for actions because it does not yet have
-an intent queue. For Bhiksha manual controls, Lathi needs a minimal operator
-action journal or kernel-backed action path:
+For Bhiksha manual controls, Lathi now has a minimal operator action journal.
+It is not the workflow kernel ledger:
 
 ```text
 operator click
@@ -326,14 +366,14 @@ operator click
   -> Control Tower refresh shows result
 ```
 
-This does not need the full workflow kernel for phase 1. It does need durable
+This does not use the full workflow kernel for phase 1. It writes durable
 records so the operator can see who clicked what and when. Do not call this the
-"Lathi ledger" unless it is actually written through the workflow kernel ledger;
-otherwise it is an operator action journal owned by Lathi Control Tower.
+"Lathi ledger" unless a later version writes through the workflow kernel ledger;
+today it is an operator action journal owned by Lathi Control Tower.
 
-### 4. Render safe actions as real buttons
+### 4. Safe actions as real buttons
 
-In phase 1, only low-risk actions should be real buttons:
+In phase 1, only low-risk external-source actions should be real buttons:
 
 - `live-status`;
 - `session-report-now`;
@@ -370,7 +410,7 @@ Lathi can still observe scheduled outcomes and run manual operator actions.
 
 Goal: make Control Tower useful without changing scheduled ownership.
 
-Build:
+Landed in the two repo branches:
 
 - Bhiksha launchd registry.
 - Bhiksha `launchd_status --json`.
@@ -394,6 +434,12 @@ Operator result:
   Schwab guard now, and click ensure live runtime behind the configured
   confirmation rule.
 - Scheduled launchd runs continue exactly as before.
+
+Remaining cutover step: deploy the Bhiksha branch to the runtime checkout,
+reinstall the Bhiksha-owned launchd jobs if the plist registry changed, restart
+or refresh Lathi Tower, and verify the oldmac Tower moves from any
+`bhiksha:status` contract-gap card to the five concrete `com.bhiksha.*` job
+cards.
 
 ## Development Ownership
 
