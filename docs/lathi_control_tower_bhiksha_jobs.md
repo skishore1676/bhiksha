@@ -14,11 +14,20 @@ The intended design is:
 Bhiksha is the engine.
 launchd is the clock.
 Lathi Control Tower is the cockpit.
+Telegram is the phone gate when Bhiksha exposes review requests.
 ```
 
 Lathi may own the visible button, action journal event, and operator workflow.
 Bhiksha still owns the actual trading-safe command and the meaning of success or
 failure.
+
+Update 2026-06-30: Lathi owns mobile decision collection, not Lane Host/Jasper.
+For Bhiksha's current observe/control bridge, Control Tower remains the primary
+manual surface. If Bhiksha later exposes a `review_queue_command` like Kamandal,
+Lathi will mirror each request into one Telegram card, collect Suman's phone
+press, journal the operator intent, and call Bhiksha's guarded decision command.
+Bhiksha must still validate request id, allowed action, expiry/fingerprint, and
+current trading state before any mutation.
 
 ## Current State
 
