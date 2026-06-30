@@ -123,21 +123,40 @@ def test_daily_report_surfaces_open_positions_and_protection(tmp_path) -> None:
                 entry_order_id="SHADOW_ENTRY",
             )
         )
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="live-target",
+                deployment_id="iwm_live",
+                symbol="IWM",
+                option_symbol="IWM260612C00303000",
+                quantity=10,
+                entry_price=0.95,
+                entry_timestamp=datetime(2026, 6, 3, 14, 37, tzinfo=UTC),
+                status="target_active",
+                entry_order_id="LIVE_ENTRY2",
+                stop_price=0.62,
+                target_order_id="TARGET2",
+                target_price=1.28,
+            )
+        )
 
     asyncio.run(seed())
 
     report = build_daily_report(db_path, trading_date="2026-06-03")
     body = render_daily_report_telegram_summary(report)
 
-    assert report["trade_summary"]["live_open_count"] == 1
+    assert report["trade_summary"]["live_open_count"] == 2
     assert report["trade_summary"]["shadow_open_count"] == 1
     assert report["open_position_summary"] == {
         "protected_count": 1,
+        "target_active_count": 1,
         "unprotected_count": 1,
         "exit_pending_count": 0,
     }
     assert report["open_positions"][0]["protection_state"] == "protected"
-    assert "Open: live 1, shadow 1, protected 1, unprotected 1, exit pending 0" in body
+    iwm_position = next(item for item in report["open_positions"] if item["symbol"] == "IWM")
+    assert iwm_position["protection_state"] == "target_active"
+    assert "Open: live 2, shadow 1, protected 1, target active 1, unprotected 1, exit pending 0" in body
     assert "live QQQ QQQ260612C00480000 qty 2" in body
 
 
@@ -173,7 +192,7 @@ def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
     body = render_daily_report_telegram_summary(report, markdown_path=tmp_path / "report.md")
 
     assert "Bhiksha Session Report - 2026-06-03" in body
-    assert "Open: live 0, shadow 0, protected 0, unprotected 0, exit pending 0" in body
+    assert "Open: live 0, shadow 0, protected 0, target active 0, unprotected 0, exit pending 0" in body
     assert "P&L: live $0.00 (0 trades), shadow $412.00 (2 trades)" in body
     assert "Data quality: 1 warning(s); first=MU" in body
     assert str(tmp_path / "report.md") in body
@@ -196,3 +215,16 @@ def test_report_status_escalates_dead_lane_to_red() -> None:
         runtime_issue_counts={},
     )
     assert ok_status == {"level": "GREEN", "reason": "ok"}
+
+
+def test_report_status_escalates_live_unprotected_position_to_red() -> None:
+    from bhiksha.ops.daily_report import _report_status
+
+    status = _report_status(
+        provider_events={"blocking_count": 0, "degraded_count": 0, "warning_count": 0},
+        data_quality_warnings=[],
+        runtime_issue_counts={},
+        open_positions=[{"lane": "live", "symbol": "IWM", "protection_state": "unprotected"}],
+    )
+
+    assert status == {"level": "RED", "reason": "live_open_unprotected"}

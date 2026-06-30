@@ -109,6 +109,7 @@ def build_daily_report(
             provider_events=provider_events,
             data_quality_warnings=data_quality_warnings,
             runtime_issue_counts=runtime_issue_counts,
+            open_positions=open_positions,
         ),
     }
 
@@ -133,6 +134,18 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"- reconciliation blocking: `{provider.get('blocking_count', 0)}`",
         f"- data-quality warnings: `{len(report.get('data_quality_warnings') or [])}`",
     ]
+    open_summary = report.get("open_position_summary") or {}
+    if any(
+        open_summary.get(key, 0)
+        for key in ("protected_count", "target_active_count", "unprotected_count", "exit_pending_count")
+    ):
+        lines.append(
+            "- open protection: "
+            f"`protected {open_summary.get('protected_count', 0)}, "
+            f"target active {open_summary.get('target_active_count', 0)}, "
+            f"unprotected {open_summary.get('unprotected_count', 0)}, "
+            f"exit pending {open_summary.get('exit_pending_count', 0)}`"
+        )
     if status.get("reason"):
         lines.append(f"- reason: `{status['reason']}`")
     code_version = report.get("code_version") or {}
@@ -216,6 +229,7 @@ def render_daily_report_telegram_summary(
             f"live {summary.get('live_open_count', 0)}, "
             f"shadow {summary.get('shadow_open_count', 0)}, "
             f"protected {open_summary.get('protected_count', 0)}, "
+            f"target active {open_summary.get('target_active_count', 0)}, "
             f"unprotected {open_summary.get('unprotected_count', 0)}, "
             f"exit pending {open_summary.get('exit_pending_count', 0)}"
         ),
@@ -493,6 +507,8 @@ def _protection_state(trade: dict[str, Any]) -> str:
         return "closed"
     if trade.get("exit_order_id") or status.endswith("exit_pending") or "exit_pending" in status:
         return "exit_pending"
+    if status == "target_active":
+        return "target_active"
     if trade.get("stop_order_id"):
         return "protected"
     return "unprotected"
@@ -502,6 +518,7 @@ def _open_position_summary(open_positions: list[dict[str, Any]]) -> dict[str, in
     counts = Counter(_protection_state(position) for position in open_positions)
     return {
         "protected_count": counts.get("protected", 0),
+        "target_active_count": counts.get("target_active", 0),
         "unprotected_count": counts.get("unprotected", 0),
         "exit_pending_count": counts.get("exit_pending", 0),
     }
@@ -512,7 +529,14 @@ def _report_status(
     provider_events: dict[str, Any],
     data_quality_warnings: list[dict[str, Any]],
     runtime_issue_counts: dict[str, int] | None = None,
+    open_positions: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
+    if any(
+        str(position.get("lane") or "").lower() == "live"
+        and position.get("protection_state") == "unprotected"
+        for position in (open_positions or [])
+    ):
+        return {"level": "RED", "reason": "live_open_unprotected"}
     if (runtime_issue_counts or {}).get("dead_lane", 0) > 0:
         return {"level": "RED", "reason": "dead_live_lane"}
     if provider_events.get("blocking_count", 0) > 0:
