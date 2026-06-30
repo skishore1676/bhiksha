@@ -69,6 +69,7 @@ Implemented Bhiksha pieces:
 | Concurrency guard | Implemented | `launchd_control` uses per-action lock files under `artifacts/playbook/launchd/control_locks/` and refuses duplicate in-flight actions unless the lock is stale. |
 | Confirmation rule | Implemented | `ensure-live-runtime` refuses without `--confirm` when market is open or when it would start a stopped live runtime. |
 | Transport/domain split | Implemented | Status output separates report/token domain health from Lathi Bus / Telegram transport health, so a GREEN report with failed Telegram delivery is visible as transport degraded, not a trading failure. |
+| Schedule semantics | Implemented | Status output exposes `schedule`, `next_fire`, `last_run_status`, and `last_run_at` separately. Lathi should render source `generated_at` as observation time only, never as last-run proof. |
 
 Verification already performed:
 

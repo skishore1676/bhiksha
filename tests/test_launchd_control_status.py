@@ -37,11 +37,18 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda: {})
     monkeypatch.setattr("bhiksha.tools.launchd_status._runtime_status", lambda repo_root: {"ok": True, "status": {"running": True}})
 
-    snapshot = launchd_status.build_status_snapshot(repo_root=tmp_path, active_plan_path=tmp_path / "active_plan.json")
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 6, 30, 15, 0, tzinfo=UTC),
+    )
     session_job = next(job for job in snapshot["jobs"] if job["runner_job"] == "session-report")
 
     assert session_job["last"]["domain"]["ok"] is True
     assert session_job["last"]["transport"]["status"] == "degraded"
+    assert session_job["last_run_status"] == "ok"
+    assert session_job["last_run_at"] == "2026-06-30T15:00:00+00:00"
+    assert session_job["next_fire"].startswith("2026-06-30T11:45:00")
     assert snapshot["transport"]["status"] == "degraded"
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -30,16 +30,20 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def build_status_snapshot(*, repo_root: Path, active_plan_path: Path) -> dict[str, Any]:
+def build_status_snapshot(*, repo_root: Path, active_plan_path: Path, now: datetime | None = None) -> dict[str, Any]:
     latest = _read_json(latest_status_path(repo_root))
     latest_jobs = latest.get("jobs") if isinstance(latest.get("jobs"), dict) else {}
     launchd = _launchd_state()
     jobs = []
+    generated_at = now or datetime.now(UTC)
     for spec in active_launchd_jobs():
         latest_record = latest_jobs.get(spec.runner_job) if isinstance(latest_jobs, dict) else None
         latest_payload = (latest_record or {}).get("payload") if isinstance(latest_record, dict) else None
         if not isinstance(latest_payload, dict):
             latest_payload = _latest_log_payload(spec.stdout_log(repo_root))
+            if isinstance(latest_payload, dict) and not isinstance(latest_record, dict):
+                latest_record = {"recorded_at": _file_mtime_iso(spec.stdout_log(repo_root))}
+        last = _last_job_view(latest_record, latest_payload)
         jobs.append(
             {
                 "label": spec.label,
@@ -51,6 +55,7 @@ def build_status_snapshot(*, repo_root: Path, active_plan_path: Path) -> dict[st
                 "launchd": launchd.get(spec.label, {"available": False, "loaded": None}),
                 "schedule": spec.schedule_label,
                 "schedule_entries": [dict(item) for item in spec.schedule],
+                "next_fire": _next_fire(spec.schedule, now=generated_at),
                 "skips_non_trading_days": spec.skips_non_trading_days,
                 "risk_class": spec.risk_class,
                 "available_actions": list(spec.allowed_manual_actions),
@@ -62,14 +67,16 @@ def build_status_snapshot(*, repo_root: Path, active_plan_path: Path) -> dict[st
                     "stdout_exists": spec.stdout_log(repo_root).is_file(),
                     "stderr_exists": spec.stderr_log(repo_root).is_file(),
                 },
-                "last": _last_job_view(latest_record, latest_payload),
+                "last": last,
+                "last_run_status": last.get("status") if isinstance(last, dict) else None,
+                "last_run_at": last.get("recorded_at") if isinstance(last, dict) else None,
             }
         )
 
     runtime_status = _runtime_status(repo_root=repo_root)
     return {
         "schema": "bhiksha.launchd.status.v1",
-        "generated_at": datetime.now(UTC).isoformat(),
+        "generated_at": generated_at.isoformat(),
         "host": os.uname().nodename,
         "repo_root": str(repo_root),
         "active_plan_path": str((repo_root / active_plan_path).resolve() if not active_plan_path.is_absolute() else active_plan_path),
@@ -134,6 +141,13 @@ def _latest_log_payload(path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _file_mtime_iso(path: Path) -> str | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
+    except OSError:
+        return None
+
+
 def _last_job_view(latest_record: Any, latest_payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if latest_payload is None:
         return None
@@ -147,6 +161,41 @@ def _last_job_view(latest_record: Any, latest_payload: dict[str, Any] | None) ->
         "action_id": latest_payload.get("action_id"),
         "payload": latest_payload,
     }
+
+
+def _next_fire(schedule: tuple[dict[str, int], ...], *, now: datetime) -> str | None:
+    """Return the next scheduled launchd fire time in Central time.
+
+    The Bhiksha registry uses launchd-style weekday numbers where Monday-Friday
+    are 1-5.
+    """
+
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # pragma: no cover - Python 3.11 has zoneinfo.
+        return None
+    central = ZoneInfo("America/Chicago")
+    local_now = now.astimezone(central)
+    candidates: list[datetime] = []
+    for offset in range(8):
+        day = local_now.date() + timedelta(days=offset)
+        weekday = day.weekday() + 1
+        for entry in schedule:
+            if int(entry.get("Weekday", -1)) != weekday:
+                continue
+            candidate = datetime(
+                day.year,
+                day.month,
+                day.day,
+                int(entry.get("Hour", 0)),
+                int(entry.get("Minute", 0)),
+                tzinfo=central,
+            )
+            if candidate > local_now:
+                candidates.append(candidate)
+    if not candidates:
+        return None
+    return min(candidates).isoformat()
 
 
 def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
