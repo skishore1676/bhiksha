@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from bhiksha.ops.launchd_registry import active_launchd_jobs
+
 
 def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
     script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
@@ -13,11 +15,13 @@ def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
 
 
 def test_bhiksha_launchd_installer_has_three_session_report_times() -> None:
-    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
+    jobs = {job.runner_job: job for job in active_launchd_jobs()}
+    session_report = jobs["session-report"]
+    times = {(entry["Hour"], entry["Minute"]) for entry in session_report.schedule}
 
-    assert "weekdays(9, 10)" in script
-    assert "weekdays(11, 45)" in script
-    assert "weekdays(14, 45)" in script
+    assert (9, 10) in times
+    assert (11, 45) in times
+    assert (14, 45) in times
 
 
 def test_bhiksha_launchd_runner_points_at_bhiksha_policy_module() -> None:

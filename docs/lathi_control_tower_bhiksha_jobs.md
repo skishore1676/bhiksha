@@ -16,7 +16,7 @@ launchd is the clock.
 Lathi Control Tower is the cockpit.
 ```
 
-Lathi may own the visible button, audit ledger event, and operator workflow.
+Lathi may own the visible button, action journal event, and operator workflow.
 Bhiksha still owns the actual trading-safe command and the meaning of success or
 failure.
 
@@ -75,7 +75,7 @@ guard receipts in one place.
 flowchart TD
     operator["Suman"]
     tower["Lathi Control Tower"]
-    lathi_ledger["Lathi ledger\noperator intent + outcome"]
+    lathi_ledger["Lathi action journal\noperator intent + outcome"]
     adapter["Bhiksha Control Adapter"]
     launchd["launchd\nscheduled wakeups"]
     runner["Bhiksha job runner"]
@@ -101,7 +101,7 @@ The operator experience should support these use cases:
 4. Click "Run Session Report Now" and receive the Telegram report.
 5. Click "Check/Ensure Live Runtime" and have Bhiksha run its own watchdog path.
 6. Click "Run Schwab Guard Now" and have Bhiksha validate token state.
-7. See a ledger entry for every Control Tower initiated action.
+7. See an action journal entry for every Control Tower initiated action.
 8. See observed scheduled failures, even if launchd rather than Lathi started
    the job.
 
@@ -154,9 +154,16 @@ The output should contain one JSON object with:
 - stderr/out tail paths, not secret contents;
 - latest Schwab token guard receipt summary;
 - latest session report path and status;
+- latest alert/transport attempt summary, including whether the report or guard
+  result was delivered through Lathi Bus / Telegram;
 - live runtime status from `bhiksha.tools.server_session status`.
 
 This command is the read-only contract Lathi should consume.
+
+The status shape should distinguish domain health from transport health. For
+example, a session report can be GREEN while the operator notification failed.
+Control Tower should render that as "Bhiksha healthy; alert transport degraded,"
+not as a trading failure.
 
 ### 3. Add a Bhiksha control command
 
@@ -172,14 +179,24 @@ Initial actions:
 | --- | --- | --- |
 | `session-report-now` | `run_bhiksha_job.sh session-report --force --report-label manual` | No extra gate. |
 | `schwab-guard-now` | `run_bhiksha_job.sh schwab-refresh --force` | No extra gate, but loud failure alert stays Bhiksha-owned. |
-| `ensure-live-runtime` | `run_bhiksha_job.sh live-watchdog --force` | Allowed, but visible as trading-adjacent. |
+| `ensure-live-runtime` | `run_bhiksha_job.sh live-watchdog --force` | Confirm when market is open or when the action would start a stopped live runtime. |
 | `live-status` | `python -m bhiksha.tools.server_session status` | Read-only. |
 
 Later actions such as `restart-live-runtime` and `stop-live-runtime` should
 exist behind an explicit confirmation gate because they can affect live trading.
 
 The command should emit a single structured JSON result and preserve the
-existing `BHIKSHA_LAUNCHD_JOB` payload when it invokes the runner.
+existing `BHIKSHA_LAUNCHD_JOB` payload when it invokes the runner. It should also
+accept or create a correlation id, such as `action_id`, and echo it in every
+result so Lathi can connect:
+
+```text
+operator click -> Lathi action journal -> Bhiksha command -> Bhiksha receipt
+```
+
+Manual controls should be concurrency-safe. If the same action is already
+running, Bhiksha should refuse, coalesce, or return the in-flight action rather
+than starting duplicate session reports, token guards, or runtime ensures.
 
 ### 4. Persist observed scheduled outcomes
 
@@ -260,20 +277,22 @@ remain the evidence.
 ### 3. Add a Control Tower intent queue before live actions
 
 The current Lathi server returns `501` for actions because it does not yet have
-an intent queue. For Bhiksha manual controls, Lathi needs a minimal queue or
-ledger-backed action path:
+an intent queue. For Bhiksha manual controls, Lathi needs a minimal operator
+action journal or kernel-backed action path:
 
 ```text
 operator click
-  -> Lathi writes intent: requested
+  -> Lathi writes action journal entry: requested
   -> Lathi invokes Bhiksha control command
   -> Lathi captures stdout/stderr summary and JSON result
-  -> Lathi writes outcome: succeeded, failed, or timed out
+  -> Lathi writes action journal entry: succeeded, failed, or timed out
   -> Control Tower refresh shows result
 ```
 
 This does not need the full workflow kernel for phase 1. It does need durable
-records so the operator can see who clicked what and when.
+records so the operator can see who clicked what and when. Do not call this the
+"Lathi ledger" unless it is actually written through the workflow kernel ledger;
+otherwise it is an operator action journal owned by Lathi Control Tower.
 
 ### 4. Render safe actions as real buttons
 
@@ -282,7 +301,8 @@ In phase 1, only low-risk actions should be real buttons:
 - `live-status`;
 - `session-report-now`;
 - `schwab-guard-now`;
-- `ensure-live-runtime`.
+- `ensure-live-runtime`, only when Lathi can show the confirmation rule and
+  Bhiksha can refuse unsafe or duplicate starts.
 
 Trading-impacting lifecycle actions should render as disabled or require a
 second confirmation:
@@ -320,20 +340,53 @@ Build:
 - Bhiksha `launchd_control --json` for safe actions.
 - Lathi external observed job adapter for Bhiksha.
 - Lathi Control Tower cards for Bhiksha jobs.
-- Lathi ledger records for Control Tower initiated actions.
+- Lathi action journal records for Control Tower initiated actions.
 
 Do not build yet:
 
 - moving Bhiksha schedules into Lathi;
 - restart/stop live runtime buttons without confirmation;
+- unconfirmed `ensure-live-runtime` when market is open or when it would start a
+  stopped live process;
 - broker/order-changing controls;
 - duplicate Telegram failure alerts from Lathi.
 
 Operator result:
 
 - Suman can open Control Tower, see Bhiksha job health, click report now, click
-  Schwab guard now, and click ensure live runtime.
+  Schwab guard now, and click ensure live runtime behind the configured
+  confirmation rule.
 - Scheduled launchd runs continue exactly as before.
+
+## Development Ownership
+
+This should be developed as a two-repo contract, not as one agent building both
+sides from one viewpoint.
+
+Bhiksha should own:
+
+- `launchd_registry`;
+- `launchd_status --json`;
+- `launchd_control --json`;
+- `latest_status.json`;
+- action ids, concurrency behavior, and command result schema;
+- the Python/runtime repair that makes Lathi Bus transport reliable from
+  launchd;
+- tests proving no secrets leak and every action uses Bhiksha-owned logic.
+
+Lathi should own:
+
+- the generic external observed source adapter;
+- the Control Tower read model and cards;
+- the operator action journal or kernel-backed intent path;
+- confirmation UI and risk rendering;
+- correlation between Lathi action ids and Bhiksha receipts;
+- observer-level stale-source detection that does not duplicate Bhiksha alerts.
+
+Codex should supervise the integration boundary and end-to-end oldmac proof.
+The Bhiksha agent can build the Bhiksha side because it knows the trading
+runtime. Lathi work should stay in Lathi because it needs the broader substrate,
+Control Tower, and action-journal context.
 
 ### Phase 2: Guarded trading-runtime controls and stale-job monitoring
 
@@ -346,7 +399,7 @@ Build:
 - stale scheduled-job detection in Lathi Control Tower;
 - optional Lathi alert for observer-level problems, such as "no Bhiksha status
   snapshot has updated for N minutes";
-- richer correlation between Lathi action ledger entries and Bhiksha receipts;
+- richer correlation between Lathi action journal entries and Bhiksha receipts;
 - `next_fire` calculation from the Bhiksha registry if launchd does not expose
   it cleanly.
 
@@ -374,7 +427,7 @@ Phase 1 is working when all of these are true on oldmac:
 3. `session-report-now` from Control Tower causes Bhiksha to send a Telegram
    session report and writes both:
    - a Bhiksha job result or report receipt;
-   - a Lathi action ledger entry.
+   - a Lathi action journal entry.
 4. `schwab-guard-now` from Control Tower returns a healthy token receipt or a
    loud Bhiksha-owned failure alert.
 5. `ensure-live-runtime` from Control Tower calls Bhiksha's watchdog path and

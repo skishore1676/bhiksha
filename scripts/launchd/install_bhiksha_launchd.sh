@@ -19,62 +19,16 @@ repo = Path(sys.argv[1])
 launchd_dir = Path(sys.argv[2])
 log_dir = Path(sys.argv[3])
 runner = repo / "scripts" / "launchd" / "run_bhiksha_job.sh"
+sys.path.insert(0, str(repo / "src"))
 
+from bhiksha.ops.launchd_registry import active_launchd_jobs
 
-def weekdays(hour, minute):
-    return [{"Weekday": day, "Hour": hour, "Minute": minute} for day in range(1, 6)]
-
-
-def every_10_minutes(start_hour, start_minute, end_hour, end_minute):
-    entries = []
-    hour, minute = start_hour, start_minute
-    while (hour, minute) <= (end_hour, end_minute):
-        entries.extend(weekdays(hour, minute))
-        minute += 10
-        if minute >= 60:
-            hour += 1
-            minute -= 60
-    return entries
-
-
-jobs = [
-    {
-        "label": "com.bhiksha.live-start",
-        "args": ["live-start"],
-        "schedule": weekdays(8, 20),
-    },
-    {
-        "label": "com.bhiksha.live-watchdog",
-        "args": ["live-watchdog"],
-        "schedule": every_10_minutes(8, 30, 15, 0),
-    },
-    {
-        "label": "com.bhiksha.live-stop",
-        "args": ["live-stop"],
-        "schedule": weekdays(15, 10),
-    },
-    {
-        "label": "com.bhiksha.schwab-guard",
-        "args": ["schwab-refresh"],
-        "schedule": weekdays(7, 10),
-    },
-    {
-        "label": "com.bhiksha.session-report",
-        "args": ["session-report"],
-        "schedule": (
-            weekdays(9, 10)
-            + weekdays(11, 45)
-            + weekdays(14, 45)
-        ),
-    },
-]
-
-for job in jobs:
-    label = job["label"]
+for job in active_launchd_jobs():
+    label = job.label
     plist = {
         "Label": label,
-        "ProgramArguments": ["/bin/bash", str(runner), *job["args"]],
-        "StartCalendarInterval": job["schedule"],
+        "ProgramArguments": ["/bin/bash", str(runner), *job.runner_args()],
+        "StartCalendarInterval": [dict(item) for item in job.schedule],
         "WorkingDirectory": str(repo),
         "StandardOutPath": str(log_dir / f"{label}.out.log"),
         "StandardErrorPath": str(log_dir / f"{label}.err.log"),

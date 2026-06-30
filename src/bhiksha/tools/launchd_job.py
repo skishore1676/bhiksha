@@ -16,6 +16,7 @@ from bhiksha.config.environment import load_dotenv
 from bhiksha.market_data.trading_calendar import is_trading_day
 from bhiksha.ops.alerts import AlertMode, send_lathi_alert
 from bhiksha.ops.daily_report import render_daily_report_telegram_summary, write_daily_report
+from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
 
 CENTRAL = ZoneInfo("America/Chicago")
@@ -34,10 +35,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report-label", default="scheduled")
     parser.add_argument("--alert-mode", default=os.getenv("BHIKSHA_LAUNCHD_ALERT_MODE", "live"), choices=["off", "spool", "live"])
     parser.add_argument("--alert-profile", default=os.getenv("BHIKSHA_LATHI_PROFILE", "jarvis-northstar"))
+    parser.add_argument("--action-id", default=os.getenv("BHIKSHA_ACTION_ID"))
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root or Path(__file__).resolve().parents[3]).resolve()
     os.chdir(repo_root)
+    if args.action_id:
+        os.environ["BHIKSHA_ACTION_ID"] = args.action_id
 
     if _should_skip_for_calendar(args.job, force=args.force):
         _print_result({"job": args.job, "status": "skipped", "reason": "non_trading_day"})
@@ -256,7 +260,21 @@ def _tail(text: str, *, max_lines: int = 40) -> str:
 
 
 def _print_result(payload: dict) -> None:
+    payload = dict(payload)
+    action_id = os.getenv("BHIKSHA_ACTION_ID")
+    if action_id and "action_id" not in payload:
+        payload["action_id"] = action_id
+    _write_latest_status(payload)
     print("BHIKSHA_LAUNCHD_JOB=" + json.dumps(payload, sort_keys=True, default=str))
+
+
+def _write_latest_status(payload: dict) -> None:
+    try:
+        write_latest_status(Path.cwd(), payload)
+    except Exception:
+        # Status snapshots are observational. They must never turn a successful
+        # trading-domain job into a failed launchd job.
+        return
 
 
 if __name__ == "__main__":
