@@ -66,6 +66,7 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
     report = build_daily_report(db_path, trading_date="2026-06-03")
 
     assert report["trade_summary"]["shadow_count"] == 1
+    assert report["trade_summary"]["shadow_open_count"] == 0
     assert report["trade_summary"]["shadow_realized_pnl_usd"] == 332.0
     assert report["provider_health"]["reconciliation"]["warning_count"] == 1
     assert report["lifecycle"]["target_approach_detected"] == 1
@@ -84,6 +85,60 @@ def test_daily_report_writes_json_and_markdown(tmp_path) -> None:
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["trading_date"] == "2026-06-03"
     assert "# Bhiksha Trade Session - 2026-06-03" in result.markdown_path.read_text(encoding="utf-8")
+
+
+def test_daily_report_surfaces_open_positions_and_protection(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="live-open",
+                deployment_id="qqq_live",
+                symbol="QQQ",
+                option_symbol="QQQ260612C00480000",
+                quantity=2,
+                entry_price=3.8,
+                entry_timestamp=datetime(2026, 6, 3, 14, 35, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="LIVE_ENTRY",
+                stop_order_id="STOP1",
+                stop_price=2.47,
+                target_order_id="TARGET1",
+                target_price=5.7,
+            )
+        )
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="shadow-open",
+                deployment_id="mu_shadow",
+                symbol="MU",
+                option_symbol="MU260612C01200000",
+                quantity=1,
+                entry_price=25.98,
+                entry_timestamp=datetime(2026, 6, 3, 14, 36, tzinfo=UTC),
+                status="open_unprotected",
+                entry_order_id="SHADOW_ENTRY",
+            )
+        )
+
+    asyncio.run(seed())
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+    body = render_daily_report_telegram_summary(report)
+
+    assert report["trade_summary"]["live_open_count"] == 1
+    assert report["trade_summary"]["shadow_open_count"] == 1
+    assert report["open_position_summary"] == {
+        "protected_count": 1,
+        "unprotected_count": 1,
+        "exit_pending_count": 0,
+    }
+    assert report["open_positions"][0]["protection_state"] == "protected"
+    assert "Open: live 1, shadow 1, protected 1, unprotected 1, exit pending 0" in body
+    assert "live QQQ QQQ260612C00480000 qty 2" in body
 
 
 def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
@@ -117,11 +172,12 @@ def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
 
     body = render_daily_report_telegram_summary(report, markdown_path=tmp_path / "report.md")
 
-    assert "Bhiksha EOD - 2026-06-03" in body
+    assert "Bhiksha Session Report - 2026-06-03" in body
+    assert "Open: live 0, shadow 0, protected 0, unprotected 0, exit pending 0" in body
     assert "P&L: live $0.00 (0 trades), shadow $412.00 (2 trades)" in body
     assert "Data quality: 1 warning(s); first=MU" in body
     assert str(tmp_path / "report.md") in body
-    assert len(body.splitlines()) <= 8
+    assert len(body.splitlines()) <= 9
 
 
 def test_report_status_escalates_dead_lane_to_red() -> None:

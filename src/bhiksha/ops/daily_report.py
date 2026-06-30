@@ -61,6 +61,10 @@ def build_daily_report(
     trades = [_augment_trade(trade) for trade in trades]
     live_trades = [trade for trade in trades if trade["lane"] == "live"]
     shadow_trades = [trade for trade in trades if trade["lane"] == "shadow"]
+    open_positions = [trade for trade in trades if _is_open_trade(trade)]
+    live_open_positions = [trade for trade in open_positions if trade["lane"] == "live"]
+    shadow_open_positions = [trade for trade in open_positions if trade["lane"] == "shadow"]
+    open_position_summary = _open_position_summary(open_positions)
     data_quality_warnings = _data_quality_warnings(trades)
     code_version = None
     for event in events:
@@ -89,10 +93,15 @@ def build_daily_report(
         "trade_summary": {
             "live_count": len(live_trades),
             "shadow_count": len(shadow_trades),
+            "live_open_count": len(live_open_positions),
+            "shadow_open_count": len(shadow_open_positions),
+            "total_open_count": len(open_positions),
             "live_realized_pnl_usd": _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in live_trades)),
             "shadow_realized_pnl_usd": _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in shadow_trades)),
             "total_realized_pnl_usd": _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in trades)),
         },
+        "open_position_summary": open_position_summary,
+        "open_positions": open_positions,
         "trades": trades,
         "lifecycle": lifecycle_events,
         "data_quality_warnings": data_quality_warnings,
@@ -114,6 +123,8 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"- status: `{status.get('level', 'UNKNOWN')}`",
         f"- live trades: `{summary.get('live_count', 0)}`",
         f"- shadow trades: `{summary.get('shadow_count', 0)}`",
+        f"- open live positions: `{summary.get('live_open_count', 0)}`",
+        f"- open shadow positions: `{summary.get('shadow_open_count', 0)}`",
         f"- live realized P&L: `${summary.get('live_realized_pnl_usd', 0.0):.2f}`",
         f"- shadow realized P&L: `${summary.get('shadow_realized_pnl_usd', 0.0):.2f}`",
         f"- total realized P&L: `${summary.get('total_realized_pnl_usd', 0.0):.2f}`",
@@ -128,6 +139,24 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
     if code_version.get("git_commit"):
         dirty_suffix = " (dirty)" if code_version.get("git_dirty") else ""
         lines.append(f"- code: `{str(code_version['git_commit'])[:12]}{dirty_suffix}`")
+
+    open_positions = report.get("open_positions") or []
+    if open_positions:
+        lines.extend(["", "## Open Positions", "", "| Lane | Symbol | Option | Qty | Status | Entry | Stop | Target | Protection |", "|---|---|---|---:|---|---:|---:|---:|---|"])
+        for position in open_positions:
+            lines.append(
+                "| {lane} | {symbol} | {option} | {qty} | {status} | {entry} | {stop} | {target} | {protection} |".format(
+                    lane=position.get("lane", ""),
+                    symbol=position.get("symbol", ""),
+                    option=position.get("option_symbol") or "",
+                    qty=position.get("quantity") or 0,
+                    status=position.get("status") or "",
+                    entry=_fmt_money(position.get("entry_price")),
+                    stop=_fmt_money(position.get("stop_price")),
+                    target=_fmt_money(position.get("target_price")),
+                    protection=position.get("protection_state") or "",
+                )
+            )
 
     trades = report.get("trades") or []
     if trades:
@@ -177,9 +206,19 @@ def render_daily_report_telegram_summary(
     provider = ((report.get("provider_health") or {}).get("reconciliation") or {})
     warnings = report.get("data_quality_warnings") or []
     trades = report.get("trades") or []
+    open_summary = report.get("open_position_summary") or {}
+    open_positions = report.get("open_positions") or []
     lines = [
-        f"Bhiksha EOD - {report.get('trading_date')}",
+        f"Bhiksha Session Report - {report.get('trading_date')}",
         f"Status: {status.get('level', 'UNKNOWN')} ({status.get('reason', 'ok')})",
+        (
+            "Open: "
+            f"live {summary.get('live_open_count', 0)}, "
+            f"shadow {summary.get('shadow_open_count', 0)}, "
+            f"protected {open_summary.get('protected_count', 0)}, "
+            f"unprotected {open_summary.get('unprotected_count', 0)}, "
+            f"exit pending {open_summary.get('exit_pending_count', 0)}"
+        ),
         (
             "P&L: "
             f"live ${summary.get('live_realized_pnl_usd', 0.0):.2f} "
@@ -194,6 +233,23 @@ def render_daily_report_telegram_summary(
             f"blocking {provider.get('blocking_count', 0)}"
         ),
     ]
+    if open_positions:
+        lines.append("Open positions:")
+        for position in open_positions[:3]:
+            lines.append(
+                "- {lane} {symbol} {option} qty {qty}: entry {entry}, stop {stop}, target {target}, {protection}".format(
+                    lane=position.get("lane", ""),
+                    symbol=position.get("symbol", ""),
+                    option=position.get("option_symbol") or "",
+                    qty=position.get("quantity") or 0,
+                    entry=_fmt_money(position.get("entry_price")) or "?",
+                    stop=_fmt_money(position.get("stop_price")) or "?",
+                    target=_fmt_money(position.get("target_price")) or "?",
+                    protection=position.get("protection_state") or "unknown",
+                )
+            )
+        if len(open_positions) > 3:
+            lines.append(f"- +{len(open_positions) - 3} more open")
     if warnings:
         first = warnings[0]
         more = len(warnings) - 1
@@ -203,9 +259,10 @@ def render_daily_report_telegram_summary(
             f"{len(warnings)} warning(s); first={first.get('symbol')} "
             f"{first.get('message')}{suffix}"
         )
-    if trades:
-        lines.append("Trades:")
-        for trade in trades[:3]:
+    closed_trades = [item for item in trades if not _is_open_trade(item)]
+    if closed_trades:
+        lines.append("Recent trades:")
+        for trade in closed_trades[:3]:
             lines.append(
                 "- {lane} {symbol} {option} qty {qty}: {entry}->{exit}, P&L ${pnl}".format(
                     lane=trade.get("lane", ""),
@@ -217,8 +274,8 @@ def render_daily_report_telegram_summary(
                     pnl=_fmt_money(trade.get("realized_pnl_usd")) or "0.00",
                 )
             )
-        if len(trades) > 3:
-            lines.append(f"- +{len(trades) - 3} more in report")
+        if len(closed_trades) > 3:
+            lines.append(f"- +{len(closed_trades) - 3} more closed in report")
     if markdown_path is not None:
         lines.append(f"Report: {markdown_path}")
     return "\n".join(lines)
@@ -237,7 +294,12 @@ def _empty_report(day: date) -> dict[str, Any]:
             "live_realized_pnl_usd": 0.0,
             "shadow_realized_pnl_usd": 0.0,
             "total_realized_pnl_usd": 0.0,
+            "live_open_count": 0,
+            "shadow_open_count": 0,
+            "total_open_count": 0,
         },
+        "open_position_summary": _open_position_summary([]),
+        "open_positions": [],
         "trades": [],
         "lifecycle": {},
         "data_quality_warnings": [],
@@ -246,6 +308,9 @@ def _empty_report(day: date) -> dict[str, Any]:
 
 
 def _load_day_events(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
+    tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "events" not in tables:
+        return []
     start = f"{day.isoformat()}T00:00:00"
     end = f"{day.isoformat()}T99:99:99"
     rows = conn.execute(
@@ -288,15 +353,28 @@ def _load_day_trades(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
     ]
     selected = [column for column in desired if column in columns]
     day_text = day.isoformat()
+    predicates: list[str] = []
+    params: list[str] = []
+    if "entry_timestamp" in columns:
+        predicates.append("substr(replace(COALESCE(entry_timestamp, ''), ' ', 'T'), 1, 10) = ?")
+        params.append(day_text)
+    if "exit_filled_at" in columns:
+        predicates.append("substr(replace(COALESCE(exit_filled_at, ''), ' ', 'T'), 1, 10) = ?")
+        params.append(day_text)
+    if "status" in columns:
+        predicates.append("status != 'closed'")
+    if not predicates:
+        return []
+    order_columns = [column for column in ("entry_timestamp", "exit_filled_at", "trade_id") if column in columns]
+    order_expr = f"COALESCE({', '.join(order_columns)})" if len(order_columns) > 1 else order_columns[0]
     rows = conn.execute(
         f"""
         SELECT {", ".join(selected)}
         FROM trade_sessions
-        WHERE substr(replace(COALESCE(entry_timestamp, ''), ' ', 'T'), 1, 10) = ?
-           OR substr(replace(COALESCE(exit_filled_at, ''), ' ', 'T'), 1, 10) = ?
-        ORDER BY COALESCE(entry_timestamp, exit_filled_at, trade_id)
+        WHERE {" OR ".join(predicates)}
+        ORDER BY {order_expr}
         """,
-        (day_text, day_text),
+        params,
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -314,6 +392,7 @@ def _augment_trade(trade: dict[str, Any]) -> dict[str, Any]:
         "lane": lane,
         "realized_pnl_usd": realized,
         "option_strike": _parse_option_strike(_maybe_str(trade.get("option_symbol"))),
+        "protection_state": _protection_state(trade),
     }
 
 
@@ -402,6 +481,30 @@ def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]
                 }
             )
     return warnings
+
+
+def _is_open_trade(trade: dict[str, Any]) -> bool:
+    return str(trade.get("status") or "").lower() != "closed"
+
+
+def _protection_state(trade: dict[str, Any]) -> str:
+    status = str(trade.get("status") or "").lower()
+    if status == "closed":
+        return "closed"
+    if trade.get("exit_order_id") or status.endswith("exit_pending") or "exit_pending" in status:
+        return "exit_pending"
+    if trade.get("stop_order_id"):
+        return "protected"
+    return "unprotected"
+
+
+def _open_position_summary(open_positions: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(_protection_state(position) for position in open_positions)
+    return {
+        "protected_count": counts.get("protected", 0),
+        "unprotected_count": counts.get("unprotected", 0),
+        "exit_pending_count": counts.get("exit_pending", 0),
+    }
 
 
 def _report_status(

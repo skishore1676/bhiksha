@@ -1,0 +1,125 @@
+import asyncio
+import json
+from datetime import UTC, datetime, timedelta
+
+from bhiksha.integrations.schwab.settings import SchwabSettings
+import bhiksha.ops.schwab_token_guard as schwab_token_guard
+from bhiksha.ops.schwab_token_guard import classify_schwab_token_state, run_schwab_token_guard
+
+
+def _settings(token_file) -> SchwabSettings:
+    return SchwabSettings(app_key="key", app_secret="secret", token_file=str(token_file))
+
+
+def _write_tokens(token_file, *, access_minutes_old=1, refresh_days_old=1):
+    now = datetime.now(UTC)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token_issued": (now - timedelta(minutes=access_minutes_old)).isoformat(),
+                "refresh_token_issued": (now - timedelta(days=refresh_days_old)).isoformat(),
+                "token_dictionary": {
+                    "access_token": "access-secret",
+                    "refresh_token": "refresh-secret",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_classify_healthy_token(tmp_path) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    _write_tokens(token_file, access_minutes_old=1, refresh_days_old=1)
+
+    snapshot = classify_schwab_token_state(_settings(token_file))
+
+    assert snapshot.state == "healthy"
+    assert snapshot.refresh_token_days_left is not None
+
+
+def test_guard_refreshes_access_token_when_stale(tmp_path, monkeypatch) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    _write_tokens(token_file, access_minutes_old=40, refresh_days_old=1)
+    calls = []
+
+    async def fake_refresh(settings):
+        calls.append(settings.token_file)
+        _write_tokens(token_file, access_minutes_old=0, refresh_days_old=0)
+
+    monkeypatch.setattr(schwab_token_guard.schwab_auth, "refresh_access_token", fake_refresh)
+
+    result = asyncio.run(run_schwab_token_guard(settings=_settings(token_file), write_receipt=False))
+
+    assert result.ok is True
+    assert result.action == "direct_refresh"
+    assert result.direct_refresh_attempted is True
+    assert result.direct_refresh_ok is True
+    assert result.browser.invoked is False
+    assert calls == [str(token_file)]
+
+
+def test_guard_invokes_browser_when_refresh_token_expired_and_auto_enabled(tmp_path, monkeypatch) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    _write_tokens(token_file, access_minutes_old=40, refresh_days_old=8)
+
+    def fake_browser(command):
+        _write_tokens(token_file, access_minutes_old=0, refresh_days_old=0)
+        return schwab_token_guard.BrowserRenewalResult(invoked=True, command=command or [], return_code=0)
+
+    monkeypatch.setattr(schwab_token_guard, "_invoke_browser_renewal", fake_browser)
+
+    result = asyncio.run(
+        run_schwab_token_guard(
+            settings=_settings(token_file),
+            browser_renewal_mode="auto",
+            browser_renewal_cmd=["/tmp/fake-refresh"],
+            write_receipt=False,
+        )
+    )
+
+    assert result.ok is True
+    assert result.initial.state == "refresh_token_expired"
+    assert result.action == "refresh_token_expired_browser_renewal"
+    assert result.browser.invoked is True
+    assert result.final.state == "healthy"
+
+
+def test_guard_writes_receipt_without_tokens(tmp_path) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    _write_tokens(token_file, access_minutes_old=1, refresh_days_old=1)
+    receipt_dir = tmp_path / "receipts"
+
+    result = asyncio.run(run_schwab_token_guard(settings=_settings(token_file), receipt_dir=receipt_dir))
+
+    assert result.receipt_path is not None
+    text = (receipt_dir / "latest.json").read_text(encoding="utf-8")
+    assert "access-secret" not in text
+    assert "refresh-secret" not in text
+    assert "healthy_noop" in text
+
+
+def test_guard_alerts_when_token_unusable(tmp_path, monkeypatch) -> None:
+    token_file = tmp_path / "missing_tokens.json"
+    alerts = []
+
+    def fake_alert(**kwargs):
+        alerts.append(kwargs)
+        return schwab_token_guard.AlertResult(attempted=True, ok=True, mode=kwargs["mode"])
+
+    monkeypatch.setattr(schwab_token_guard, "send_lathi_alert", fake_alert)
+
+    result = asyncio.run(
+        run_schwab_token_guard(
+            settings=_settings(token_file),
+            write_receipt=False,
+            alert_mode="spool",
+            alert_profile="jarvis-northstar",
+        )
+    )
+
+    assert result.ok is False
+    assert result.action == "token_file_missing_operator_required"
+    assert result.alert.attempted is True
+    assert alerts[0]["profile"] == "jarvis-northstar"
+    assert "Final state: token_file_missing" in alerts[0]["body"]
