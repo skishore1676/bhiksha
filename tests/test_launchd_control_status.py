@@ -46,8 +46,9 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
 
     assert session_job["last"]["domain"]["ok"] is True
     assert session_job["last"]["transport"]["status"] == "degraded"
-    assert session_job["last_run_status"] == "ok"
+    assert session_job["last_run_status"] == "GREEN"
     assert session_job["last_run_at"] == "2026-06-30T15:00:00+00:00"
+    assert session_job["transport_status"] == "degraded"
     assert session_job["next_fire"].startswith("2026-06-30T11:45:00")
     assert snapshot["transport"]["status"] == "degraded"
 

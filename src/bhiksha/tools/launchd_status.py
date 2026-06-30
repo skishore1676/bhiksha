@@ -68,8 +68,9 @@ def build_status_snapshot(*, repo_root: Path, active_plan_path: Path, now: datet
                     "stderr_exists": spec.stderr_log(repo_root).is_file(),
                 },
                 "last": last,
-                "last_run_status": last.get("status") if isinstance(last, dict) else None,
+                "last_run_status": _last_run_status(last),
                 "last_run_at": last.get("recorded_at") if isinstance(last, dict) else None,
+                "transport_status": _last_transport_status(last),
             }
         )
 
@@ -163,6 +164,20 @@ def _last_job_view(latest_record: Any, latest_payload: dict[str, Any] | None) ->
     }
 
 
+def _last_run_status(last: dict[str, Any] | None) -> str | None:
+    if not isinstance(last, dict):
+        return None
+    domain = last.get("domain") if isinstance(last.get("domain"), dict) else {}
+    return domain.get("status") or last.get("status")
+
+
+def _last_transport_status(last: dict[str, Any] | None) -> str | None:
+    if not isinstance(last, dict):
+        return None
+    transport = last.get("transport") if isinstance(last.get("transport"), dict) else {}
+    return transport.get("status")
+
+
 def _next_fire(schedule: tuple[dict[str, int], ...], *, now: datetime) -> str | None:
     """Return the next scheduled launchd fire time in Central time.
 
@@ -200,8 +215,14 @@ def _next_fire(schedule: tuple[dict[str, int], ...], *, now: datetime) -> str | 
 
 def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("job") == "session-report":
-        status = str(payload.get("report_status") or "").upper()
-        return {"ok": payload.get("status") == "ok", "status": status or payload.get("status"), "reason": "session_report"}
+        report_status = payload.get("report_status")
+        if isinstance(report_status, dict):
+            status = str(report_status.get("level") or report_status.get("LEVEL") or "").upper()
+            ok = status == "GREEN"
+        else:
+            status = str(report_status or "").upper()
+            ok = payload.get("status") == "ok"
+        return {"ok": ok, "status": status or payload.get("status"), "reason": "session_report"}
     if payload.get("job") == "schwab-refresh":
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         final = result.get("final") if isinstance(result.get("final"), dict) else {}
