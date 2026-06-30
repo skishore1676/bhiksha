@@ -7,4 +7,5 @@ ulimit -n 10240
 export PYTHONPATH=src
 export PYTHONUNBUFFERED=1
 
-"$REPO_ROOT/.venv/bin/python" -m bhiksha.tools.server_session ensure-running --live
+"$REPO_ROOT/.venv/bin/python" -m bhiksha.tools.server_session ensure-running --live \
+  --post-start-check-seconds "${BHIKSHA_POST_START_CHECK_SECONDS:-20}"

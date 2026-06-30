@@ -27,5 +27,13 @@ def test_cron_run_uses_server_session_logging_contract() -> None:
     script = Path("scripts/cron_run_bhiksha.sh").read_text(encoding="utf-8")
 
     assert "bhiksha.tools.server_session restart --live" in script
+    assert "--post-start-check-seconds" in script
     assert "bhiksha.tools.trade_session" not in script
     assert "cron_output.log" not in script
+
+
+def test_watchdog_uses_post_start_health_window() -> None:
+    script = Path("scripts/cron_ensure_bhiksha_running.sh").read_text(encoding="utf-8")
+
+    assert "bhiksha.tools.server_session ensure-running --live" in script
+    assert "--post-start-check-seconds" in script

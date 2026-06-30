@@ -99,6 +99,8 @@ def _defaults() -> dict[str, str | None]:
         "pid_path": os.getenv("BHIKSHA_RUNTIME_PID_PATH", "artifacts/playbook/runtime/bhiksha.pid"),
         "runtime_log_dir": os.getenv("BHIKSHA_RUNTIME_LOG_DIR", "artifacts/playbook/runtime"),
         "python_executable": os.getenv("BHIKSHA_RUNTIME_PYTHON", sys.executable),
+        "post_start_check_seconds": os.getenv("BHIKSHA_RUNTIME_POST_START_CHECK_SECONDS", "0"),
+        "post_start_check_interval_seconds": os.getenv("BHIKSHA_RUNTIME_POST_START_CHECK_INTERVAL_SECONDS", "1"),
         "repo_root": str(repo_root),
     }
 
@@ -146,6 +148,18 @@ def _add_runtime_args(
     parser.add_argument("--repo-root", default=defaults["repo_root"], help="Repository root used as the subprocess working directory")
     parser.add_argument("--live", action="store_true", help="Run Bhiksha in live mode")
     parser.add_argument("--max-bars", type=int, default=None, help="Optional max-bars limit for the runtime")
+    parser.add_argument(
+        "--post-start-check-seconds",
+        type=float,
+        default=float(defaults["post_start_check_seconds"] or 0),
+        help="Require the launched runtime to stay alive for this many seconds before reporting success",
+    )
+    parser.add_argument(
+        "--post-start-check-interval-seconds",
+        type=float,
+        default=float(defaults["post_start_check_interval_seconds"] or 1),
+        help="Polling interval used by --post-start-check-seconds",
+    )
 
 
 def _sync_from_args(args: argparse.Namespace):
@@ -214,7 +228,51 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
     }
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _verify_post_start_survival(
+        process=process,
+        pid_path=pid_path,
+        err_log_path=err_log_path,
+        seconds=max(0.0, float(args.post_start_check_seconds or 0.0)),
+        interval_seconds=max(0.1, float(args.post_start_check_interval_seconds or 1.0)),
+    )
     return {"action": "started", "running": True, **metadata}
+
+
+def _verify_post_start_survival(
+    *,
+    process: subprocess.Popen,
+    pid_path: Path,
+    err_log_path: Path,
+    seconds: float,
+    interval_seconds: float,
+) -> None:
+    if seconds <= 0:
+        return
+
+    deadline = time.monotonic() + seconds
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            if pid_path.exists():
+                pid_path.unlink()
+            err_tail = _tail_text(err_log_path, max_lines=40)
+            raise RuntimeError(
+                "Bhiksha runtime exited during post-start health window "
+                f"return_code={return_code} err_log_path={err_log_path} err_tail={err_tail!r}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(interval_seconds, remaining))
+
+
+def _tail_text(path: Path, *, max_lines: int) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:])
+    except OSError as exc:
+        return f"<unable to read {path}: {exc}>"
 
 
 def _stop_runtime(pid_path: Path, *, timeout_seconds: float, missing_ok: bool = False) -> dict[str, object]:

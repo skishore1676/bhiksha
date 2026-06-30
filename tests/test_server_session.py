@@ -219,6 +219,48 @@ def test_server_session_ensure_running_starts_when_missing(tmp_path: Path, monke
     assert metadata["pid"] == 54321
 
 
+def test_server_session_post_start_check_fails_when_runtime_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pid_path = tmp_path / "runtime" / "bhiksha.pid"
+    runtime_log_dir = tmp_path / "runtime_logs"
+    active_plan_path = tmp_path / "active_plan.json"
+    active_plan_path.write_text("{}", encoding="utf-8")
+
+    class _FakeProcess:
+        pid = 65432
+
+        def poll(self) -> int:
+            return 1
+
+    def _fake_popen(command, **kwargs):
+        del command
+        kwargs["stderr"].write("RuntimeError: Startup health check failed for: schwab_token\n")
+        kwargs["stderr"].flush()
+        return _FakeProcess()
+
+    monkeypatch.setattr("bhiksha.tools.server_session.subprocess.Popen", _fake_popen)
+
+    with pytest.raises(RuntimeError, match="Startup health check failed for: schwab_token"):
+        server_session_main(
+            [
+                "ensure-running",
+                "--pid-path",
+                str(pid_path),
+                "--runtime-log-dir",
+                str(runtime_log_dir),
+                "--active-plan",
+                str(active_plan_path),
+                "--repo-root",
+                str(tmp_path),
+                "--python-executable",
+                "/tmp/python",
+                "--post-start-check-seconds",
+                "1",
+            ]
+        )
+
+    assert not pid_path.exists()
+
+
 def test_server_session_ensure_running_noops_when_alive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pid_path = tmp_path / "runtime" / "bhiksha.pid"
     pid_path.parent.mkdir(parents=True, exist_ok=True)
