@@ -50,6 +50,43 @@ That line is the best first observation contract for Lathi. It lets Control
 Tower render job status and lets a manual Control Tower action capture the
 Bhiksha-owned result without reimplementing Bhiksha logic.
 
+## Status - Bhiksha
+
+Status on branch `codex/bhiksha-control-tower-contract`: the Bhiksha-side
+contract is implemented and pushed, but not yet merged to `main` or deployed to
+oldmac. Lathi-side Control Tower work is intentionally separate.
+
+Implemented Bhiksha pieces:
+
+| Piece | Status | Notes |
+| --- | --- | --- |
+| `launchd_registry` | Implemented | `src/bhiksha/ops/launchd_registry.py` is now the shared registry for labels, schedules, risk classes, manual actions, and confirmation metadata. The launchd installer reads this registry instead of duplicating schedules. |
+| `launchd_status --json` | Implemented | `python -m bhiksha.tools.launchd_status --json` emits schema `bhiksha.launchd.status.v1`, one row per active `com.bhiksha.*` job, runtime status, latest report summary, Schwab guard summary, and transport rollup. |
+| `launchd_control --json` | Implemented | `python -m bhiksha.tools.launchd_control <action> --json` emits schema `bhiksha.launchd.control_result.v1` for `live-status`, `session-report-now`, `schwab-guard-now`, and `ensure-live-runtime`. |
+| `latest_status.json` | Implemented | Every `bhiksha.tools.launchd_job` run attempts to update `artifacts/playbook/launchd/latest_status.json` with the latest non-secret job payload. Snapshot-write failure is observational and does not fail the trading-domain job. |
+| Action ids | Implemented | `launchd_control` creates or accepts `--action-id`; `launchd_job` echoes it into `BHIKSHA_LAUNCHD_JOB` payloads. |
+| Concurrency guard | Implemented | `launchd_control` uses per-action lock files under `artifacts/playbook/launchd/control_locks/` and refuses duplicate in-flight actions unless the lock is stale. |
+| Confirmation rule | Implemented | `ensure-live-runtime` refuses without `--confirm` when market is open or when it would start a stopped live runtime. |
+| Transport/domain split | Implemented | Status output separates report/token domain health from Lathi Bus / Telegram transport health, so a GREEN report with failed Telegram delivery is visible as transport degraded, not a trading failure. |
+
+Local verification already performed on this branch:
+
+```bash
+PYTHONPATH=src python3 -m pytest \
+  tests/test_bhiksha_launchd.py \
+  tests/test_launchd_control_status.py \
+  tests/test_alerts.py \
+  tests/test_daily_report.py
+
+PYTHONPATH=src python3 -m bhiksha.tools.launchd_status --json
+PYTHONPATH=src python3 -m bhiksha.tools.launchd_control live-status --json
+PYTHONPATH=src python3 -m bhiksha.tools.launchd_control ensure-live-runtime --json
+```
+
+The final command should refuse without `--confirm` when it would start a
+stopped live runtime. That refusal is expected and is part of the Control Tower
+safety contract.
+
 ### Lathi
 
 The Lathi aspirational worldview says Lathi should be the small operating core
@@ -109,12 +146,12 @@ Control Tower should not infer trading truth from Telegram alone. Telegram is a
 projection. Runtime status, Bhiksha receipts, logs, and command result JSON are
 the evidence.
 
-## Bhiksha Development Needed
+## Bhiksha Development Status
 
 ### 1. Add a launchd job registry
 
-Create a machine-readable registry for the five Bhiksha jobs. The registry
-should be the shared source for docs, installer generation, and status output.
+Implemented. A machine-readable registry for the five Bhiksha jobs now exists
+and is the shared source for installer generation and status output.
 
 Suggested file:
 
@@ -122,7 +159,7 @@ Suggested file:
 src/bhiksha/ops/launchd_registry.py
 ```
 
-Each job record should include:
+Each job record includes:
 
 - launchd label;
 - Bhiksha runner job name;
@@ -138,13 +175,13 @@ This avoids Lathi scraping shell scripts for meaning.
 
 ### 2. Add a Bhiksha status snapshot command
 
-Create:
+Implemented:
 
 ```bash
 python -m bhiksha.tools.launchd_status --json
 ```
 
-The output should contain one JSON object with:
+The output contains one JSON object with:
 
 - generated timestamp and host;
 - repo root and active plan path;
@@ -167,7 +204,7 @@ not as a trading failure.
 
 ### 3. Add a Bhiksha control command
 
-Create:
+Implemented:
 
 ```bash
 python -m bhiksha.tools.launchd_control <action> --json
@@ -185,7 +222,7 @@ Initial actions:
 Later actions such as `restart-live-runtime` and `stop-live-runtime` should
 exist behind an explicit confirmation gate because they can affect live trading.
 
-The command should emit a single structured JSON result and preserve the
+The command emits a single structured JSON result and preserves the
 existing `BHIKSHA_LAUNCHD_JOB` payload when it invokes the runner. It should also
 accept or create a correlation id, such as `action_id`, and echo it in every
 result so Lathi can connect:
@@ -194,22 +231,22 @@ result so Lathi can connect:
 operator click -> Lathi action journal -> Bhiksha command -> Bhiksha receipt
 ```
 
-Manual controls should be concurrency-safe. If the same action is already
-running, Bhiksha should refuse, coalesce, or return the in-flight action rather
-than starting duplicate session reports, token guards, or runtime ensures.
+Manual controls are concurrency-safe. If the same action is already running,
+Bhiksha refuses with the in-flight action metadata rather than starting
+duplicate session reports, token guards, or runtime ensures.
 
 ### 4. Persist observed scheduled outcomes
 
-Scheduled launchd runs happen outside Lathi, but they should still be visible.
-Bhiksha should write or update a compact file after each run:
+Implemented. Scheduled launchd runs happen outside Lathi, but they are visible
+because Bhiksha writes or updates a compact file after each run:
 
 ```text
 artifacts/playbook/launchd/latest_status.json
 ```
 
-This file should be derived from non-secret receipts and log summaries. Lathi
-can read this file or call `launchd_status --json`; the file makes the dashboard
-fast and stable even when a command call is undesirable.
+This file is derived from non-secret receipts and log summaries. Lathi can read
+this file or call `launchd_status --json`; the file makes the dashboard fast and
+stable even when a command call is undesirable.
 
 ### 5. Keep Bhiksha alert ownership
 

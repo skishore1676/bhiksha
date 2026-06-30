@@ -24,6 +24,15 @@ The installer writes plists into `~/Library/LaunchAgents` and logs under:
 artifacts/playbook/launchd/
 ```
 
+The active launchd registry lives in code at:
+
+```text
+src/bhiksha/ops/launchd_registry.py
+```
+
+The installer reads that registry, so labels, schedules, risk classes, and
+manual Control Tower actions do not need to be duplicated in shell.
+
 ## Jobs
 
 | Label | Schedule | Purpose |
@@ -55,18 +64,77 @@ Use `--force` to bypass the trading-day skip during testing:
 scripts/launchd/run_bhiksha_job.sh session-report --force --report-label test
 ```
 
+The runner accepts `--action-id` so a Control Tower action journal entry can be
+correlated with the Bhiksha receipt:
+
+```bash
+scripts/launchd/run_bhiksha_job.sh session-report --force --report-label manual --action-id manual-test-001
+```
+
+Every runner invocation attempts to update:
+
+```text
+artifacts/playbook/launchd/latest_status.json
+```
+
+That file is observational. If it cannot be written, the scheduled trading job
+must not fail only because the status breadcrumb failed.
+
+## Status And Control
+
+External observers such as Lathi Control Tower should use the read-only status
+command instead of scraping logs directly:
+
+```bash
+python -m bhiksha.tools.launchd_status --json
+```
+
+The status payload uses schema `bhiksha.launchd.status.v1` and includes:
+
+- all five active `com.bhiksha.*` jobs;
+- launchd loaded/exit state where available;
+- latest `BHIKSHA_LAUNCHD_JOB` payloads;
+- report and Schwab guard summaries;
+- live runtime status;
+- transport health separate from trading-domain health.
+
+Manual actions for Control Tower go through:
+
+```bash
+python -m bhiksha.tools.launchd_control live-status --json
+python -m bhiksha.tools.launchd_control session-report-now --json
+python -m bhiksha.tools.launchd_control schwab-guard-now --json
+python -m bhiksha.tools.launchd_control ensure-live-runtime --json
+```
+
+`launchd_control` emits schema `bhiksha.launchd.control_result.v1`, creates or
+accepts `--action-id`, and uses per-action lock files under
+`artifacts/playbook/launchd/control_locks/` so duplicate manual actions do not
+run concurrently.
+
+`ensure-live-runtime` is trading-adjacent. It refuses without `--confirm` when
+the market is open or when it would start a stopped live runtime:
+
+```bash
+python -m bhiksha.tools.launchd_control ensure-live-runtime --confirm --json
+```
+
 ## Cutover Verification
 
 1. Install or reinstall Bhiksha-owned launchd jobs.
 2. Read back `launchctl list | grep bhiksha` and verify the five `com.bhiksha.*`
    labels are loaded.
-3. Kickstart or manually run `com.bhiksha.session-report` and verify the Telegram
+3. Run `python -m bhiksha.tools.launchd_status --json` and verify the five
+   jobs appear with schema `bhiksha.launchd.status.v1`.
+4. Kickstart or manually run `com.bhiksha.session-report` and verify the Telegram
    report arrives through Lathi Bus.
-4. Kickstart or manually run `com.bhiksha.schwab-guard` and verify a healthy
+5. Kickstart or manually run `com.bhiksha.schwab-guard` and verify a healthy
    token receipt or an actionable Lathi Bus alert.
-5. Confirm live runtime status through `scripts/launchd/run_bhiksha_job.sh
-   live-watchdog --force` or `python -m bhiksha.tools.server_session status`.
-6. Verify old OpenClaw/browser-agent Bhiksha labels are not loaded.
+6. Confirm live runtime status through `python -m bhiksha.tools.launchd_control
+   live-status --json`.
+7. Confirm `ensure-live-runtime` requires confirmation when it would start a
+   stopped live runtime.
+8. Verify old OpenClaw/browser-agent Bhiksha labels are not loaded.
 
 ## Archived Legacy Labels
 

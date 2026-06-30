@@ -10,7 +10,7 @@ jobs are the scheduler. Lathi Bus is the human notification/gate transport.
 
 | Repo | Owns | Change |
 | --- | --- | --- |
-| `bhiksha` | Schwab token classification, safe token-endpoint refresh, alert decision, receipts, operator-facing CLI | Add `bhiksha.tools.schwab_token_guard`, `bhiksha.ops.alerts`, and `scripts/schwab_token_guard.sh`. |
+| `bhiksha` | Schwab token classification, safe token-endpoint refresh, alert decision, receipts, operator-facing CLI | Owns `bhiksha.tools.schwab_token_guard`, `bhiksha.ops.alerts`, launchd status/control surfaces, and Lathi Bus invocation safety. |
 | `browser-agent` | Headed Schwab OAuth browser work | Keep `scripts/schwab-auto-refresh.sh` as an invoked adapter; remove independent LaunchAgent schedule from `deploy/com.bhiksha.schwab-refresh.plist`. |
 | `openclaw-core` | Legacy scheduler/evidence wrapper | No runtime dependency after the Bhiksha-owned launchd cutover. Old OpenClaw Bhiksha labels should remain archived/unloaded. |
 | `lathi-bus` | Receipt/approval/Telegram transport | Provide `telegram-notify`; Bhiksha owns whether and when the alert is sent. |
@@ -76,9 +76,12 @@ and exit-code semantics without opening a real Schwab OAuth session.
 - In `live` alert mode, Bhiksha treats Lathi Bus success as real only when the
   Lathi receipt says `network_call_performed=true`. A spool-only packet is not
   counted as delivered.
-- Bhiksha discovers Lathi Bus via `lathi-bus` on `PATH` or `~/code/lathi-bus`.
-  On oldmac it can use existing lane-host Telegram secret-file paths through
-  Lathi Bus environment overrides; it does not call OpenClaw to send the alert.
+- Bhiksha prefers the `~/code/lathi-bus/.venv/bin/python -m lathi_bus.cli`
+  checkout invocation when available, then falls back to `lathi-bus` on `PATH`.
+  This avoids launchd using a different Python environment than Lathi Bus
+  expects. On oldmac it can use existing lane-host Telegram secret-file paths
+  through Lathi Bus environment overrides; it does not call OpenClaw to send the
+  alert.
 - Startup trading health may fail closed if Schwab auth is unusable; the
   browser adapter is premarket maintenance, not an in-trade surprise action.
 
@@ -101,3 +104,17 @@ Current sequence:
    manually when the report surfaces something odd.
 5. Old OpenClaw/browser-agent Bhiksha launchd labels stay archived/unloaded to
    avoid duplicate schedulers.
+
+## Control Tower Status
+
+The Schwab guard participates in the Bhiksha launchd status/control contract:
+
+```bash
+python -m bhiksha.tools.launchd_status --json
+python -m bhiksha.tools.launchd_control schwab-guard-now --json
+```
+
+The status payload exposes the latest Schwab token guard receipt summary and
+separates token-domain health from alert transport health. A usable token with a
+failed Telegram delivery should be rendered as transport degraded, not as a
+token failure.
