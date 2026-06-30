@@ -55,9 +55,9 @@ Use `--force` to bypass the trading-day skip during testing:
 scripts/launchd/run_bhiksha_job.sh session-report --force --report-label test
 ```
 
-## Cutover Plan
+## Cutover Verification
 
-1. Install Bhiksha-owned launchd jobs.
+1. Install or reinstall Bhiksha-owned launchd jobs.
 2. Read back `launchctl list | grep bhiksha` and verify the five `com.bhiksha.*`
    labels are loaded.
 3. Kickstart or manually run `com.bhiksha.session-report` and verify the Telegram
@@ -66,13 +66,12 @@ scripts/launchd/run_bhiksha_job.sh session-report --force --report-label test
    token receipt or an actionable Lathi Bus alert.
 5. Confirm live runtime status through `scripts/launchd/run_bhiksha_job.sh
    live-watchdog --force` or `python -m bhiksha.tools.server_session status`.
-6. Only after the new labels are verified, unload/archive the old OpenClaw and
-   browser-agent Bhiksha launchd jobs to remove confusion.
+6. Verify old OpenClaw/browser-agent Bhiksha labels are not loaded.
 
-## Old Labels To Retire After Verification
+## Archived Legacy Labels
 
-These are expected to be unloaded or archived after the Bhiksha-owned labels are
-verified on oldmac:
+These labels were replaced by the Bhiksha-owned launchd jobs and should remain
+unloaded/archived:
 
 ```text
 ai.openclaw.bhiksha-live-start
@@ -83,7 +82,7 @@ ai.openclaw.bhiksha-schwab-refresh
 com.bhiksha.schwab-refresh
 ```
 
-The replacement labels are:
+The active labels are:
 
 ```text
 com.bhiksha.live-start

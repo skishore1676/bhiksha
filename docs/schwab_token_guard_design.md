@@ -3,9 +3,8 @@
 ## Ownership
 
 Bhiksha owns Schwab token state, the decision to renew, and the decision to
-alert. Browser-agent is only the headed-browser adapter. OpenClaw launchd is
-only the scheduler/evidence wrapper. Lathi Bus is the human notification/gate
-transport.
+alert. Browser-agent is only the headed-browser adapter. Bhiksha-owned launchd
+jobs are the scheduler. Lathi Bus is the human notification/gate transport.
 
 ## Repository Map
 
@@ -13,7 +12,7 @@ transport.
 | --- | --- | --- |
 | `bhiksha` | Schwab token classification, safe token-endpoint refresh, alert decision, receipts, operator-facing CLI | Add `bhiksha.tools.schwab_token_guard`, `bhiksha.ops.alerts`, and `scripts/schwab_token_guard.sh`. |
 | `browser-agent` | Headed Schwab OAuth browser work | Keep `scripts/schwab-auto-refresh.sh` as an invoked adapter; remove independent LaunchAgent schedule from `deploy/com.bhiksha.schwab-refresh.plist`. |
-| `openclaw-core` | oldmac launchd wrapper and runtime evidence | Point `send_bhiksha_schwab_refresh.sh` at Bhiksha's guard CLI. Do not rely on OpenClaw for Schwab token failure alerts. |
+| `openclaw-core` | Legacy scheduler/evidence wrapper | No runtime dependency after the Bhiksha-owned launchd cutover. Old OpenClaw Bhiksha labels should remain archived/unloaded. |
 | `lathi-bus` | Receipt/approval/Telegram transport | Provide `telegram-notify`; Bhiksha owns whether and when the alert is sent. |
 | `lane-host` / `lathi` | Higher-level orchestration | No Schwab-token runtime change in this slice. |
 
@@ -42,20 +41,15 @@ and exit-code semantics without opening a real Schwab OAuth session.
 
 ## Runtime Flow
 
-1. Launchd wakes OpenClaw's `ai.openclaw.bhiksha-schwab-refresh`.
-2. OpenClaw runs `scripts/lanes/send_bhiksha_schwab_refresh.sh`.
-3. That wrapper runs Bhiksha:
+1. Launchd wakes Bhiksha's `com.bhiksha.schwab-guard`.
+2. The Bhiksha launchd runner calls:
 
    ```bash
-   /Users/sunny/Documents/bhiksha/scripts/schwab_token_guard.sh \
-     premarket \
-     --browser-renewal-mode auto \
-     --browser-renewal-cmd /Users/sunny/code/browser-agent/scripts/schwab-auto-refresh.sh \
-     --alert-mode live \
-     --alert-profile jarvis-northstar \
-     --json
+   /Users/sunny/Documents/bhiksha/scripts/launchd/run_bhiksha_job.sh schwab-refresh
    ```
 
+3. `bhiksha.tools.launchd_job` runs the Schwab token guard with browser renewal
+   mode `auto` and Bhiksha-owned alerting.
 4. Bhiksha classifies token state:
    - `healthy`: no-op success.
    - `access_token_stale`: safe token-endpoint refresh.
@@ -66,8 +60,8 @@ and exit-code semantics without opening a real Schwab OAuth session.
    `artifacts/playbook/schwab_token_guard/`.
 6. If the final token state is not usable, Bhiksha sends a Lathi Bus
    `telegram-notify` alert and exits non-zero.
-7. OpenClaw records launchd evidence only; it is not the alert owner for this
-   failure path.
+7. Launchd records stdout/stderr under `artifacts/playbook/launchd/`; OpenClaw
+   is not in the runtime alert path.
 
 ## Safety Boundaries
 
@@ -91,19 +85,19 @@ and exit-code semantics without opening a real Schwab OAuth session.
 ## Launchd Direction
 
 Bhiksha-owned LaunchAgents are documented in `docs/bhiksha_launchd.md`. The
-new labels are `com.bhiksha.*`, not `ai.openclaw.*`, and they all run through
+labels are `com.bhiksha.*`, and they all run through
 `scripts/launchd/run_bhiksha_job.sh`.
 
-Proposed sequence:
+Current sequence:
 
-1. Install `com.bhiksha.schwab-guard` as the new scheduler for Bhiksha's guard.
+1. `com.bhiksha.schwab-guard` is the scheduler for Bhiksha's guard.
    Bhiksha owns alerting immediately.
-2. Replace the browser-agent `com.bhiksha.schwab-refresh` LaunchAgent with no
-   schedule. Browser-agent remains an adapter only.
-3. Use `com.bhiksha.live-start`, `com.bhiksha.live-watchdog`, and
+2. Browser-agent remains an adapter only and has no independent Bhiksha token
+   refresh schedule.
+3. `com.bhiksha.live-start`, `com.bhiksha.live-watchdog`, and
    `com.bhiksha.live-stop` for runtime control.
-4. Replace EOD-only receipt with `com.bhiksha.session-report`, scheduled at
+4. `com.bhiksha.session-report` sends intraday reports at
    09:10, 11:45, and 14:45 CT on trading days so the operator can still act
    manually when the report surfaces something odd.
-5. After the above, OpenClaw becomes optional scheduling/evidence infrastructure
-   for Bhiksha rather than a required dependency for trading health.
+5. Old OpenClaw/browser-agent Bhiksha launchd labels stay archived/unloaded to
+   avoid duplicate schedulers.

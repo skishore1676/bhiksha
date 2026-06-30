@@ -41,8 +41,8 @@ Verification:
 - Regenerated the June 3 report at
   `artifacts/playbook/reports/trade_session_report_2026-06-03.md`; it shows
   `$0` live P&L, `$412` shadow P&L, and a data-quality warning for MU scaling.
-- Dry-ran `bhiksha-eod-receipt` on oldmac; the message body rendered correctly
-  and no Telegram message was sent during setup.
+- Dry-ran the original EOD receipt path on oldmac during setup; that flow later
+  became the Bhiksha-owned intraday `com.bhiksha.session-report` launchd job.
 
 ### 2026-05-17
 

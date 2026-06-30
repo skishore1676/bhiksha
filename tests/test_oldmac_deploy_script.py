@@ -23,17 +23,22 @@ def test_oldmac_deploy_script_refuses_dirty_tree_by_default() -> None:
     assert guard_index < rsync_index
 
 
-def test_cron_run_uses_server_session_logging_contract() -> None:
-    script = Path("scripts/cron_run_bhiksha.sh").read_text(encoding="utf-8")
+def test_legacy_scheduler_scripts_stay_archived() -> None:
+    retired = [
+        "scripts/cron_run_bhiksha.sh",
+        "scripts/cron_ensure_bhiksha_running.sh",
+        "scripts/launchd_start_bhiksha.sh",
+        "scripts/launchd_stop_bhiksha.sh",
+    ]
 
-    assert "bhiksha.tools.server_session restart --live" in script
-    assert "--post-start-check-seconds" in script
-    assert "bhiksha.tools.trade_session" not in script
-    assert "cron_output.log" not in script
+    for path in retired:
+        assert not Path(path).exists()
 
 
-def test_watchdog_uses_post_start_health_window() -> None:
-    script = Path("scripts/cron_ensure_bhiksha_running.sh").read_text(encoding="utf-8")
+def test_bhiksha_launchd_runner_is_the_scheduler_entrypoint() -> None:
+    script = Path("scripts/launchd/run_bhiksha_job.sh").read_text(encoding="utf-8")
+    installer = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
 
-    assert "bhiksha.tools.server_session ensure-running --live" in script
-    assert "--post-start-check-seconds" in script
+    assert "bhiksha.tools.launchd_job" in script
+    assert "com.bhiksha.live-start" in installer
+    assert "com.bhiksha.live-watchdog" in installer
