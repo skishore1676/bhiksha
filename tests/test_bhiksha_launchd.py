@@ -15,9 +15,9 @@ def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
 def test_bhiksha_launchd_installer_has_three_session_report_times() -> None:
     script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
 
-    assert "weekdays(9, 45)" in script
-    assert "weekdays(12, 15)" in script
-    assert "weekdays(15, 8)" in script
+    assert "weekdays(9, 10)" in script
+    assert "weekdays(11, 45)" in script
+    assert "weekdays(14, 45)" in script
 
 
 def test_bhiksha_launchd_runner_points_at_bhiksha_policy_module() -> None:

@@ -102,7 +102,8 @@ Proposed sequence:
    schedule. Browser-agent remains an adapter only.
 3. Use `com.bhiksha.live-start`, `com.bhiksha.live-watchdog`, and
    `com.bhiksha.live-stop` for runtime control.
-4. Replace EOD-only receipt with `com.bhiksha.session-report`, scheduled three
-   times per trading day.
+4. Replace EOD-only receipt with `com.bhiksha.session-report`, scheduled at
+   09:10, 11:45, and 14:45 CT on trading days so the operator can still act
+   manually when the report surfaces something odd.
 5. After the above, OpenClaw becomes optional scheduling/evidence infrastructure
    for Bhiksha rather than a required dependency for trading health.

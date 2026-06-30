@@ -23,9 +23,9 @@ Completed:
 - Added date-scoped daily report generation from SQLite `events` and
   `trade_sessions`, including live/shadow P&L, lifecycle counts, provider
   reconciliation severity, and option/underlying data-quality warnings.
-- Added a concise Telegram summary renderer for the daily report and wired
-  oldmac/OpenClaw launchd to send it through Jarvis Receipts at 15:08 CT on
-  market weekdays.
+- Added a concise Telegram summary renderer for the session report. This later
+  moved to Bhiksha-owned launchd jobs at 09:10, 11:45, and 14:45 CT on market
+  weekdays.
 - Scheduled the existing trading-systems watch Telegram triage for 10:00 CT
   and 15:15 CT on market weekdays.
 - Hardened reconciliation severity: an isolated periodic portfolio failure is

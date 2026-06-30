@@ -32,7 +32,7 @@ artifacts/playbook/launchd/
 | `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is still running. Skips non-trading days. |
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop the live runtime. It does not skip non-trading days, so stale processes can still be cleaned up. |
 | `com.bhiksha.schwab-guard` | Weekdays 07:10 CT | Run the Schwab token guard; direct refresh first, browser-agent renewal only when needed. Skips non-trading days. |
-| `com.bhiksha.session-report` | Weekdays 09:45, 12:15, and 15:08 CT | Send an intraday session report with open positions, realized P&L, protection state, provider/runtime issues, and recent trades. Skips non-trading days. |
+| `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send an intraday session report with open positions, realized P&L, protection state, provider/runtime issues, and recent trades early enough for manual action. Skips non-trading days. |
 
 Launchd cannot natively express market holidays, so the runner performs the
 trading-day check before doing work.

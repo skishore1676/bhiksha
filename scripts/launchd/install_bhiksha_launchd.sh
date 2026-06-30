@@ -62,9 +62,9 @@ jobs = [
         "label": "com.bhiksha.session-report",
         "args": ["session-report"],
         "schedule": (
-            weekdays(9, 45)
-            + weekdays(12, 15)
-            + weekdays(15, 8)
+            weekdays(9, 10)
+            + weekdays(11, 45)
+            + weekdays(14, 45)
         ),
     },
 ]
