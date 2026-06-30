@@ -52,9 +52,10 @@ Bhiksha-owned result without reimplementing Bhiksha logic.
 
 ## Status - Bhiksha
 
-Status on branch `codex/bhiksha-control-tower-contract`: the Bhiksha-side
-contract is implemented and pushed, but not yet merged to `main` or deployed to
-oldmac. Lathi-side Control Tower work is intentionally separate.
+Status on `main`: the Bhiksha-side contract is implemented, pushed, and deployed
+to oldmac. Lathi-side Control Tower work remains intentionally separate:
+Bhiksha owns trading meaning and side effects; Lathi owns projection, operator
+review, and the Control Tower action journal.
 
 Implemented Bhiksha pieces:
 
@@ -69,7 +70,7 @@ Implemented Bhiksha pieces:
 | Confirmation rule | Implemented | `ensure-live-runtime` refuses without `--confirm` when market is open or when it would start a stopped live runtime. |
 | Transport/domain split | Implemented | Status output separates report/token domain health from Lathi Bus / Telegram transport health, so a GREEN report with failed Telegram delivery is visible as transport degraded, not a trading failure. |
 
-Local verification already performed on this branch:
+Verification already performed:
 
 ```bash
 PYTHONPATH=src python3 -m pytest \
@@ -85,7 +86,9 @@ PYTHONPATH=src python3 -m bhiksha.tools.launchd_control ensure-live-runtime --js
 
 The final command should refuse without `--confirm` when it would start a
 stopped live runtime. That refusal is expected and is part of the Control Tower
-safety contract.
+safety contract. On oldmac, the installed launchd labels are the `com.bhiksha.*`
+labels listed above; legacy `ai.openclaw.bhiksha*` labels should remain
+unloaded.
 
 ### Lathi
 
@@ -118,7 +121,7 @@ Implemented Lathi pieces:
 | Operator action journal | Implemented | `lathi.control_tower.actions` writes requested/outcome records to `control-tower-actions.jsonl` for external-source actions. This is intentionally called an action journal, not the workflow kernel ledger. |
 | External action endpoint | Implemented | `POST /api/action` accepts external actions with `source_id`, `unit_id`, `action`, optional `action_id`, and `confirmed`. It invokes the owning source's control command and records the result. |
 | Confirmation behavior | Implemented | Lathi enforces provider-declared confirmation requirements before invoking an external action. Bhiksha's `ensure-live-runtime` is therefore blocked until the Tower request is confirmed when the Bhiksha status contract says confirmation is required. |
-| Tower UI cards | Implemented | External-source buttons are real controls; pack/kernel workflow buttons remain disabled until their separate intent path exists. |
+| Tower UI | Implemented | The Tower has a cross-job attention rail, source filters, text search, owner/risk chips, and an in-page confirmation dialog for confirmation-gated external actions. External-source buttons are real controls; pack/kernel workflow buttons remain disabled until their separate intent path exists. |
 | Default oldmac source | Implemented | `scripts/launchd/run_lathi_tower.sh` defaults `LATHI_EXTERNAL_SOURCES=bhiksha`, so the oldmac tower attempts to render Bhiksha if the runtime checkout has the Bhiksha status/control modules. |
 
 Lathi verification performed:
@@ -410,7 +413,7 @@ Lathi can still observe scheduled outcomes and run manual operator actions.
 
 Goal: make Control Tower useful without changing scheduled ownership.
 
-Landed in the two repo branches:
+Landed on the two repo `main` branches and deployed to oldmac:
 
 - Bhiksha launchd registry.
 - Bhiksha `launchd_status --json`.
@@ -435,11 +438,10 @@ Operator result:
   confirmation rule.
 - Scheduled launchd runs continue exactly as before.
 
-Remaining cutover step: deploy the Bhiksha branch to the runtime checkout,
-reinstall the Bhiksha-owned launchd jobs if the plist registry changed, restart
-or refresh Lathi Tower, and verify the oldmac Tower moves from any
-`bhiksha:status` contract-gap card to the five concrete `com.bhiksha.*` job
-cards.
+Cutover status: the Bhiksha branch has been merged to `main`, deployed to the
+runtime checkout, and the Bhiksha-owned launchd jobs have been reinstalled. The
+oldmac Lathi Tower renders the five concrete `com.bhiksha.*` job cards under
+Trading Intel through the Air tunnel at `http://127.0.0.1:8788`.
 
 ## Development Ownership
 
