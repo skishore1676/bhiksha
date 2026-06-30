@@ -1,6 +1,7 @@
 import subprocess
+from pathlib import Path
 
-from bhiksha.ops.alerts import send_lathi_alert
+from bhiksha.ops.alerts import _default_lathi_invocation, send_lathi_alert
 
 
 def test_send_lathi_alert_invokes_telegram_notify_with_redaction(monkeypatch) -> None:
@@ -106,3 +107,59 @@ def test_send_lathi_alert_live_mode_requires_network_call(monkeypatch) -> None:
     assert result.ok is False
     assert result.return_code == 0
     assert result.network_call_performed is False
+
+
+def test_default_lathi_invocation_prefers_checkout_venv(monkeypatch, tmp_path) -> None:
+    repo = tmp_path / "lathi-bus"
+    package = repo / "lathi_bus"
+    package.mkdir(parents=True)
+    (package / "cli.py").write_text("")
+    python = repo / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\n")
+    python.chmod(0o755)
+
+    monkeypatch.delenv("BHIKSHA_LATHI_BUS_CMD", raising=False)
+    monkeypatch.delenv("BHIKSHA_LATHI_BUS_CWD", raising=False)
+    monkeypatch.setattr("bhiksha.ops.alerts.shutil.which", lambda name: None)
+
+    command, cwd = _default_lathi_invocation(repo)
+
+    assert command == [str(python), "-m", "lathi_bus.cli"]
+    assert cwd == repo
+
+
+def test_default_lathi_invocation_can_fall_back_to_python3(monkeypatch, tmp_path) -> None:
+    repo = tmp_path / "lathi-bus"
+    (repo / "lathi_bus").mkdir(parents=True)
+    (repo / "lathi_bus" / "cli.py").write_text("")
+
+    monkeypatch.delenv("BHIKSHA_LATHI_BUS_CMD", raising=False)
+    monkeypatch.delenv("BHIKSHA_LATHI_BUS_CWD", raising=False)
+    monkeypatch.setattr("bhiksha.ops.alerts.shutil.which", lambda name: None)
+
+    command, cwd = _default_lathi_invocation(Path(repo))
+
+    assert command == ["python3", "-m", "lathi_bus.cli"]
+    assert cwd == repo
+
+
+def test_default_lathi_invocation_prefers_home_checkout_over_path_wrapper(monkeypatch, tmp_path) -> None:
+    home = tmp_path / "home"
+    repo = home / "code" / "lathi-bus"
+    (repo / "lathi_bus").mkdir(parents=True)
+    (repo / "lathi_bus" / "cli.py").write_text("")
+    python = repo / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\n")
+    python.chmod(0o755)
+
+    monkeypatch.delenv("BHIKSHA_LATHI_BUS_CMD", raising=False)
+    monkeypatch.delenv("BHIKSHA_LATHI_BUS_CWD", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("bhiksha.ops.alerts.shutil.which", lambda name: "/usr/local/bin/lathi-bus")
+
+    command, cwd = _default_lathi_invocation()
+
+    assert command == [str(python), "-m", "lathi_bus.cli"]
+    assert cwd == repo

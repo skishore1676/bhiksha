@@ -128,13 +128,20 @@ def _default_lathi_invocation(cwd: str | Path | None = None) -> tuple[list[str],
         return shlex.split(raw), cwd or os.getenv("BHIKSHA_LATHI_BUS_CWD") or None
     configured_cwd = cwd or os.getenv("BHIKSHA_LATHI_BUS_CWD")
     if configured_cwd:
-        return ["python3", "-m", "lathi_bus.cli"], configured_cwd
-    if shutil.which("lathi-bus"):
-        return ["lathi-bus"], None
+        return _lathi_bus_module_invocation(Path(configured_cwd).expanduser())
     for candidate in (Path.home() / "code" / "lathi-bus", Path("/Users/sunny/code/lathi-bus")):
         if (candidate / "lathi_bus" / "cli.py").is_file():
-            return ["python3", "-m", "lathi_bus.cli"], candidate
+            return _lathi_bus_module_invocation(candidate)
+    if shutil.which("lathi-bus"):
+        return ["lathi-bus"], None
     return ["lathi-bus"], None
+
+
+def _lathi_bus_module_invocation(repo_root: Path) -> tuple[list[str], Path]:
+    python = repo_root / ".venv" / "bin" / "python"
+    if python.is_file() and os.access(python, os.X_OK):
+        return [str(python), "-m", "lathi_bus.cli"], repo_root
+    return ["python3", "-m", "lathi_bus.cli"], repo_root
 
 
 def _populate_secret_fallbacks(env: dict[str, str]) -> None:
