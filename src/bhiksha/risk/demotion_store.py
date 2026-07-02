@@ -20,11 +20,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import tempfile
 from typing import Any
 
-DEFAULT_DEMOTION_OVERRIDE_PATH = "config/risk/demoted_deployments.json"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+# Audit fix (2026-07-02): repo-root-anchored absolute default (same pattern as
+# strategy.capabilities.DEFAULT_CAPABILITY_MANIFEST_PATH) instead of a bare
+# relative path — the runtime (launchd, WorkingDirectory-pinned) and the
+# ad-hoc CLI tools (arbitrary cwd) must always read/write the SAME file.
+# Env override for tests/alternate topologies.
+DEMOTION_OVERRIDE_PATH_ENV = "BHIKSHA_RISK_DEMOTION_STORE_PATH"
+DEFAULT_DEMOTION_OVERRIDE_PATH = _REPO_ROOT / "config" / "risk" / "demoted_deployments.json"
+
+
+def default_demotion_override_path() -> Path:
+    configured = os.getenv(DEMOTION_OVERRIDE_PATH_ENV)
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return DEFAULT_DEMOTION_OVERRIDE_PATH
 
 
 @dataclass(slots=True, frozen=True)
@@ -65,8 +80,8 @@ class DemotionStore:
     (or delete the file). Nothing in the automated runtime does this.
     """
 
-    def __init__(self, path: str | Path = DEFAULT_DEMOTION_OVERRIDE_PATH) -> None:
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path is not None else default_demotion_override_path()
 
     def load(self) -> dict[str, DemotionRecord]:
         if not self.path.exists():

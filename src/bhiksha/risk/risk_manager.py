@@ -429,7 +429,11 @@ class RiskManager:
         B's demotion. A HALT should never silently flip back to OK mid-day.
         """
         rail_a = await self._compute_rail_a_status()
-        if rail_a.active and rail_a.halted:
+        # Audit fix (2026-07-02): tier-2 flatten IMPLIES tier-1's entry block.
+        # Settings validation now clamps flatten >= halt, but this is the
+        # independent backstop: a flattening book must never accept new
+        # entries regardless of how the thresholds were configured.
+        if rail_a.active and (rail_a.halted or rail_a.flatten):
             self._session_halted = True
         if self._session_halted:
             decision = EntryDecision(

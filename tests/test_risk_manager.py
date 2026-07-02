@@ -423,3 +423,104 @@ def test_resolve_risk_settings_defaults_when_no_env(monkeypatch) -> None:
     assert settings.demote_threshold_usd == 0.0
     assert settings.rail_a_enabled is True
     assert settings.rail_b_enabled is True
+
+
+# --------------------------------------------------------------------------
+# 2026-07-02 adversarial-audit fixes
+# --------------------------------------------------------------------------
+
+
+def test_allow_entry_blocked_when_only_tier2_breached(tmp_path) -> None:
+    """Audit finding #1: a flattening book must never accept new entries.
+
+    With inverted tiers (flatten smaller than halt — reachable pre-validation
+    or via a future settings source), a loss can breach tier-2 without
+    breaching tier-1. Entries must still be blocked.
+    """
+    inverted = _settings(max_daily_drawdown_pct=3.0, flatten_daily_drawdown_pct=2.0)
+    manager, db_path = _manager(tmp_path, settings=inverted, now=NOW)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    # -2.5% of 10000 = -250: breaches flatten (-200) but not halt (-300).
+    trade = _closed_live_trade("T1", deployment_id="dep1", entry=5.0, exit_=2.5, exit_at=NOW)
+    asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+    asyncio.run(manager.trade_state_repository.mark_closed("T1", exit_price=2.5, exit_filled_quantity=1, exit_filled_at=NOW))
+
+    book = asyncio.run(manager.book_actions())
+    assert book.rail_a.flatten is True
+    assert book.rail_a.halted is False
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+    assert decision.allowed is False
+
+
+def test_resolve_settings_clamps_inverted_tiers(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_MAX_DAILY_DRAWDOWN_PCT", "3.0")
+    monkeypatch.setenv("BHIKSHA_RISK_FLATTEN_DAILY_DRAWDOWN_PCT", "2.0")
+    settings = resolve_risk_settings()
+    assert settings.flatten_daily_drawdown_pct == 3.0
+    assert any("clamping flatten" in w for w in settings.validation_warnings)
+
+
+def test_resolve_settings_rejects_negative_percentages(monkeypatch) -> None:
+    """Audit finding #2: a negative pct flipped the threshold sign and would
+    flatten a healthy, flat book. Negative values must fall back to defaults
+    with a visible warning."""
+    monkeypatch.setenv("BHIKSHA_RISK_FLATTEN_DAILY_DRAWDOWN_PCT", "-3.0")
+    settings = resolve_risk_settings()
+    assert settings.flatten_daily_drawdown_pct == 3.0
+    assert any("must be > 0" in w for w in settings.validation_warnings)
+
+
+def test_resolve_settings_warns_on_unparseable_env(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_MAX_DAILY_DRAWDOWN_PCT", "two percent")
+    settings = resolve_risk_settings()
+    assert settings.max_daily_drawdown_pct == 2.0
+    assert any("not a valid number" in w for w in settings.validation_warnings)
+
+
+def test_resolve_settings_clamps_min_n_to_window(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_DEMOTE_WINDOW", "5")
+    monkeypatch.setenv("BHIKSHA_RISK_DEMOTE_MIN_N", "10")
+    settings = resolve_risk_settings()
+    assert settings.demote_min_n == 5
+    assert any("clamping min_n" in w for w in settings.validation_warnings)
+
+
+def test_startup_log_carries_validation_warnings(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_FLATTEN_DAILY_DRAWDOWN_PCT", "-1")
+    settings = resolve_risk_settings()
+    manager, db_path = _manager(tmp_path, settings=settings, now=NOW)
+    asyncio.run(manager.startup_log())
+    startup = _events(db_path, "risk_manager_startup")
+    assert startup and startup[-1]["payload"]["validation_warnings"]
+
+
+def test_demotion_store_default_path_is_absolute(monkeypatch) -> None:
+    """Audit finding #4: the default store path must not depend on cwd."""
+    monkeypatch.delenv("BHIKSHA_RISK_DEMOTION_STORE_PATH", raising=False)
+    store = DemotionStore()
+    assert store.path.is_absolute()
+    assert store.path.name == "demoted_deployments.json"
+
+
+def test_demotion_store_env_path_override(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_DEMOTION_STORE_PATH", str(tmp_path / "alt.json"))
+    store = DemotionStore()
+    assert store.path == tmp_path / "alt.json"
+
+
+def test_trade_sessions_updated_at_index_created(tmp_path) -> None:
+    """Audit perf finding: get_recent_trades must not full-table-scan."""
+    db_path = str(tmp_path / "bhiksha.db")
+    backend = SQLiteBackend(db_path)
+    repo = SQLiteTradeStateRepository(db_path, backend=backend)
+    asyncio.run(repo.get_recent_trades(limit=1))  # triggers lazy _init_db
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_trade_sessions_updated_at'"
+        ).fetchall()
+    assert rows
