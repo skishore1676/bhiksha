@@ -8,7 +8,13 @@ import sqlite3
 from bhiksha.domain.models import CashBudgetDay, TradeRecord
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.risk.demotion_store import DemotionStore
-from bhiksha.risk.risk_manager import RiskManager, TIER1_HALT_REASON, TIER2_FLATTEN_REASON, RAIL_B_DEMOTED_REASON
+from bhiksha.risk.risk_manager import (
+    RiskManager,
+    TIER1_HALT_REASON,
+    TIER2_FLATTEN_REASON,
+    RAIL_B_DEMOTED_REASON,
+    BUDGET_UNAVAILABLE_REASON,
+)
 from bhiksha.risk.risk_settings import RiskSettings, resolve_risk_settings
 
 
@@ -246,12 +252,144 @@ def test_rail_a_disabled_via_settings_is_inactive(tmp_path) -> None:
 
 
 # --------------------------------------------------------------------------
+# Operator audit P2 (2026-07-03 finding): unknown budget blocks NEW live
+# entries but never flattens existing positions.
+# --------------------------------------------------------------------------
+
+
+def test_allow_entry_blocks_when_no_cash_budget_day(tmp_path) -> None:
+    """(a) No cash_budget_days row yet -> allow_entry blocks with
+    risk_rail_a_budget_unavailable, and still emits its decision event."""
+    manager, db_path = _manager(tmp_path, now=NOW)
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+
+    assert decision.allowed is False
+    assert decision.reason == BUDGET_UNAVAILABLE_REASON
+    assert decision.rail == "A"
+
+    events = _events(db_path, "risk_manager_decision")
+    entry_scoped = [event for event in events if event["payload"].get("deployment_id") == "dep1"]
+    assert len(entry_scoped) == 1
+    assert entry_scoped[0]["payload"]["decision"] == "blocked"
+    assert entry_scoped[0]["payload"]["reason"] == BUDGET_UNAVAILABLE_REASON
+
+
+def test_allow_entry_blocks_when_budget_query_fails(tmp_path, monkeypatch) -> None:
+    """Same block for the other unknown-budget reason: the read itself
+    raised, not just "row absent"."""
+    manager, db_path = _manager(tmp_path, now=NOW)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(manager.cash_budget_repository, "get_day", boom)
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+
+    assert decision.allowed is False
+    assert decision.reason == BUDGET_UNAVAILABLE_REASON
+    assert decision.rail == "A"
+
+
+def test_allow_entry_allows_once_budget_row_exists(tmp_path) -> None:
+    """(b) Once the cash_budget_days row exists (e.g. after the startup
+    prefetch or a lazy-create), allow_entry evaluates normally again -- the
+    unknown-budget block is not latched."""
+    manager, db_path = _manager(tmp_path, now=NOW)
+
+    blocked = asyncio.run(manager.allow_entry("dep1"))
+    assert blocked.allowed is False
+    assert blocked.reason == BUDGET_UNAVAILABLE_REASON
+
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+
+    allowed = asyncio.run(manager.allow_entry("dep1"))
+    assert allowed.allowed is True
+    assert allowed.reason == "approved"
+
+
+def test_allow_entry_rail_a_disabled_still_allows_with_no_budget_row(tmp_path) -> None:
+    """(c) rail_a_enabled=False must keep allowing entries even with no
+    budget row -- only the enabled-but-unknown case blocks."""
+    manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(rail_a_enabled=False))
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+
+    assert decision.allowed is True
+    assert decision.reason == "approved"
+
+
+def test_allow_entry_not_blocked_by_pnl_query_failure(tmp_path, monkeypatch) -> None:
+    """pnl_query_failed is a DIFFERENT inactive reason than the two budget-
+    unavailable ones (the budget row exists and is known; the P&L read
+    failed) -- it must NOT trip the new BUDGET_UNAVAILABLE_REASON block."""
+    manager, db_path = _manager(tmp_path, now=NOW)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=9500.0, buffer_pct=0.05)
+        )
+    )
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(manager, "_realized_live_pnl_today", boom)
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+
+    assert decision.reason != BUDGET_UNAVAILABLE_REASON
+    assert decision.allowed is True
+    assert decision.reason == "approved"
+
+
+def test_book_actions_stays_inactive_no_flatten_when_no_budget_row(tmp_path) -> None:
+    """(d) The unknown-budget entry block must NOT change book_actions /
+    flatten behavior: no budget row -> still inactive, never a flatten,
+    regardless of the new allow_entry posture."""
+    manager, db_path = _manager(tmp_path, now=NOW)
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.rail_a.active is False
+    assert result.rail_a.reason == "no_cash_budget_day"
+    assert result.should_flatten is False
+    assert result.flatten_reason is None
+
+
+# --------------------------------------------------------------------------
 # Rail B
 # --------------------------------------------------------------------------
+#
+# Every Rail-B test seeds a large cash_budget_days row first: since P2
+# (2026-07-03), allow_entry blocks with risk_rail_a_budget_unavailable when
+# Rail A is enabled and the row is missing, which would otherwise mask what
+# these tests are actually checking (Rail B's own decision). The budget is
+# sized well above any accumulated realized loss in these fixtures so Rail A
+# itself never trips tier-1/tier-2 and interferes.
+
+
+def _seed_large_budget(manager) -> None:
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(
+                trade_date="2026-04-20",
+                account_type="CASH",
+                broker_cash_only_buying_power=1_000_000.0,
+                usable_budget=1_000_000.0,
+                buffer_pct=0.0,
+            )
+        )
+    )
 
 
 def test_rail_b_fires_exactly_at_min_n_with_negative_expectancy(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0))
+    _seed_large_budget(manager)
     for i in range(9):
         trade = _closed_live_trade(f"T{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW)
         asyncio.run(manager.trade_state_repository.upsert_trade(trade))
@@ -282,6 +420,7 @@ def test_rail_b_fires_exactly_at_min_n_with_negative_expectancy(tmp_path) -> Non
 
 def test_rail_b_does_not_fire_with_positive_expectancy(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0))
+    _seed_large_budget(manager)
     for i in range(10):
         # winning trades: exit > entry
         trade = _closed_live_trade(f"T{i}", deployment_id="dep1", entry=4.0, exit_=5.0, exit_at=NOW)
@@ -295,6 +434,7 @@ def test_rail_b_does_not_fire_with_positive_expectancy(tmp_path) -> None:
 
 def test_rail_b_is_one_way_no_flap(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0))
+    _seed_large_budget(manager)
     for i in range(10):
         trade = _closed_live_trade(f"T{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW)
         asyncio.run(manager.trade_state_repository.upsert_trade(trade))
@@ -320,6 +460,7 @@ def test_rail_b_is_one_way_no_flap(tmp_path) -> None:
 
 def test_rail_b_only_counts_live_closed_trades_for_this_deployment(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(demote_window=10, demote_min_n=3, demote_threshold_usd=0.0))
+    _seed_large_budget(manager)
     # Losing trades for a DIFFERENT deployment should not affect dep1.
     for i in range(5):
         trade = _closed_live_trade(f"OTHER{i}", deployment_id="dep2", entry=5.0, exit_=1.0, exit_at=NOW)
@@ -350,6 +491,7 @@ def test_rail_b_only_counts_live_closed_trades_for_this_deployment(tmp_path) -> 
 
 def test_rail_b_disabled_via_settings_never_demotes(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(rail_b_enabled=False, demote_min_n=1))
+    _seed_large_budget(manager)
     trade = _closed_live_trade("T0", deployment_id="dep1", entry=5.0, exit_=0.0, exit_at=NOW)
     asyncio.run(manager.trade_state_repository.upsert_trade(trade))
     asyncio.run(manager.trade_state_repository.mark_closed("T0", exit_price=0.0, exit_filled_quantity=1, exit_filled_at=NOW))
@@ -366,15 +508,23 @@ def test_rail_b_disabled_via_settings_never_demotes(tmp_path) -> None:
 
 def test_allow_entry_always_emits_decision_event_even_when_allowed(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW)
+    # A budget row must exist for allow_entry to reach "allowed" -- see
+    # test_allow_entry_blocks_when_no_cash_budget_day for the unknown-budget
+    # case (P2, 2026-07-03).
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
 
     decision = asyncio.run(manager.allow_entry("dep1"))
 
     assert decision.allowed is True
     assert decision.reason == "approved"
     events = _events(db_path, "risk_manager_decision")
-    # One internal Rail-A status decision (no budget day -> inactive) plus one
-    # deployment-scoped final entry decision: the production proof surface
-    # fires on every consult, even a fully "allowed, nothing blocked" one.
+    # One deployment-scoped final entry decision: the production proof
+    # surface fires on every consult, even a fully "allowed, nothing
+    # blocked" one.
     entry_scoped = [event for event in events if event["payload"].get("deployment_id") == "dep1"]
     assert len(entry_scoped) == 1
     assert entry_scoped[0]["payload"]["decision"] == "allowed"
