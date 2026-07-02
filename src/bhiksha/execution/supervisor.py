@@ -13,6 +13,8 @@ import os
 import uuid
 from typing import Any
 
+from loguru import logger
+
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.config.models import AppConfig
 from bhiksha.config.models import DeploymentManifest
@@ -138,6 +140,25 @@ class ExecutionSupervisor:
         """
         key = self._profile_state_key(position)
         state = self._profile_exit_states.get(key)
+        if state is not None and _profile_state_identity_mismatch(
+            state, entry_premium=entry_premium, position_quantity=position.quantity
+        ):
+            # Identity backstop (audit fix 2026-07-02): the cached ladder was
+            # seeded by a DIFFERENT fill (trade-identity mismatch upstream in
+            # reconciliation matching). Driving exits off another fill's peak /
+            # banked partials produced spurious full square-offs in the audit
+            # repro. Reseed clean rather than inherit; the mismatch is logged
+            # for the audit trail.
+            logger.warning(
+                "profile_exit_state_identity_mismatch key={} cached_seed={} current_entry={} "
+                "banked_quantity={} position_quantity={} -- reseeding ladder",
+                key,
+                state.seed_entry_premium,
+                entry_premium,
+                state.banked_quantity,
+                position.quantity,
+            )
+            state = None
         if state is None:
             state = ProfileExitState.new(entry_premium)
             self._profile_exit_states[key] = state
@@ -266,8 +287,13 @@ class ExecutionSupervisor:
 
         Why stateless (not a mutable claim set): the native exit task runs with a
         STALE pre-manage position snapshot, but the only gate input it reads from the
-        position is ``source``, which is fixed at entry and identical in the stale and
-        post-manage snapshots; ``deployment`` is the same object. So this predicate
+        position is ``source``, which is SNAPSHOT-CONSISTENT within a tick: both the
+        manage path and the trailing native exit task read positions from the SAME
+        reconciliation snapshot, so they see the same ``source`` value.
+        (``source`` is NOT immutable across reconcile sweeps — since 2026-07-02 a
+        sweep may relabel a matched open live trade's position ``live_open`` — but
+        a sweep swaps the whole snapshot between ticks, never inside one.)
+        ``deployment`` is the same object. So this predicate
         returns the SAME verdict whether evaluated inside ``manage`` (where the
         profile route acts) or in the trailing native ``exit`` task (where it yields)
         — they are guaranteed consistent, with no lifecycle/leak/ordering hazard.
@@ -330,7 +356,7 @@ class ExecutionSupervisor:
         the profile route is its SOLE exit authority; the native ``handle_exit``
         consults the SAME fail-closed gate via ``_profile_exit_is_authoritative`` and
         YIELDS for that position. The verdict is computed STATELESSLY (it depends only
-        on the deployment and ``position.source``, fixed at entry), so it is identical
+        on the deployment and ``position.source``, snapshot-consistent within the tick), so it is identical
         whether evaluated here or in the trailing native task that carries a stale
         pre-route snapshot — the two authorities can NEVER act on the same position
         conflictingly (no double close, no fighting stops), with no claim-set
@@ -4023,6 +4049,31 @@ def _tracked_trade_status(position: TrackedPosition) -> str:
     if position.target_order_id:
         return "target_active"
     return "open_protected" if position.stop_order_id else "open_unprotected"
+
+
+def _profile_state_identity_mismatch(
+    state: ProfileExitState,
+    *,
+    entry_premium: float,
+    position_quantity: int,
+) -> bool:
+    """True when a cached ladder state clearly belongs to a DIFFERENT fill.
+
+    Backstop behind reconciliation's trade matching (audit fix 2026-07-02).
+    Two independent signals, both conservative so ordinary broker jitter
+    (estimated vs actual fill price) never trips it:
+      * seed entry premium diverges >10% relative -- same-fill entry premium is
+        fixed at entry; a 0-2 DTE re-entry days later diverges far more;
+      * the ladder claims more banked quantity than the position holds
+        (an impossible state for the same fill).
+    """
+    seed = state.seed_entry_premium
+    if seed is not None and entry_premium > 0 and seed > 0:
+        if abs(seed - entry_premium) > 0.10 * max(seed, entry_premium):
+            return True
+    if state.banked_quantity > position_quantity:
+        return True
+    return False
 
 
 def _is_paper_order_id(order_id: str | None) -> bool:

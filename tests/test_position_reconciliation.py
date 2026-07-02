@@ -382,3 +382,119 @@ def test_reconcile_matched_closed_trade_stays_broker_sync_even_with_live_entry_i
 
     assert len(tracked) == 1
     assert tracked[0].source == "broker_sync"
+
+
+def test_reconcile_stale_open_trade_does_not_capture_new_fill() -> None:
+    """Audit repro (2026-07-02): a stale open record (close-write lagged) must
+    NOT capture a brand-new fill on the same contract when the broker's own
+    evidence (openedAt / cost basis) contradicts it — the position degrades to
+    broker_recovered (gate shut) instead of inheriting the stale trade's id,
+    live authority, and ladder state."""
+    qqq = historical_deployment("market_impulse_qqq_short_v1")
+    positions = [
+        {
+            "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+            "quantity": "1.0",
+            # New fill: today, at a very different premium.
+            "openedAt": "2026-03-31T14:00:00Z",
+            "costBasis": {"unitCost": "5.40"},
+        }
+    ]
+    stale_open_trade = TradeRecord(
+        trade_id="STALE123",
+        deployment_id=qqq.deployment_id,
+        symbol="QQQ",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.73,
+        entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),  # >6h earlier
+        status="open_protected",  # should be closed; close-write failed
+        entry_order_id="REAL-ORDER-1",
+    )
+
+    tracked = reconcile_public_positions(positions, [qqq], known_trades=[stale_open_trade])
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id != "STALE123"
+    assert tracked[0].source == "broker_recovered"
+
+
+def test_reconcile_two_open_trades_same_contract_degrades_safely() -> None:
+    """Two plausible open records for the same contract with no distinguishing
+    broker evidence: must NOT silently pick one — falls back to
+    broker_recovered (single-deployment symbol) with a synthetic id."""
+    qqq = historical_deployment("market_impulse_qqq_short_v1")
+    positions = [
+        {
+            "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+            "quantity": "1.0",
+        }
+    ]
+    trades = [
+        TradeRecord(
+            trade_id=f"T{i}",
+            deployment_id=qqq.deployment_id,
+            symbol="QQQ",
+            option_symbol="QQQ260401P00556000",
+            quantity=1,
+            status="open_protected",
+            entry_order_id=f"REAL-{i}",
+        )
+        for i in (1, 2)
+    ]
+
+    tracked = reconcile_public_positions(positions, [qqq], known_trades=trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id not in {"T1", "T2"}
+    assert tracked[0].source == "broker_recovered"
+
+
+def test_reconcile_closed_trade_order_ids_do_not_shadow_open_trade() -> None:
+    """A closed trade's historical order id must not win the order-id index
+    over an open trade (index is open-trades-only, newest-first)."""
+    qqq = historical_deployment("market_impulse_qqq_short_v1")
+    positions = [
+        {
+            "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+            "quantity": "1.0",
+        }
+    ]
+    orders = [
+        {
+            "orderId": "STOP-SHARED",
+            "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+            "type": "STOP",
+            "side": "SELL",
+            "status": "NEW",
+        }
+    ]
+    # newest-first ordering, as get_recent_trades returns (updated_at DESC)
+    open_trade = TradeRecord(
+        trade_id="OPEN1",
+        deployment_id=qqq.deployment_id,
+        symbol="QQQ",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        status="open_protected",
+        entry_order_id="REAL-OPEN",
+        stop_order_id="STOP-SHARED",
+    )
+    closed_trade = TradeRecord(
+        trade_id="CLOSED1",
+        deployment_id=qqq.deployment_id,
+        symbol="QQQ",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        status="closed",
+        entry_order_id="REAL-CLOSED",
+        exit_order_id="STOP-SHARED",
+    )
+
+    tracked = reconcile_public_positions(
+        positions, [qqq], orders=orders, known_trades=[open_trade, closed_trade]
+    )
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id == "OPEN1"
+    assert tracked[0].source == "live_open"

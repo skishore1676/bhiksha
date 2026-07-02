@@ -46,9 +46,17 @@ def reconcile_public_positions(
     for trade in known_trades:
         if trade.option_symbol:
             trades_by_option_symbol.setdefault(trade.option_symbol, []).append(trade)
+        # Order-id index (audit fix 2026-07-02): only OPEN trades can own a
+        # RESTING broker order, so closed trades are excluded — a closed
+        # trade's historical exit_order_id must never shadow a live trade's
+        # resting stop. ``known_trades`` arrives newest-first (updated_at
+        # DESC); ``setdefault`` keeps the NEWEST trade on an id collision
+        # (the previous last-write-wins favored the oldest — backwards).
+        if trade.status == "closed":
+            continue
         for order_id in (trade.entry_order_id, trade.stop_order_id, trade.target_order_id, trade.exit_order_id):
             if order_id:
-                trades_by_order_id[order_id] = trade
+                trades_by_order_id.setdefault(order_id, trade)
     tracked: list[TrackedPosition] = []
 
     for position in positions:
@@ -156,21 +164,62 @@ def _resolve_trade(
         if order_id and order_id in trades_by_order_id:
             return trades_by_order_id[order_id]
     option_trades = trades_by_option_symbol.get(option_symbol, [])
-    if len(option_trades) == 1:
-        return option_trades[0]
+    # Hard evidence filter (audit fix 2026-07-02): a candidate that POSITIVELY
+    # contradicts the broker's own evidence (openedAt outside the recovery
+    # window, or cost basis disagreeing — both sides present) can never match
+    # this position, no matter how few candidates remain. Without this, a
+    # stale open record (a close-write that lagged or failed) captured a
+    # brand-new fill on the same contract via the single-candidate shortcut —
+    # handing it live_open dispatch authority plus the stale trade's ladder
+    # state, and self-reinforcing (the mismatched position kept the stale
+    # record looking active, so it was never marked closed). Candidates with
+    # missing evidence on either side are NOT contradicted (nothing to
+    # corroborate against) and continue through the cascade unchanged.
+    candidates = [
+        trade
+        for trade in option_trades
+        if not _contradicts_broker_evidence(
+            trade, broker_opened_at=broker_opened_at, broker_entry_price=broker_entry_price
+        )
+    ]
+    # Single-candidate shortcut, restricted to a single surviving OPEN trade
+    # (a closed record should reach a live broker position only through the
+    # corroborated fuzzy cascade below, never by being the only record left).
+    open_trades = [trade for trade in candidates if trade.status != "closed"]
+    if len(open_trades) == 1:
+        return open_trades[0]
     time_matches = [
-        trade for trade in option_trades
+        trade for trade in candidates
         if _matches_broker_opened_at(trade, broker_opened_at)
     ]
     if len(time_matches) == 1:
         return time_matches[0]
     price_matches = [
-        trade for trade in time_matches or option_trades
+        trade for trade in time_matches or candidates
         if _matches_broker_entry_price(trade, broker_entry_price)
     ]
     if len(price_matches) == 1:
         return price_matches[0]
     return None
+
+
+def _contradicts_broker_evidence(
+    trade: TradeRecord,
+    *,
+    broker_opened_at: datetime | None,
+    broker_entry_price: float | None,
+) -> bool:
+    opened_at_contradicts = (
+        broker_opened_at is not None
+        and trade.entry_timestamp is not None
+        and not _matches_broker_opened_at(trade, broker_opened_at)
+    )
+    price_contradicts = (
+        broker_entry_price is not None
+        and trade.entry_price is not None
+        and not _matches_broker_entry_price(trade, broker_entry_price)
+    )
+    return opened_at_contradicts or price_contradicts
 
 
 def _matches_broker_opened_at(trade: TradeRecord, broker_opened_at: datetime | None) -> bool:

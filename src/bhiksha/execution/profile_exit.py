@@ -321,10 +321,18 @@ class ProfileExitState:
     # ever evaluated live never sets it, so a clean-from-entry live ladder is
     # unaffected.
     shadow_advanced: bool = False
+    # Identity backstop (audit fix 2026-07-02): the entry premium this ladder
+    # was seeded with. If a later tick presents a position with a materially
+    # different entry premium under the SAME state key (a trade-identity
+    # mismatch -- e.g. a stale trade record captured a different fill), the
+    # supervisor reseeds rather than driving exits off another fill's ladder.
+    # ``None`` only for states created before this field existed (in-memory
+    # only, so fresh after any restart).
+    seed_entry_premium: float | None = None
 
     @classmethod
     def new(cls, entry_premium: float) -> "ProfileExitState":
-        return cls(peak_premium=entry_premium)
+        return cls(peak_premium=entry_premium, seed_entry_premium=entry_premium)
 
     def target_1_banked_stop_emitted(self) -> bool:
         """True once the stop-to-breakeven FSM action has been surfaced."""
@@ -356,6 +364,7 @@ class ProfileExitState:
         self.banked_quantity = 0
         self.breakeven_emitted = False
         self.shadow_advanced = False
+        self.seed_entry_premium = entry_premium
 
 
 @dataclass(slots=True, frozen=True)

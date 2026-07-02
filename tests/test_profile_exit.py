@@ -938,3 +938,25 @@ def test_shadow_recorder_never_dispatches_a_hold_even_when_live() -> None:
     assert outcome.decision.rule is ProfileLadderRule.HOLD
     assert outcome.dispatched is False  # nothing to dispatch on a hold
     assert outcome.exit_decision is None
+
+
+def test_profile_state_identity_mismatch_reseeds_ladder() -> None:
+    """Audit backstop (2026-07-02): a cached ladder seeded by a DIFFERENT fill
+    (entry premium >10% off, or banked quantity exceeding the position) must
+    reseed instead of driving exits off the other fill's state."""
+    from bhiksha.execution.supervisor import _profile_state_identity_mismatch
+
+    state = ProfileExitState.new(8.8)
+    state.target_1_banked = True
+    state.banked_quantity = 2
+    state.peak_premium = 24.4
+
+    # Same fill, small jitter: no mismatch.
+    assert _profile_state_identity_mismatch(state, entry_premium=8.85, position_quantity=2) is False
+    # Different fill (premium far off): mismatch.
+    assert _profile_state_identity_mismatch(state, entry_premium=24.4, position_quantity=2) is True
+    # Impossible banked quantity: mismatch.
+    assert _profile_state_identity_mismatch(state, entry_premium=8.8, position_quantity=1) is True
+    # Legacy state without a seed (pre-field): premium check skipped, quantity check still active.
+    state.seed_entry_premium = None
+    assert _profile_state_identity_mismatch(state, entry_premium=24.4, position_quantity=3) is False
