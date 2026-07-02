@@ -581,6 +581,7 @@ class BhikshaRuntime:
                 result = write_daily_report(
                     self.app_config.sqlite_path,
                     output_dir=report_dir,
+                    deployments=self.deployments,
                 )
                 output(f"DAILY_REPORT json={result.json_path} markdown={result.markdown_path}")
             except Exception as exc:

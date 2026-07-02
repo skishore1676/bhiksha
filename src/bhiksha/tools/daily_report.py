@@ -21,7 +21,12 @@ def main(argv: list[str] | None = None) -> int:
     runtime = build_runtime(active_plan_path=args.active_plan)
     db_path = Path(args.db_path or runtime.app_config.sqlite_path)
     output_dir = Path(args.output_dir or Path(runtime.app_config.playbook_artifacts_dir) / "reports")
-    result = write_daily_report(db_path, output_dir=output_dir, trading_date=args.trading_date)
+    result = write_daily_report(
+        db_path,
+        output_dir=output_dir,
+        trading_date=args.trading_date,
+        deployments=runtime.deployments,
+    )
     print(f"DAILY_REPORT_JSON={result.json_path}")
     print(f"DAILY_REPORT_MARKDOWN={result.markdown_path}")
     print(f"DAILY_REPORT_STATUS={result.report['status']['level']}")

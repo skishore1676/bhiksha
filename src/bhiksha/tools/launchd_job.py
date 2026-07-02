@@ -137,7 +137,7 @@ def _session_report_job(args: argparse.Namespace) -> int:
     runtime = build_runtime(active_plan_path=args.active_plan)
     db_path = Path(runtime.app_config.sqlite_path)
     output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
-    result = write_daily_report(db_path, output_dir=output_dir)
+    result = write_daily_report(db_path, output_dir=output_dir, deployments=runtime.deployments)
     level = _alert_level_for_report(result.report)
     body = render_daily_report_telegram_summary(result.report, markdown_path=result.markdown_path)
     alert = send_lathi_alert(

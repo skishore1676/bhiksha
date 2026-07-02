@@ -165,6 +165,10 @@ class TradeRecord:
     exit_order_status: str | None = None
     exit_order_type: str | None = None
     exit_broker_payload: dict[str, Any] | None = None
+    # Attribution-only label for a profile-dispatched exit (e.g. "no_progress",
+    # "target_1_partial"). None for a native/legacy thesis exit. Never read by
+    # order-management logic — daily_report is the sole consumer (workplan #10).
+    exit_rule: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

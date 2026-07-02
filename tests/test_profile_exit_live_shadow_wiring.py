@@ -19,6 +19,7 @@ import pytest
 
 from bhiksha.config.models import DeploymentManifest, ExitSpec
 from bhiksha.domain.enums import ExitMode
+from bhiksha.domain.models import TradeRecord
 from bhiksha.execution.order_manager import OrderResult, PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
@@ -441,6 +442,71 @@ def test_shadow_profile_exit_closes_shadow_position_without_broker_dispatch(tmp_
     assert managed is None
     assert sup.planner.position_tracker.active_positions() == []
     assert not any(c[0] in {"place_close", "place_square_off"} for c in om.calls)
+
+
+def test_shadow_profile_exit_records_distinct_exit_mode_and_rule(tmp_path) -> None:
+    """Workplan #10: a profile-route close must be attributable in trade_sessions
+    as distinct from a native strategy exit — ``exit_mode`` stays "strategy" (the
+    route still shares ``_handle_exit_locked``, so order-management behavior is
+    byte-for-byte unchanged) but ``exit_rule`` carries the firing profile rule
+    (e.g. "initial_stop") so the month-long profile-vs-legacy readback can tell
+    the two apart without touching order placement/sizing/suppression at all."""
+    om = _CallRecordingOrderManager(bid=2.10)  # below profile stop 2.25
+    events_repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "trades.db"))
+    sup = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=events_repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    dep = _profile_deployment(drives_live=False)
+    sup.planner.position_tracker.open_position(
+        "QQQ",
+        dep.deployment_id,
+        trade_id="S1",
+        option_symbol=OPTION,
+        quantity=2,
+        entry_price=3.0,
+        entry_timestamp=datetime(2026, 3, 30, 14, 0, tzinfo=UTC),
+        source="shadow",
+        stop_order_id="DRY_RUN_STOP",
+        stop_price=2.0,
+    )
+    pos = sup.planner.position_tracker.active_positions()[0]
+
+    asyncio.run(trade_repo.upsert_trade(
+        TradeRecord(
+            trade_id="S1",
+            deployment_id=dep.deployment_id,
+            symbol="QQQ",
+            option_symbol=OPTION,
+            quantity=2,
+            entry_price=3.0,
+            entry_timestamp=datetime(2026, 3, 30, 14, 0, tzinfo=UTC),
+            status="open_protected",
+            stop_order_id="DRY_RUN_STOP",
+            stop_price=2.0,
+        )
+    ))
+
+    managed = asyncio.run(sup.manage_open_position(dep, pos, dry_run=True))
+    assert managed is None
+
+    shadow = _events_of_type(events_repo, "profile_exit_shadow")
+    assert shadow[0]["rule"] == "initial_stop"
+
+    trades = asyncio.run(trade_repo.get_recent_trades())
+    closed = next(t for t in trades if t.trade_id == "S1")
+    assert closed.status == "closed"
+    # A dry_run/paper close never sets exit_mode (unchanged, pre-existing
+    # behavior of the shared _handle_exit_locked dry_run branch — it closes the
+    # tracked position directly without going through _submit_exit_request).
+    # exit_rule is the NEW, additive, reporting-only attribution that survives
+    # regardless: it is what lets daily_report tell a profile-route close apart
+    # from a native one even though both share the exact same dispatcher.
+    assert closed.exit_mode is None
+    assert closed.exit_rule == "initial_stop"
 
 
 # --------------------------------------------------------------------------- #

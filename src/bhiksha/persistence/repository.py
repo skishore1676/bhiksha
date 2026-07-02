@@ -39,6 +39,7 @@ class TradeStateRepository(ABC):
         exit_order_status: str | None = None,
         exit_order_type: str | None = None,
         exit_broker_payload: dict[str, Any] | None = None,
+        exit_rule: str | None = None,
     ) -> None:
         """Mark a trade session as closed."""
 
@@ -66,6 +67,7 @@ class NullTradeStateRepository(TradeStateRepository):
         exit_order_status: str | None = None,
         exit_order_type: str | None = None,
         exit_broker_payload: dict[str, Any] | None = None,
+        exit_rule: str | None = None,
     ) -> None:
         del (
             exit_price,
@@ -74,6 +76,7 @@ class NullTradeStateRepository(TradeStateRepository):
             exit_order_status,
             exit_order_type,
             exit_broker_payload,
+            exit_rule,
         )
         return None
 
