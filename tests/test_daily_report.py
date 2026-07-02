@@ -29,8 +29,8 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
             "target_approach_detected",
             {
                 "deployment_id": "mu_shadow",
-                "symbol": "MU",
-                "option_symbol": "MU260612C01200000",
+                "symbol": "ACME",
+                "option_symbol": "ACME260612C01200000",
                 "target_price": 35.073,
             },
         )
@@ -38,8 +38,8 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
             TradeRecord(
                 trade_id="trade-mu",
                 deployment_id="mu_shadow",
-                symbol="MU",
-                option_symbol="MU260612C01200000",
+                symbol="ACME",
+                option_symbol="ACME260612C01200000",
                 quantity=1,
                 entry_price=25.98,
                 underlying_entry_price=1064.485,
@@ -70,7 +70,7 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
     assert report["trade_summary"]["shadow_realized_pnl_usd"] == 332.0
     assert report["provider_health"]["reconciliation"]["warning_count"] == 1
     assert report["lifecycle"]["target_approach_detected"] == 1
-    assert report["data_quality_warnings"][0]["symbol"] == "MU"
+    assert report["data_quality_warnings"][0]["symbol"] == "ACME"
     assert report["status"] == {"level": "YELLOW", "reason": "data_quality_warning"}
 
 
@@ -114,8 +114,8 @@ def test_daily_report_surfaces_open_positions_and_protection(tmp_path) -> None:
             TradeRecord(
                 trade_id="shadow-open",
                 deployment_id="mu_shadow",
-                symbol="MU",
-                option_symbol="MU260612C01200000",
+                symbol="ACME",
+                option_symbol="ACME260612C01200000",
                 quantity=1,
                 entry_price=25.98,
                 entry_timestamp=datetime(2026, 6, 3, 14, 36, tzinfo=UTC),
@@ -174,13 +174,13 @@ def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
             "reconciliation": {"warning_count": 0, "degraded_count": 0, "blocking_count": 0}
         },
         "data_quality_warnings": [
-            {"symbol": "MU", "message": "single-name equity has index-like underlying and strike levels"}
+            {"symbol": "ACME", "message": "single-name equity has index-like underlying and strike levels"}
         ],
         "trades": [
             {
                 "lane": "shadow",
-                "symbol": "MU",
-                "option_symbol": "MU260612C01200000",
+                "symbol": "ACME",
+                "option_symbol": "ACME260612C01200000",
                 "quantity": 1,
                 "entry_price": 25.98,
                 "exit_price": 29.3,
@@ -194,7 +194,7 @@ def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
     assert "Bhiksha Session Report - 2026-06-03" in body
     assert "Open: live 0, shadow 0, protected 0, target active 0, unprotected 0, exit pending 0" in body
     assert "P&L: live $0.00 (0 trades), shadow $412.00 (2 trades)" in body
-    assert "Data quality: 1 warning(s); first=MU" in body
+    assert "Data quality: 1 warning(s); first=ACME" in body
     assert str(tmp_path / "report.md") in body
     assert len(body.splitlines()) <= 9
 

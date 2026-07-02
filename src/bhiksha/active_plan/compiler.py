@@ -710,8 +710,16 @@ def _compile_strategy_row(
             f"Strategy row {row.row_id!r} overrides symbol {row.symbol!r}, "
             f"but catalog entry {strategy_id!r} is bound to {entry.symbol!r}"
         )
+    relaxed_evidence_gates: list[str] = []
     if google_catalog_entry is not None:
-        _validate_google_catalog_alignment(strategy_id, entry, google_catalog_entry)
+        relaxed_evidence_gates = _validate_google_catalog_alignment(
+            strategy_id,
+            entry,
+            google_catalog_entry,
+            live=row.authorization_mode == "live",
+        )
+    if relaxed_evidence_gates and row.authorization_mode == "live":  # pragma: no cover - defense in depth
+        raise ValueError(f"Strategy {strategy_id!r}: evidence gates may not be relaxed for a live row")
     effective_row = row
     if row.exit_profile_spec is None and google_catalog_entry is not None and google_catalog_entry.exit_profile_spec:
         effective_row = row.model_copy(update={"exit_profile_spec": google_catalog_entry.exit_profile_spec})
@@ -731,6 +739,7 @@ def _compile_strategy_row(
             "strategy_id": strategy_id,
             "catalog_symbol": entry.symbol,
             **_google_catalog_metadata(google_catalog_entry),
+            **({"evidence_gates_relaxed": relaxed_evidence_gates} if relaxed_evidence_gates else {}),
         },
     )
     return DeploymentManifest.model_validate(payload)
@@ -1681,7 +1690,26 @@ def _validate_google_catalog_alignment(
     strategy_id: str,
     local_entry: StrategyCatalogEntry,
     google_entry: StrategyCatalogSheetRow,
-) -> None:
+    *,
+    live: bool = True,
+) -> list[str]:
+    """Validate a Sheet catalog row against the local entry before compiling.
+
+    Two gate classes:
+      * SAFETY/INTEGRITY gates always raise regardless of ``live`` — runtime
+        capability, bhiksha_ready, explicit m7 ``block``, triage ``KILL``,
+        retired lifecycle, symbol/strategy_key mismatch. A row that fails
+        these cannot produce meaningful trades in any mode.
+      * EVIDENCE-QUALITY gates (mala_evidence_ready / activation_candidate /
+        option_trade_ready) raise only for ``live`` rows. Shadow rows are the
+        instrument that GATHERS this evidence (paper fills on the real feed),
+        so blocking shadow on missing activation evidence is circular.
+
+    Returns the list of relaxed gate descriptions (empty for live rows or
+    fully-passing rows) so the caller can stamp them into deployment
+    metadata — a shadow lane running on sub-activation evidence must be
+    visibly labeled, and any future live promotion re-runs the full gate.
+    """
     if _uses_bhiksha_capability_contract(google_entry):
         capability = evaluate_strategy_capability(
             strategy_key=google_entry.strategy_key,
@@ -1696,14 +1724,21 @@ def _validate_google_catalog_alignment(
             )
     if not google_entry.bhiksha_ready:
         raise ValueError(f"Strategy {strategy_id!r} is not Bhiksha runtime-ready in Mala_Evidence_v1")
+    relaxed_gates: list[str] = []
     if google_entry.mala_evidence_ready is False:
         reason = google_entry.mala_evidence_blocking_checks or "mala_evidence_ready=false"
-        raise ValueError(f"Strategy {strategy_id!r} is not mala_evidence_ready in Mala_Evidence_v1: {reason}")
+        if live:
+            raise ValueError(f"Strategy {strategy_id!r} is not mala_evidence_ready in Mala_Evidence_v1: {reason}")
+        relaxed_gates.append(f"mala_evidence_ready: {reason}")
     if google_entry.activation_candidate is False:
         reason = google_entry.activation_blocking_checks or google_entry.triage_blocking_checks or "activation_candidate=false"
-        raise ValueError(f"Strategy {strategy_id!r} is not activation_candidate in Mala_Evidence_v1: {reason}")
+        if live:
+            raise ValueError(f"Strategy {strategy_id!r} is not activation_candidate in Mala_Evidence_v1: {reason}")
+        relaxed_gates.append(f"activation_candidate: {reason}")
     if google_entry.option_trade_ready is False:
-        raise ValueError(f"Strategy {strategy_id!r} is not option_trade_ready in Mala_Evidence_v1")
+        if live:
+            raise ValueError(f"Strategy {strategy_id!r} is not option_trade_ready in Mala_Evidence_v1")
+        relaxed_gates.append("option_trade_ready: option_trade_ready=false")
     if str(google_entry.m7_status or "").strip().lower() == "block":
         raise ValueError(f"Strategy {strategy_id!r} has m7_status=block in Mala_Evidence_v1")
     if str(google_entry.triage_verdict or "").strip().lower() == "kill":
@@ -1721,6 +1756,7 @@ def _validate_google_catalog_alignment(
             f"Google strategy catalog strategy_key mismatch for {strategy_id!r}: "
             f"{google_entry.strategy_key!r} vs local {local_entry.strategy.key!r}"
         )
+    return relaxed_gates
 
 
 def _validate_google_catalog_exit_contract(strategy_id: str, google_entry: StrategyCatalogSheetRow) -> None:

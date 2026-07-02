@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any
 
 _OPTION_SYMBOL_RE = re.compile(r"^[A-Z]+\d{6}[CP](\d{8})$")
-_HIGH_PRICE_SYMBOL_ALLOWLIST = {"SPY", "QQQ", "IWM", "SMH"}
+# Single-name equities that legitimately trade at index-like price levels.
+# MU crossed $1T market cap in 2026-05 and trades ~$1,100+; the strike/underlying
+# ratio check above this allowlist still catches genuine quote-scaling errors.
+_HIGH_PRICE_SYMBOL_ALLOWLIST = {"SPY", "QQQ", "IWM", "SMH", "MU"}
 
 
 @dataclass(slots=True, frozen=True)
