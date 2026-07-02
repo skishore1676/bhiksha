@@ -166,3 +166,44 @@ def test_launchd_control_reclaims_stale_action_lock(monkeypatch, tmp_path) -> No
     assert result["ok"] is True
     assert result["bhiksha_job"]["action_id"] == "new"
     assert "--action-id" in result["command"]
+
+
+def test_runtime_status_parses_runtime_status_line(monkeypatch, tmp_path) -> None:
+    """Operator-audit regression (2026-07-02): _runtime_status's parsing block
+    was stranded after _bhiksha_python's return (dead code), so the function
+    silently returned None and Control Tower reported no runtime state at all.
+    When server_session status emits RUNTIME_STATUS=..., the parsed payload
+    must be non-null."""
+    from bhiksha.tools import launchd_status
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout='before\nRUNTIME_STATUS={"running": true, "active_plan_id": "active_plan_2026-07-02"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", fake_run)
+
+    result = launchd_status._runtime_status(repo_root=tmp_path)
+
+    assert result is not None, "stranded-return regression: _runtime_status returned None"
+    assert result["ok"] is True
+    assert result["return_code"] == 0
+    assert result["status"] == {"running": True, "active_plan_id": "active_plan_2026-07-02"}
+
+
+def test_runtime_status_handles_missing_runtime_line(monkeypatch, tmp_path) -> None:
+    from bhiksha.tools import launchd_status
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=3, stdout="no marker here\n", stderr="boom")
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", fake_run)
+
+    result = launchd_status._runtime_status(repo_root=tmp_path)
+
+    assert result["ok"] is False
+    assert result["return_code"] == 3
+    assert result["status"] is None

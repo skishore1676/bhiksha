@@ -286,13 +286,10 @@ def _runtime_status(*, repo_root: Path) -> dict[str, Any]:
         timeout=10,
         env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
     )
-
-
-def _bhiksha_python(repo_root: Path) -> str:
-    candidate = repo_root / ".venv" / "bin" / "python"
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return str(candidate)
-    return sys.executable
+    # 2026-07-02 operator-audit fix: this parsing block had been stranded after
+    # _bhiksha_python()'s return (dead code), so _runtime_status silently
+    # returned None and Control Tower / launchd_status reported no runtime
+    # state at all — a lie by omission.
     payload = None
     for line in completed.stdout.splitlines():
         if line.startswith("RUNTIME_STATUS="):
@@ -307,6 +304,13 @@ def _bhiksha_python(repo_root: Path) -> str:
         "status": payload,
         "stderr_tail": _tail(completed.stderr),
     }
+
+
+def _bhiksha_python(repo_root: Path) -> str:
+    candidate = repo_root / ".venv" / "bin" / "python"
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return sys.executable
 
 
 def _latest_report_summary(repo_root: Path) -> dict[str, Any] | None:
