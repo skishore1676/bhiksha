@@ -65,12 +65,16 @@ def _write_catalog_entry(path: Path, *, strategy_id: str, symbol: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# Deny-list regression: a hostile row cannot pre-stage the profile-exit
-# live-dispatch-gate inputs through execution_overrides/exit_overrides.
+# Gate-override audit: a row that sets profile-exit live-dispatch-gate inputs
+# through execution/exit overrides is HONORED (the Sheet is the operator's
+# sanctioned arming surface — it already controls mode=live) but every
+# occurrence is surfaced in plan.summary for the audit trail.
+# Policy changed 2026-07-02: strip -> surface (stripping would silently
+# disarm the operator's pre-staged live flip on the next compile).
 # --------------------------------------------------------------------------
 
 
-def test_hostile_row_cannot_prestage_dispatch_gate_inputs_via_overrides(tmp_path: Path) -> None:
+def test_row_gate_override_keys_are_honored_and_surfaced(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
     _write_catalog_entry(catalog_root / "spy.yaml", strategy_id="spy_strategy_v1", symbol="SPY")
@@ -108,20 +112,23 @@ def test_hostile_row_cannot_prestage_dispatch_gate_inputs_via_overrides(tmp_path
     )
 
     deployment = compiled.plan.deployments[0]
-    # The two dispatch-gate inputs must NOT have been set by the hostile row.
-    assert deployment.execution.runtime_mode is None
-    assert deployment.exit.profile_exit_drives_live is False
-    # Legitimate override keys in the SAME payload must still apply.
+    # The dispatch-gate inputs set by the row are HONORED (operator surface).
+    assert deployment.execution.runtime_mode == "live_automated"
+    assert deployment.exit.profile_exit_drives_live is True
+    # Legitimate override keys in the SAME payload still apply.
     assert deployment.execution.dte_min == 1
     assert deployment.exit.stop_loss_pct == 0.30
 
-    warnings = compiled.plan.summary["denied_override_key_warnings"]
+    # ...and every gate key is surfaced in the compiled-plan audit trail.
+    warnings = compiled.plan.summary["gate_override_key_warnings"]
     assert len(warnings) == 1
     assert warnings[0]["row_id"] == "hostile_row"
-    assert set(warnings[0]["denied_keys"]) == {"execution_overrides.runtime_mode", "exit_overrides.profile_exit_drives_live"}
+    assert set(warnings[0]["gate_keys"]) == {"execution_overrides.runtime_mode", "exit_overrides.profile_exit_drives_live"}
+    # NOTE: runtime_mode "live_automated" still cannot dispatch a profile exit —
+    # the runtime allowlist only opens for "live_approval_gated".
 
 
-def test_shadow_only_override_key_is_also_denied() -> None:
+def test_shadow_only_override_key_is_also_surfaced() -> None:
     row = ActivePlanSheetRow.model_validate(
         {
             "row_id": "r1",
@@ -131,8 +138,8 @@ def test_shadow_only_override_key_is_also_denied() -> None:
             "execution_overrides": {"shadow_only": False},
         }
     )
-    assert "shadow_only" not in row.execution_overrides
-    assert row.denied_override_keys == ["execution_overrides.shadow_only"]
+    assert row.execution_overrides == {"shadow_only": False}
+    assert row.gate_override_keys == ["execution_overrides.shadow_only"]
 
 
 def test_legitimate_override_keys_pass_through_untouched() -> None:
@@ -148,7 +155,7 @@ def test_legitimate_override_keys_pass_through_untouched() -> None:
     )
     assert row.execution_overrides == {"dte_min": 2, "dte_max": 6}
     assert row.exit_overrides == {"stop_loss_pct": 0.2, "eod_flat": False}
-    assert row.denied_override_keys == []
+    assert row.gate_override_keys == []
 
 
 # --------------------------------------------------------------------------

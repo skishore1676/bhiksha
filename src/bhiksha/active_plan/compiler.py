@@ -185,13 +185,14 @@ class ActivePlanSheetRow(BaseModel):
     # default) reproduces pre-bridge behavior exactly: no v2 fields are set.
     exit_profile_spec: dict[str, Any] | None = None
     source_metadata: dict[str, Any] = Field(default_factory=dict)
-    # HARDENING: populated by ``normalize_input`` when a hostile/careless row
-    # tried to pre-stage a profile-exit live-dispatch-gate input through the
-    # free-form ``execution_overrides``/``exit_overrides`` deep-merge (see
-    # ``_DENIED_OVERRIDE_KEYS`` below). Excluded from ``DeploymentManifest``
-    # (never becomes part of the compiled deployment) -- it exists purely so
-    # ``compile_active_plan_from_rows`` can surface a warning.
-    denied_override_keys: list[str] = Field(default_factory=list)
+    # AUDIT VISIBILITY: populated by ``normalize_input`` when a row sets a
+    # profile-exit live-dispatch-gate input through the ``execution``/``exit``
+    # override channels (see ``_detect_gate_override_keys``). The keys are
+    # HONORED — the Sheet is the operator's sanctioned arming surface (it
+    # already controls ``mode=live``) — but every occurrence is surfaced into
+    # ``plan.summary["gate_override_key_warnings"]`` so arming is always
+    # visible in the compiled-plan audit trail.
+    gate_override_keys: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -239,12 +240,12 @@ class ActivePlanSheetRow(BaseModel):
         ):
             if normalized.get(key) is None:
                 normalized[key] = {}
-        normalized["execution_overrides"], normalized["exit_overrides"], denied = _strip_denied_override_keys(
+        detected_gate_keys = _detect_gate_override_keys(
             execution_overrides=normalized.get("execution_overrides") or {},
             exit_overrides=normalized.get("exit_overrides") or {},
         )
-        if denied:
-            normalized["denied_override_keys"] = denied
+        if detected_gate_keys:
+            normalized["gate_override_keys"] = detected_gate_keys
         for key, metadata_key in (
             ("entry_window_start_et", "start_date"),
             ("entry_window_end_et", "end_date"),
@@ -358,7 +359,7 @@ def compile_active_plan_from_rows(
     deployments: list[DeploymentManifest] = []
     row_type_counts: dict[str, int] = {}
     seen_row_ids: set[str] = set()
-    deny_list_warnings: list[dict[str, Any]] = []
+    gate_override_warnings: list[dict[str, Any]] = []
     for row in rows:
         if row.row_id in seen_row_ids:
             suppressed_rows.append(
@@ -369,14 +370,15 @@ def compile_active_plan_from_rows(
             )
             continue
         seen_row_ids.add(row.row_id)
-        if row.denied_override_keys:
-            deny_list_warnings.append(
+        if row.gate_override_keys:
+            gate_override_warnings.append(
                 {
                     "row_id": row.row_id,
-                    "denied_keys": list(row.denied_override_keys),
+                    "gate_keys": list(row.gate_override_keys),
                     "message": (
-                        "Sheet row attempted to set profile-exit dispatch-gate inputs via "
-                        "execution_overrides/exit_overrides; keys were stripped before compile."
+                        "Sheet row sets profile-exit dispatch-gate inputs via "
+                        "execution/exit overrides; keys are HONORED (operator arming "
+                        "surface) and surfaced here for audit."
                     ),
                 }
             )
@@ -411,7 +413,7 @@ def compile_active_plan_from_rows(
             "enabled_deployment_count": sum(1 for deployment in deployments if deployment.enabled),
             "suppressed_count": len(suppressed_rows),
             "symbols": sorted({deployment.symbol for deployment in deployments}),
-            "denied_override_key_warnings": deny_list_warnings,
+            "gate_override_key_warnings": gate_override_warnings,
             "risk_demotion_warnings": demotion_warnings,
         },
         suppressed=suppressed_rows,
@@ -1976,27 +1978,35 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 # active-plan row (strategy or manual) passes through -- rather than at each
 # ``_apply_*_overrides`` call site, so no future row-compile path can forget
 # the strip.
-_DENIED_EXECUTION_OVERRIDE_KEYS = frozenset({"runtime_mode", "shadow_only"})
-_DENIED_EXIT_OVERRIDE_KEYS = frozenset({"profile_exit_drives_live"})
+_GATE_EXECUTION_OVERRIDE_KEYS = frozenset({"runtime_mode", "shadow_only"})
+_GATE_EXIT_OVERRIDE_KEYS = frozenset({"profile_exit_drives_live"})
 
 
-def _strip_denied_override_keys(
+def _detect_gate_override_keys(
     *,
     execution_overrides: dict[str, Any],
     exit_overrides: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    stripped_execution = dict(execution_overrides)
-    stripped_exit = dict(exit_overrides)
-    denied: list[str] = []
-    for key in list(stripped_execution):
-        if key in _DENIED_EXECUTION_OVERRIDE_KEYS:
-            stripped_execution.pop(key)
-            denied.append(f"execution_overrides.{key}")
-    for key in list(stripped_exit):
-        if key in _DENIED_EXIT_OVERRIDE_KEYS:
-            stripped_exit.pop(key)
-            denied.append(f"exit_overrides.{key}")
-    return stripped_execution, stripped_exit, sorted(denied)
+) -> list[str]:
+    """Surface (never strip) profile-exit dispatch-gate inputs set by a Sheet row.
+
+    Policy decision 2026-07-02: the active_strategies Sheet is the operator's
+    sanctioned control surface — it already decides ``mode=live`` (order
+    submission), which is strictly more powerful than these keys. The live
+    lanes' profile-exit arming is legitimately carried in the ``execution`` /
+    ``exit`` row cells (aliased into these override channels), so stripping
+    the keys would silently DISARM an operator-configured flip on the next
+    compile. Instead every occurrence is surfaced into
+    ``plan.summary["gate_override_key_warnings"]`` so an arming (or a hostile
+    edit) is always visible in the compiled-plan audit trail.
+    """
+    detected: list[str] = []
+    for key in execution_overrides:
+        if key in _GATE_EXECUTION_OVERRIDE_KEYS:
+            detected.append(f"execution_overrides.{key}")
+    for key in exit_overrides:
+        if key in _GATE_EXIT_OVERRIDE_KEYS:
+            detected.append(f"exit_overrides.{key}")
+    return sorted(detected)
 
 
 def _suppressed_row(
