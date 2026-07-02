@@ -902,6 +902,7 @@ class ExecutionSupervisor:
                 "deployment_id": plan.deployment_id,
                 "entry_order_id": plan.order_id,
             },
+            emit_suppressed_event=True,
         )
         protection_error = None if stop_result.order_id else (stop_result.error or "missing_stop_order_id")
         protection_status = "target_active" if target_order_id and stop_result.order_id else (
@@ -3615,6 +3616,7 @@ class ExecutionSupervisor:
         entry_price: float,
         dry_run: bool,
         event_payload: dict[str, object],
+        emit_suppressed_event: bool = False,
     ):
         stop_loss_pct, _ = _resolved_recovery_stop_loss_pct(deployment)
         requested_stop_price = entry_price * (1.0 - (stop_loss_pct or 0.0))
@@ -3640,6 +3642,20 @@ class ExecutionSupervisor:
         target_price = None
         if _profit_target_configured(deployment):
             target_price = _deployment_target_price(deployment, entry_price)
+        elif emit_suppressed_event and _profit_target_would_be_configured_absent_profile_rule(deployment):
+            # OPERATOR RULE (2026-07-02): the profile ladder owns profit-taking for
+            # this deployment, so the full-size target that WOULD have been armed
+            # (NVDA/AMD 2026-07-02 style) was suppressed. Entry-frequency signal
+            # only (one per entry, not per tick) — see ``_profit_target_configured``.
+            await self.event_repository.append(
+                "profit_target_suppressed",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": deployment.symbol,
+                    "reason": "profile_owns_profit_taking",
+                },
+            )
+        if target_price is not None:
             if self._supports_concurrent_exit_orders():
                 target_result = (
                     _DryRunOrderResult("DRY_RUN_TARGET")
@@ -3839,7 +3855,60 @@ class ExecutionSupervisor:
         )
 
 
-def _profit_target_configured(deployment: DeploymentManifest) -> bool:
+def _profile_owns_profit_taking(deployment: DeploymentManifest) -> bool:
+    """OPERATOR RULE (2026-07-02, non-overridable by config): when the profile-exit
+    route owns a deployment's exits (armed live), the runtime must NOT ALSO arm a
+    full-size profit target — neither a resting broker target order nor the
+    virtual-target machinery. The profile ladder owns ALL profit-taking (T1
+    partial at 1R via dispatch, breakeven, T2 runner, giveback, no_progress,
+    eod_flat). The resting protective STOP is untouched by this rule.
+
+    Motivation: on 2026-07-02 NVDA and AMD carried both a full-size resting
+    target at ``option_profit_target_pct`` (+35%) AND an armed profile ladder.
+    The resting target filled broker-side before the ladder could bank its T1
+    partial, so both positions exited 100% at 1R and the T2 runner never had a
+    chance to play out. This predicate is the single deployment-level gate that
+    stops that recurrence.
+
+    Probes the SAME fail-closed dispatch gate the armed profile-exit route uses
+    (``profile_exit_dispatch_allowed``), with ``position_source`` plugged as the
+    live-entry value (``"live_open"``) — this is a DEPLOYMENT-level capability
+    check ("if this deployment opened a live position right now, would the
+    profile route be authoritative over it"), not a read of any actual open
+    position's source.
+
+    Because the probe hardcodes a permissive ``position_source``, it cannot rely
+    on the real position-source gate to keep a shadow-only lane closed. A
+    shadow-only deployment (``deployment.execution.shadow_only`` — e.g. the MU
+    lane, which may still carry ``exit.profile_exit_drives_live=true`` in the
+    sheet) structurally never opens a ``live_open`` position (see
+    ``app/runtime.py``'s ``simulate_only = deployment.execution.shadow_only`` ->
+    forced ``dry_run`` -> ``planner.plan_entry`` never yields a broker
+    ``order_id`` -> ``handle_signal`` takes the ``simulate_only`` branch,
+    ``source="shadow"``, never ``_protect_live_entry``). So this predicate
+    fails closed on ``deployment.execution.shadow_only`` explicitly, in addition
+    to probing the gate, keeping the target machinery unchanged for shadow-only
+    lanes regardless of the sheet's live-drive flag.
+    """
+    if not ExecutionSupervisor._deployment_carries_exit_profile(deployment):
+        return False
+    if deployment.execution.shadow_only:
+        return False
+    drives_live = ExecutionSupervisor._profile_exit_drives_live(deployment)
+    return profile_exit_dispatch_allowed(
+        live=drives_live,
+        deployment_shadow_only=not drives_live,
+        position_source="live_open",
+        runtime_mode=ExecutionSupervisor._resolved_runtime_mode(deployment),
+    )
+
+
+def _profit_target_would_be_configured_absent_profile_rule(deployment: DeploymentManifest) -> bool:
+    """The raw target-configured check, ignoring the profile-owns-profit-taking
+    rule. Used ONLY to detect (for observability) that the operator rule is the
+    reason a target was suppressed, not merely that the deployment never asked
+    for a target in the first place.
+    """
     return bool(
         deployment.exit.use_profit_target
         and (
@@ -3847,6 +3916,12 @@ def _profit_target_configured(deployment: DeploymentManifest) -> bool:
             or deployment.exit.profit_target_multiple is not None
         )
     )
+
+
+def _profit_target_configured(deployment: DeploymentManifest) -> bool:
+    if _profile_owns_profit_taking(deployment):
+        return False
+    return _profit_target_would_be_configured_absent_profile_rule(deployment)
 
 
 def _deployment_target_price(deployment: DeploymentManifest, entry_price: float) -> float:
