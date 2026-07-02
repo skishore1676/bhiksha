@@ -15,6 +15,18 @@ _OPTION_ROOT_RE = re.compile(r"^([A-Z]+)")
 _RECOVERY_MATCH_WINDOW = timedelta(hours=6)
 
 
+def _is_live_entry_order_id(order_id: str | None) -> bool:
+    """True only for a REAL broker entry order id.
+
+    Paper markers ("SHADOW_ENTRY", "DRY_RUN*") and missing ids are not live —
+    mirrors ``bhiksha.execution.supervisor._is_paper_order_id`` semantics
+    (kept local: the state layer must not import the execution layer).
+    """
+    if not order_id:
+        return False
+    return not (order_id == "SHADOW_ENTRY" or order_id.startswith("DRY_RUN"))
+
+
 def reconcile_public_positions(
     positions: Iterable[dict],
     deployments: list[DeploymentManifest],
@@ -34,9 +46,17 @@ def reconcile_public_positions(
     for trade in known_trades:
         if trade.option_symbol:
             trades_by_option_symbol.setdefault(trade.option_symbol, []).append(trade)
+        # Order-id index (audit fix 2026-07-02): only OPEN trades can own a
+        # RESTING broker order, so closed trades are excluded — a closed
+        # trade's historical exit_order_id must never shadow a live trade's
+        # resting stop. ``known_trades`` arrives newest-first (updated_at
+        # DESC); ``setdefault`` keeps the NEWEST trade on an id collision
+        # (the previous last-write-wins favored the oldest — backwards).
+        if trade.status == "closed":
+            continue
         for order_id in (trade.entry_order_id, trade.stop_order_id, trade.target_order_id, trade.exit_order_id):
             if order_id:
-                trades_by_order_id[order_id] = trade
+                trades_by_order_id.setdefault(order_id, trade)
     tracked: list[TrackedPosition] = []
 
     for position in positions:
@@ -68,6 +88,18 @@ def reconcile_public_positions(
             trade_id = matched_trade.trade_id
             entry_price = entry_price or matched_trade.entry_price
             entry_timestamp = entry_timestamp or matched_trade.entry_timestamp
+            # A broker position matched to a durable OPEN trade record whose entry
+            # was a REAL broker order keeps its live identity. Reconciliation runs
+            # every ~15s and REPLACES the tracker's positions wholesale, so labeling
+            # these "broker_sync" stripped live positions of their profile-exit
+            # dispatch authority within seconds of entry (the fail-closed allowlist
+            # only opens for live_open/live_pending) — the 2026-07-01 armed-lanes-
+            # never-dispatch root cause. Excluded on purpose: unmatched positions
+            # ("broker_recovered"), paper entries, and positions matched to a
+            # CLOSED trade record (record/broker divergence — not a position the
+            # profile route should own).
+            if _is_live_entry_order_id(matched_trade.entry_order_id) and matched_trade.status != "closed":
+                source = "live_open"
         else:
             symbol_deployments = deployments_by_symbol.get(symbol, [])
             if len(symbol_deployments) == 1:
@@ -132,21 +164,69 @@ def _resolve_trade(
         if order_id and order_id in trades_by_order_id:
             return trades_by_order_id[order_id]
     option_trades = trades_by_option_symbol.get(option_symbol, [])
-    if len(option_trades) == 1:
-        return option_trades[0]
+    # Hard evidence filter (audit fix 2026-07-02): a candidate that POSITIVELY
+    # contradicts the broker's own evidence (openedAt outside the recovery
+    # window, or cost basis disagreeing — both sides present) can never match
+    # this position, no matter how few candidates remain. Without this, a
+    # stale open record (a close-write that lagged or failed) captured a
+    # brand-new fill on the same contract via the single-candidate shortcut —
+    # handing it live_open dispatch authority plus the stale trade's ladder
+    # state, and self-reinforcing (the mismatched position kept the stale
+    # record looking active, so it was never marked closed). Candidates with
+    # missing evidence on either side are NOT contradicted (nothing to
+    # corroborate against) and continue through the cascade unchanged.
+    candidates = [
+        trade
+        for trade in option_trades
+        if not _contradicts_broker_evidence(
+            trade, broker_opened_at=broker_opened_at, broker_entry_price=broker_entry_price
+        )
+    ]
+    # Single-candidate shortcut, restricted to a single surviving OPEN trade
+    # (a closed record should reach a live broker position only through the
+    # corroborated fuzzy cascade below, never by being the only record left).
+    open_trades = [trade for trade in candidates if trade.status != "closed"]
+    if len(open_trades) == 1:
+        return open_trades[0]
     time_matches = [
-        trade for trade in option_trades
+        trade for trade in candidates
         if _matches_broker_opened_at(trade, broker_opened_at)
     ]
     if len(time_matches) == 1:
         return time_matches[0]
     price_matches = [
-        trade for trade in time_matches or option_trades
+        trade for trade in time_matches or candidates
         if _matches_broker_entry_price(trade, broker_entry_price)
     ]
     if len(price_matches) == 1:
         return price_matches[0]
     return None
+
+
+def _contradicts_broker_evidence(
+    trade: TradeRecord,
+    *,
+    broker_opened_at: datetime | None,
+    broker_entry_price: float | None,
+) -> bool:
+    opened_at_contradicts = (
+        broker_opened_at is not None
+        and trade.entry_timestamp is not None
+        and not _matches_broker_opened_at(trade, broker_opened_at)
+    )
+    # REGRESSION-D guard (re-audit 2026-07-02): a record's entry_price can
+    # legitimately diverge from the broker's cost basis by more than the tight
+    # $0.05 CORROBORATION threshold (e.g. the fill payload lacked price keys
+    # and the record fell back to the submitted limit, then the fill improved).
+    # Price alone therefore CONTRADICTS only on gross divergence — >10%
+    # relative AND >$0.25 — so a true record can't be rejected (which both
+    # shut the dispatch gate and let sync_lifecycle mis-close the real trade).
+    price_contradicts = False
+    if broker_entry_price is not None and trade.entry_price is not None:
+        divergence = abs(trade.entry_price - broker_entry_price)
+        gross = divergence > max(0.25, 0.10 * max(trade.entry_price, broker_entry_price))
+        price_contradicts = gross
+    return opened_at_contradicts or price_contradicts
 
 
 def _matches_broker_opened_at(trade: TradeRecord, broker_opened_at: datetime | None) -> bool:
