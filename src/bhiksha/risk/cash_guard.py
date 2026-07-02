@@ -48,7 +48,7 @@ class CashGuard:
         if mode == "off":
             return CashGuardResult(enforced=False, blocked=False)
 
-        account_type = await self._account_type()
+        account_type = await self.account_type()
         if not _should_enforce(mode, account_type):
             return CashGuardResult(
                 enforced=False,
@@ -145,7 +145,7 @@ class CashGuard:
         mode = cash_guard_mode()
         if mode == "off":
             return
-        account_type = await self._account_type()
+        account_type = await self.account_type()
         if not _should_enforce(mode, account_type):
             return
         for position in positions:
@@ -157,7 +157,7 @@ class CashGuard:
                 if amount is None:
                     continue
                 entry_timestamp = position.entry_timestamp or datetime.now(UTC)
-                await self._ensure_day(entry_timestamp, account_type=account_type)
+                await self.ensure_day(entry_timestamp, account_type=account_type)
                 await self.repository.upsert_reservation(
                     CashBudgetReservation(
                         trade_id=position.trade_id,
@@ -180,7 +180,7 @@ class CashGuard:
             amount = _trade_cash_cost(trade)
             if amount is None:
                 continue
-            await self._ensure_day(trade.entry_timestamp, account_type=account_type)
+            await self.ensure_day(trade.entry_timestamp, account_type=account_type)
             await self.repository.upsert_reservation(
                 CashBudgetReservation(
                     trade_id=trade.trade_id,
@@ -190,7 +190,18 @@ class CashGuard:
                 )
             )
 
-    async def _ensure_day(self, timestamp: datetime, *, account_type: str | None) -> CashBudgetDay | None:
+    async def ensure_day(self, timestamp: datetime, *, account_type: str | None) -> CashBudgetDay | None:
+        """Idempotently create (or return the existing) ``cash_budget_days`` row.
+
+        The SAME buying-power computation used by ``reserve_entry``'s lazy
+        create path: broker cash-only buying power minus
+        ``cash_guard_buffer_pct()``. Public (not ``_``-prefixed) because
+        ``BhikshaRuntime``'s startup budget prefetch (see
+        ``bhiksha.app.runtime.prefetch_cash_budget_day``) calls this directly
+        to upsert today's row before the bar loop / any entry runner can
+        fire, instead of leaving it to be created lazily by the first entry
+        attempt of the day.
+        """
         trade_date = trade_date_et(timestamp)
         day = await self.repository.get_day(trade_date)
         if day is not None:
@@ -212,7 +223,7 @@ class CashGuard:
         await self.repository.upsert_day(day)
         return day
 
-    async def _account_type(self) -> str | None:
+    async def account_type(self) -> str | None:
         try:
             payload = await self.order_manager.get_account_info()
         except Exception:

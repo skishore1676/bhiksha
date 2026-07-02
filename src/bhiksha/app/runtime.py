@@ -51,7 +51,7 @@ from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.ops.daily_report import write_daily_report
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
-from bhiksha.risk.cash_guard import CashGuard
+from bhiksha.risk.cash_guard import CashGuard, trade_date_et
 from bhiksha.risk.risk_manager import RiskManager
 from bhiksha.risk.risk_settings import resolve_risk_settings
 from bhiksha.state.position_tracker import TrackedPosition
@@ -368,6 +368,20 @@ class BhikshaRuntime:
                 reconciliation_snapshot=reconciliation_snapshot,
                 output=output,
                 reason="startup",
+            )
+
+            # STARTUP BUDGET PREFETCH (operator audit P2, 2026-07-03 finding):
+            # fetch + upsert today's cash_budget_days row now, before the bar
+            # loop / any entry runner can fire, instead of leaving it to be
+            # created lazily by the first live entry attempt. A broker
+            # failure here is logged as a warning and does NOT crash the
+            # session -- RiskManager.allow_entry's Rail-A unknown-budget
+            # block is the backstop that keeps new live entries blocked
+            # until the row exists.
+            await prefetch_cash_budget_day(
+                planner.cash_guard,
+                event_repository=event_repository,
+                output=output,
             )
 
             warmup_provider = self.provider_config.underlying_backfill_primary
@@ -1874,6 +1888,59 @@ async def _append_event_best_effort(
     except Exception as exc:
         if output is not None:
             output(f"RUNTIME_TELEMETRY_DROPPED event={event_type} error={exc}")
+
+
+async def prefetch_cash_budget_day(
+    cash_guard: CashGuard,
+    *,
+    event_repository,
+    now: datetime | None = None,
+    output: callable | None = None,
+) -> None:
+    """Startup budget prefetch (operator audit P2, 2026-07-03 finding).
+
+    Fetches today's buying power and upserts the ``cash_budget_days`` row
+    BEFORE the bar loop / any entry runner can fire, instead of leaving the
+    row to be created lazily by the first live entry attempt of the day. On
+    2026-07-03 that lazy-create gap let a live entry (SMH) through between
+    08:31-08:37 CT while Rail A repeatedly logged ``no_cash_budget_day``.
+
+    Reuses ``CashGuard.ensure_day`` / ``CashGuard.account_type`` -- the exact
+    buying-power computation ``CashGuard.reserve_entry``'s lazy-create path
+    already uses (broker cash-only buying power minus
+    ``cash_guard_buffer_pct()``) -- rather than inventing a second formula.
+    ``ensure_day`` is idempotent: if a row already exists for today it is
+    left untouched.
+
+    A broker failure here is NOT fatal -- the session must still start. This
+    is a best-effort prefetch; ``RiskManager.allow_entry``'s Rail-A-enabled-
+    but-unknown-budget block (``risk_rail_a_budget_unavailable``) is the
+    backstop that keeps new live entries blocked for however long the budget
+    row stays missing (the lazy-create path in ``CashGuard.reserve_entry``
+    also still runs per-attempt, so entries recover as soon as the broker
+    call succeeds).
+    """
+    now = now or datetime.now(UTC)
+    account_type = await cash_guard.account_type()
+    day = await cash_guard.ensure_day(now, account_type=account_type)
+    if day is None:
+        message = f"CASH_BUDGET_PREFETCH_FAILED trade_date={trade_date_et(now)} account_type={account_type}"
+        if output is not None:
+            output(message)
+        await _append_event_best_effort(
+            event_repository,
+            "cash_budget_prefetch_failed",
+            {"trade_date": trade_date_et(now), "account_type": account_type},
+            output=output,
+        )
+        return
+    if output is not None:
+        output(
+            "CASH_BUDGET_PREFETCH "
+            f"trade_date={day.trade_date} account_type={day.account_type} "
+            f"broker_cash_only_buying_power={day.broker_cash_only_buying_power} "
+            f"usable_budget={day.usable_budget} buffer_pct={day.buffer_pct}"
+        )
 
 
 async def _cancel_and_await(tasks) -> None:

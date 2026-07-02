@@ -25,12 +25,22 @@ RAIL A (two-tier portfolio daily-drawdown cap, realized-only v1):
   - tier 2 (flatten): <= -(flatten_daily_drawdown_pct/100) * usable_budget ->
     ALSO flatten open live positions via the caller's existing
     halt_and_flatten_positions/EmergencyBiasControl seam.
-  - Missing data is fail-safe for trading continuity, not fail-open on a
-    computed breach: no cash_budget_days row for today -> INACTIVE + one
-    warning event, never a spurious halt. A P&L query failure is the same:
-    INACTIVE + warning. But once both budget and P&L are available, a
-    computed breach always acts -- there is no "fail open" path once data
-    exists.
+  - Missing data is fail-safe for EXISTING positions / flatten, not fail-open
+    on a computed breach: no cash_budget_days row for today -> INACTIVE + one
+    warning event, never a spurious halt or flatten. A P&L query failure is
+    the same: INACTIVE + warning. ``book_actions()`` (the flatten path) never
+    acts on missing data -- once both budget and P&L are available, a
+    computed breach always acts, there is no "fail open" flatten path once
+    data exists.
+  - Missing/unknown budget is FAIL-CLOSED for NEW entries specifically
+    (operator audit P2, 2026-07-03 finding): ``allow_entry`` returns
+    ``allowed=False, reason="risk_rail_a_budget_unavailable"`` whenever Rail A
+    is enabled but the budget read came back ``no_cash_budget_day`` or
+    ``cash_budget_query_failed`` -- unknown budget must not authorize new
+    live risk, even though it must not flatten existing risk either. See
+    ``BhikshaRuntime.run_session``'s startup budget prefetch
+    (``bhiksha.app.runtime.prefetch_cash_budget_day``), which upserts the
+    row before the bar loop starts specifically to keep this window short.
 
 RAIL B (per-deployment auto-demote, one-way):
   - over the rolling last N (demote_window, default 10) CLOSED LIVE trades
@@ -59,6 +69,14 @@ SHADOW_ENTRY_ORDER_ID = "SHADOW_ENTRY"
 TIER1_HALT_REASON = "risk_rail_a_tier1_halt"
 TIER2_FLATTEN_REASON = "risk_rail_a_tier2_flatten"
 RAIL_B_DEMOTED_REASON = "risk_rail_b_demoted"
+BUDGET_UNAVAILABLE_REASON = "risk_rail_a_budget_unavailable"
+
+# Rail-A-active-but-can't-tell-if-it's-breached reasons (see
+# _compute_rail_a_status): only these two mean "the budget/pnl read failed or
+# the row does not exist yet". "rail_a_disabled" is a DIFFERENT inactive
+# reason (the operator turned the rail off via settings) and must keep
+# allowing entries -- see allow_entry's BUDGET_UNAVAILABLE_REASONS check.
+BUDGET_UNAVAILABLE_REASONS = frozenset({"no_cash_budget_day", "cash_budget_query_failed"})
 
 # book_actions() is called once per SYMBOL-bar from BhikshaRuntime._handle_bar_event
 # (13 symbols x ~1 call/min => ~13x more Rail-A evaluations and event rows than
@@ -491,6 +509,28 @@ class RiskManager:
         momentarily back above threshold (e.g. a late fill correction) --
         the same "act once, stay acted" posture as tier-2 flatten and Rail
         B's demotion. A HALT should never silently flip back to OK mid-day.
+
+        UNKNOWN BUDGET BLOCKS NEW ENTRIES (operator audit P2, 2026-07-03
+        finding): when Rail A is ENABLED but ``_compute_rail_a_status``
+        cannot tell whether it's breached -- no ``cash_budget_days`` row for
+        today yet (``no_cash_budget_day``), or the budget/pnl read itself
+        failed (``cash_budget_query_failed``) -- this returns
+        ``allowed=False, reason=BUDGET_UNAVAILABLE_REASON`` instead of
+        falling through to allowed. This DELIBERATELY flips the prior
+        fail-safe posture for NEW entries only: unknown budget must not
+        flatten anything (``book_actions`` / ``_compute_rail_a_status``
+        stay ``active=False``, no computed breach, no flatten -- unchanged),
+        but it must not let a live entry through blind either -- on
+        2026-07-03 a live SMH entry was allowed during a 6-minute window
+        where the budget row simply hadn't been created yet. This check is
+        NOT latched (unlike tier-1 halt): as soon as the row exists again
+        (e.g. the startup prefetch or the next lazy-create succeeds),
+        entries resume being evaluated normally.
+
+        When Rail A is explicitly DISABLED via settings
+        (``rail_a_enabled=False`` -> reason ``"rail_a_disabled"``), that is a
+        distinct inactive reason and entries continue to be ALLOWED -- the
+        operator turned the rail off on purpose, unlike an unknown budget.
         """
         rail_a = await self._compute_rail_a_status()
         # Audit fix (2026-07-02): tier-2 flatten IMPLIES tier-1's entry block.
@@ -508,6 +548,16 @@ class RiskManager:
                     "realized_live_pnl_usd": rail_a.realized_live_pnl_usd,
                     "halt_threshold_usd": rail_a.halt_threshold_usd,
                 },
+            )
+            await self._emit_entry_decision(deployment_id, decision)
+            return decision
+
+        if self.settings.rail_a_enabled and not rail_a.active and rail_a.reason in BUDGET_UNAVAILABLE_REASONS:
+            decision = EntryDecision(
+                allowed=False,
+                reason=BUDGET_UNAVAILABLE_REASON,
+                rail="A",
+                details={"rail_a_inactive_reason": rail_a.reason, "trade_date": rail_a.trade_date},
             )
             await self._emit_entry_decision(deployment_id, decision)
             return decision

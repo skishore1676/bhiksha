@@ -117,6 +117,67 @@ def test_cash_guard_sync_positions_counts_pending_entry_reconcile(monkeypatch, t
     assert blocked.details["remaining_budget"] == 660.0
 
 
+def test_cash_guard_ensure_day_computes_and_upserts_budget(tmp_path) -> None:
+    """ensure_day is the reused computation the startup prefetch calls
+    (bhiksha.app.runtime.prefetch_cash_budget_day): broker cash-only buying
+    power minus cash_guard_buffer_pct(), upserted once for the trade date."""
+    guard = _guard(tmp_path, account_type="CASH", cash_only_buying_power="2000.00")
+    timestamp = datetime(2026, 4, 20, 15, 0, tzinfo=UTC)
+
+    account_type = asyncio.run(guard.account_type())
+    day = asyncio.run(guard.ensure_day(timestamp, account_type=account_type))
+
+    assert account_type == "CASH"
+    assert day is not None
+    assert day.trade_date == "2026-04-20"
+    assert day.broker_cash_only_buying_power == 2000.0
+    # default buffer_pct is 0.05 -> usable_budget = 2000 * 0.95
+    assert day.usable_budget == 1900.0
+
+    stored = asyncio.run(guard.repository.get_day("2026-04-20"))
+    assert stored is not None
+    assert stored.usable_budget == 1900.0
+
+
+def test_cash_guard_ensure_day_is_idempotent(tmp_path) -> None:
+    """A second ensure_day call for a date that already has a row leaves it
+    untouched (does not re-query the broker or overwrite)."""
+    guard = _guard(tmp_path, account_type="CASH", cash_only_buying_power="2000.00")
+    timestamp = datetime(2026, 4, 20, 15, 0, tzinfo=UTC)
+
+    first = asyncio.run(guard.ensure_day(timestamp, account_type="CASH"))
+    guard.order_manager.cash_only_buying_power = "999999.00"  # would change the result if re-fetched
+    second = asyncio.run(guard.ensure_day(timestamp, account_type="CASH"))
+
+    assert first.usable_budget == second.usable_budget == 1900.0
+
+
+def test_cash_guard_ensure_day_returns_none_on_broker_failure(tmp_path) -> None:
+    """A broker failure at ensure_day time returns None instead of raising --
+    the startup prefetch caller (prefetch_cash_budget_day) treats this as a
+    warning, not a crash."""
+
+    class BoomOrderManager:
+        async def get_portfolio(self):
+            raise RuntimeError("broker unreachable")
+
+        async def get_account_info(self):
+            raise RuntimeError("broker unreachable")
+
+    backend = SQLiteBackend(str(tmp_path / "bhiksha.db"))
+    guard = CashGuard(
+        order_manager=BoomOrderManager(),
+        repository=SQLiteCashBudgetRepository(str(tmp_path / "bhiksha.db"), backend=backend),
+    )
+    timestamp = datetime(2026, 4, 20, 15, 0, tzinfo=UTC)
+
+    account_type = asyncio.run(guard.account_type())
+    day = asyncio.run(guard.ensure_day(timestamp, account_type=account_type))
+
+    assert account_type is None
+    assert day is None
+
+
 def test_cash_guard_serializes_concurrent_reservations(monkeypatch) -> None:
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "on")
     monkeypatch.setenv("BHIKSHA_CASH_GUARD_BUFFER_PCT", "0.05")
