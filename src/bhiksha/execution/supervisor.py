@@ -1896,6 +1896,14 @@ class ExecutionSupervisor:
         *,
         dry_run: bool,
     ) -> ExitPlan | None:
+        # ATTRIBUTION (workplan #10): a profile-dispatched decision is stamped
+        # with features["profile_rule"] by profile_decision_to_exit_decision
+        # (the sole producer of that key — see profile_exit.py). A native/legacy
+        # thesis exit never sets it, so this is None on every pre-existing call
+        # path and behavior there is byte-for-byte unchanged. Reporting-only: the
+        # value is persisted to trade_sessions.exit_rule and consumed solely by
+        # daily_report; nothing in order-management reads it.
+        exit_rule = decision.features.get("profile_rule")
         await self.event_repository.append(
             "exit_decision",
             {
@@ -1988,7 +1996,9 @@ class ExecutionSupervisor:
             )
             self.clear_profile_exit_state(updated_position)
             if updated_position.trade_id is not None:
-                await self.trade_state_repository.mark_closed(updated_position.trade_id, **fill_details)
+                await self.trade_state_repository.mark_closed(
+                    updated_position.trade_id, exit_rule=exit_rule, **fill_details
+                )
             transition = self.lifecycle_store.mark_closed(updated_position.symbol, updated_position.deployment_id)
             await self._emit_lifecycle_transition(transition, reason="exit_closed")
             if updated_position.source == "shadow":
@@ -2030,6 +2040,7 @@ class ExecutionSupervisor:
             canceled_stop_order_id=canceled_stop_order_id,
             canceled_target_order_id=canceled_target_order_id,
             inherited_error=cancel_error,
+            exit_rule=exit_rule,
         )
         await self.event_repository.append("exit_plan", asdict(plan))
         await self._record_manual_status(
@@ -2063,6 +2074,9 @@ class ExecutionSupervisor:
         Hard invariant: ``close_qty < position.quantity`` always — a PARTIAL_SCALE
         can never flatten the position (enforced by ``_resolve_exit_quantity``).
         """
+        # ATTRIBUTION (workplan #10): see the matching comment in
+        # ``_handle_exit_locked`` — None on every native/legacy call path.
+        exit_rule = decision.features.get("profile_rule")
         close_qty = _resolve_exit_quantity(decision, position)  # raises if it would flatten
         residual_qty = position.quantity - close_qty
         # Defensive: the resolver guarantees this, but never proceed if the math
@@ -2284,6 +2298,7 @@ class ExecutionSupervisor:
                     entry_order_id=residual.order_id,
                     stop_order_id=residual.stop_order_id,
                     stop_price=residual.stop_price,
+                    exit_rule=exit_rule,
                 )
             )
         # Reflect the residual's protection state in the lifecycle store so the
@@ -2489,6 +2504,7 @@ class ExecutionSupervisor:
         force_market: bool = False,
         submitted_at: datetime | None = None,
         increment_reprice: bool = False,
+        exit_rule: str | None = None,
     ) -> tuple[TrackedPosition, ExitPlan]:
         if position.option_symbol is None:
             raise ValueError("Cannot submit exit without option_symbol")
@@ -2610,6 +2626,7 @@ class ExecutionSupervisor:
                     exit_limit_price=updated.exit_limit_price,
                     exit_submitted_at=updated.exit_submitted_at,
                     exit_mode=updated.exit_mode,
+                    exit_rule=exit_rule,
                 )
             )
         await self.event_repository.append(

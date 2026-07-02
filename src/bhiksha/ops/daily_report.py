@@ -10,7 +10,10 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bhiksha.config.models import DeploymentManifest
 
 _OPTION_SYMBOL_RE = re.compile(r"^[A-Z]+\d{6}[CP](\d{8})$")
 # Single-name equities that legitimately trade at index-like price levels.
@@ -31,8 +34,9 @@ def write_daily_report(
     *,
     output_dir: str | Path,
     trading_date: date | str | None = None,
+    deployments: list["DeploymentManifest"] | None = None,
 ) -> DailyReportWriteResult:
-    report = build_daily_report(db_path, trading_date=trading_date)
+    report = build_daily_report(db_path, trading_date=trading_date, deployments=deployments)
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     day = report["trading_date"]
@@ -47,7 +51,16 @@ def build_daily_report(
     db_path: str | Path,
     *,
     trading_date: date | str | None = None,
+    deployments: list["DeploymentManifest"] | None = None,
 ) -> dict[str, Any]:
+    """Build the date-scoped report.
+
+    ``deployments`` is the OPTIONAL active-plan deployment list (workplan #17):
+    when supplied, any deployment carrying ``source.metadata.evidence_gates_relaxed``
+    that also traded today is surfaced in ``relaxed_evidence_lanes`` so a
+    weak-evidence shadow lane is never promoted by accident. Report-only —
+    nothing here reads order placement/sizing/suppression state.
+    """
     day = _coerce_day(trading_date)
     path = Path(db_path)
     if not path.exists():
@@ -69,6 +82,8 @@ def build_daily_report(
     shadow_open_positions = [trade for trade in open_positions if trade["lane"] == "shadow"]
     open_position_summary = _open_position_summary(open_positions)
     data_quality_warnings = _data_quality_warnings(trades)
+    profile_exit_summary = _profile_exit_summary(trades)
+    relaxed_evidence_lanes = _relaxed_evidence_lanes(trades, deployments)
     code_version = None
     for event in events:
         if event["event_type"] == "startup_config":
@@ -108,6 +123,8 @@ def build_daily_report(
         "trades": trades,
         "lifecycle": lifecycle_events,
         "data_quality_warnings": data_quality_warnings,
+        "profile_exit_summary": profile_exit_summary,
+        "relaxed_evidence_lanes": relaxed_evidence_lanes,
         "status": _report_status(
             provider_events=provider_events,
             data_quality_warnings=data_quality_warnings,
@@ -137,6 +154,10 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"- reconciliation blocking: `{provider.get('blocking_count', 0)}`",
         f"- data-quality warnings: `{len(report.get('data_quality_warnings') or [])}`",
     ]
+    profile_exits = report.get("profile_exit_summary") or {}
+    if profile_exits.get("count"):
+        rules = ", ".join(sorted(profile_exits.get("rule_counts") or {}))
+        lines.append(f"- profile exits: `{profile_exits['count']}` ({rules})")
     open_summary = report.get("open_position_summary") or {}
     if any(
         open_summary.get(key, 0)
@@ -176,16 +197,25 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
 
     trades = report.get("trades") or []
     if trades:
-        lines.extend(["", "## Trades", "", "| Lane | Symbol | Option | Qty | Entry | Exit | P&L | Status |", "|---|---|---|---:|---:|---:|---:|---|"])
+        lines.extend(
+            [
+                "",
+                "## Trades",
+                "",
+                "| Lane | Symbol | Option | Qty | Entry | Exit Px | Exit | P&L | Status |",
+                "|---|---|---|---:|---:|---:|---|---:|---|",
+            ]
+        )
         for trade in trades:
             lines.append(
-                "| {lane} | {symbol} | {option} | {qty} | {entry} | {exit} | {pnl} | {status} |".format(
+                "| {lane} | {symbol} | {option} | {qty} | {entry} | {exit_px} | {exit} | {pnl} | {status} |".format(
                     lane=trade.get("lane", ""),
                     symbol=trade.get("symbol", ""),
                     option=trade.get("option_symbol") or "",
                     qty=trade.get("quantity") or 0,
                     entry=_fmt_money(trade.get("entry_price")),
-                    exit=_fmt_money(trade.get("exit_price")),
+                    exit_px=_fmt_money(trade.get("exit_price")),
+                    exit=trade.get("exit_attribution") or "",
                     pnl=_fmt_money(trade.get("realized_pnl_usd")),
                     status=trade.get("status") or "",
                 )
@@ -202,6 +232,13 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Data Quality Warnings"])
         for warning in warnings:
             lines.append(f"- `{warning.get('symbol')}` `{warning.get('option_symbol')}`: {warning.get('message')}")
+
+    relaxed_lanes = report.get("relaxed_evidence_lanes") or []
+    if relaxed_lanes:
+        lines.extend(["", "## Shadow Lanes on Relaxed Evidence"])
+        for lane in relaxed_lanes:
+            gates = ", ".join(lane.get("evidence_gates_relaxed") or [])
+            lines.append(f"- `{lane.get('deployment_id')}` [{gates}]")
 
     runtime_issue_counts = ((report.get("provider_health") or {}).get("runtime_issue_counts") or {})
     if runtime_issue_counts:
@@ -250,6 +287,14 @@ def render_daily_report_telegram_summary(
             f"blocking {provider.get('blocking_count', 0)}"
         ),
     ]
+    profile_exits = report.get("profile_exit_summary") or {}
+    if profile_exits.get("count"):
+        rules = ", ".join(sorted(profile_exits.get("rule_counts") or {}))
+        lines.append(f"Profile exits: {profile_exits['count']} ({rules})")
+    relaxed_lanes = report.get("relaxed_evidence_lanes") or []
+    for lane in relaxed_lanes:
+        gates = ", ".join(lane.get("evidence_gates_relaxed") or [])
+        lines.append(f"Shadow lanes on relaxed evidence: {lane.get('deployment_id')} [{gates}]")
     if open_positions:
         lines.append("Open positions:")
         for position in open_positions[:3]:
@@ -320,6 +365,8 @@ def _empty_report(day: date) -> dict[str, Any]:
         "trades": [],
         "lifecycle": {},
         "data_quality_warnings": [],
+        "profile_exit_summary": {"count": 0, "rule_counts": {}},
+        "relaxed_evidence_lanes": [],
         "status": {"level": "NO_DATA", "reason": "db_missing"},
     }
 
@@ -367,6 +414,8 @@ def _load_day_trades(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
         "exit_filled_at",
         "exit_order_status",
         "exit_order_type",
+        "exit_mode",
+        "exit_rule",
     ]
     selected = [column for column in desired if column in columns]
     day_text = day.isoformat()
@@ -410,7 +459,45 @@ def _augment_trade(trade: dict[str, Any]) -> dict[str, Any]:
         "realized_pnl_usd": realized,
         "option_strike": _parse_option_strike(_maybe_str(trade.get("option_symbol"))),
         "protection_state": _protection_state(trade),
+        "exit_attribution": _exit_attribution(trade),
     }
+
+
+def _exit_attribution(trade: dict[str, Any]) -> str | None:
+    """Classify how a trade exited for the report's "Exit" column (workplan #10).
+
+    A profile-dispatched exit is labeled ``profile:<rule>`` (e.g.
+    ``profile:no_progress``) from the ``exit_rule`` attribution stamped by the
+    profile route — distinct from a native/legacy thesis exit even though both
+    share the exact same ``_handle_exit_locked`` dispatcher and ``exit_mode``.
+    Absent that, fall back to what the existing fields already tell us:
+    ``hard_flat`` (the EOD sweep), ``stop``/``target`` (the exit order id matches
+    the resting protective order), or ``strategy`` (a native thesis exit — either
+    ``exit_mode == "strategy"`` or any other filled exit). Returns ``None`` for a
+    still-open trade (nothing to attribute yet).
+    """
+    if _is_open_trade(trade):
+        return None
+    exit_rule = _maybe_str(trade.get("exit_rule"))
+    if exit_rule:
+        return f"profile:{exit_rule}"
+    exit_mode = str(trade.get("exit_mode") or "").lower()
+    if exit_mode == "hard_flat":
+        return "hard_flat"
+    exit_order_id = trade.get("exit_order_id")
+    if exit_order_id is not None:
+        if exit_order_id == trade.get("stop_order_id"):
+            return "stop"
+        if exit_order_id == trade.get("target_order_id"):
+            return "target"
+    if exit_mode == "strategy":
+        return "strategy"
+    if exit_order_id is not None or trade.get("exit_price") is not None:
+        # A closed trade with no other attribution (e.g. a dry_run/paper close,
+        # which never sets exit_mode) is a native strategy exit by elimination —
+        # the profile route always stamps exit_rule, checked above.
+        return "strategy"
+    return None
 
 
 def _provider_events(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -459,6 +546,56 @@ def _lifecycle_events(events: list[dict[str, Any]]) -> dict[str, int]:
         "exit_decision",
     }
     return dict(sorted(Counter(event["event_type"] for event in events if event["event_type"] in interesting).items()))
+
+
+def _profile_exit_summary(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count + rule breakdown of profile-dispatched exits today (workplan #10).
+
+    Only trades whose ``exit_attribution`` is ``profile:<rule>`` count — a
+    reporting-only rollup so the operator's profile-vs-legacy exit readback has
+    a headline number without scanning the full Trades table.
+    """
+    rules: list[str] = []
+    for trade in trades:
+        attribution = trade.get("exit_attribution")
+        if isinstance(attribution, str) and attribution.startswith("profile:"):
+            rules.append(attribution.split(":", 1)[1])
+    return {
+        "count": len(rules),
+        "rule_counts": dict(sorted(Counter(rules).items())),
+    }
+
+
+def _relaxed_evidence_lanes(
+    trades: list[dict[str, Any]],
+    deployments: list["DeploymentManifest"] | None,
+) -> list[dict[str, Any]]:
+    """Surface today's trading lanes whose active-plan deployment carries
+    ``source.metadata.evidence_gates_relaxed`` (workplan #17 / operator-audit P5).
+
+    A shadow lane compiled with relaxed evidence gates is a genuine risk of
+    accidental promotion if it happens to look good on a thin sample; this list
+    is reporting-only (it does not touch which lanes trade or how) so the
+    operator sees "this row's evidence was relaxed" right next to today's
+    activity instead of having to cross-reference active_plan.json by hand.
+    """
+    if not deployments:
+        return []
+    traded_today = {trade.get("deployment_id") for trade in trades if trade.get("deployment_id")}
+    if not traded_today:
+        return []
+    lanes: list[dict[str, Any]] = []
+    for deployment in deployments:
+        deployment_id = getattr(deployment, "deployment_id", None)
+        if deployment_id is None or deployment_id not in traded_today:
+            continue
+        source = getattr(deployment, "source", None)
+        metadata = getattr(source, "metadata", None) or {}
+        gates = metadata.get("evidence_gates_relaxed")
+        if not gates:
+            continue
+        lanes.append({"deployment_id": deployment_id, "evidence_gates_relaxed": list(gates)})
+    return sorted(lanes, key=lambda lane: lane["deployment_id"])
 
 
 def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
