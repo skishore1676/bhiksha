@@ -1354,7 +1354,7 @@ def test_compile_active_plan_suppresses_mala_evidence_when_activation_candidate_
         rows=[
             {
                 "enabled": "TRUE",
-                "authorization_mode": "shadow",
+                "authorization_mode": "live",
                 "strategy_id": "market-impulse-all-basket-discovery__amd_short",
             }
         ],
@@ -1425,7 +1425,7 @@ def test_mala_evidence_watch_only_runtime_supported_fails_on_activation_not_runt
         rows=[
             {
                 "enabled": "TRUE",
-                "authorization_mode": "shadow",
+                "authorization_mode": "live",
                 "strategy_id": "market-impulse-all-basket-discovery__iwm_long",
             }
         ],
@@ -1495,7 +1495,7 @@ def test_compile_active_plan_suppresses_mala_evidence_when_option_trade_not_read
         rows=[
             {
                 "enabled": "TRUE",
-                "authorization_mode": "shadow",
+                "authorization_mode": "live",
                 "strategy_id": "market-impulse-all-basket-discovery__amd_short",
             }
         ],
@@ -2007,3 +2007,121 @@ def _catalog_sheet_row(**overrides):
     from bhiksha.active_plan.compiler import StrategyCatalogSheetRow
 
     return StrategyCatalogSheetRow.model_validate(payload)
+
+
+def _evidence_gate_catalog_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "mala_handoff_version": "1",
+        "catalog_key": "market-impulse-all-basket-discovery__amd_short",
+        "hypothesis_id": "market-impulse-all-basket-discovery",
+        "symbol": "AMD",
+        "direction": "short",
+        "strategy_key": "market_impulse",
+        "strategy_name": "Market Impulse (Cross & Reclaim)",
+        "strategy_variant": "cross_reclaim",
+        "strategy_params_json": json.dumps({"direction": "short"}),
+        "recommendation_tier": "watch_only",
+        "lifecycle_status": "candidate",
+        "bhiksha_ready": "TRUE",
+        "bhiksha_capability_status": "supported",
+        "bhiksha_capability_reason": "runtime_verified",
+        "mala_evidence_ready": "FALSE",
+        "mala_evidence_blocking_checks": "recommendation_tier=watch_only",
+        "activation_candidate": "FALSE",
+        "activation_blocking_checks": "m7_signal_overlap=0.875; required>=0.95_for_activation",
+        "option_trade_ready": "FALSE",
+        "thesis_exit_tested": "TRUE",
+        "thesis_exit_policy": "fixed_rr_underlying",
+        "thesis_exit_params_json": json.dumps(
+            {
+                "stop_loss_underlying_pct": 0.005,
+                "take_profit_underlying_r_multiple": 2.0,
+            }
+        ),
+        "thesis_exit_metrics_json": json.dumps({"expectancy": 0.56, "profit_factor": 2.0}),
+    }
+    row.update(overrides)
+    return row
+
+
+def _compile_single_evidence_gate_row(
+    tmp_path: Path, *, catalog_overrides: dict[str, object] | None = None, authorization_mode: str = "shadow"
+):
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir(exist_ok=True)
+    _write_catalog_entry(
+        catalog_root / "mi_amd.yaml",
+        strategy_id="market-impulse-all-basket-discovery__amd_short",
+        symbol="AMD",
+    )
+    catalog_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="Mala_Evidence_v1",
+        rows=[_evidence_gate_catalog_row(**(catalog_overrides or {}))],
+    )
+    strategy_client = _FakeSheetClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="active_strategy",
+        rows=[
+            {
+                "enabled": "TRUE",
+                "authorization_mode": authorization_mode,
+                "strategy_id": "market-impulse-all-basket-discovery__amd_short",
+            }
+        ],
+    )
+    manual_client = _FakeSheetClient(spreadsheet_id="spreadsheet123", sheet_name="manual_entry", rows=[])
+    return compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=catalog_client,
+        strategy_client=strategy_client,
+        manual_client=manual_client,
+    )
+
+
+def test_shadow_row_compiles_with_relaxed_evidence_gates(tmp_path: Path) -> None:
+    """Shadow rows accept candidate-grade evidence; the relaxation is stamped into metadata."""
+    compiled = _compile_single_evidence_gate_row(tmp_path)
+
+    assert compiled.plan.summary["suppressed_count"] == 0
+    assert len(compiled.plan.deployments) == 1
+    deployment = compiled.plan.deployments[0]
+    assert deployment.execution.shadow_only is True
+    relaxed = deployment.source.metadata["evidence_gates_relaxed"]
+    assert [gate.split(":")[0] for gate in relaxed] == [
+        "mala_evidence_ready",
+        "activation_candidate",
+        "option_trade_ready",
+    ]
+    assert "m7_signal_overlap=0.875" in relaxed[1]
+
+
+def test_live_row_still_suppressed_on_relaxed_evidence_gates(tmp_path: Path) -> None:
+    """The same sub-activation row in live mode keeps the full evidence bar."""
+    compiled = _compile_single_evidence_gate_row(tmp_path, authorization_mode="live")
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "not mala_evidence_ready" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_shadow_row_still_suppressed_on_safety_gates(tmp_path: Path) -> None:
+    """Evidence gates relax for shadow; safety/integrity gates never do."""
+    kill = _compile_single_evidence_gate_row(
+        tmp_path, catalog_overrides={"triage_verdict": "KILL", "triage_verdict_reason": "regime artifact"}
+    )
+    assert kill.plan.deployments == []
+    assert "triage_verdict=KILL" in kill.plan.suppressed[0]["reason"]
+
+    blocked = _compile_single_evidence_gate_row(tmp_path, catalog_overrides={"m7_status": "block"})
+    assert blocked.plan.deployments == []
+    assert "m7_status=block" in blocked.plan.suppressed[0]["reason"]
+
+    not_ready = _compile_single_evidence_gate_row(tmp_path, catalog_overrides={"bhiksha_ready": "FALSE"})
+    assert not_ready.plan.deployments == []
+    assert "not Bhiksha runtime-ready" in not_ready.plan.suppressed[0]["reason"]
