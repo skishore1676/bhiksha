@@ -214,11 +214,18 @@ def _contradicts_broker_evidence(
         and trade.entry_timestamp is not None
         and not _matches_broker_opened_at(trade, broker_opened_at)
     )
-    price_contradicts = (
-        broker_entry_price is not None
-        and trade.entry_price is not None
-        and not _matches_broker_entry_price(trade, broker_entry_price)
-    )
+    # REGRESSION-D guard (re-audit 2026-07-02): a record's entry_price can
+    # legitimately diverge from the broker's cost basis by more than the tight
+    # $0.05 CORROBORATION threshold (e.g. the fill payload lacked price keys
+    # and the record fell back to the submitted limit, then the fill improved).
+    # Price alone therefore CONTRADICTS only on gross divergence — >10%
+    # relative AND >$0.25 — so a true record can't be rejected (which both
+    # shut the dispatch gate and let sync_lifecycle mis-close the real trade).
+    price_contradicts = False
+    if broker_entry_price is not None and trade.entry_price is not None:
+        divergence = abs(trade.entry_price - broker_entry_price)
+        gross = divergence > max(0.25, 0.10 * max(trade.entry_price, broker_entry_price))
+        price_contradicts = gross
     return opened_at_contradicts or price_contradicts
 
 

@@ -942,21 +942,45 @@ def test_shadow_recorder_never_dispatches_a_hold_even_when_live() -> None:
 
 def test_profile_state_identity_mismatch_reseeds_ladder() -> None:
     """Audit backstop (2026-07-02): a cached ladder seeded by a DIFFERENT fill
-    (entry premium >10% off, or banked quantity exceeding the position) must
-    reseed instead of driving exits off the other fill's state."""
+    (entry premium >10% off, or banked quantity exceeding the ORIGINAL seeded
+    quantity) must reseed instead of driving exits off the other fill's state."""
     from bhiksha.execution.supervisor import _profile_state_identity_mismatch
 
-    state = ProfileExitState.new(8.8)
+    state = ProfileExitState.new(8.8, seed_quantity=3)
     state.target_1_banked = True
     state.banked_quantity = 2
     state.peak_premium = 24.4
 
     # Same fill, small jitter: no mismatch.
-    assert _profile_state_identity_mismatch(state, entry_premium=8.85, position_quantity=2) is False
+    assert _profile_state_identity_mismatch(state, entry_premium=8.85) is False
     # Different fill (premium far off): mismatch.
-    assert _profile_state_identity_mismatch(state, entry_premium=24.4, position_quantity=2) is True
-    # Impossible banked quantity: mismatch.
-    assert _profile_state_identity_mismatch(state, entry_premium=8.8, position_quantity=1) is True
-    # Legacy state without a seed (pre-field): premium check skipped, quantity check still active.
+    assert _profile_state_identity_mismatch(state, entry_premium=24.4) is True
+    # Banked more than the ORIGINAL seed quantity: impossible for the same fill.
+    state.banked_quantity = 4
+    assert _profile_state_identity_mismatch(state, entry_premium=8.8) is True
+    # Legacy state without seeds (pre-field): both checks skipped, no reseed.
     state.seed_entry_premium = None
-    assert _profile_state_identity_mismatch(state, entry_premium=24.4, position_quantity=3) is False
+    state.seed_quantity = None
+    assert _profile_state_identity_mismatch(state, entry_premium=24.4) is False
+
+
+def test_post_partial_residual_tick_does_not_reseed() -> None:
+    """RE-AUDIT BLOCKER (2026-07-02): after a routine T1 partial the tracked
+    position holds only the RESIDUAL quantity, so banked > residual is the
+    NORMAL state — the identity backstop must NOT reseed (the earlier
+    residual-based check refired T1 and closed the T2 runner)."""
+    from bhiksha.execution.supervisor import _profile_state_identity_mismatch
+
+    # qty=3 fill at 8.8; T1 banks 60% => banked=2, residual position qty=1.
+    state = ProfileExitState.new(8.8, seed_quantity=3)
+    state.target_1_banked = True
+    state.banked_quantity = 2
+    state.stop_at_breakeven = True
+
+    assert _profile_state_identity_mismatch(state, entry_premium=8.8) is False
+
+    # qty=5, bank 60% => banked=3, residual=2: also must not reseed.
+    state5 = ProfileExitState.new(4.0, seed_quantity=5)
+    state5.target_1_banked = True
+    state5.banked_quantity = 3
+    assert _profile_state_identity_mismatch(state5, entry_premium=4.0) is False

@@ -498,3 +498,33 @@ def test_reconcile_closed_trade_order_ids_do_not_shadow_open_trade() -> None:
     assert len(tracked) == 1
     assert tracked[0].trade_id == "OPEN1"
     assert tracked[0].source == "live_open"
+
+
+def test_reconcile_price_divergence_alone_does_not_reject_true_record() -> None:
+    """REGRESSION-D (re-audit 2026-07-02): a true record whose entry_price
+    diverges modestly from the broker cost basis (fallback-to-limit record +
+    price-improved fill) must still match — price alone contradicts only on
+    gross divergence (>10% relative and >$0.25)."""
+    positions, deployments, known_trades = _matched_open_trade_fixture("a1b2c3d4-real-order")
+    # Record says 2.73 (fixture); broker fill improved to 2.55 (~7%, $0.18).
+    positions[0]["costBasis"]["unitCost"] = "2.55"
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id == "TRADE123"
+    assert tracked[0].source == "live_open"
+
+
+def test_reconcile_gross_price_divergence_still_contradicts() -> None:
+    """A genuinely different fill (gross price divergence, no matching
+    timestamp evidence) must still be rejected."""
+    positions, deployments, known_trades = _matched_open_trade_fixture("a1b2c3d4-real-order")
+    positions[0]["costBasis"]["unitCost"] = "5.40"  # ~66% off, $2.67
+    positions[0]["openedAt"] = "2026-03-31T14:00:00Z"  # >6h from record
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id != "TRADE123"
+    assert tracked[0].source == "broker_recovered"

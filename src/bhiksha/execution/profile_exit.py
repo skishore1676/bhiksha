@@ -329,10 +329,18 @@ class ProfileExitState:
     # ``None`` only for states created before this field existed (in-memory
     # only, so fresh after any restart).
     seed_entry_premium: float | None = None
+    # The ORIGINAL position quantity this ladder was seeded with (before any
+    # partial). The identity backstop must compare banked_quantity against
+    # THIS, never against the current position quantity: after a routine T1
+    # partial the tracked position holds only the residual, so
+    # banked > residual is the NORMAL post-partial state (re-audit blocker
+    # 2026-07-02: comparing against the residual reseeded every post-partial
+    # tick and closed the T2 runner at T1).
+    seed_quantity: int | None = None
 
     @classmethod
-    def new(cls, entry_premium: float) -> "ProfileExitState":
-        return cls(peak_premium=entry_premium, seed_entry_premium=entry_premium)
+    def new(cls, entry_premium: float, seed_quantity: int | None = None) -> "ProfileExitState":
+        return cls(peak_premium=entry_premium, seed_entry_premium=entry_premium, seed_quantity=seed_quantity)
 
     def target_1_banked_stop_emitted(self) -> bool:
         """True once the stop-to-breakeven FSM action has been surfaced."""
@@ -345,7 +353,7 @@ class ProfileExitState:
         """Record that this state was advanced by a shadow (record-only) tick."""
         self.shadow_advanced = True
 
-    def reseed_for_live(self, entry_premium: float) -> None:
+    def reseed_for_live(self, entry_premium: float, seed_quantity: int | None = None) -> None:
         """Reset the ladder to a clean entry-state for a first LIVE evaluation.
 
         MEDIUM-1(flip): called exactly once when a position whose state was
@@ -365,6 +373,8 @@ class ProfileExitState:
         self.breakeven_emitted = False
         self.shadow_advanced = False
         self.seed_entry_premium = entry_premium
+        if seed_quantity is not None:
+            self.seed_quantity = seed_quantity
 
 
 @dataclass(slots=True, frozen=True)

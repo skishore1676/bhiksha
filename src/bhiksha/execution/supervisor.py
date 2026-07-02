@@ -141,7 +141,7 @@ class ExecutionSupervisor:
         key = self._profile_state_key(position)
         state = self._profile_exit_states.get(key)
         if state is not None and _profile_state_identity_mismatch(
-            state, entry_premium=entry_premium, position_quantity=position.quantity
+            state, entry_premium=entry_premium
         ):
             # Identity backstop (audit fix 2026-07-02): the cached ladder was
             # seeded by a DIFFERENT fill (trade-identity mismatch upstream in
@@ -160,7 +160,7 @@ class ExecutionSupervisor:
             )
             state = None
         if state is None:
-            state = ProfileExitState.new(entry_premium)
+            state = ProfileExitState.new(entry_premium, seed_quantity=position.quantity)
             self._profile_exit_states[key] = state
         return state
 
@@ -405,7 +405,7 @@ class ExecutionSupervisor:
         if not drives_live:
             state.mark_shadow_advanced()
         elif state.shadow_advanced:
-            state.reseed_for_live(position.entry_price)
+            state.reseed_for_live(position.entry_price, seed_quantity=position.quantity)
 
         outcome = await evaluate_and_record_profile_exit(
             event_sink=self.event_repository,
@@ -4055,23 +4055,25 @@ def _profile_state_identity_mismatch(
     state: ProfileExitState,
     *,
     entry_premium: float,
-    position_quantity: int,
 ) -> bool:
     """True when a cached ladder state clearly belongs to a DIFFERENT fill.
 
     Backstop behind reconciliation's trade matching (audit fix 2026-07-02).
-    Two independent signals, both conservative so ordinary broker jitter
-    (estimated vs actual fill price) never trips it:
-      * seed entry premium diverges >10% relative -- same-fill entry premium is
+    Conservative signals only, so ordinary broker jitter and the ROUTINE
+    post-partial state never trip it (re-audit blocker: comparing banked
+    quantity against the CURRENT position quantity fired on every tick after
+    a normal T1 partial — the position then holds only the residual — and
+    reseeding refired T1 and closed the T2 runner):
+      * seed entry premium diverges >10% relative — same-fill entry premium is
         fixed at entry; a 0-2 DTE re-entry days later diverges far more;
-      * the ladder claims more banked quantity than the position holds
-        (an impossible state for the same fill).
+      * the ladder claims more banked quantity than the ORIGINAL seeded
+        quantity (impossible for the same fill at any partial stage).
     """
     seed = state.seed_entry_premium
     if seed is not None and entry_premium > 0 and seed > 0:
         if abs(seed - entry_premium) > 0.10 * max(seed, entry_premium):
             return True
-    if state.banked_quantity > position_quantity:
+    if state.seed_quantity is not None and state.banked_quantity > state.seed_quantity:
         return True
     return False
 
