@@ -148,6 +148,16 @@ async def evaluate_and_record_profile_exit(
             "current_premium": market.current_premium,
             "mode": "live_dispatch" if dispatched else "shadow_record",
             "dispatch_allowed": dispatch_allowed,
+            # Gate-input diagnostics: when dispatch_allowed is False on an armed
+            # deployment these show WHICH input closed the fail-closed allowlist
+            # (2026-07-01 finding: a reconciliation-rewritten position_source such
+            # as "broker_sync" silently closes the gate on a live position).
+            "gate_inputs": {
+                "live": live,
+                "deployment_shadow_only": deployment_shadow_only,
+                "position_source": position_source,
+                "runtime_mode": getattr(runtime_mode, "value", runtime_mode),
+            },
             "features": decision.features,
         },
     )
