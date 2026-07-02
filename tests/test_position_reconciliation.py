@@ -300,3 +300,85 @@ def test_reconcile_public_positions_creates_synthetic_trade_for_orphan() -> None
     assert tracked[0].trade_id is not None
     assert tracked[0].trade_id.startswith("recovered:")
     assert tracked[0].source == "broker_recovered"
+
+
+def _matched_open_trade_fixture(entry_order_id, status="open_protected"):
+    qqq = historical_deployment("market_impulse_qqq_short_v1")
+    positions = [
+        {
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "quantity": "1.0",
+            "openedAt": "2026-03-30T14:31:00Z",
+            "costBasis": {"unitCost": "2.73"},
+        }
+    ]
+    known_trades = [
+        TradeRecord(
+            trade_id="TRADE123",
+            deployment_id=qqq.deployment_id,
+            symbol="QQQ",
+            option_symbol="QQQ260401P00556000",
+            quantity=1,
+            entry_price=2.73,
+            entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+            status=status,
+            entry_order_id=entry_order_id,
+        )
+    ]
+    return positions, [qqq], known_trades
+
+
+def test_reconcile_matched_open_live_trade_keeps_live_source() -> None:
+    """The 2026-07-01 root cause: reconciliation must not strip live identity.
+
+    A broker position matched to a durable OPEN trade record with a REAL broker
+    entry order id reconciles as ``live_open`` — so the profile-exit dispatch
+    allowlist (which only opens for live_open/live_pending) can stay open for a
+    position the reconciliation sweep has replaced.
+    """
+    positions, deployments, known_trades = _matched_open_trade_fixture("a1b2c3d4-real-order")
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].trade_id == "TRADE123"
+    assert tracked[0].source == "live_open"
+
+    from bhiksha.execution.profile_exit import profile_exit_dispatch_allowed
+
+    assert profile_exit_dispatch_allowed(
+        live=True,
+        deployment_shadow_only=False,
+        position_source=tracked[0].source,
+        runtime_mode="live_approval_gated",
+    )
+
+
+def test_reconcile_matched_paper_entry_stays_broker_sync() -> None:
+    positions, deployments, known_trades = _matched_open_trade_fixture("SHADOW_ENTRY")
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].source == "broker_sync"
+
+
+def test_reconcile_matched_trade_without_entry_order_id_stays_broker_sync() -> None:
+    positions, deployments, known_trades = _matched_open_trade_fixture(None)
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].source == "broker_sync"
+
+
+def test_reconcile_matched_closed_trade_stays_broker_sync_even_with_live_entry_id() -> None:
+    positions, deployments, known_trades = _matched_open_trade_fixture("a1b2c3d4-real-order", status="closed")
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+
+    assert len(tracked) == 1
+    assert tracked[0].source == "broker_sync"

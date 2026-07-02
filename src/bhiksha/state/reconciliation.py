@@ -15,6 +15,18 @@ _OPTION_ROOT_RE = re.compile(r"^([A-Z]+)")
 _RECOVERY_MATCH_WINDOW = timedelta(hours=6)
 
 
+def _is_live_entry_order_id(order_id: str | None) -> bool:
+    """True only for a REAL broker entry order id.
+
+    Paper markers ("SHADOW_ENTRY", "DRY_RUN*") and missing ids are not live —
+    mirrors ``bhiksha.execution.supervisor._is_paper_order_id`` semantics
+    (kept local: the state layer must not import the execution layer).
+    """
+    if not order_id:
+        return False
+    return not (order_id == "SHADOW_ENTRY" or order_id.startswith("DRY_RUN"))
+
+
 def reconcile_public_positions(
     positions: Iterable[dict],
     deployments: list[DeploymentManifest],
@@ -68,6 +80,18 @@ def reconcile_public_positions(
             trade_id = matched_trade.trade_id
             entry_price = entry_price or matched_trade.entry_price
             entry_timestamp = entry_timestamp or matched_trade.entry_timestamp
+            # A broker position matched to a durable OPEN trade record whose entry
+            # was a REAL broker order keeps its live identity. Reconciliation runs
+            # every ~15s and REPLACES the tracker's positions wholesale, so labeling
+            # these "broker_sync" stripped live positions of their profile-exit
+            # dispatch authority within seconds of entry (the fail-closed allowlist
+            # only opens for live_open/live_pending) — the 2026-07-01 armed-lanes-
+            # never-dispatch root cause. Excluded on purpose: unmatched positions
+            # ("broker_recovered"), paper entries, and positions matched to a
+            # CLOSED trade record (record/broker divergence — not a position the
+            # profile route should own).
+            if _is_live_entry_order_id(matched_trade.entry_order_id) and matched_trade.status != "closed":
+                source = "live_open"
         else:
             symbol_deployments = deployments_by_symbol.get(symbol, [])
             if len(symbol_deployments) == 1:
