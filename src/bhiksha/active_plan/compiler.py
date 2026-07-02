@@ -18,6 +18,7 @@ import yaml
 from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
+from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.strategy.capabilities import (
     NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS,
     derive_strategy_variant,
@@ -184,6 +185,14 @@ class ActivePlanSheetRow(BaseModel):
     # default) reproduces pre-bridge behavior exactly: no v2 fields are set.
     exit_profile_spec: dict[str, Any] | None = None
     source_metadata: dict[str, Any] = Field(default_factory=dict)
+    # AUDIT VISIBILITY: populated by ``normalize_input`` when a row sets a
+    # profile-exit live-dispatch-gate input through the ``execution``/``exit``
+    # override channels (see ``_detect_gate_override_keys``). The keys are
+    # HONORED — the Sheet is the operator's sanctioned arming surface (it
+    # already controls ``mode=live``) — but every occurrence is surfaced into
+    # ``plan.summary["gate_override_key_warnings"]`` so arming is always
+    # visible in the compiled-plan audit trail.
+    gate_override_keys: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -231,6 +240,12 @@ class ActivePlanSheetRow(BaseModel):
         ):
             if normalized.get(key) is None:
                 normalized[key] = {}
+        detected_gate_keys = _detect_gate_override_keys(
+            execution_overrides=normalized.get("execution_overrides") or {},
+            exit_overrides=normalized.get("exit_overrides") or {},
+        )
+        if detected_gate_keys:
+            normalized["gate_override_keys"] = detected_gate_keys
         for key, metadata_key in (
             ("entry_window_start_et", "start_date"),
             ("entry_window_end_et", "end_date"),
@@ -324,6 +339,7 @@ def compile_active_plan_from_rows(
     google_strategy_catalog: list[StrategyCatalogSheetRow] | None = None,
     operator_defaults: dict[str, Any] | None = None,
     suppressed: list[dict[str, Any]] | None = None,
+    risk_demotion_store: DemotionStore | None = None,
 ) -> CompiledActivePlan:
     suppressed_rows = list(suppressed or [])
     if google_strategy_catalog is not None:
@@ -343,6 +359,7 @@ def compile_active_plan_from_rows(
     deployments: list[DeploymentManifest] = []
     row_type_counts: dict[str, int] = {}
     seen_row_ids: set[str] = set()
+    gate_override_warnings: list[dict[str, Any]] = []
     for row in rows:
         if row.row_id in seen_row_ids:
             suppressed_rows.append(
@@ -353,6 +370,18 @@ def compile_active_plan_from_rows(
             )
             continue
         seen_row_ids.add(row.row_id)
+        if row.gate_override_keys:
+            gate_override_warnings.append(
+                {
+                    "row_id": row.row_id,
+                    "gate_keys": list(row.gate_override_keys),
+                    "message": (
+                        "Sheet row sets profile-exit dispatch-gate inputs via "
+                        "execution/exit overrides; keys are HONORED (operator arming "
+                        "surface) and surfaced here for audit."
+                    ),
+                }
+            )
         try:
             deployment = _compile_row(row, catalog_by_id, google_catalog_by_id, enforce_google_catalog)
         except (ValidationError, ValueError) as exc:
@@ -360,6 +389,8 @@ def compile_active_plan_from_rows(
             continue
         deployments.append(deployment)
         row_type_counts[row.row_type] = row_type_counts.get(row.row_type, 0) + 1
+
+    deployments, demotion_warnings = apply_risk_demotion_overrides(deployments, demotion_store=risk_demotion_store)
 
     effective_trading_date = trading_date or datetime.now(UTC).date().isoformat()
     effective_active_plan_id = active_plan_id or f"active_plan_{effective_trading_date}"
@@ -382,6 +413,8 @@ def compile_active_plan_from_rows(
             "enabled_deployment_count": sum(1 for deployment in deployments if deployment.enabled),
             "suppressed_count": len(suppressed_rows),
             "symbols": sorted({deployment.symbol for deployment in deployments}),
+            "gate_override_key_warnings": gate_override_warnings,
+            "risk_demotion_warnings": demotion_warnings,
         },
         suppressed=suppressed_rows,
         deployments=deployments,
@@ -664,6 +697,68 @@ def _load_json_rows_with_report(path: Path) -> RowValidationResult:
         except (ValidationError, ValueError) as exc:
             suppressed.append(_suppressed_row(reason=str(exc), payload=prepared, raw=item))
     return RowValidationResult(rows=validated_rows, suppressed=suppressed)
+
+
+def apply_risk_demotion_overrides(
+    deployments: list[DeploymentManifest],
+    *,
+    demotion_store: DemotionStore | None = None,
+) -> tuple[list[DeploymentManifest], list[dict[str, Any]]]:
+    """Rail B compiler hook: force demoted deployments to compile shadow-only.
+
+    Additive and safe by construction:
+      - Only ever flips ``execution.shadow_only`` to ``True`` for a
+        deployment id present in the local ``DemotionStore`` (see
+        ``bhiksha.risk.demotion_store``); every other deployment and every
+        other field is passed through completely unchanged.
+      - A demotion entry for a deployment id that is not present in this
+        compiled plan (an unknown/stale id -- e.g. a retired deployment, or
+        an id typo) is ignored, with a warning entry returned for the
+        caller's summary. It is never an error: a demotion override must
+        never be able to break a compile.
+      - One-way: this function only reads the store; only
+        ``RiskManager._evaluate_rail_b`` (in ``bhiksha.risk.risk_manager``)
+        ever writes to it. There is no re-promote path here.
+    """
+    store = demotion_store or DemotionStore()
+    demotions = store.load()
+    if not demotions:
+        return deployments, []
+
+    known_ids = {deployment.deployment_id for deployment in deployments}
+    warnings: list[dict[str, Any]] = []
+    updated: list[DeploymentManifest] = []
+    for deployment in deployments:
+        record = demotions.get(deployment.deployment_id)
+        if record is None:
+            updated.append(deployment)
+            continue
+        if deployment.execution.shadow_only:
+            updated.append(deployment)
+            continue
+        forced_execution = deployment.execution.model_copy(update={"shadow_only": True})
+        updated.append(deployment.model_copy(update={"execution": forced_execution}))
+        warnings.append(
+            {
+                "deployment_id": deployment.deployment_id,
+                "reason": record.reason,
+                "demoted_at": record.demoted_at,
+                "mean_pnl_usd": record.mean_pnl_usd,
+                "window_n": record.window_n,
+                "message": "Rail B demotion override forced this deployment to shadow_only at compile.",
+            }
+        )
+
+    for deployment_id in sorted(set(demotions) - known_ids):
+        warnings.append(
+            {
+                "deployment_id": deployment_id,
+                "reason": "unknown_deployment_id",
+                "message": "Demotion override references a deployment id not present in this compiled plan; ignored.",
+            }
+        )
+
+    return updated, warnings
 
 
 def _compile_row(
@@ -1899,6 +1994,55 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = value
     return merged
+
+
+# HARDENING: the free-form ``execution_overrides``/``exit_overrides`` sheet
+# columns deep-merge directly onto the compiled ``ExecutionSpec``/``ExitSpec``
+# (see ``_apply_execution_overrides``/``_apply_exit_overrides`` above). Before
+# this deny-list, a Sheet row could pre-stage 3 of the 4 profile-exit
+# live-dispatch-gate inputs purely through that generic channel:
+#   - execution_overrides.runtime_mode         (HIGH-1 dispatch-gate input)
+#   - exit_overrides.profile_exit_drives_live  (the one live-enablement switch)
+#   - execution_overrides.shadow_only          (already re-derived from
+#     authorization_mode right after the merge in
+#     ``_apply_execution_overrides``, but stripped here too for
+#     defense-in-depth and so "denied" is exact and unconditional, not
+#     merge-order-dependent)
+# ``profile_exit_dispatch_allowed`` (the 4th gate input, a code-level
+# allowlist) is not sheet-settable at all, so these three are the complete
+# sheet-reachable surface. Stripped here -- the single choke point every
+# active-plan row (strategy or manual) passes through -- rather than at each
+# ``_apply_*_overrides`` call site, so no future row-compile path can forget
+# the strip.
+_GATE_EXECUTION_OVERRIDE_KEYS = frozenset({"runtime_mode", "shadow_only"})
+_GATE_EXIT_OVERRIDE_KEYS = frozenset({"profile_exit_drives_live"})
+
+
+def _detect_gate_override_keys(
+    *,
+    execution_overrides: dict[str, Any],
+    exit_overrides: dict[str, Any],
+) -> list[str]:
+    """Surface (never strip) profile-exit dispatch-gate inputs set by a Sheet row.
+
+    Policy decision 2026-07-02: the active_strategies Sheet is the operator's
+    sanctioned control surface — it already decides ``mode=live`` (order
+    submission), which is strictly more powerful than these keys. The live
+    lanes' profile-exit arming is legitimately carried in the ``execution`` /
+    ``exit`` row cells (aliased into these override channels), so stripping
+    the keys would silently DISARM an operator-configured flip on the next
+    compile. Instead every occurrence is surfaced into
+    ``plan.summary["gate_override_key_warnings"]`` so an arming (or a hostile
+    edit) is always visible in the compiled-plan audit trail.
+    """
+    detected: list[str] = []
+    for key in execution_overrides:
+        if key in _GATE_EXECUTION_OVERRIDE_KEYS:
+            detected.append(f"execution_overrides.{key}")
+    for key in exit_overrides:
+        if key in _GATE_EXIT_OVERRIDE_KEYS:
+            detected.append(f"exit_overrides.{key}")
+    return sorted(detected)
 
 
 def _suppressed_row(

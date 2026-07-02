@@ -222,6 +222,13 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_order_type TEXT")
             if "exit_broker_payload" not in existing_columns:
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_broker_payload TEXT")
+            # get_recent_trades orders by updated_at DESC on every risk-manager
+            # consult (2-3x per entry attempt + once per bar); without this
+            # index that is a full-table scan + temp b-tree sort that grows
+            # with trade history (2026-07-02 audit finding).
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_sessions_updated_at ON trade_sessions(updated_at)"
+            )
             conn.commit()
 
     def _upsert_trade_sync(self, record: TradeRecord) -> None:
