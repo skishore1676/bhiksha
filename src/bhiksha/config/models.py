@@ -414,6 +414,14 @@ class ActivePlan(BaseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
     suppressed: list[dict[str, Any]] = Field(default_factory=list)
     deployments: list[DeploymentManifest] = Field(default_factory=list)
+    # Carries the flat ``Operator_Defaults_v1`` "default"-section dict (see
+    # ``load_operator_defaults_sheet_rows`` in ``bhiksha.active_plan.compiler``)
+    # through into the compiled plan payload so the live runtime can read
+    # operator-set risk knobs at session start without a new network
+    # dependency (the plan is already synced at live-start). Additive,
+    # harmless if absent: defaults to ``{}`` for any plan compiled before
+    # this field existed. See ``bhiksha.risk.plan_operator_defaults_source``.
+    operator_defaults: dict[str, Any] = Field(default_factory=dict)
 
 
 class StrategyCatalogEntry(BaseModel):

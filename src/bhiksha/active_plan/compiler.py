@@ -418,6 +418,7 @@ def compile_active_plan_from_rows(
         },
         suppressed=suppressed_rows,
         deployments=deployments,
+        operator_defaults=operator_defaults or {},
     )
     return CompiledActivePlan(plan=plan, rows=rows)
 

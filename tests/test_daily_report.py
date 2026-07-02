@@ -3,9 +3,19 @@ from datetime import UTC, datetime
 import json
 import sqlite3
 
-from bhiksha.domain.models import TradeRecord
-from bhiksha.ops.daily_report import build_daily_report, render_daily_report_telegram_summary, write_daily_report
-from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteEventRepository, SQLiteTradeStateRepository
+from bhiksha.domain.models import CashBudgetDay, TradeRecord
+from bhiksha.ops.daily_report import (
+    build_daily_report,
+    render_daily_report_markdown,
+    render_daily_report_telegram_summary,
+    write_daily_report,
+)
+from bhiksha.persistence.sqlite import (
+    SQLiteBackend,
+    SQLiteCashBudgetRepository,
+    SQLiteEventRepository,
+    SQLiteTradeStateRepository,
+)
 
 
 def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_path) -> None:
@@ -228,3 +238,117 @@ def test_report_status_escalates_live_unprotected_position_to_red() -> None:
     )
 
     assert status == {"level": "RED", "reason": "live_open_unprotected"}
+
+
+# --- Risk rails section tests (operator-audit P3) ---------------------------
+def test_daily_report_renders_risk_rails_section_from_startup_event_and_budget(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    cash_budget = SQLiteCashBudgetRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await events.append(
+            "risk_manager_startup",
+            {
+                "rail_a_enabled": True,
+                "rail_b_enabled": True,
+                "max_daily_drawdown_pct": 2.0,
+                "flatten_daily_drawdown_pct": 3.0,
+                "demote_window": 10,
+                "demote_min_n": 10,
+                "demote_threshold_usd": 0.0,
+                "validation_warnings": [],
+            },
+        )
+        await cash_budget.upsert_day(
+            CashBudgetDay(
+                trade_date="2026-06-03",
+                account_type="CASH",
+                broker_cash_only_buying_power=10000.0,
+                usable_budget=8000.0,
+                buffer_pct=0.2,
+            )
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE events SET created_at = '2026-06-03T13:30:00+00:00'")
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+
+    risk_rails = report["risk_rails"]
+    assert risk_rails["rail_a_enabled"] is True
+    assert risk_rails["rail_b_enabled"] is True
+    assert risk_rails["usable_budget_usd"] == 8000.0
+    assert risk_rails["max_daily_drawdown_pct"] == 2.0
+    assert risk_rails["max_daily_drawdown_usd"] == 160.0  # 2% of 8000
+    assert risk_rails["flatten_daily_drawdown_pct"] == 3.0
+    assert risk_rails["flatten_daily_drawdown_usd"] == 240.0  # 3% of 8000
+    assert risk_rails["demote_window"] == 10
+    assert risk_rails["demote_min_n"] == 10
+    assert risk_rails["demote_threshold_usd"] == 0.0
+    assert risk_rails["validation_warnings"] == []
+
+    markdown = render_daily_report_markdown(report)
+    assert "## Risk Rails" in markdown
+    assert "rail-A(halt) on, rail-B(demote) on" in markdown
+    assert "usable budget: `$8,000.00`" in markdown
+    assert "tier-1 halt (new entries): `2.00% ($160.00)`" in markdown
+    assert "tier-2 flatten (book): `3.00% ($240.00)`" in markdown
+    assert "auto-demote: `window 10, min_n 10, threshold $0.00`" in markdown
+
+
+def test_daily_report_risk_rails_section_surfaces_validation_warnings(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await events.append(
+            "risk_manager_startup",
+            {
+                "rail_a_enabled": True,
+                "rail_b_enabled": False,
+                "max_daily_drawdown_pct": 2.0,
+                "flatten_daily_drawdown_pct": 2.0,
+                "demote_window": 10,
+                "demote_min_n": 10,
+                "demote_threshold_usd": 0.0,
+                "validation_warnings": [
+                    "flatten_daily_drawdown_pct=-1.0 must be > 0; using default 3.0",
+                ],
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE events SET created_at = '2026-06-03T13:30:00+00:00'")
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+
+    risk_rails = report["risk_rails"]
+    assert risk_rails["rail_b_enabled"] is False
+    # No cash_budget_days row seeded for this day -> $ figures are unknown.
+    assert risk_rails["usable_budget_usd"] is None
+    assert risk_rails["max_daily_drawdown_usd"] is None
+    assert len(risk_rails["validation_warnings"]) == 1
+
+    markdown = render_daily_report_markdown(report)
+    assert "usable budget: `unknown`" in markdown
+    assert "tier-1 halt (new entries): `2.00% (n/a)`" in markdown
+    assert "validation warnings: `1`" in markdown
+    assert "flatten_daily_drawdown_pct=-1.0" in markdown
+
+
+def test_daily_report_risk_rails_absent_when_no_startup_event(tmp_path) -> None:
+    db_path = tmp_path / "missing.db"
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+
+    assert report["risk_rails"] is None
+    markdown = render_daily_report_markdown(report)
+    assert "## Risk Rails" not in markdown
+# --- end risk rails section tests -------------------------------------------

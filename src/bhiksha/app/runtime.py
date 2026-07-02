@@ -52,6 +52,7 @@ from bhiksha.ops.daily_report import write_daily_report
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.risk.cash_guard import CashGuard, trade_date_et
+from bhiksha.risk.plan_operator_defaults_source import PlanOperatorDefaultsSource
 from bhiksha.risk.risk_manager import RiskManager
 from bhiksha.risk.risk_settings import resolve_risk_settings
 from bhiksha.state.position_tracker import TrackedPosition
@@ -233,8 +234,14 @@ class BhikshaRuntime:
         event_repository = SQLiteEventRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         trade_state_repository = SQLiteTradeStateRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         cash_budget_repository = SQLiteCashBudgetRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        # Operator-sheet risk knobs: env > Operator_Defaults_v1 (via the
+        # already-compiled active plan) > hardcoded default. See
+        # bhiksha.risk.plan_operator_defaults_source for the sheet key
+        # convention; resolve_risk_settings applies the same validation to
+        # sheet values as it does to env values.
+        risk_settings_source = PlanOperatorDefaultsSource.from_active_plan(self.active_plan)
         self.risk_manager = RiskManager(
-            settings=resolve_risk_settings(),
+            settings=resolve_risk_settings(settings_source=risk_settings_source),
             cash_budget_repository=cash_budget_repository,
             trade_state_repository=trade_state_repository,
             event_repository=event_repository,

@@ -1218,6 +1218,52 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.source.metadata["option_adjusted_expectancy_pct"] == 0.18
     assert deployment.source.metadata["recommended_dte_min"] == 3
     assert deployment.source.metadata["recommended_dte_max"] == 7
+    # operator-audit P3: the compiled plan carries the flat operator_defaults
+    # dict through so the live runtime can build a PlanOperatorDefaultsSource
+    # without a second Sheet read at session start.
+    assert compiled.plan.operator_defaults["option_stop_pct"] == "0.35"
+    assert compiled.plan.operator_defaults["dte_min"] == "5"
+    plan_payload = compiled.plan.model_dump(mode="json")
+    assert plan_payload["operator_defaults"]["option_stop_pct"] == "0.35"
+
+
+def test_active_plan_operator_defaults_round_trips_through_load_active_plan(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(catalog_root / "spy_jerk.yaml", strategy_id="spy_jerk_pivot_short_v1", symbol="SPY")
+
+    compiled = compile_active_plan_from_rows(
+        rows=[],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_test",
+        trading_date="2026-07-02",
+        operator_defaults={"risk_max_daily_drawdown_pct": "1.5", "max_daily_drawdown_pct": "1.75"},
+    )
+    assert compiled.plan.operator_defaults == {
+        "risk_max_daily_drawdown_pct": "1.5",
+        "max_daily_drawdown_pct": "1.75",
+    }
+
+    output_path = tmp_path / "artifacts" / "playbook" / "active_plan.json"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text(json.dumps(compiled.plan.model_dump(mode="json")), encoding="utf-8")
+
+    reloaded = load_active_plan(output_path)
+    assert reloaded.operator_defaults["max_daily_drawdown_pct"] == "1.75"
+
+
+def test_compile_active_plan_from_rows_defaults_operator_defaults_to_empty_dict(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    compiled = compile_active_plan_from_rows(
+        rows=[],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_no_defaults",
+        trading_date="2026-07-02",
+    )
+
+    assert compiled.plan.operator_defaults == {}
 
 
 def test_mala_evidence_preserves_explicit_bhiksha_ready_when_provider_columns_are_advisory(tmp_path: Path) -> None:
