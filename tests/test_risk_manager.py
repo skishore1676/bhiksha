@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 
@@ -10,6 +10,20 @@ from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
 from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.risk.risk_manager import RiskManager, TIER1_HALT_REASON, TIER2_FLATTEN_REASON, RAIL_B_DEMOTED_REASON
 from bhiksha.risk.risk_settings import RiskSettings, resolve_risk_settings
+
+
+class _ManualClock:
+    """A settable ``now_fn`` for tests that need to move wall-clock time
+    across multiple ``book_actions()`` calls without sleeping."""
+
+    def __init__(self, start: datetime) -> None:
+        self._now = start
+
+    def __call__(self) -> datetime:
+        return self._now
+
+    def advance(self, **kwargs) -> None:
+        self._now = self._now + timedelta(**kwargs)
 
 
 def _settings(**overrides) -> RiskSettings:
@@ -524,3 +538,202 @@ def test_trade_sessions_updated_at_index_created(tmp_path) -> None:
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_trade_sessions_updated_at'"
         ).fetchall()
     assert rows
+
+
+# --------------------------------------------------------------------------
+# 2026-07-02 risk-noise: book_actions() evaluate-throttle + ok-event policy
+#
+# book_actions() is called once per SYMBOL-bar from BhikshaRuntime (13
+# symbols/minute in production) but Rail A is a book-level check. These
+# tests cover: (1) the per-minute evaluate cache returns the SAME result
+# without recomputing within a minute and DOES recompute across minutes;
+# (2) non-ok decisions and decision/state changes always emit a
+# risk_manager_decision row uncapped; (3) repeated "ok" decisions are
+# capped to one heartbeat row per 10 minutes.
+# --------------------------------------------------------------------------
+
+
+def _manager_with_clock(tmp_path, clock: _ManualClock, *, settings=None, alert_mode="off"):
+    db_path = str(tmp_path / "bhiksha.db")
+    backend = SQLiteBackend(db_path)
+    return RiskManager(
+        settings=settings or _settings(),
+        cash_budget_repository=SQLiteCashBudgetRepository(db_path, backend=backend),
+        trade_state_repository=SQLiteTradeStateRepository(db_path, backend=backend),
+        event_repository=SQLiteEventRepository(db_path, backend=backend),
+        demotion_store=DemotionStore(tmp_path / "demoted_deployments.json"),
+        alert_mode=alert_mode,
+        now_fn=clock,
+    ), db_path
+
+
+def test_book_actions_returns_cached_result_within_same_minute(tmp_path) -> None:
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(tmp_path, clock)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+
+    first = asyncio.run(manager.book_actions())
+    # 12 more calls within the SAME minute -- simulating the 13-symbol tick
+    # fan-out this is meant to collapse.
+    for _ in range(12):
+        clock.advance(seconds=1)
+        result = asyncio.run(manager.book_actions())
+        assert result is first  # literally the cached object, not recomputed
+
+    # Exactly one "ok" decision event was emitted for all 13 calls.
+    decisions = _events(db_path, "risk_manager_decision")
+    assert len(decisions) == 1
+    assert decisions[0]["payload"]["decision"] == "ok"
+
+
+def test_book_actions_reevaluates_across_minute_boundary(tmp_path) -> None:
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(tmp_path, clock)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+
+    first = asyncio.run(manager.book_actions())
+    clock.advance(minutes=1)
+    second = asyncio.run(manager.book_actions())
+
+    assert second is not first
+    assert second.rail_a.realized_live_pnl_usd == first.rail_a.realized_live_pnl_usd  # same book, recomputed fresh
+
+
+def test_book_actions_flatten_latch_unaffected_by_cache(tmp_path) -> None:
+    """The should_flatten session latch must stay fired even though the
+    triggering evaluation itself is now cached per-minute."""
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(tmp_path, clock)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    # -4% of 10000 = -400, breaches both tier1 (-200) and tier2 (-300)
+    trade = _closed_live_trade("T1", deployment_id="dep1", entry=8.0, exit_=4.0, exit_at=NOW)
+    asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+    asyncio.run(manager.trade_state_repository.mark_closed("T1", exit_price=4.0, exit_filled_quantity=1, exit_filled_at=NOW))
+
+    result = asyncio.run(manager.book_actions())
+    assert result.should_flatten is True
+
+    # A "late fill correction" within the SAME minute that would look
+    # healthy again must not un-flatten -- but this call also hits the
+    # evaluate cache, so it returns the SAME cached flattened result.
+    asyncio.run(manager.trade_state_repository.mark_closed("T1", exit_price=8.0, exit_filled_quantity=1, exit_filled_at=NOW))
+    still_cached = asyncio.run(manager.book_actions())
+    assert still_cached.should_flatten is True
+
+    # Advance past the minute boundary: recompute happens, P&L now looks
+    # healthy, but the session latch must still hold (once flattened, never
+    # un-flattened this session).
+    clock.advance(minutes=1)
+    recomputed = asyncio.run(manager.book_actions())
+    assert recomputed.should_flatten is True
+
+
+def test_book_actions_non_ok_decisions_always_emit_uncapped(tmp_path) -> None:
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(tmp_path, clock)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    # -4% of 10000 = -400, breaches both tiers -> every re-evaluation reports "flatten".
+    trade = _closed_live_trade("T1", deployment_id="dep1", entry=8.0, exit_=4.0, exit_at=NOW)
+    asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+    asyncio.run(manager.trade_state_repository.mark_closed("T1", exit_price=4.0, exit_filled_quantity=1, exit_filled_at=NOW))
+
+    # 5 evaluations, each in a DIFFERENT minute (so the evaluate-cache does
+    # not collapse them) -- every one must emit, well under the 10-minute
+    # "ok" heartbeat window that would otherwise cap them.
+    for _ in range(5):
+        asyncio.run(manager.book_actions())
+        clock.advance(minutes=1)
+
+    decisions = _events(db_path, "risk_manager_decision")
+    assert len(decisions) == 5
+    assert all(d["payload"]["decision"] == "flatten" for d in decisions)
+
+
+def test_book_actions_ok_decision_emits_on_state_change(tmp_path) -> None:
+    """A halt->ok or ok->halt transition must emit immediately even if it
+    happens well inside the 10-minute ok-heartbeat window."""
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(tmp_path, clock)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+
+    # Minute 0: healthy book -> "ok".
+    first = asyncio.run(manager.book_actions())
+    assert first.rail_a.reason is None
+
+    # Minute 1: book now breaches tier1 -> "halt". Must emit even though
+    # only 1 minute has passed since the last "ok" heartbeat.
+    clock.advance(minutes=1)
+    trade = _closed_live_trade("T1", deployment_id="dep1", entry=5.0, exit_=2.5, exit_at=NOW)
+    asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+    asyncio.run(manager.trade_state_repository.mark_closed("T1", exit_price=2.5, exit_filled_quantity=1, exit_filled_at=NOW))
+    second = asyncio.run(manager.book_actions())
+    assert second.rail_a.halted is True
+
+    decisions = _events(db_path, "risk_manager_decision")
+    assert [d["payload"]["decision"] for d in decisions] == ["ok", "halt"]
+
+
+def test_book_actions_ok_heartbeat_emits_once_per_ten_minutes(tmp_path) -> None:
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(tmp_path, clock)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+
+    # 15 one-minute ticks, all steady "ok" -- expect a heartbeat at minute 0
+    # and minute 10 only (the 10-minute window), i.e. 2 rows, not 15.
+    for _ in range(15):
+        asyncio.run(manager.book_actions())
+        clock.advance(minutes=1)
+
+    decisions = _events(db_path, "risk_manager_decision")
+    assert all(d["payload"]["decision"] == "ok" for d in decisions)
+    assert len(decisions) == 2
+
+
+def test_book_actions_net_daily_ok_row_volume_is_low(tmp_path) -> None:
+    """Sanity check on the net effect: ~6.5 evaluation hours (13 symbols x 1
+    call/min for 390 minutes each, collapsed by the minute cache to 390
+    evaluations) of a steady healthy book should produce ~40 ok-rows/day
+    (one per 10-minute heartbeat), not ~5000."""
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(tmp_path, clock)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+
+    trading_day_minutes = 390  # one 6.5h US equity/options session
+    symbols_per_minute = 13
+    for _minute in range(trading_day_minutes):
+        for _symbol in range(symbols_per_minute):
+            asyncio.run(manager.book_actions())
+        clock.advance(minutes=1)
+
+    decisions = _events(db_path, "risk_manager_decision")
+    assert all(d["payload"]["decision"] == "ok" for d in decisions)
+    # 390 minutes / 10-minute heartbeat -> 39 rows (minute 0, 10, ..., 380).
+    assert len(decisions) == 39

@@ -60,6 +60,18 @@ TIER1_HALT_REASON = "risk_rail_a_tier1_halt"
 TIER2_FLATTEN_REASON = "risk_rail_a_tier2_flatten"
 RAIL_B_DEMOTED_REASON = "risk_rail_b_demoted"
 
+# book_actions() is called once per SYMBOL-bar from BhikshaRuntime._handle_bar_event
+# (13 symbols x ~1 call/min => ~13x more Rail-A evaluations and event rows than
+# needed -- Rail A is a BOOK-level check, not a per-symbol one). Throttle
+# constants (2026-07-02 noise-reduction pass, see risk-noise branch):
+#   - re-evaluate Rail A at most once per wall-clock minute (matches the
+#     1-minute bar cadence -- a new breach is still caught within ~1 tick).
+#   - emit an "ok" risk_manager_decision heartbeat at most once per 10
+#     minutes OR immediately on any decision/state change; halt/flatten
+#     (non-ok) decisions always emit, uncapped.
+_EVALUATE_THROTTLE_SECONDS = 60
+_OK_HEARTBEAT_SECONDS = 600
+
 
 def _is_live_trade(trade: TradeRecord) -> bool:
     return trade.entry_order_id != SHADOW_ENTRY_ORDER_ID
@@ -168,6 +180,18 @@ class RiskManager:
         self._session_demoted_ids: set[str] = set()
         self._notified_tier1 = False
         self._notified_tier2 = False
+        # Rail-A evaluate-throttle cache (see _EVALUATE_THROTTLE_SECONDS):
+        # book_actions() is called once per symbol-bar (13x/minute) but Rail A
+        # is a book-level check -- cache the result for the rest of the
+        # wall-clock minute instead of recomputing/re-notifying per symbol.
+        self._book_actions_cache_minute: int | None = None
+        self._book_actions_cache_result: BookActionsResult | None = None
+        # "ok" event heartbeat throttle (see _OK_HEARTBEAT_SECONDS): always
+        # emit on a decision/state change or a non-ok decision; otherwise cap
+        # "ok" rows to one per heartbeat window so the event log stays
+        # readable without losing the halt/flatten/change signal.
+        self._last_emitted_decision: str | None = None
+        self._last_ok_heartbeat_at: datetime | None = None
 
     async def startup_log(self) -> None:
         """Emit the one startup event proving resolved knobs (env > sheet > default)."""
@@ -273,7 +297,29 @@ class RiskManager:
         limited to one notification per tier per session (see
         ``_notified_tier1``/``_notified_tier2``) so this is safe to call once
         per tick-batch without spamming Telegram.
+
+        EVALUATE THROTTLE: this is called once per SYMBOL-bar by
+        ``BhikshaRuntime._handle_bar_event`` (13 symbols/minute in
+        production), but Rail A is a BOOK-level check -- recomputing it 13x
+        a minute is redundant. Cache the result per wall-clock minute (from
+        ``self._now_fn()``, the same clock ``_compute_rail_a_status`` already
+        uses -- not bar-timestamp parsing) and return the cached
+        ``BookActionsResult`` for any call within the same minute. A new
+        breach is still caught within ~1 minute worst case, matching the
+        1-minute bar cadence this already ran at. The flatten latch itself
+        (``_session_flattened``) is untouched by the cache: once set it
+        never clears, cached or not.
         """
+        minute_key = int(self._now_fn().timestamp() // _EVALUATE_THROTTLE_SECONDS)
+        if self._book_actions_cache_minute == minute_key and self._book_actions_cache_result is not None:
+            return self._book_actions_cache_result
+
+        result = await self._book_actions_uncached()
+        self._book_actions_cache_minute = minute_key
+        self._book_actions_cache_result = result
+        return result
+
+    async def _book_actions_uncached(self) -> BookActionsResult:
         status = await self._compute_rail_a_status()
         if status.active and status.halted:
             self._session_halted = True
@@ -284,20 +330,38 @@ class RiskManager:
         # Rail A is INACTIVE (missing budget day / query failure); do not
         # double-log here, just report the tick's ok/halt/flatten decision
         # while Rail A is actually active and evaluated.
+        #
+        # EVENT-ROW POLICY (2026-07-02 noise-reduction pass): non-ok
+        # decisions (halt/flatten) and any decision/state CHANGE always
+        # emit, uncapped -- that is the actionable signal. A repeated "ok"
+        # decision is a heartbeat/proof-of-life row, capped to once per
+        # _OK_HEARTBEAT_SECONDS so the event log stays readable.
         if status.active:
-            await self.event_repository.append(
-                "risk_manager_decision",
-                {
-                    "rail": "A",
-                    "decision": "flatten" if status.flatten else ("halt" if status.halted else "ok"),
-                    "active": status.active,
-                    "realized_live_pnl_usd": status.realized_live_pnl_usd,
-                    "usable_budget": status.usable_budget,
-                    "halt_threshold_usd": status.halt_threshold_usd,
-                    "flatten_threshold_usd": status.flatten_threshold_usd,
-                    "trade_date": status.trade_date,
-                },
+            decision = "flatten" if status.flatten else ("halt" if status.halted else "ok")
+            changed = decision != self._last_emitted_decision
+            now = self._now_fn()
+            heartbeat_due = (
+                self._last_ok_heartbeat_at is None
+                or (now - self._last_ok_heartbeat_at).total_seconds() >= _OK_HEARTBEAT_SECONDS
             )
+            should_emit = decision != "ok" or changed or heartbeat_due
+            if should_emit:
+                await self.event_repository.append(
+                    "risk_manager_decision",
+                    {
+                        "rail": "A",
+                        "decision": decision,
+                        "active": status.active,
+                        "realized_live_pnl_usd": status.realized_live_pnl_usd,
+                        "usable_budget": status.usable_budget,
+                        "halt_threshold_usd": status.halt_threshold_usd,
+                        "flatten_threshold_usd": status.flatten_threshold_usd,
+                        "trade_date": status.trade_date,
+                    },
+                )
+                self._last_emitted_decision = decision
+                if decision == "ok":
+                    self._last_ok_heartbeat_at = now
 
         if status.active and status.halted and not self._notified_tier1:
             self._notified_tier1 = True
