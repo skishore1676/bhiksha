@@ -34,10 +34,37 @@ override.
 
 Two-tier daily drawdown on realized live P&L vs usable budget — tier-1 halts new entries, tier-2
 flattens the book — plus per-deployment auto-demote (rolling-10 negative expectancy → forced
-shadow via a local `DemotionStore`; re-promotion is a deliberate operator edit). Knobs are env
-vars (`BHIKSHA_RISK_*`), validated at startup with warnings surfaced in the `risk_manager_startup`
-event. Every consult emits a `risk_manager_decision` event (throttled to state-changes + heartbeat
-so the stream stays readable).
+shadow via a local `DemotionStore`; re-promotion is a deliberate operator edit). Knobs resolve
+`env > Operator_Defaults_v1 sheet > default` (see `bhiksha.risk.risk_settings.resolve_risk_settings`),
+validated at startup with warnings surfaced in the `risk_manager_startup` event. Every consult
+emits a `risk_manager_decision` event (throttled to state-changes + heartbeat so the stream stays
+readable). The daily session report's **Risk Rails** section renders the resolved thresholds
+(pct and $, the $ figure computed against that day's usable budget), the demote window/min_n/
+threshold, rail enabled flags, and any validation warnings.
+
+### Operator-editable risk knobs (`Operator_Defaults_v1` sheet)
+
+Env vars always win. To make a knob operator-editable without a deploy, add a row to the
+`Operator_Defaults_v1` Google Sheet tab with `section=default` and one of these `key` values
+(`value` is the raw knob value, same format as the env var):
+
+| Sheet `key`                    | Env var                                     | Default |
+|---------------------------------|----------------------------------------------|---------|
+| `max_daily_drawdown_pct`        | `BHIKSHA_RISK_MAX_DAILY_DRAWDOWN_PCT`         | `2.0`   |
+| `flatten_daily_drawdown_pct`    | `BHIKSHA_RISK_FLATTEN_DAILY_DRAWDOWN_PCT`     | `3.0`   |
+| `demote_window`                 | `BHIKSHA_RISK_DEMOTE_WINDOW`                  | `10`    |
+| `demote_min_n`                  | `BHIKSHA_RISK_DEMOTE_MIN_N`                   | `10`    |
+| `demote_threshold_usd`          | `BHIKSHA_RISK_DEMOTE_THRESHOLD_USD`           | `0.0`   |
+| `rail_a_enabled`                | `BHIKSHA_RISK_RAIL_A_ENABLED`                 | `true`  |
+| `rail_b_enabled`                | `BHIKSHA_RISK_RAIL_B_ENABLED`                 | `true`  |
+
+These keys are exactly the env var name with the `BHIKSHA_RISK_` prefix stripped and
+lowercased — see `bhiksha.risk.plan_operator_defaults_source` for the concrete `SettingsSource`
+and the exact derivation it must match. The sheet is read once at plan-compile time (it is
+carried on the compiled `active_plan.json` as `operator_defaults`, not re-read live), so a sheet
+edit takes effect on the next plan sync/session start — same cadence as any other
+`Operator_Defaults_v1` row. Sheet values pass through the same validation/clamping as env values;
+an invalid value falls back to the default and is reported in `validation_warnings`.
 
 ## Where to look
 

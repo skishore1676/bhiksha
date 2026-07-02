@@ -70,6 +70,7 @@ def build_daily_report(
         conn.row_factory = sqlite3.Row
         events = _load_day_events(conn, day)
         trades = _load_day_trades(conn, day)
+        risk_rails = _risk_rails_summary(conn, day, events)
 
     event_counts = Counter(event["event_type"] for event in events)
     provider_events = _provider_events(events)
@@ -125,6 +126,7 @@ def build_daily_report(
         "data_quality_warnings": data_quality_warnings,
         "profile_exit_summary": profile_exit_summary,
         "relaxed_evidence_lanes": relaxed_evidence_lanes,
+        "risk_rails": risk_rails,
         "status": _report_status(
             provider_events=provider_events,
             data_quality_warnings=data_quality_warnings,
@@ -245,6 +247,41 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Runtime Issues"])
         for category, count in sorted(runtime_issue_counts.items()):
             lines.append(f"- `{category}`: `{count}`")
+
+    # --- Risk rails section (operator-audit P3) ---------------------------
+    risk_rails = report.get("risk_rails")
+    if risk_rails:
+        lines.extend(["", "## Risk Rails"])
+        lines.append(
+            "- rails: "
+            f"`rail-A(halt) {'on' if risk_rails.get('rail_a_enabled') else 'off'}, "
+            f"rail-B(demote) {'on' if risk_rails.get('rail_b_enabled') else 'off'}`"
+        )
+        usable_budget = risk_rails.get("usable_budget_usd")
+        budget_text = f"${usable_budget:,.2f}" if usable_budget is not None else "unknown"
+        lines.append(f"- usable budget: `{budget_text}`")
+        lines.append(
+            "- tier-1 halt (new entries): "
+            f"`{_fmt_pct(risk_rails.get('max_daily_drawdown_pct'))} "
+            f"({_fmt_money_or_na(risk_rails.get('max_daily_drawdown_usd'))})`"
+        )
+        lines.append(
+            "- tier-2 flatten (book): "
+            f"`{_fmt_pct(risk_rails.get('flatten_daily_drawdown_pct'))} "
+            f"({_fmt_money_or_na(risk_rails.get('flatten_daily_drawdown_usd'))})`"
+        )
+        lines.append(
+            "- auto-demote: "
+            f"`window {risk_rails.get('demote_window')}, "
+            f"min_n {risk_rails.get('demote_min_n')}, "
+            f"threshold {_fmt_money_or_na(risk_rails.get('demote_threshold_usd'))}`"
+        )
+        rail_warnings = risk_rails.get("validation_warnings") or []
+        if rail_warnings:
+            lines.append(f"- validation warnings: `{len(rail_warnings)}`")
+            for warning in rail_warnings:
+                lines.append(f"  - {warning}")
+    # --- end risk rails section ---------------------------------------------
 
     return "\n".join(lines) + "\n"
 
@@ -367,6 +404,7 @@ def _empty_report(day: date) -> dict[str, Any]:
         "data_quality_warnings": [],
         "profile_exit_summary": {"count": 0, "rule_counts": {}},
         "relaxed_evidence_lanes": [],
+        "risk_rails": None,
         "status": {"level": "NO_DATA", "reason": "db_missing"},
     }
 
@@ -386,6 +424,57 @@ def _load_day_events(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
         payload = _safe_json(row["payload"])
         events.append({"created_at": row["created_at"], "event_type": row["event_type"], "payload": payload})
     return events
+
+
+# --- Risk rails section (operator-audit P3) -------------------------------
+# Reads the day's resolved risk-manager thresholds from the
+# ``risk_manager_startup`` event (payload == ``RiskSettings.to_dict()``,
+# emitted once at session start by ``RiskManager.startup_log``) and renders
+# pct thresholds as $ amounts by joining the day's ``cash_budget_days`` row
+# (``usable_budget``). Self-contained: safe to read as one block when
+# resolving merge conflicts against other daily_report.py edits.
+def _risk_rails_summary(conn: sqlite3.Connection, day: date, events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    settings_payload: dict[str, Any] | None = None
+    for event in events:
+        if event["event_type"] == "risk_manager_startup":
+            settings_payload = event["payload"] or {}
+    if settings_payload is None:
+        return None
+
+    usable_budget = _load_day_usable_budget(conn, day)
+    max_dd_pct = _maybe_float(settings_payload.get("max_daily_drawdown_pct"))
+    flatten_dd_pct = _maybe_float(settings_payload.get("flatten_daily_drawdown_pct"))
+
+    def _pct_to_usd(pct: float | None) -> float | None:
+        if pct is None or usable_budget is None:
+            return None
+        return _round_money((pct / 100.0) * usable_budget)
+
+    return {
+        "rail_a_enabled": bool(settings_payload.get("rail_a_enabled", True)),
+        "rail_b_enabled": bool(settings_payload.get("rail_b_enabled", True)),
+        "usable_budget_usd": _round_money(usable_budget) if usable_budget is not None else None,
+        "max_daily_drawdown_pct": max_dd_pct,
+        "max_daily_drawdown_usd": _pct_to_usd(max_dd_pct),
+        "flatten_daily_drawdown_pct": flatten_dd_pct,
+        "flatten_daily_drawdown_usd": _pct_to_usd(flatten_dd_pct),
+        "demote_window": _maybe_int(settings_payload.get("demote_window")),
+        "demote_min_n": _maybe_int(settings_payload.get("demote_min_n")),
+        "demote_threshold_usd": _maybe_float(settings_payload.get("demote_threshold_usd")),
+        "validation_warnings": list(settings_payload.get("validation_warnings") or []),
+    }
+
+
+def _load_day_usable_budget(conn: sqlite3.Connection, day: date) -> float | None:
+    tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "cash_budget_days" not in tables:
+        return None
+    row = conn.execute(
+        "SELECT usable_budget FROM cash_budget_days WHERE trade_date = ?",
+        (day.isoformat(),),
+    ).fetchone()
+    return _maybe_float(row["usable_budget"]) if row is not None else None
+# --- end risk rails section -------------------------------------------------
 
 
 def _load_day_trades(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
@@ -757,3 +846,18 @@ def _round_money(value: float) -> float:
 def _fmt_money(value: Any) -> str:
     number = _maybe_float(value)
     return "" if number is None else f"{number:.2f}"
+
+
+# --- Risk rails formatting helpers (operator-audit P3) ---------------------
+def _fmt_pct(value: Any) -> str:
+    number = _maybe_float(value)
+    return "n/a" if number is None else f"{number:.2f}%"
+
+
+def _fmt_money_or_na(value: Any) -> str:
+    number = _maybe_float(value)
+    if number is None:
+        return "n/a"
+    sign = "-" if number < 0 else ""
+    return f"{sign}${abs(number):,.2f}"
+# --- end risk rails formatting helpers --------------------------------------

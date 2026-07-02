@@ -4,20 +4,19 @@ Mirrors the resolution style already used for cash-guard knobs
 (``bhiksha.risk.cash_guard.cash_guard_mode`` /
 ``cash_guard_buffer_pct``): a plain ``os.getenv`` read with a typed default,
 no framework. The one addition here is a documented ``SettingsSource`` seam
-for a future operator-sheet layer, plus a single ``resolve_risk_settings()``
+for the operator-sheet layer, plus a single ``resolve_risk_settings()``
 call so the runtime can log the resolved values once at startup (see
 ``risk_manager_startup`` event emitted by callers of this module).
 
-Operator-sheet layer: as of this build there is NO live-runtime settings read
-from the Google Sheet at session start (the only sheet-driven "operator
-defaults" path in this repo -- ``load_operator_defaults_sheet_rows`` /
-``Operator_Defaults_v1`` in ``bhiksha.active_plan.compiler`` -- is a
-strategy-catalog-sync-time input, not something the running session
-re-reads). Adding a new Sheet dependency purely for risk thresholds was
-explicitly out of scope for this build. ``SettingsSource`` below is the
-documented extension point: implement it against that same worksheet
-pattern (a "section"/"key"/"value" tab, read once at startup) when the
-operator wants sheet-editable risk knobs instead of env vars.
+Operator-sheet layer: the concrete implementation is
+``bhiksha.risk.plan_operator_defaults_source.PlanOperatorDefaultsSource``. It
+does NOT add a new network read at live-session start -- it wraps the
+``operator_defaults`` dict already carried on the compiled ``active_plan.json``
+(populated from the ``Operator_Defaults_v1`` Google Sheet tab -- see
+``load_operator_defaults_sheet_rows`` / ``ActivePlan.operator_defaults`` in
+``bhiksha.active_plan.compiler`` / ``bhiksha.config.models``), which is
+already synced well before the session starts. See that module's docstring
+for the exact sheet key names the operator adds as rows.
 """
 
 from __future__ import annotations
@@ -28,17 +27,16 @@ from typing import Protocol
 
 
 class SettingsSource(Protocol):
-    """Future operator-sheet settings layer (TODO, not implemented).
+    """Operator-sheet settings layer consulted between env and default.
 
-    Precedence is env > operator-sheet > default. A concrete implementation
-    would read a small "section=risk,key=...,value=..." worksheet (the same
-    shape as ``Operator_Defaults_v1``) once at startup and return a flat
-    dict of ``BHIKSHA_RISK_*``-shaped keys (without the env prefix) for
-    ``resolve_risk_settings`` to consult between env and the hardcoded
-    default. Left unimplemented deliberately: wiring a new Sheet read into
-    the live session start path is a real product decision (extra network
-    dependency at startup, extra failure mode) that the operator should
-    make explicitly, not something a risk-rails patch should smuggle in.
+    Precedence is env > operator-sheet > default. The concrete
+    implementation, ``PlanOperatorDefaultsSource`` (see
+    ``bhiksha.risk.plan_operator_defaults_source``), wraps the
+    ``operator_defaults`` dict already carried on the compiled active plan --
+    a flat "section=default" projection of the ``Operator_Defaults_v1``
+    worksheet -- and returns values for ``BHIKSHA_RISK_*``-shaped keys
+    (without the env prefix, lowercased) for ``resolve_risk_settings`` to
+    consult between env and the hardcoded default.
     """
 
     def get(self, key: str) -> str | None:
@@ -83,10 +81,12 @@ _DEFAULT_DEMOTE_THRESHOLD_USD = 0.0
 def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> RiskSettings:
     """Resolve every risk-manager knob once: env > operator-sheet > default.
 
-    ``settings_source`` is the ``SettingsSource`` hook described above; it is
-    ``None`` in every current call site (no Sheet layer exists yet), which
-    makes this degrade to env > default -- identical to the rest of the
-    repo's env-resolved knobs.
+    ``settings_source`` is the ``SettingsSource`` hook described above. The
+    live runtime passes a ``PlanOperatorDefaultsSource`` built from the
+    session's compiled active plan (see ``BhikshaRuntime.run_session`` in
+    ``bhiksha.app.runtime``); other callers (tests, one-off scripts) may
+    still omit it, which degrades this to env > default -- identical to the
+    rest of the repo's env-resolved knobs.
 
     VALIDATION (audit fix 2026-07-02): values are range-checked and
     cross-checked; anything rejected falls back to the safe default and is
