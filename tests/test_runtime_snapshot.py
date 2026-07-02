@@ -32,7 +32,7 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
         }
     )
     assert {selection["symbol"] for selection in snapshot["bias_inputs"]} >= {"IWM", "TSLA"}
-    assert snapshot["emergency_controls"] == {"halt_and_flatten": False}
+    assert snapshot["emergency_controls"] == {"halt_and_flatten": False, "risk_manager_flatten": False}
     assert snapshot["deployment_selection"]["mode"] == "prefer_generated"
     deployment_ids = {deployment["deployment_id"] for deployment in snapshot["deployments"]}
     assert "market_impulse_qqq_short_v1" not in deployment_ids
@@ -220,6 +220,62 @@ def test_runtime_reload_bias_controls_updates_intraday_emergency_flag(tmp_path: 
 
     assert changed is True
     assert runtime.halt_and_flatten is True
+
+
+def test_risk_manager_flatten_survives_bias_control_reload(tmp_path: Path) -> None:
+    """Regression: risk_manager_flatten must NOT be clobbered by the bias-inputs
+    reload. ``_refresh_intraday_bias_controls`` unconditionally overwrites
+    ``runtime.halt_and_flatten`` from bias_inputs.yaml every bar; a Rail-A
+    tier-2 flatten must survive on a SEPARATE flag or it would silently
+    un-flatten on the very next tick even though the drawdown breach is still
+    real. See BhikshaRuntime.risk_manager_flatten / _handle_bar_event's
+    ``effective_halt_and_flatten = self.halt_and_flatten or self.risk_manager_flatten``.
+    """
+    config_root = tmp_path / "config"
+    deployments_root = config_root / "deployments"
+    deployments_root.mkdir(parents=True)
+    bias_inputs_path = tmp_path / "research" / "bias_inputs.yaml"
+    bias_inputs_path.parent.mkdir(parents=True)
+    (config_root / "app.yaml").write_text(
+        yaml.safe_dump({"app_name": "bhiksha", "bias_inputs_path": "research/bias_inputs.yaml"}, sort_keys=False),
+        encoding="utf-8",
+    )
+    (config_root / "providers.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "underlying_live_primary": "polygon",
+                "underlying_backfill_primary": "polygon",
+                "execution_broker_primary": "public",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    bias_inputs_path.write_text(
+        yaml.safe_dump({"emergency": {"halt_and_flatten": False}, "selections": []}, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    runtime = build_runtime(config_root)
+    runtime.risk_manager_flatten = True  # simulate a Rail-A tier-2 breach already latched this session
+
+    class StubRepo:
+        async def append(self, event_type: str, payload: dict) -> None:
+            return None
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.event_repository = StubRepo()
+
+    # bias_inputs.yaml still says False -> a bare reload would reset
+    # halt_and_flatten to False. risk_manager_flatten must be untouched by
+    # this call (it is not bias_inputs-controlled) and the OR'd
+    # effective flag callers compute must remain True.
+    asyncio.run(runtime._refresh_intraday_bias_controls(supervisor=StubSupervisor(), output=lambda _: None))
+
+    assert runtime.halt_and_flatten is False
+    assert runtime.risk_manager_flatten is True
+    assert (runtime.halt_and_flatten or runtime.risk_manager_flatten) is True
 
 
 def test_manual_intrabar_loop_records_fetch_errors_without_crashing() -> None:

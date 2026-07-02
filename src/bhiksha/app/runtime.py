@@ -52,6 +52,8 @@ from bhiksha.ops.daily_report import write_daily_report
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.risk.cash_guard import CashGuard
+from bhiksha.risk.risk_manager import RiskManager
+from bhiksha.risk.risk_settings import resolve_risk_settings
 from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
@@ -115,6 +117,17 @@ class BhikshaRuntime:
     _live_entry_failure_counts: dict[str, int] = field(default_factory=dict, init=False)
     _live_entry_success_ids: set[str] = field(default_factory=set, init=False)
     _dead_lane_alerted_ids: set[str] = field(default_factory=set, init=False)
+    # RISK MANAGER: constructed once per run_session (needs the same sqlite
+    # backend as the rest of the runtime), None until then. See
+    # bhiksha.risk.risk_manager.RiskManager.
+    risk_manager: RiskManager | None = field(default=None, init=False)
+    # Session-latched separately from ``halt_and_flatten`` (which is reloaded
+    # from ``bias_inputs.yaml`` every bar by ``_refresh_intraday_bias_control``
+    # and would otherwise silently clear a Rail-A-triggered flatten back to
+    # False on the very next tick). Once True, stays True for the rest of the
+    # session; only an operator restart (or editing bias_inputs.yaml, which
+    # ORs in independently) changes it.
+    risk_manager_flatten: bool = field(default=False, init=False)
 
     @property
     def enabled_deployments(self) -> list[DeploymentManifest]:
@@ -220,6 +233,13 @@ class BhikshaRuntime:
         event_repository = SQLiteEventRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         trade_state_repository = SQLiteTradeStateRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         cash_budget_repository = SQLiteCashBudgetRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        self.risk_manager = RiskManager(
+            settings=resolve_risk_settings(),
+            cash_budget_repository=cash_budget_repository,
+            trade_state_repository=trade_state_repository,
+            event_repository=event_repository,
+        )
+        await self.risk_manager.startup_log()
         order_manager = OrderManager()
         planner = ExecutionPlanner(
             order_manager=order_manager,
@@ -587,6 +607,7 @@ class BhikshaRuntime:
             "bias_inputs": [selection.model_dump() for selection in self.bias_inputs],
             "emergency_controls": {
                 "halt_and_flatten": self.halt_and_flatten,
+                "risk_manager_flatten": self.risk_manager_flatten,
             },
             "session": {
                 "live": live,
@@ -697,8 +718,32 @@ class BhikshaRuntime:
         )
 
         emergency_changed = await self._refresh_intraday_bias_controls(supervisor=supervisor, output=output)
-        if emergency_changed or self.halt_and_flatten:
-            output(f"EMERGENCY_STATE halt_and_flatten={self.halt_and_flatten}")
+
+        # RISK MANAGER consult point: Rail A tick evaluation. book_actions()
+        # recomputes today's realized live P&L against the daily-drawdown
+        # thresholds and reports whether tier-2 (flatten) has been breached;
+        # it does not place or cancel any order itself. When it has, latch
+        # ``risk_manager_flatten`` -- a SEPARATE session flag from
+        # ``halt_and_flatten`` (which _refresh_intraday_bias_controls above
+        # reloads from bias_inputs.yaml every bar and would otherwise
+        # silently clear a Rail-A-triggered flatten back to False on the very
+        # next tick). Both flags OR together below into the SAME existing
+        # emergency-flat path (EmergencyBiasControl / halt_and_flatten_positions)
+        # -- no new order code. once-per-bar is the tick-batch rate limit;
+        # book_actions()/allow_entry() further latch their own operator
+        # notifications to once per session so this cannot spam.
+        if live and self.risk_manager is not None:
+            book_result = await self.risk_manager.book_actions()
+            if book_result.should_flatten and not self.risk_manager_flatten:
+                self.risk_manager_flatten = True
+                output(f"RISK_MANAGER_FLATTEN reason={book_result.flatten_reason}")
+
+        effective_halt_and_flatten = self.halt_and_flatten or self.risk_manager_flatten
+        if emergency_changed or effective_halt_and_flatten:
+            output(
+                f"EMERGENCY_STATE halt_and_flatten={self.halt_and_flatten} "
+                f"risk_manager_flatten={self.risk_manager_flatten}"
+            )
 
         async with sync_lock:
             tracker_positions = list(reconciliation_snapshot.positions)
@@ -733,7 +778,7 @@ class BhikshaRuntime:
             )
             output(f"SYNC positions={joined}")
 
-        if self.halt_and_flatten:
+        if effective_halt_and_flatten:
             emergency_enqueued = execution_dispatcher.submit(
                 bar.symbol,
                 key=f"emergency_flat:{bar.symbol}",
@@ -1456,13 +1501,24 @@ class BhikshaRuntime:
     ):
         async def runner() -> None:
             simulate_only = deployment.execution.shadow_only
+            # RISK MANAGER consult point (Rail A halt / Rail B demote). Evaluated
+            # lazily here -- once per actual entry attempt, not per bar -- so it
+            # is fresh at decision time and matches the "once per entry attempt"
+            # proof-event rate limit. Reconciliation's live_entry_block_reason
+            # (an infra-health gate) wins first if already set; the risk gate is
+            # a second, independent reason a live entry can be blocked.
+            entry_block_reason = live_entry_block_reason
+            if entry_block_reason is None and self.risk_manager is not None and live and not simulate_only:
+                risk_decision = await self.risk_manager.allow_entry(deployment.deployment_id)
+                if not risk_decision.allowed:
+                    entry_block_reason = risk_decision.reason
             try:
                 plan = await supervisor.handle_signal(
                     deployment,
                     decision,
                     dry_run=(not live) or simulate_only,
                     simulate_only=simulate_only,
-                    live_entry_block_reason=live_entry_block_reason,
+                    live_entry_block_reason=entry_block_reason,
                 )
             except Exception as exc:
                 if isinstance(exc, SelectorEmptyError):
