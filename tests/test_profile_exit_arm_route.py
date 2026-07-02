@@ -20,7 +20,8 @@ from datetime import UTC, datetime
 import pytest
 
 from bhiksha.config.models import AppConfig, DeploymentManifest, ExitSpec
-from bhiksha.domain.models import ExitDecision
+from bhiksha.domain.enums import SignalDirection
+from bhiksha.domain.models import ExitDecision, TradePlan
 from bhiksha.execution.order_manager import OrderResult, PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.execution.profile_exit_shadow import ProfileExitDispatchError
@@ -98,11 +99,20 @@ def _profile_deployment(
     runtime_mode: str | None,
     target_1_quantity: float = 1.0,
     target_2_r: float = 2.0,
+    shadow_only: bool = False,
+    use_profit_target: bool = False,
+    option_profit_target_pct: float | None = None,
 ):
     """A v2 operator exit profile pinned onto the base deployment.
 
     ``target_1_quantity`` 1.0 -> a full SQUARE_OFF at T1; 0.5 -> a PARTIAL_SCALE
     (bank 1 of a 2-lot) which arms breakeven for a later STOP_TO_BREAKEVEN tick.
+
+    ``shadow_only`` mirrors ``deployment.execution.shadow_only`` (e.g. the MU
+    lane) — a deployment-level dry-run-everything flag INDEPENDENT of
+    ``profile_exit_drives_live``. ``use_profit_target``/``option_profit_target_pct``
+    pin a legacy full-size resting target (e.g. NVDA/AMD's +35%) for the
+    profile-owns-profit-taking suppression tests.
     """
     base = _enabled_deployment(BASE_DEPLOYMENT_ID)
     exit_spec = base.exit.model_copy(
@@ -118,9 +128,11 @@ def _profile_deployment(
             "high_water_giveback_policy": "OFF",
             "breakeven_after_t1": True,
             "eod_flat": False,
+            "use_profit_target": use_profit_target,
+            "option_profit_target_pct": option_profit_target_pct,
         }
     )
-    execution = base.execution.model_copy(update={"runtime_mode": runtime_mode})
+    execution = base.execution.model_copy(update={"runtime_mode": runtime_mode, "shadow_only": shadow_only})
     return DeploymentManifest(
         deployment_id=base.deployment_id,
         enabled=True,
@@ -494,3 +506,148 @@ def test_armed_dispatch_failure_surfaces_runtime_issue_and_does_not_false_manage
     assert _events_of_type(repo, "profile_exit_shadow_error") == []
     # The position was NOT falsely closed/managed: it is still tracked.
     assert len(sup.planner.position_tracker.active_positions()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 5. OPERATOR RULE (2026-07-02): when the profile-exit route owns a
+#    deployment's exits, NO full-size profit target is armed — neither the
+#    resting broker order nor the virtual-target machinery. The protective
+#    STOP is unaffected. Motivated by NVDA/AMD 2026-07-02: a resting target at
+#    option_profit_target_pct filled broker-side before the ladder could bank
+#    its T1 partial, so the T2 runner never happened.
+# --------------------------------------------------------------------------- #
+
+
+def _entry_plan(deployment: DeploymentManifest, *, entry_price: float = 2.0) -> TradePlan:
+    return TradePlan(
+        trade_id="TRADE_RULE",
+        deployment_id=deployment.deployment_id,
+        symbol=deployment.symbol,
+        direction=SignalDirection.SHORT,
+        option_symbol=OPTION,
+        quantity=2,
+        estimated_entry_price=entry_price,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_RULE",
+    )
+
+
+def test_armed_live_profile_deployment_suppresses_profit_target_on_entry(tmp_path) -> None:
+    """THE RULE. An armed live deployment (drives_live, live_approval_gated,
+    NOT shadow_only, carries a profile) that ALSO configures a legacy full-size
+    resting target (NVDA/AMD's option_profit_target_pct=0.35 shape): the entry
+    flow must NOT place/arm any target, but MUST still place the protective
+    stop, and must emit exactly one profit_target_suppressed event."""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(
+        drives_live=True,
+        runtime_mode="live_approval_gated",
+        shadow_only=False,
+        use_profit_target=True,
+        option_profit_target_pct=0.35,
+    )
+    assert dep.execution.shadow_only is False
+
+    # The gate itself: _profit_target_configured must be False for this deployment.
+    from bhiksha.execution.supervisor import _profit_target_configured, _profile_owns_profit_taking
+
+    assert _profile_owns_profit_taking(dep) is True
+    assert _profit_target_configured(dep) is False
+
+    plan = _entry_plan(dep)
+    protected = asyncio.run(sup._protect_live_entry(plan, dep))
+
+    # NO target armed or placed.
+    assert protected.target_order_id is None
+    tracked = sup.planner.position_tracker.active_positions()[0]
+    assert tracked.target_order_id is None
+    assert tracked.target_price is None
+    assert not any(c[0] == "place_target" for c in om.calls)
+    assert _events_of_type(repo, "profit_target_submission") == []
+    assert _events_of_type(repo, "profit_target_armed") == []
+
+    # The protective STOP IS still placed (this rule never touches the stop).
+    assert protected.stop_order_id is not None
+    assert tracked.stop_order_id == protected.stop_order_id
+    stop_events = _events_of_type(repo, "protective_stop_submission")
+    assert len(stop_events) == 1
+    assert stop_events[0]["stop_order_id"] == protected.stop_order_id
+    assert any(c[0] == "place_stop" for c in om.calls)
+
+    # Exactly ONE profit_target_suppressed event, entry-frequency.
+    suppressed = _events_of_type(repo, "profit_target_suppressed")
+    assert len(suppressed) == 1
+    assert suppressed[0] == {
+        "deployment_id": dep.deployment_id,
+        "symbol": dep.symbol,
+        "reason": "profile_owns_profit_taking",
+    }
+
+
+def test_shadow_only_profile_deployment_keeps_profit_target_machinery(tmp_path) -> None:
+    """The MU-lane case: deployment.execution.shadow_only=True even though the
+    sheet still carries profile_exit_drives_live=true. The rule must NOT apply —
+    _profit_target_configured stays True and target machinery is unchanged."""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    dep = _profile_deployment(
+        drives_live=True,
+        runtime_mode="live_approval_gated",
+        shadow_only=True,
+        use_profit_target=True,
+        option_profit_target_pct=0.35,
+    )
+    assert dep.execution.shadow_only is True
+    assert dep.exit.profile_exit_drives_live is True
+
+    from bhiksha.execution.supervisor import _profit_target_configured, _profile_owns_profit_taking
+
+    assert _profile_owns_profit_taking(dep) is False
+    assert _profit_target_configured(dep) is True
+
+    plan = _entry_plan(dep)
+    protected = asyncio.run(sup._protect_live_entry(plan, dep))
+
+    # Target machinery unchanged: virtual target armed (broker here does not
+    # support concurrent exit orders, matching the base fixture's StubOrderManager).
+    assert protected.target_order_id is None
+    tracked = sup.planner.position_tracker.active_positions()[0]
+    assert tracked.target_price is not None
+    armed = _events_of_type(repo, "profit_target_armed")
+    assert len(armed) == 1
+    assert _events_of_type(repo, "profit_target_suppressed") == []
+
+
+def test_non_profile_deployment_profit_target_behavior_unchanged(tmp_path) -> None:
+    """A deployment WITHOUT a pinned exit profile: the rule never engages, target
+    machinery behaves exactly as before, and no suppression event is emitted."""
+    om = _CallRecordingOrderManager(bid=2.10)
+    sup, repo = _supervisor(tmp_path, om)
+    base = _enabled_deployment(BASE_DEPLOYMENT_ID)
+    dep = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_profit_target": True,
+                    "option_profit_target_pct": 0.35,
+                    "profile_exit_id": None,
+                }
+            )
+        }
+    )
+    assert dep.exit.profile_exit_id is None
+
+    from bhiksha.execution.supervisor import _profit_target_configured, _profile_owns_profit_taking
+
+    assert _profile_owns_profit_taking(dep) is False
+    assert _profit_target_configured(dep) is True
+
+    plan = _entry_plan(dep)
+    protected = asyncio.run(sup._protect_live_entry(plan, dep))
+
+    tracked = sup.planner.position_tracker.active_positions()[0]
+    assert tracked.target_price is not None
+    assert _events_of_type(repo, "profit_target_armed")
+    assert _events_of_type(repo, "profit_target_suppressed") == []
