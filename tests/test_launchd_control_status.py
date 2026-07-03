@@ -53,6 +53,28 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     assert snapshot["transport"]["status"] == "degraded"
 
 
+def test_runtime_status_parses_payload_and_returns_dict(monkeypatch, tmp_path) -> None:
+    # Regression: _runtime_status previously fell off the end without a return
+    # (its body had been misplaced after _bhiksha_python's return), so it always
+    # returned None even for a healthy runtime, leaving snapshot["runtime"] None.
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args[0] if args else ["status"],
+            0,
+            stdout='RUNTIME_STATUS={"running": true, "pid": 4242}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", fake_run)
+
+    runtime = launchd_status._runtime_status(repo_root=tmp_path)
+
+    assert runtime is not None
+    assert runtime["ok"] is True
+    assert runtime["return_code"] == 0
+    assert runtime["status"] == {"running": True, "pid": 4242}
+
+
 def test_launchd_job_writes_latest_status(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
 
