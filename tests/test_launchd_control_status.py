@@ -34,8 +34,11 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     }
     latest_status_path(tmp_path).parent.mkdir(parents=True)
     latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda: {})
-    monkeypatch.setattr("bhiksha.tools.launchd_status._runtime_status", lambda repo_root: {"ok": True, "status": {"running": True}})
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": True}},
+    )
 
     snapshot = launchd_status.build_status_snapshot(
         repo_root=tmp_path,
@@ -229,3 +232,92 @@ def test_runtime_status_handles_missing_runtime_line(monkeypatch, tmp_path) -> N
     assert result["ok"] is False
     assert result["return_code"] == 3
     assert result["status"] is None
+
+
+def test_launchd_state_probe_timeout_degrades_only_that_field(monkeypatch) -> None:
+    """One slow `launchctl print` must degrade only that job's launchd field to
+    an explicit "timeout" value; the other probes and the overall snapshot must
+    proceed normally (external callers kill the whole command at 20s)."""
+    from bhiksha.ops.launchd_registry import active_launchd_jobs
+
+    labels = [spec.label for spec in active_launchd_jobs()]
+    slow_label = labels[0]
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl")
+
+    def fake_run(command, **kwargs):
+        if slow_label in command[-1]:
+            raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout"))
+        return subprocess.CompletedProcess(
+            command, 0, stdout="state = running\nlast exit code = 0\n", stderr=""
+        )
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", fake_run)
+
+    state = launchd_status._launchd_state(deadline=launchd_status._Deadline(15.0))
+
+    assert state[slow_label]["state"] == "timeout"
+    assert state[slow_label]["loaded"] is None
+    assert state[slow_label]["available"] is True
+    for label in labels[1:]:
+        assert state[label]["loaded"] is True
+        assert state[label]["state"] == "running"
+
+
+def test_status_snapshot_survives_all_probes_timing_out(monkeypatch, tmp_path) -> None:
+    """TimeoutExpired from any subprocess probe (launchctl or server_session)
+    must never propagate; the snapshot stays valid same-schema JSON with
+    degraded field values."""
+    monkeypatch.setattr("bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl")
+
+    def always_timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", always_timeout)
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 5, 15, 0, tzinfo=UTC),
+        budget_seconds=15.0,
+    )
+
+    round_tripped = json.loads(json.dumps(snapshot, default=str))
+    assert round_tripped["schema"] == "bhiksha.launchd.status.v1"
+    for job in round_tripped["jobs"]:
+        assert job["launchd"]["state"] == "timeout"
+        assert job["launchd"]["loaded"] is None
+    assert round_tripped["runtime"]["ok"] is False
+    assert round_tripped["runtime"]["return_code"] is None
+    assert round_tripped["runtime"]["stderr_tail"].startswith("timeout:")
+
+
+def test_status_snapshot_deadline_exhaustion_short_circuits_to_not_checked(monkeypatch, tmp_path) -> None:
+    """With the overall budget exhausted, remaining probes must not run at all:
+    they short-circuit to explicit "not_checked" values and the snapshot
+    returns immediately as valid JSON."""
+    import time as _time
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl")
+
+    def must_not_run(command, **kwargs):
+        raise AssertionError("subprocess.run must not be called once the budget is exhausted")
+
+    monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", must_not_run)
+
+    started = _time.monotonic()
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 5, 15, 0, tzinfo=UTC),
+        budget_seconds=0.0,
+    )
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 2.0, f"snapshot took {elapsed:.2f}s despite exhausted budget"
+    round_tripped = json.loads(json.dumps(snapshot, default=str))
+    for job in round_tripped["jobs"]:
+        assert job["launchd"]["state"] == "not_checked"
+        assert job["launchd"]["loaded"] is None
+    assert round_tripped["runtime"]["ok"] is False
+    assert round_tripped["runtime"]["stderr_tail"].startswith("not_checked:")

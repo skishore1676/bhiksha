@@ -11,6 +11,10 @@ Purpose: keep a simple running record of what we changed, what we decided, and w
 
 ## Session Log
 
+### 2026-07-05
+
+- Bounded `bhiksha.tools.launchd_status` probes for external callers: each `launchctl print` / `server_session status` subprocess now catches `TimeoutExpired`/`OSError` and degrades only that field (`timeout`/`error`), and an overall 15s budget (env `BHIKSHA_STATUS_BUDGET_SECONDS`) short-circuits remaining probes to `not_checked`, so the status JSON always returns under lathi Control Tower's 20s kill; added root `RUNBOOK.md`. Verified: 34 launchd/alerts/report tests pass, 5 consecutive live runs 1.3-1.5s valid JSON.
+
 ### 2026-06-03
 
 Completed:
