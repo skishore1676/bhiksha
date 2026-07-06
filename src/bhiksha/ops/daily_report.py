@@ -16,10 +16,6 @@ if TYPE_CHECKING:
     from bhiksha.config.models import DeploymentManifest
 
 _OPTION_SYMBOL_RE = re.compile(r"^[A-Z]+\d{6}[CP](\d{8})$")
-# Single-name equities that legitimately trade at index-like price levels.
-# MU crossed $1T market cap in 2026-05 and trades ~$1,100+; the strike/underlying
-# ratio check above this allowlist still catches genuine quote-scaling errors.
-_HIGH_PRICE_SYMBOL_ALLOWLIST = {"SPY", "QQQ", "IWM", "SMH", "MU"}
 
 
 @dataclass(slots=True, frozen=True)
@@ -422,8 +418,6 @@ def _compact_deployment_id(value: Any) -> str:
 
 def _compact_warning_message(value: Any) -> str:
     message = str(value or "warning")
-    if "index-like underlying" in message and "quote scaling" in message:
-        return "quote-scaling check"
     if len(message) <= 72:
         return message
     return f"{message[:69]}..."
@@ -758,20 +752,6 @@ def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]
                 }
             )
             continue
-        symbol = str(trade.get("symbol") or "")
-        if symbol not in _HIGH_PRICE_SYMBOL_ALLOWLIST and underlying >= 500 and strike >= 500:
-            warnings.append(
-                {
-                    "trade_id": trade.get("trade_id"),
-                    "deployment_id": trade.get("deployment_id"),
-                    "symbol": symbol,
-                    "option_symbol": trade.get("option_symbol"),
-                    "underlying_entry_price": underlying,
-                    "option_strike": strike,
-                    "ratio": round(ratio, 4),
-                    "message": "single-name equity has index-like underlying and strike levels; check quote scaling before using this as promotion evidence",
-                }
-            )
     return warnings
 
 

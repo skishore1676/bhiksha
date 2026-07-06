@@ -100,7 +100,51 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
     assert report["trade_summary"]["shadow_realized_pnl_usd"] == 332.0
     assert report["provider_health"]["reconciliation"]["warning_count"] == 1
     assert report["lifecycle"]["target_approach_detected"] == 1
-    assert report["data_quality_warnings"][0]["symbol"] == "ACME"
+    assert report["data_quality_warnings"] == []
+    assert report["status"] == {"level": "YELLOW", "reason": "provider_warning"}
+
+
+def test_daily_report_flags_only_implausible_underlying_to_strike_ratio(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="normal-high-price",
+                deployment_id="meta_shadow",
+                symbol="META",
+                option_symbol="META260612C00580000",
+                quantity=1,
+                entry_price=1.0,
+                underlying_entry_price=585.0,
+                entry_timestamp=datetime(2026, 6, 3, 13, 39, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="SHADOW_ENTRY",
+            )
+        )
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="bad-scale",
+                deployment_id="bad_scale_shadow",
+                symbol="ACME",
+                option_symbol="ACME260612C00012000",
+                quantity=1,
+                entry_price=1.0,
+                underlying_entry_price=585.0,
+                entry_timestamp=datetime(2026, 6, 3, 13, 40, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="SHADOW_ENTRY",
+            )
+        )
+
+    asyncio.run(seed())
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+
+    assert [warning["trade_id"] for warning in report["data_quality_warnings"]] == ["bad-scale"]
+    assert report["data_quality_warnings"][0]["message"].startswith("underlying entry price is far from option strike")
     assert report["status"] == {"level": "YELLOW", "reason": "data_quality_warning"}
 
 
