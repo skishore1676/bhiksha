@@ -520,7 +520,9 @@ Phase 1 is working when all of these are true on oldmac:
    `com.bhiksha.*` jobs with no secrets and valid JSON.
 2. Control Tower renders the five Bhiksha jobs under the trading group.
 3. `session-report-now` from Control Tower causes Bhiksha to send a Telegram
-   session report and writes both:
+   session report using the Lathi Bus Telegram `status` template. The message is
+   a compact operator card; the full markdown report remains the detailed audit
+   artifact. The action also writes both:
    - a Bhiksha job result or report receipt;
    - a Lathi action journal entry.
 4. `schwab-guard-now` from Control Tower returns a healthy token receipt or a

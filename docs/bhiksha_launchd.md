@@ -46,6 +46,12 @@ manual Control Tower actions do not need to be duplicated in shell.
 Launchd cannot natively express market holidays, so the runner performs the
 trading-day check before doing work.
 
+The session report intentionally uses Lathi Bus's Telegram `status` template.
+Telegram gets a compact operator card: quick read, open positions, watch items,
+and a pointer to the full markdown report. The markdown artifact remains the
+long-form source for full strategy evidence, raw relaxed-gate details, lifecycle
+events, and risk-rail audit lines.
+
 ## Manual Runs
 
 All labels use one runner:

@@ -300,46 +300,48 @@ def render_daily_report_telegram_summary(
     open_positions = report.get("open_positions") or []
     lines = [
         f"Bhiksha Session Report - {report.get('trading_date')}",
-        f"Status: {status.get('level', 'UNKNOWN')} ({status.get('reason', 'ok')})",
+        "",
+        "Quick read",
+        f"- Status: {status.get('level', 'UNKNOWN')} ({status.get('reason', 'ok')})",
+        f"- Open: live {summary.get('live_open_count', 0)}, shadow {summary.get('shadow_open_count', 0)}",
         (
-            "Open: "
-            f"live {summary.get('live_open_count', 0)}, "
-            f"shadow {summary.get('shadow_open_count', 0)}, "
+            "- Protection: "
             f"protected {open_summary.get('protected_count', 0)}, "
             f"target active {open_summary.get('target_active_count', 0)}, "
             f"unprotected {open_summary.get('unprotected_count', 0)}, "
             f"exit pending {open_summary.get('exit_pending_count', 0)}"
         ),
         (
-            "P&L: "
+            "- P&L: "
             f"live ${summary.get('live_realized_pnl_usd', 0.0):.2f} "
             f"({summary.get('live_count', 0)} trades), "
             f"shadow ${summary.get('shadow_realized_pnl_usd', 0.0):.2f} "
             f"({summary.get('shadow_count', 0)} trades)"
         ),
         (
-            "Reconciliation: "
+            "- Reconciliation: "
             f"warn {provider.get('warning_count', 0)}, "
             f"degraded {provider.get('degraded_count', 0)}, "
             f"blocking {provider.get('blocking_count', 0)}"
         ),
     ]
+    watch_items: list[str] = []
     profile_exits = report.get("profile_exit_summary") or {}
     if profile_exits.get("count"):
         rules = ", ".join(sorted(profile_exits.get("rule_counts") or {}))
-        lines.append(f"Profile exits: {profile_exits['count']} ({rules})")
+        watch_items.append(f"Profile exits: {profile_exits['count']} ({rules})")
     relaxed_lanes = report.get("relaxed_evidence_lanes") or []
     for lane in relaxed_lanes:
-        gates = ", ".join(lane.get("evidence_gates_relaxed") or [])
-        lines.append(f"Shadow lanes on relaxed evidence: {lane.get('deployment_id')} [{gates}]")
+        gate_count = len(lane.get("evidence_gates_relaxed") or [])
+        gate_text = f"{gate_count} gate" if gate_count == 1 else f"{gate_count} gates"
+        watch_items.append(f"Relaxed shadow evidence: {_compact_deployment_id(lane.get('deployment_id'))} ({gate_text})")
     if open_positions:
-        lines.append("Open positions:")
+        lines.extend(["", "Open positions"])
         for position in open_positions[:3]:
             lines.append(
-                "- {lane} {symbol} {option} qty {qty}: entry {entry}, stop {stop}, target {target}, {protection}".format(
-                    lane=position.get("lane", ""),
+                "- {lane} {symbol} qty {qty}: entry {entry}, stop {stop}, target {target}, {protection}".format(
+                    lane=str(position.get("lane", "")).upper(),
                     symbol=position.get("symbol", ""),
-                    option=position.get("option_symbol") or "",
                     qty=position.get("quantity") or 0,
                     entry=_fmt_money(position.get("entry_price")) or "?",
                     stop=_fmt_money(position.get("stop_price")) or "?",
@@ -349,18 +351,36 @@ def render_daily_report_telegram_summary(
             )
         if len(open_positions) > 3:
             lines.append(f"- +{len(open_positions) - 3} more open")
+    else:
+        lines.extend(["", "Open positions", "- None"])
     if warnings:
         first = warnings[0]
         more = len(warnings) - 1
         suffix = f" +{more} more" if more else ""
-        lines.append(
+        watch_items.append(
             "Data quality: "
             f"{len(warnings)} warning(s); first={first.get('symbol')} "
             f"{first.get('message')}{suffix}"
         )
+    runtime_issues = (((report.get("provider_health") or {}).get("runtime_issue_counts")) or {})
+    if runtime_issues:
+        issue_text = ", ".join(f"{key} x{value}" for key, value in list(runtime_issues.items())[:3])
+        more = len(runtime_issues) - 3
+        if more > 0:
+            issue_text = f"{issue_text}, +{more} more"
+        watch_items.append(f"Runtime issue: {issue_text}")
+    risk_rails = report.get("risk_rails")
+    if risk_rails:
+        watch_items.append(
+            "Risk rails: "
+            f"halt {_fmt_pct(risk_rails.get('max_daily_drawdown_pct'))} "
+            f"({_fmt_money_or_na(risk_rails.get('max_daily_drawdown_usd'))}), "
+            f"flatten {_fmt_pct(risk_rails.get('flatten_daily_drawdown_pct'))} "
+            f"({_fmt_money_or_na(risk_rails.get('flatten_daily_drawdown_usd'))})"
+        )
     closed_trades = [item for item in trades if not _is_open_trade(item)]
     if closed_trades:
-        lines.append("Recent trades:")
+        lines.extend(["", "Recent closes"])
         for trade in closed_trades[:3]:
             lines.append(
                 "- {lane} {symbol} {option} qty {qty}: {entry}->{exit}, P&L ${pnl}".format(
@@ -375,9 +395,30 @@ def render_daily_report_telegram_summary(
             )
         if len(closed_trades) > 3:
             lines.append(f"- +{len(closed_trades) - 3} more closed in report")
+    if watch_items:
+        lines.extend(["", "Watch"])
+        lines.extend(f"- {item}" for item in watch_items[:5])
+        if len(watch_items) > 5:
+            lines.append(f"- +{len(watch_items) - 5} more watch item(s)")
     if markdown_path is not None:
-        lines.append(f"Report: {markdown_path}")
+        lines.extend(["", f"Full report: {markdown_path}"])
     return "\n".join(lines)
+
+
+def _compact_deployment_id(value: Any) -> str:
+    deployment_id = str(value or "unknown")
+    prefixes = (
+        "strategy_market_impulse_all_basket_discovery_",
+        "strategy_market_impulse_",
+        "strategy_",
+    )
+    for prefix in prefixes:
+        if deployment_id.startswith(prefix):
+            deployment_id = deployment_id.removeprefix(prefix)
+            break
+    if len(deployment_id) <= 48:
+        return deployment_id
+    return f"{deployment_id[:45]}..."
 
 
 def _empty_report(day: date) -> dict[str, Any]:

@@ -86,6 +86,36 @@ def test_info_alert_is_not_decorated(monkeypatch) -> None:
     assert calls[0][calls[0].index("--body") + 1] == "Routine body"
 
 
+def test_send_lathi_alert_passes_telegram_presentation_flags(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = send_lathi_alert(
+        title="Session report",
+        body="Quick read",
+        level="info",
+        mode="spool",
+        profile="beacon",
+        command=["lathi-bus"],
+        template="status",
+        fields={"Status": "GREEN", "token": "access_token=secret-token"},
+        link_preview="disabled",
+    )
+
+    assert result.ok is True
+    args = calls[0]
+    assert args[args.index("--template") + 1] == "status"
+    assert args[args.index("--link-preview") + 1] == "disabled"
+    assert "--field" in args
+    assert "Status=GREEN" in args
+    assert "secret-token" not in " ".join(args)
+
+
 def test_send_lathi_alert_live_mode_requires_network_call(monkeypatch) -> None:
     def fake_run(args, **kwargs):
         return subprocess.CompletedProcess(

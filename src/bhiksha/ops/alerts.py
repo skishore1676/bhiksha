@@ -46,6 +46,9 @@ def send_lathi_alert(
     level: str = "error",
     mode: AlertMode = "live",
     profile: str | None = None,
+    template: Literal["plain", "compact", "urgent_gate", "status"] | None = None,
+    fields: dict[str, Any] | list[tuple[str, Any]] | None = None,
+    link_preview: Literal["default", "disabled", "enabled", "large", "small", "above"] | None = None,
     command: list[str] | None = None,
     cwd: str | Path | None = None,
     timeout_seconds: float | None = None,
@@ -75,6 +78,12 @@ def send_lathi_alert(
         "--level",
         level,
     ]
+    if template:
+        args.extend(["--template", template])
+    for field in _format_fields(fields):
+        args.extend(["--field", field])
+    if link_preview:
+        args.extend(["--link-preview", link_preview])
     if mode == "live":
         args.append("--live")
 
@@ -170,6 +179,16 @@ def _parse_lathi_receipt(text: str) -> dict[str, Any]:
 
 def _optional_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _format_fields(fields: dict[str, Any] | list[tuple[str, Any]] | None) -> list[str]:
+    if not fields:
+        return []
+    items = fields.items() if isinstance(fields, dict) else fields
+    formatted: list[str] = []
+    for key, value in items:
+        formatted.append(f"{_redact(str(key))}={_redact(str(value))}")
+    return formatted
 
 
 def _decorate_title(title: str, level: str) -> str:

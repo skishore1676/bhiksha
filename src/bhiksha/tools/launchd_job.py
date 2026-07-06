@@ -146,6 +146,8 @@ def _session_report_job(args: argparse.Namespace) -> int:
         level=level,
         mode=args.alert_mode,
         profile=args.alert_profile,
+        template="status",
+        link_preview="disabled",
     )
     ok = alert.ok or args.alert_mode == "off"
     _print_result(

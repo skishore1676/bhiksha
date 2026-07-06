@@ -186,8 +186,9 @@ def test_daily_report_surfaces_open_positions_and_protection(tmp_path) -> None:
     assert report["open_positions"][0]["protection_state"] == "protected"
     iwm_position = next(item for item in report["open_positions"] if item["symbol"] == "IWM")
     assert iwm_position["protection_state"] == "target_active"
-    assert "Open: live 2, shadow 1, protected 1, target active 1, unprotected 1, exit pending 0" in body
-    assert "live QQQ QQQ260612C00480000 qty 2" in body
+    assert "- Open: live 2, shadow 1" in body
+    assert "- Protection: protected 1, target active 1, unprotected 1, exit pending 0" in body
+    assert "- LIVE QQQ qty 2: entry 3.80, stop 2.47, target 5.70, protected" in body
 
 
 def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
@@ -222,11 +223,15 @@ def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
     body = render_daily_report_telegram_summary(report, markdown_path=tmp_path / "report.md")
 
     assert "Bhiksha Session Report - 2026-06-03" in body
-    assert "Open: live 0, shadow 0, protected 0, target active 0, unprotected 0, exit pending 0" in body
-    assert "P&L: live $0.00 (0 trades), shadow $412.00 (2 trades)" in body
-    assert "Data quality: 1 warning(s); first=ACME" in body
+    assert "Quick read" in body
+    assert "- Open: live 0, shadow 0" in body
+    assert "- Protection: protected 0, target active 0, unprotected 0, exit pending 0" in body
+    assert "- P&L: live $0.00 (0 trades), shadow $412.00 (2 trades)" in body
+    assert "Open positions\n- None" in body
+    assert "Watch" in body
+    assert "- Data quality: 1 warning(s); first=ACME" in body
     assert str(tmp_path / "report.md") in body
-    assert len(body.splitlines()) <= 9
+    assert len(body.splitlines()) <= 18
 
 
 def test_report_status_escalates_dead_lane_to_red() -> None:
@@ -514,10 +519,8 @@ def test_daily_report_surfaces_relaxed_evidence_lanes_trading_today(tmp_path) ->
     assert "spy_shadow_relaxed_idle" not in markdown
 
     telegram = render_daily_report_telegram_summary(report)
-    assert (
-        "Shadow lanes on relaxed evidence: mu_shadow_relaxed "
-        "[mala_evidence_ready:candidate, activation_candidate:candidate]" in telegram
-    )
+    assert "- Relaxed shadow evidence: mu_shadow_relaxed (2 gates)" in telegram
+    assert "mala_evidence_ready:candidate" not in telegram
 
 
 def test_daily_report_without_deployments_omits_relaxed_evidence_section(tmp_path) -> None:
