@@ -360,7 +360,7 @@ def render_daily_report_telegram_summary(
         watch_items.append(
             "Data quality: "
             f"{len(warnings)} warning(s); first={first.get('symbol')} "
-            f"{first.get('message')}{suffix}"
+            f"{_compact_warning_message(first.get('message'))}{suffix}"
         )
     runtime_issues = (((report.get("provider_health") or {}).get("runtime_issue_counts")) or {})
     if runtime_issues:
@@ -383,10 +383,9 @@ def render_daily_report_telegram_summary(
         lines.extend(["", "Recent closes"])
         for trade in closed_trades[:3]:
             lines.append(
-                "- {lane} {symbol} {option} qty {qty}: {entry}->{exit}, P&L ${pnl}".format(
-                    lane=trade.get("lane", ""),
+                "- {lane} {symbol} qty {qty}: {entry}->{exit}, P&L ${pnl}".format(
+                    lane=str(trade.get("lane", "")).upper(),
                     symbol=trade.get("symbol", ""),
-                    option=trade.get("option_symbol") or "",
                     qty=trade.get("quantity") or 0,
                     entry=_fmt_money(trade.get("entry_price")) or "?",
                     exit=_fmt_money(trade.get("exit_price")) or "?",
@@ -419,6 +418,15 @@ def _compact_deployment_id(value: Any) -> str:
     if len(deployment_id) <= 48:
         return deployment_id
     return f"{deployment_id[:45]}..."
+
+
+def _compact_warning_message(value: Any) -> str:
+    message = str(value or "warning")
+    if "index-like underlying" in message and "quote scaling" in message:
+        return "quote-scaling check"
+    if len(message) <= 72:
+        return message
+    return f"{message[:69]}..."
 
 
 def _empty_report(day: date) -> dict[str, Any]:
