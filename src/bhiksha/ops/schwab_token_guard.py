@@ -143,12 +143,15 @@ async def run_schwab_token_guard(
     error: str | None = None
 
     state = initial.state
+    near_expiry_needs_attention = False
     if browser_renewal_mode == "force":
         action = "browser_renewal_forced"
         browser = _invoke_browser_renewal(browser_renewal_cmd)
     elif state in {"healthy"}:
         action = "healthy_noop"
-    elif state in {"access_token_stale", "refresh_token_near_expiry"}:
+    elif state == "access_token_stale":
+        # Refresh-token-healthy, access-token-stale is the normal daily case:
+        # only a direct refresh is needed, never a browser renewal.
         direct_refresh_attempted = True
         try:
             await schwab_auth.refresh_access_token(settings)
@@ -161,6 +164,29 @@ async def run_schwab_token_guard(
                 browser = _invoke_browser_renewal(browser_renewal_cmd)
             else:
                 action = "direct_refresh_failed"
+    elif state == "refresh_token_near_expiry":
+        # Inside the renewal lead window: the refresh token still works today,
+        # but waiting for it to actually expire before invoking browser
+        # renewal is exactly the bug this branch exists to close (the browser
+        # agent was previously invoked 0 times because near-expiry only ever
+        # attempted a direct_refresh, which mints a new access token but not a
+        # new refresh token). So: do the direct_refresh first (keeps the
+        # access token fresh so trading/enrichment keeps working even if the
+        # browser renewal below has trouble), then proactively invoke the
+        # browser renewal to mint a NEW refresh token and reset the 7-day
+        # clock while the current refresh token still works.
+        near_expiry_needs_attention = True
+        direct_refresh_attempted = True
+        try:
+            await schwab_auth.refresh_access_token(settings)
+            direct_refresh_ok = True
+        except Exception as exc:
+            error = _redact(str(exc))
+        if browser_renewal_mode in {"auto"}:
+            action = "refresh_token_near_expiry_browser_renewal"
+            browser = _invoke_browser_renewal(browser_renewal_cmd)
+        else:
+            action = "direct_refresh" if direct_refresh_ok else "direct_refresh_failed"
     elif state in {"refresh_token_expired", "token_file_missing", "invalid_token_payload"}:
         if browser_renewal_mode == "auto":
             action = f"{state}_browser_renewal"
@@ -172,11 +198,19 @@ async def run_schwab_token_guard(
 
     final = classify_schwab_token_state(settings, refresh_lead_days=refresh_lead_days)
     ok = _state_is_usable(final.state)
-    if browser.invoked and browser.return_code != 0:
-        ok = False
+    browser_failed = browser.invoked and browser.return_code != 0
+    if browser_failed:
+        # Near-expiry is a special case: the browser renewal here is
+        # *proactive* (the refresh token is not dead yet), so a failure does
+        # not make today unusable as long as the direct_refresh above kept
+        # the access token fresh. It still needs operator attention before
+        # the refresh token actually expires -- see alert_needed below.
+        if state != "refresh_token_near_expiry" or not direct_refresh_ok:
+            ok = False
     if error and not direct_refresh_ok and not browser.invoked:
         ok = False
     alert = AlertResult(mode=alert_mode)
+    alert_needed = (not ok) or near_expiry_needs_attention or browser_failed
 
     result = SchwabTokenGuardResult(
         ok=ok,
@@ -193,11 +227,13 @@ async def run_schwab_token_guard(
     )
     if write_receipt and receipt_dir is not None:
         result.receipt_path = str(_write_receipt(result, receipt_dir=receipt_dir))
-    if not ok and alert_mode != "off":
+    if alert_needed and alert_mode != "off":
+        level = "error" if not ok else "warning"
+        title = "Bhiksha Schwab token guard failed" if not ok else "Bhiksha Schwab token guard needs attention"
         result.alert = send_lathi_alert(
-            title="Bhiksha Schwab token guard failed",
+            title=title,
             body=_render_alert_body(result),
-            level="error",
+            level=level,
             mode=alert_mode,
             profile=alert_profile,
             command=alert_command,
@@ -271,7 +307,21 @@ def _render_alert_body(result: SchwabTokenGuardResult) -> str:
         lines.append(f"Error: {result.error}")
     if result.receipt_path:
         lines.append(f"Receipt: {result.receipt_path}")
-    lines.append("Trading should fail closed until Schwab token health is restored.")
+    if result.initial.state == "refresh_token_near_expiry":
+        lines.append(
+            f"Refresh token near expiry (days left: {result.initial.refresh_token_days_left}); "
+            "proactive browser renewal to mint a new refresh token."
+        )
+        if result.browser.invoked and result.browser.return_code != 0:
+            lines.append(
+                "Proactive browser renewal FAILED. Access token is still fresh from direct_refresh "
+                "(trading can continue today), but this needs operator attention before the current "
+                "refresh token actually expires."
+            )
+    if result.ok:
+        lines.append("Token is currently usable; trading can continue.")
+    else:
+        lines.append("Trading should fail closed until Schwab token health is restored.")
     return "\n".join(lines)
 
 
