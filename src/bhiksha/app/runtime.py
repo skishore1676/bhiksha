@@ -240,14 +240,28 @@ class BhikshaRuntime:
         # convention; resolve_risk_settings applies the same validation to
         # sheet values as it does to env values.
         risk_settings_source = PlanOperatorDefaultsSource.from_active_plan(self.active_plan)
+        # Built before RiskManager (reordered, harmless -- OrderManager() has
+        # no dependency on the risk manager) so the SAME broker quote client
+        # the native exit path already uses can be reused as the risk
+        # manager's optional per-position mark seam (operator audit P4,
+        # 2026-07-06 -- open-book mark-to-market WARNING). No new broker
+        # integration: get_option_quote is the identical call
+        # ExecutionSupervisor._manage_open_position_locked's ensure_quote()
+        # already makes.
+        order_manager = OrderManager()
+
+        async def _mark_price_provider(option_symbol: str) -> float | None:
+            quote = await order_manager.get_option_quote(option_symbol)
+            return quote.exit_reference_price
+
         self.risk_manager = RiskManager(
             settings=resolve_risk_settings(settings_source=risk_settings_source),
             cash_budget_repository=cash_budget_repository,
             trade_state_repository=trade_state_repository,
             event_repository=event_repository,
+            mark_price_provider=_mark_price_provider,
         )
         await self.risk_manager.startup_log()
-        order_manager = OrderManager()
         planner = ExecutionPlanner(
             order_manager=order_manager,
             cash_guard=CashGuard(

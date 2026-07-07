@@ -54,6 +54,7 @@ def test_resolve_risk_settings_sheet_covers_all_documented_keys(monkeypatch) -> 
         "BHIKSHA_RISK_DEMOTE_WINDOW",
         "BHIKSHA_RISK_DEMOTE_MIN_N",
         "BHIKSHA_RISK_DEMOTE_THRESHOLD_USD",
+        "BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT",
     ):
         monkeypatch.delenv(env_key, raising=False)
     source = PlanOperatorDefaultsSource(
@@ -65,6 +66,7 @@ def test_resolve_risk_settings_sheet_covers_all_documented_keys(monkeypatch) -> 
             "demote_window": "5",
             "demote_min_n": "3",
             "demote_threshold_usd": "-50",
+            "open_drawdown_warn_pct": "0.6",
         }
     )
 
@@ -77,6 +79,7 @@ def test_resolve_risk_settings_sheet_covers_all_documented_keys(monkeypatch) -> 
     assert settings.demote_window == 5
     assert settings.demote_min_n == 3
     assert settings.demote_threshold_usd == -50.0
+    assert settings.open_drawdown_warn_pct == 0.6
     assert settings.validation_warnings == ()
 
 
@@ -101,3 +104,41 @@ def test_plan_operator_defaults_source_from_active_plan_handles_none_and_missing
         PlanOperatorDefaultsSource.from_active_plan({"active_plan_id": "x"}).get("max_daily_drawdown_pct")
         is None
     )
+
+
+# --------------------------------------------------------------------------
+# Operator audit P4 (2026-07-06): open_drawdown_warn_pct sheet/env/default
+# precedence, following the exact same env > sheet > default pattern as
+# max_daily_drawdown_pct above -- the only difference is the "default" is
+# None (unset), not a hardcoded number; RiskManager.effective_open_drawdown_
+# warn_pct applies the "unset -> max_daily_drawdown_pct" fallback at the
+# point of use (see test_risk_manager.py).
+# --------------------------------------------------------------------------
+
+
+def test_resolve_open_drawdown_warn_pct_uses_sheet_value_when_env_absent(monkeypatch) -> None:
+    monkeypatch.delenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", raising=False)
+    source = PlanOperatorDefaultsSource({"open_drawdown_warn_pct": "0.9"})
+
+    settings = resolve_risk_settings(settings_source=source)
+
+    assert settings.open_drawdown_warn_pct == 0.9
+    assert settings.validation_warnings == ()
+
+
+def test_resolve_open_drawdown_warn_pct_env_wins_over_sheet(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", "1.1")
+    source = PlanOperatorDefaultsSource({"open_drawdown_warn_pct": "0.9"})
+
+    settings = resolve_risk_settings(settings_source=source)
+
+    assert settings.open_drawdown_warn_pct == 1.1
+
+
+def test_resolve_open_drawdown_warn_pct_falls_back_to_none_when_sheet_and_env_absent(monkeypatch) -> None:
+    monkeypatch.delenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", raising=False)
+    source = PlanOperatorDefaultsSource({})
+
+    settings = resolve_risk_settings(settings_source=source)
+
+    assert settings.open_drawdown_warn_pct is None  # "unset" -- not a numeric default

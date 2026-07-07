@@ -684,4 +684,123 @@ def test_daily_report_risk_rails_absent_when_no_startup_event(tmp_path) -> None:
     assert report["risk_rails"] is None
     markdown = render_daily_report_markdown(report)
     assert "## Risk Rails" not in markdown
+
+
+# --- Open-book MTM warning section tests (operator audit P4) ----------------
+def test_daily_report_renders_open_drawdown_warn_pct_defaulted_to_tier1(tmp_path) -> None:
+    """open_drawdown_warn_pct absent from the startup payload (unset knob,
+    matches RiskSettings.open_drawdown_warn_pct=None) -- the report displays
+    the SAME "falls back to max_daily_drawdown_pct" value RiskManager.
+    effective_open_drawdown_warn_pct would use, not a blank/unknown."""
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    cash_budget = SQLiteCashBudgetRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await events.append(
+            "risk_manager_startup",
+            {
+                "rail_a_enabled": True,
+                "rail_b_enabled": True,
+                "max_daily_drawdown_pct": 2.0,
+                "flatten_daily_drawdown_pct": 3.0,
+                "demote_window": 10,
+                "demote_min_n": 10,
+                "demote_threshold_usd": 0.0,
+                "open_drawdown_warn_pct": None,
+                "validation_warnings": [],
+            },
+        )
+        await cash_budget.upsert_day(
+            CashBudgetDay(
+                trade_date="2026-06-03",
+                account_type="CASH",
+                broker_cash_only_buying_power=10000.0,
+                usable_budget=8000.0,
+                buffer_pct=0.2,
+            )
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE events SET created_at = '2026-06-03T13:30:00+00:00'")
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+
+    risk_rails = report["risk_rails"]
+    assert risk_rails["open_drawdown_warn_pct"] == 2.0  # defaulted to max_daily_drawdown_pct
+    assert risk_rails["open_drawdown_warn_usd"] == 160.0  # 2% of 8000
+    assert risk_rails["open_drawdown_warnings"] == []
+
+    markdown = render_daily_report_markdown(report)
+    assert "open-book MTM warn (awareness only): `2.00% ($160.00)`" in markdown
+    assert "open-book MTM warnings fired" not in markdown
+
+
+def test_daily_report_renders_open_drawdown_warning_events(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    cash_budget = SQLiteCashBudgetRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await events.append(
+            "risk_manager_startup",
+            {
+                "rail_a_enabled": True,
+                "rail_b_enabled": True,
+                "max_daily_drawdown_pct": 2.0,
+                "flatten_daily_drawdown_pct": 3.0,
+                "demote_window": 10,
+                "demote_min_n": 10,
+                "demote_threshold_usd": 0.0,
+                "open_drawdown_warn_pct": 1.0,
+                "validation_warnings": [],
+            },
+        )
+        await cash_budget.upsert_day(
+            CashBudgetDay(
+                trade_date="2026-06-03",
+                account_type="CASH",
+                broker_cash_only_buying_power=10000.0,
+                usable_budget=10000.0,
+                buffer_pct=0.0,
+            )
+        )
+        await events.append(
+            "risk_open_drawdown_warning",
+            {
+                "realized_usd": 0.0,
+                "unrealized_open_usd": -350.0,
+                "day_mtm_usd": -350.0,
+                "warn_threshold_usd": -100.0,
+                "warn_pct": 1.0,
+                "usable_budget": 10000.0,
+                "open_position_count": 2,
+                "trade_date": "2026-06-03",
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE events SET created_at = '2026-06-03T13:30:00+00:00'")
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+
+    risk_rails = report["risk_rails"]
+    assert risk_rails["open_drawdown_warn_pct"] == 1.0
+    assert risk_rails["open_drawdown_warn_usd"] == 100.0
+    assert len(risk_rails["open_drawdown_warnings"]) == 1
+    warning = risk_rails["open_drawdown_warnings"][0]
+    assert warning["day_mtm_usd"] == -350.0
+    assert warning["open_position_count"] == 2
+
+    markdown = render_daily_report_markdown(report)
+    assert "open-book MTM warn (awareness only): `1.00% ($100.00)`" in markdown
+    assert "open-book MTM warnings fired: `1`" in markdown
+    assert "day MTM -$350.00 (realized $0.00 + unrealized open -$350.00 across 2 position(s)) <= threshold -$100.00" in markdown
+# --- end open-book MTM warning section tests ---------------------------------
 # --- end risk rails section tests -------------------------------------------

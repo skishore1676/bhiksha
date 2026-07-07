@@ -17,6 +17,12 @@ if TYPE_CHECKING:
 
 _OPTION_SYMBOL_RE = re.compile(r"^[A-Z]+\d{6}[CP](\d{8})$")
 
+# Matches bhiksha.risk.risk_manager.OPEN_DRAWDOWN_WARNING_REASON. Kept as a
+# plain string literal (not an import) to match this file's existing
+# convention of not importing bhiksha.risk.risk_manager -- see the
+# "risk_manager_startup"/"risk_manager_decision" literals below.
+OPEN_DRAWDOWN_WARNING_EVENT_TYPE = "risk_open_drawdown_warning"
+
 
 @dataclass(slots=True, frozen=True)
 class DailyReportWriteResult:
@@ -272,6 +278,25 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
             f"min_n {risk_rails.get('demote_min_n')}, "
             f"threshold {_fmt_money_or_na(risk_rails.get('demote_threshold_usd'))}`"
         )
+        # Operator audit P4 (2026-07-06): open-book mark-to-market WARNING
+        # (never a halt/flatten -- see RiskManager.OpenDrawdownStatus).
+        lines.append(
+            "- open-book MTM warn (awareness only): "
+            f"`{_fmt_pct(risk_rails.get('open_drawdown_warn_pct'))} "
+            f"({_fmt_money_or_na(risk_rails.get('open_drawdown_warn_usd'))})`"
+        )
+        open_drawdown_warnings = risk_rails.get("open_drawdown_warnings") or []
+        if open_drawdown_warnings:
+            lines.append(f"- open-book MTM warnings fired: `{len(open_drawdown_warnings)}`")
+            for warning in open_drawdown_warnings:
+                lines.append(
+                    "  - day MTM "
+                    f"{_fmt_money_or_na(warning.get('day_mtm_usd'))} "
+                    f"(realized {_fmt_money_or_na(warning.get('realized_usd'))} + "
+                    f"unrealized open {_fmt_money_or_na(warning.get('unrealized_open_usd'))} "
+                    f"across {warning.get('open_position_count')} position(s)) "
+                    f"<= threshold {_fmt_money_or_na(warning.get('warn_threshold_usd'))}"
+                )
         rail_warnings = risk_rails.get("validation_warnings") or []
         if rail_warnings:
             lines.append(f"- validation warnings: `{len(rail_warnings)}`")
@@ -487,11 +512,28 @@ def _risk_rails_summary(conn: sqlite3.Connection, day: date, events: list[dict[s
     usable_budget = _load_day_usable_budget(conn, day)
     max_dd_pct = _maybe_float(settings_payload.get("max_daily_drawdown_pct"))
     flatten_dd_pct = _maybe_float(settings_payload.get("flatten_daily_drawdown_pct"))
+    # Operator audit P4 (2026-07-06): open_drawdown_warn_pct defaults to None
+    # in the raw RiskSettings payload when unset -- RiskManager falls back to
+    # max_daily_drawdown_pct at point-of-use (effective_open_drawdown_warn_pct),
+    # so mirror that same fallback here for display rather than showing a
+    # blank/"unknown" threshold when nothing was explicitly configured.
+    open_dd_warn_pct = _maybe_float(settings_payload.get("open_drawdown_warn_pct"))
+    if open_dd_warn_pct is None:
+        open_dd_warn_pct = max_dd_pct
 
     def _pct_to_usd(pct: float | None) -> float | None:
         if pct is None or usable_budget is None:
             return None
         return _round_money((pct / 100.0) * usable_budget)
+
+    # Operator audit P4: the day's open-book mark-to-market WARNING events
+    # (risk_open_drawdown_warning), if any fired this session -- see
+    # RiskManager._compute_open_drawdown_status / _book_actions_uncached.
+    # This is warning-only (never a halt/flatten): surfaced for visibility,
+    # not as an actionable rail toggle.
+    open_drawdown_warnings = [
+        event["payload"] or {} for event in events if event["event_type"] == OPEN_DRAWDOWN_WARNING_EVENT_TYPE
+    ]
 
     return {
         "rail_a_enabled": bool(settings_payload.get("rail_a_enabled", True)),
@@ -504,6 +546,9 @@ def _risk_rails_summary(conn: sqlite3.Connection, day: date, events: list[dict[s
         "demote_window": _maybe_int(settings_payload.get("demote_window")),
         "demote_min_n": _maybe_int(settings_payload.get("demote_min_n")),
         "demote_threshold_usd": _maybe_float(settings_payload.get("demote_threshold_usd")),
+        "open_drawdown_warn_pct": open_dd_warn_pct,
+        "open_drawdown_warn_usd": _pct_to_usd(open_dd_warn_pct),
+        "open_drawdown_warnings": open_drawdown_warnings,
         "validation_warnings": list(settings_payload.get("validation_warnings") or []),
     }
 
