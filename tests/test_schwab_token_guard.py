@@ -140,6 +140,47 @@ def test_guard_near_expiry_auto_mode_direct_refresh_and_browser_renewal(tmp_path
     assert result.final.state == "healthy"
 
 
+def test_guard_near_expiry_successful_renewal_sends_no_alert(tmp_path, monkeypatch) -> None:
+    """Operator preference (2026-07-07): a silent successful proactive renewal
+    at the near-expiry mark must NOT ping the operator — only a FAILED re-auth
+    attempt (or an unusable token) alerts."""
+    token_file = tmp_path / "schwab_tokens.json"
+    _write_tokens(token_file, access_minutes_old=1, refresh_days_old=6)
+
+    async def fake_refresh(settings):
+        return None
+
+    def fake_browser(command):
+        _write_tokens(token_file, access_minutes_old=0, refresh_days_old=0)
+        return schwab_token_guard.BrowserRenewalResult(invoked=True, command=command or [], return_code=0)
+
+    alerts = []
+
+    def fake_alert(**kwargs):
+        alerts.append(kwargs)
+        return schwab_token_guard.AlertResult(mode="spool", attempted=True, ok=True)
+
+    monkeypatch.setattr(schwab_token_guard.schwab_auth, "refresh_access_token", fake_refresh)
+    monkeypatch.setattr(schwab_token_guard, "_invoke_browser_renewal", fake_browser)
+    monkeypatch.setattr(schwab_token_guard, "send_lathi_alert", fake_alert)
+
+    result = asyncio.run(
+        run_schwab_token_guard(
+            settings=_settings(token_file),
+            browser_renewal_mode="auto",
+            browser_renewal_cmd=["/tmp/fake-refresh"],
+            alert_mode="spool",
+            alert_profile="jarvis-northstar",
+            write_receipt=False,
+        )
+    )
+
+    assert result.initial.state == "refresh_token_near_expiry"
+    assert result.browser.invoked is True
+    assert result.ok is True
+    assert alerts == []  # silent success — no operator ping
+
+
 def test_guard_near_expiry_browser_renewal_fails_stays_usable_and_alerts(tmp_path, monkeypatch) -> None:
     token_file = tmp_path / "schwab_tokens.json"
     _write_tokens(token_file, access_minutes_old=1, refresh_days_old=6)

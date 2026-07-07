@@ -143,7 +143,6 @@ async def run_schwab_token_guard(
     error: str | None = None
 
     state = initial.state
-    near_expiry_needs_attention = False
     if browser_renewal_mode == "force":
         action = "browser_renewal_forced"
         browser = _invoke_browser_renewal(browser_renewal_cmd)
@@ -175,7 +174,6 @@ async def run_schwab_token_guard(
         # browser renewal below has trouble), then proactively invoke the
         # browser renewal to mint a NEW refresh token and reset the 7-day
         # clock while the current refresh token still works.
-        near_expiry_needs_attention = True
         direct_refresh_attempted = True
         try:
             await schwab_auth.refresh_access_token(settings)
@@ -210,7 +208,12 @@ async def run_schwab_token_guard(
     if error and not direct_refresh_ok and not browser.invoked:
         ok = False
     alert = AlertResult(mode=alert_mode)
-    alert_needed = (not ok) or near_expiry_needs_attention or browser_failed
+    # Operator preference (2026-07-07): notify ONLY when a re-auth ATTEMPT
+    # actually failed (or the token is otherwise unusable) — NOT on a silent
+    # successful proactive renewal at the near-expiry mark. A near-expiry run
+    # that browser-renews cleanly resets the 7-day clock and needs no ping;
+    # ``near_expiry_needs_attention`` is intentionally NOT an alert trigger.
+    alert_needed = (not ok) or browser_failed
 
     result = SchwabTokenGuardResult(
         ok=ok,
