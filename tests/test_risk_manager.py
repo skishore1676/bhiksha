@@ -14,6 +14,7 @@ from bhiksha.risk.risk_manager import (
     TIER2_FLATTEN_REASON,
     RAIL_B_DEMOTED_REASON,
     BUDGET_UNAVAILABLE_REASON,
+    OPEN_DRAWDOWN_WARNING_REASON,
 )
 from bhiksha.risk.risk_settings import RiskSettings, resolve_risk_settings
 
@@ -46,7 +47,7 @@ def _settings(**overrides) -> RiskSettings:
     return RiskSettings(**base)
 
 
-def _manager(tmp_path, *, settings=None, now=None, alert_mode="off"):
+def _manager(tmp_path, *, settings=None, now=None, alert_mode="off", mark_price_provider=None):
     db_path = str(tmp_path / "bhiksha.db")
     backend = SQLiteBackend(db_path)
     return RiskManager(
@@ -57,7 +58,38 @@ def _manager(tmp_path, *, settings=None, now=None, alert_mode="off"):
         demotion_store=DemotionStore(tmp_path / "demoted_deployments.json"),
         alert_mode=alert_mode,
         now_fn=(lambda: now) if now is not None else None,
+        mark_price_provider=mark_price_provider,
     ), db_path
+
+
+def _mark_provider_from(marks: dict[str, float | None]):
+    """A mark_price_provider fixture that returns a fixed mark per option_symbol.
+
+    A symbol absent from ``marks`` raises (simulating a quote fetch failure)
+    so tests can distinguish "no mark configured" from "mark is None"."""
+
+    async def provider(option_symbol: str) -> float | None:
+        if option_symbol not in marks:
+            raise ValueError(f"no mark configured for {option_symbol}")
+        return marks[option_symbol]
+
+    return provider
+
+
+def _open_live_trade(
+    trade_id: str, *, deployment_id: str, option_symbol: str, entry: float, quantity: int = 1
+) -> TradeRecord:
+    return TradeRecord(
+        trade_id=trade_id,
+        deployment_id=deployment_id,
+        symbol="QQQ",
+        option_symbol=option_symbol,
+        quantity=quantity,
+        entry_price=entry,
+        entry_timestamp=NOW,
+        status="open_unprotected",
+        entry_order_id="LIVE123",
+    )
 
 
 def _events(db_path: str, event_type: str | None = None) -> list[dict]:
@@ -703,7 +735,7 @@ def test_trade_sessions_updated_at_index_created(tmp_path) -> None:
 # --------------------------------------------------------------------------
 
 
-def _manager_with_clock(tmp_path, clock: _ManualClock, *, settings=None, alert_mode="off"):
+def _manager_with_clock(tmp_path, clock: _ManualClock, *, settings=None, alert_mode="off", mark_price_provider=None):
     db_path = str(tmp_path / "bhiksha.db")
     backend = SQLiteBackend(db_path)
     return RiskManager(
@@ -714,6 +746,7 @@ def _manager_with_clock(tmp_path, clock: _ManualClock, *, settings=None, alert_m
         demotion_store=DemotionStore(tmp_path / "demoted_deployments.json"),
         alert_mode=alert_mode,
         now_fn=clock,
+        mark_price_provider=mark_price_provider,
     ), db_path
 
 
@@ -887,3 +920,398 @@ def test_book_actions_net_daily_ok_row_volume_is_low(tmp_path) -> None:
     assert all(d["payload"]["decision"] == "ok" for d in decisions)
     # 390 minutes / 10-minute heartbeat -> 39 rows (minute 0, 10, ..., 380).
     assert len(decisions) == 39
+
+
+# --------------------------------------------------------------------------
+# Operator audit P4 (2026-07-06): open-book mark-to-market WARNING.
+#
+# Rail A is realized-P&L-only -- it will not notice an open live position
+# bleeding intraday until the loss is realized. Native protective stops still
+# guard every trade (this is an awareness gap, not a naked-risk gap). These
+# tests cover: correct unrealized-P&L math from open live positions + marks
+# (profitable and losing); combined day-MTM breach emits exactly ONE warning
+# event (latched, not per-tick); no warning when Rail A has already
+# realized-halted; missing marks/budget/provider -> no warning (fail-safe);
+# sheet/env/default precedence for the new knob including default-to-tier1.
+# --------------------------------------------------------------------------
+
+
+def test_open_drawdown_no_warning_when_mark_price_provider_not_wired(tmp_path) -> None:
+    """Feature is INACTIVE (never a spurious warning) when the runtime hasn't
+    wired a mark_price_provider -- e.g. an older/partial construction path."""
+    manager, db_path = _manager(tmp_path, now=NOW)  # no mark_price_provider
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101C00500000", entry=5.0)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.open_drawdown is not None
+    assert result.open_drawdown.active is False
+    assert result.open_drawdown.reason == "mark_price_provider_unavailable"
+    warnings = _events(db_path, OPEN_DRAWDOWN_WARNING_REASON)
+    assert warnings == []
+
+
+def test_open_drawdown_computes_unrealized_pnl_for_long_profitable_position(tmp_path) -> None:
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({"QQQ260101C00500000": 7.0}),
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101C00500000", entry=5.0, quantity=2)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    # (7.0 - 5.0) * 2 * 100 = +400
+    assert result.open_drawdown.active is True
+    assert result.open_drawdown.unrealized_open_usd == 400.0
+    assert result.open_drawdown.realized_usd == 0.0
+    assert result.open_drawdown.day_mtm_usd == 400.0
+    assert result.open_drawdown.breached is False
+    assert result.open_drawdown.open_position_count == 1
+
+
+def test_open_drawdown_computes_unrealized_pnl_for_losing_position(tmp_path) -> None:
+    """'Short and long' framing (coordinator spec): this book is always-long-
+    premium (buy calls/puts), so the interesting sign case is a LOSING long
+    position (mark below entry), not an actual short-position formula."""
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({"QQQ260101P00500000": 2.0}),
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101P00500000", entry=5.0, quantity=1)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    # (2.0 - 5.0) * 1 * 100 = -300
+    assert result.open_drawdown.unrealized_open_usd == -300.0
+    assert result.open_drawdown.day_mtm_usd == -300.0
+
+
+def test_open_drawdown_breach_emits_exactly_one_latched_warning(tmp_path) -> None:
+    clock = _ManualClock(NOW)
+    manager, db_path = _manager_with_clock(
+        tmp_path, clock, mark_price_provider=_mark_provider_from({"QQQ260101C00500000": 1.0})
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    # (1.0 - 5.0) * 4 * 100 = -1600 unrealized; -1600/10000 = -16% >> the
+    # default warn pct (falls back to tier-1's 2.0%, threshold -200).
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101C00500000", entry=5.0, quantity=4)
+        )
+    )
+
+    first = asyncio.run(manager.book_actions())
+    assert first.open_drawdown.breached is True
+    assert first.open_drawdown.day_mtm_usd == -1600.0
+    assert first.open_drawdown.warn_pct == 2.0  # defaulted to max_daily_drawdown_pct
+    assert first.open_drawdown.warn_threshold_usd == -200.0
+
+    warnings = _events(db_path, OPEN_DRAWDOWN_WARNING_REASON)
+    assert len(warnings) == 1
+    payload = warnings[0]["payload"]
+    assert payload["realized_usd"] == 0.0
+    assert payload["unrealized_open_usd"] == -1600.0
+    assert payload["day_mtm_usd"] == -1600.0
+    assert payload["open_position_count"] == 1
+
+    # A second tick (still breached, next minute so the evaluate-cache
+    # doesn't just return the same cached object) must NOT emit a second
+    # warning event -- latched once per session, matching tier1/tier2.
+    clock.advance(minutes=1)
+    second = asyncio.run(manager.book_actions())
+    assert second.open_drawdown.breached is True
+    warnings_after = _events(db_path, OPEN_DRAWDOWN_WARNING_REASON)
+    assert len(warnings_after) == 1
+
+
+def test_open_drawdown_no_warning_when_rail_a_already_realized_halted(tmp_path) -> None:
+    """When realized-only Rail A has ALREADY halted (tier-1), the open-book
+    warning is specifically about unrealized pushing past the line BEFORE
+    realized does -- so it must not also fire here (avoid double-signaling
+    the same underlying "book is in trouble" fact via two separate events).
+    """
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({"QQQ260101C00500000": 1.0}),
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    # Realized loss alone already breaches tier-1 (-250 <= -200).
+    closed = _closed_live_trade("T1", deployment_id="dep1", entry=5.0, exit_=2.5, exit_at=NOW)
+    asyncio.run(manager.trade_state_repository.upsert_trade(closed))
+    asyncio.run(manager.trade_state_repository.mark_closed("T1", exit_price=2.5, exit_filled_quantity=1, exit_filled_at=NOW))
+    # Also an open position bleeding further, which alone would breach the
+    # open-book warning threshold too.
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101C00500000", entry=5.0, quantity=4)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.rail_a.halted is True  # realized-only Rail A already tripped
+    assert result.open_drawdown.active is True
+    assert result.open_drawdown.breached is False  # suppressed -- already signaled via Rail A halt
+    warnings = _events(db_path, OPEN_DRAWDOWN_WARNING_REASON)
+    assert warnings == []
+
+
+def test_open_drawdown_no_warning_when_a_position_mark_is_missing(tmp_path) -> None:
+    """Fail-safe: a mark fetch failure for one open position excludes it from
+    the sum (never estimates/guesses); with only ONE open position and its
+    mark missing, priced_count is 0 -> the whole check is inactive, never a
+    spurious warning built from zero real data."""
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({}),  # no marks configured -> always raises
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101C00500000", entry=5.0)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.open_drawdown.active is False
+    assert result.open_drawdown.reason == "no_priced_open_positions"
+    warnings = _events(db_path, OPEN_DRAWDOWN_WARNING_REASON)
+    assert warnings == []
+
+
+def test_open_drawdown_partial_marks_excludes_only_the_missing_position(tmp_path) -> None:
+    """Two open positions, one with a mark and one without: the priced one
+    still contributes to the sum, the unpriced one is simply excluded (not
+    estimated), and open_position_count reflects only the priced one."""
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({"QQQ260101C00500000": 1.0}),
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101C00500000", entry=5.0, quantity=1)
+        )
+    )
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O2", deployment_id="dep1", option_symbol="NO_MARK_SYMBOL", entry=3.0, quantity=1)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.open_drawdown.active is True
+    assert result.open_drawdown.open_position_count == 1
+    # (1.0 - 5.0) * 1 * 100 = -400 -- only the priced position contributes.
+    assert result.open_drawdown.unrealized_open_usd == -400.0
+
+
+def test_open_drawdown_no_warning_when_no_cash_budget_day(tmp_path) -> None:
+    """Missing budget -> Rail A itself is inactive, so the open-book check is
+    never even evaluated (book_actions only computes it when Rail A is
+    active) -- fail-safe, never a spurious warning built on an unknown budget."""
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({"QQQ260101C00500000": 1.0}),
+    )
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            _open_live_trade("O1", deployment_id="dep1", option_symbol="QQQ260101C00500000", entry=5.0, quantity=4)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.rail_a.active is False
+    assert result.open_drawdown is None
+    warnings = _events(db_path, OPEN_DRAWDOWN_WARNING_REASON)
+    assert warnings == []
+
+
+def test_open_drawdown_no_open_positions_still_evaluates_realized_only(tmp_path) -> None:
+    """No open live positions: unrealized is unambiguously zero (no marks to
+    fetch), but the day-MTM check still runs against realized-only so a
+    warning is never silently skipped just because the book happens to be
+    flat right now."""
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({}),
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    # -1.5% of 10000 = -150: below the default 2.0% warn threshold (-200), so
+    # NOT breached -- proves the realized-only path is evaluated correctly
+    # (not just "no open positions -> skip").
+    closed = _closed_live_trade("T1", deployment_id="dep1", entry=5.0, exit_=3.5, exit_at=NOW)
+    asyncio.run(manager.trade_state_repository.upsert_trade(closed))
+    asyncio.run(manager.trade_state_repository.mark_closed("T1", exit_price=3.5, exit_filled_quantity=1, exit_filled_at=NOW))
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.open_drawdown.active is True
+    assert result.open_drawdown.open_position_count == 0
+    assert result.open_drawdown.unrealized_open_usd == 0.0
+    assert result.open_drawdown.day_mtm_usd == -150.0
+    assert result.open_drawdown.breached is False
+
+
+def test_open_drawdown_shadow_open_positions_excluded_from_unrealized(tmp_path) -> None:
+    """Shadow/dry-run open positions must not contribute to the open-book
+    unrealized sum, mirroring Rail A's realized-P&L live/shadow filter."""
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        mark_price_provider=_mark_provider_from({"QQQ260101C00500000": 1.0}),
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+    shadow_open = TradeRecord(
+        trade_id="S1",
+        deployment_id="dep1",
+        symbol="QQQ",
+        option_symbol="QQQ260101C00500000",
+        quantity=10,
+        entry_price=5.0,
+        entry_timestamp=NOW,
+        status="open_unprotected",
+        entry_order_id="SHADOW_ENTRY",
+    )
+    asyncio.run(manager.trade_state_repository.upsert_trade(shadow_open))
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.open_drawdown.active is True
+    assert result.open_drawdown.open_position_count == 0
+    assert result.open_drawdown.unrealized_open_usd == 0.0
+
+
+def test_open_drawdown_rail_a_disabled_is_inactive(tmp_path) -> None:
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(rail_a_enabled=False),
+        mark_price_provider=_mark_provider_from({"QQQ260101C00500000": 1.0}),
+    )
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(trade_date="2026-04-20", account_type="CASH", broker_cash_only_buying_power=10000.0, usable_budget=10000.0, buffer_pct=0.0)
+        )
+    )
+
+    result = asyncio.run(manager.book_actions())
+
+    # Rail A disabled -> _compute_rail_a_status returns active=False, so
+    # book_actions never even reaches _compute_open_drawdown_status.
+    assert result.open_drawdown is None
+
+
+# --------------------------------------------------------------------------
+# Operator audit P4: open_drawdown_warn_pct settings precedence, including
+# "unset -> falls back to max_daily_drawdown_pct" (RiskManager.
+# effective_open_drawdown_warn_pct), tested both via the resolver AND via a
+# directly-constructed RiskSettings (the two paths must agree).
+# --------------------------------------------------------------------------
+
+
+def test_resolve_open_drawdown_warn_pct_env_overrides_default(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", "0.75")
+    settings = resolve_risk_settings()
+    assert settings.open_drawdown_warn_pct == 0.75
+
+
+def test_resolve_open_drawdown_warn_pct_unset_stays_none_on_settings(monkeypatch) -> None:
+    monkeypatch.delenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", raising=False)
+    settings = resolve_risk_settings()
+    assert settings.open_drawdown_warn_pct is None
+
+
+def test_effective_open_drawdown_warn_pct_falls_back_to_tier1_when_unset(tmp_path) -> None:
+    manager, _ = _manager(tmp_path, settings=_settings(max_daily_drawdown_pct=1.25))
+    assert manager.settings.open_drawdown_warn_pct is None
+    assert manager.effective_open_drawdown_warn_pct == 1.25
+
+
+def test_effective_open_drawdown_warn_pct_uses_explicit_value_when_set(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path, settings=_settings(max_daily_drawdown_pct=2.0, open_drawdown_warn_pct=0.5)
+    )
+    assert manager.effective_open_drawdown_warn_pct == 0.5
+
+
+def test_resolve_open_drawdown_warn_pct_rejects_non_positive(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", "0")
+    settings = resolve_risk_settings()
+    assert settings.open_drawdown_warn_pct is None
+    assert any("open_drawdown_warn_pct" in w for w in settings.validation_warnings)
+
+
+def test_resolve_open_drawdown_warn_pct_warns_on_unparseable_env(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", "not-a-number")
+    settings = resolve_risk_settings()
+    assert settings.open_drawdown_warn_pct is None
+    assert any("not a valid number" in w for w in settings.validation_warnings)
+
+
+def test_startup_log_carries_open_drawdown_warn_pct(tmp_path) -> None:
+    manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(open_drawdown_warn_pct=0.8))
+    asyncio.run(manager.startup_log())
+    startup = _events(db_path, "risk_manager_startup")
+    assert startup[-1]["payload"]["open_drawdown_warn_pct"] == 0.8

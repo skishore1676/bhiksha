@@ -52,6 +52,20 @@ class RiskSettings:
     demote_window: int
     demote_min_n: int
     demote_threshold_usd: float
+    # Operator audit P4 (2026-07-06): Rail A is realized-P&L-only -- it will
+    # not notice an open live position bleeding intraday until the loss is
+    # REALIZED (native protective stops still guard every trade, so this is
+    # an awareness gap, not a naked-risk gap). ``open_drawdown_warn_pct``
+    # gates a WARNING-ONLY mark-to-market open-book check (see
+    # ``RiskManager._compute_open_drawdown_status``): v1 never halts or
+    # flattens anything, it only emits ``risk_open_drawdown_warning``.
+    # ``None`` means "not explicitly set" -- ``RiskManager`` falls back to
+    # ``max_daily_drawdown_pct`` (the tier-1 value) at the point of use (see
+    # ``RiskManager.effective_open_drawdown_warn_pct``) so the warning has a
+    # sane threshold out of the box without a second operator decision, and
+    # so a directly-constructed ``RiskSettings`` (e.g. in tests) gets the
+    # identical fallback as the ``resolve_risk_settings`` path.
+    open_drawdown_warn_pct: float | None = None
     # Audit fix (2026-07-02): every rejected/clamped input is surfaced here and
     # carried into the ``risk_manager_startup`` event — a silent fallback hid
     # two reproducible live bugs (tier inversion; negative pct flipping the
@@ -67,6 +81,7 @@ class RiskSettings:
             "demote_window": self.demote_window,
             "demote_min_n": self.demote_min_n,
             "demote_threshold_usd": self.demote_threshold_usd,
+            "open_drawdown_warn_pct": self.open_drawdown_warn_pct,
             "validation_warnings": list(self.validation_warnings),
         }
 
@@ -76,6 +91,9 @@ _DEFAULT_FLATTEN_DAILY_DRAWDOWN_PCT = 3.0
 _DEFAULT_DEMOTE_WINDOW = 10
 _DEFAULT_DEMOTE_MIN_N = 10
 _DEFAULT_DEMOTE_THRESHOLD_USD = 0.0
+# No hardcoded numeric default: unset resolves to max_daily_drawdown_pct (see
+# resolve_risk_settings) -- the sentinel here is just "not configured".
+_DEFAULT_OPEN_DRAWDOWN_WARN_PCT = None
 
 
 def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> RiskSettings:
@@ -108,6 +126,9 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
     demote_threshold_usd = _resolve_float(
         "BHIKSHA_RISK_DEMOTE_THRESHOLD_USD", _DEFAULT_DEMOTE_THRESHOLD_USD, settings_source, warnings
     )
+    open_drawdown_warn_pct = _resolve_optional_float(
+        "BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", _DEFAULT_OPEN_DRAWDOWN_WARN_PCT, settings_source, warnings
+    )
 
     if max_dd <= 0:
         warnings.append(
@@ -136,6 +157,19 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
             f"demote_min_n={demote_min_n} > demote_window={demote_window}; clamping min_n to the window"
         )
         demote_min_n = demote_window
+    if open_drawdown_warn_pct is not None and open_drawdown_warn_pct <= 0:
+        warnings.append(
+            f"open_drawdown_warn_pct={open_drawdown_warn_pct} must be > 0; "
+            "falling back to unset (defaults to max_daily_drawdown_pct)"
+        )
+        open_drawdown_warn_pct = None
+    # NOTE: open_drawdown_warn_pct is left as None here when unconfigured --
+    # it is NOT baked to max_daily_drawdown_pct at resolve time. The fallback
+    # ("unset -> tier-1 halt pct") is applied at the POINT OF USE
+    # (RiskManager.effective_open_drawdown_warn_pct) so that RiskSettings
+    # constructed directly (e.g. in tests, via RiskSettings(**kwargs) without
+    # this field) gets the identical fallback behavior as the resolver path --
+    # one fallback rule, not two.
 
     return RiskSettings(
         rail_a_enabled=rail_a_enabled,
@@ -145,6 +179,7 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
         demote_window=demote_window,
         demote_min_n=demote_min_n,
         demote_threshold_usd=demote_threshold_usd,
+        open_drawdown_warn_pct=open_drawdown_warn_pct,
         validation_warnings=tuple(warnings),
     )
 
@@ -175,6 +210,19 @@ def _resolve_bool(key: str, default: bool, settings_source: SettingsSource | Non
 
 
 def _resolve_float(key: str, default: float, settings_source: SettingsSource | None, warnings: list[str]) -> float:
+    raw = _raw_value(key, settings_source)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        warnings.append(f"{key}={raw!r} is not a valid number; using default {default}")
+        return default
+
+
+def _resolve_optional_float(
+    key: str, default: float | None, settings_source: SettingsSource | None, warnings: list[str]
+) -> float | None:
     raw = _raw_value(key, settings_source)
     if raw is None:
         return default

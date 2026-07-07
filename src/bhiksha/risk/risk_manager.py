@@ -55,6 +55,7 @@ RAIL B (per-deployment auto-demote, one-way):
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -70,6 +71,15 @@ TIER1_HALT_REASON = "risk_rail_a_tier1_halt"
 TIER2_FLATTEN_REASON = "risk_rail_a_tier2_flatten"
 RAIL_B_DEMOTED_REASON = "risk_rail_b_demoted"
 BUDGET_UNAVAILABLE_REASON = "risk_rail_a_budget_unavailable"
+OPEN_DRAWDOWN_WARNING_REASON = "risk_open_drawdown_warning"
+
+# Type of the optional per-position mark-price callback (operator audit P4,
+# 2026-07-06 -- see _compute_open_drawdown_status). Keyed by option_symbol,
+# returns the current mark (the same "exit reference" premium the native
+# exit path already fetches via OrderManager.get_option_quote), or None if a
+# quote could not be obtained for that symbol this tick (fail-safe: that
+# position is simply excluded from the unrealized sum, never estimated).
+MarkPriceProvider = Callable[[str], Awaitable[float | None]]
 
 # Rail-A-active-but-can't-tell-if-it's-breached reasons (see
 # _compute_rail_a_status): only these two mean "the budget/pnl read failed or
@@ -97,6 +107,30 @@ def _is_live_trade(trade: TradeRecord) -> bool:
 
 def _is_closed_trade(trade: TradeRecord) -> bool:
     return trade.status == "closed"
+
+
+def _is_open_live_trade(trade: TradeRecord) -> bool:
+    """An OPEN live position: a live (non-shadow) trade not yet closed.
+
+    Mirrors ``_is_closed_trade`` (``status == "closed"``) the same way
+    ``daily_report._is_open_trade`` does -- "open" is simply "not closed",
+    there is no separate open/pending status enum to branch on.
+    """
+    return _is_live_trade(trade) and not _is_closed_trade(trade)
+
+
+def _unrealized_pnl_usd(entry_price: float | None, current_mark: float | None, quantity: int | None) -> float | None:
+    """Unrealized P&L for one open position, same shape as _realized_pnl_usd.
+
+    This book is always-long-premium (buy calls/puts, quantity is always
+    guarded > 0 elsewhere in this codebase -- see TrackedPosition/TradeRecord
+    usage in supervisor.py) so there is no separate short-position sign flip:
+    the formula is identical to the realized one, entry vs. current instead
+    of entry vs. exit.
+    """
+    if entry_price is None or current_mark is None or not quantity:
+        return None
+    return round((current_mark - entry_price) * quantity * 100, 2)
 
 
 def _realized_pnl_usd(trade: TradeRecord) -> float | None:
@@ -133,6 +167,29 @@ class RailAStatus:
 
 
 @dataclass(slots=True, frozen=True)
+class OpenDrawdownStatus:
+    """Operator audit P4 (2026-07-06): mark-to-market open-book WARNING.
+
+    WARNING ONLY -- this never halts new entries, never flattens, never
+    places/cancels/suppresses an order. It exists because Rail A is
+    realized-P&L-only and will not notice an open live position bleeding
+    intraday until the loss is realized (native protective stops still
+    guard every trade -- this is an awareness gap, not a naked-risk gap).
+    """
+
+    active: bool
+    breached: bool
+    reason: str | None
+    realized_usd: float | None = None
+    unrealized_open_usd: float | None = None
+    day_mtm_usd: float | None = None
+    warn_threshold_usd: float | None = None
+    warn_pct: float | None = None
+    usable_budget: float | None = None
+    open_position_count: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class RailBStatus:
     demoted: bool
     reason: str | None
@@ -155,6 +212,7 @@ class BookActionsResult:
     rail_a: RailAStatus
     should_flatten: bool
     flatten_reason: str | None = None
+    open_drawdown: OpenDrawdownStatus | None = None
 
 
 class RiskManager:
@@ -177,6 +235,7 @@ class RiskManager:
         alert_mode: AlertMode = "live",
         alert_profile: str | None = None,
         now_fn=None,
+        mark_price_provider: MarkPriceProvider | None = None,
     ) -> None:
         self.settings = settings
         self.cash_budget_repository = cash_budget_repository
@@ -186,6 +245,16 @@ class RiskManager:
         self.alert_mode = alert_mode
         self.alert_profile = alert_profile
         self._now_fn = now_fn or (lambda: datetime.now(UTC))
+        # Operator audit P4 (2026-07-06): optional per-option-symbol mark
+        # fetch, reusing the SAME broker quote flow the native exit path
+        # already uses (OrderManager.get_option_quote) -- there is no
+        # existing per-tick cache of live marks reachable from book_actions()
+        # without this seam (see risk-a5-mtm-warning branch notes / PR
+        # description for the recon). None (the default) means the feature
+        # is INACTIVE: _compute_open_drawdown_status always returns
+        # active=False, never a spurious warning -- fail-safe, matching Rail
+        # A's own missing-data posture.
+        self._mark_price_provider = mark_price_provider
         # Session-scoped: once Rail A halts, stay halted for the rest of the
         # session even if a subsequent P&L read is momentarily better (no
         # flip-flopping new entries back on intraday). Tier 2 flatten is
@@ -198,6 +267,11 @@ class RiskManager:
         self._session_demoted_ids: set[str] = set()
         self._notified_tier1 = False
         self._notified_tier2 = False
+        # Operator audit P4: same "once per session" latch as tier1/tier2 --
+        # never clears once fired, even if a later mark makes the book look
+        # healthy again intraday (matches the existing rail posture: act
+        # once, stay acted/notified).
+        self._notified_open_drawdown_warning = False
         # Rail-A evaluate-throttle cache (see _EVALUATE_THROTTLE_SECONDS):
         # book_actions() is called once per symbol-bar (13x/minute) but Rail A
         # is a book-level check -- cache the result for the rest of the
@@ -307,6 +381,112 @@ class RiskManager:
                 total += pnl
         return round(total, 2)
 
+    @property
+    def effective_open_drawdown_warn_pct(self) -> float:
+        """The resolved warn pct: an explicit setting, else tier-1's pct.
+
+        Applied at point-of-use (not baked into ``resolve_risk_settings``) so
+        a directly-constructed ``RiskSettings`` -- e.g. in tests, without this
+        field -- gets the identical "unset -> tier-1" fallback as the env/
+        sheet-resolved path.
+        """
+        if self.settings.open_drawdown_warn_pct is not None:
+            return self.settings.open_drawdown_warn_pct
+        return self.settings.max_daily_drawdown_pct
+
+    # ------------------------------------------------------------------ #
+    # Operator audit P4 (2026-07-06): mark-to-market open-book WARNING.
+    # WARNING ONLY -- see OpenDrawdownStatus docstring. Combines TODAY's
+    # realized live P&L (the exact same _realized_live_pnl_today Rail A
+    # uses) with the CURRENT unrealized P&L of every OPEN live position
+    # (mark - entry_price) * quantity * 100, same formula as
+    # _realized_pnl_usd/_unrealized_pnl_usd, just entry-vs-current instead of
+    # entry-vs-exit. Fail-safe: any missing mark, missing budget, or a rail
+    # already realized-halted skips silently -- never a spurious warning.
+    # ------------------------------------------------------------------ #
+
+    async def _compute_open_drawdown_status(
+        self, *, realized_pnl: float, usable_budget: float, trade_date: str, rail_a_already_breached: bool
+    ) -> OpenDrawdownStatus:
+        if not self.settings.rail_a_enabled:
+            return OpenDrawdownStatus(active=False, breached=False, reason="rail_a_disabled")
+        if self._mark_price_provider is None:
+            # No quote seam wired up (e.g. a test/tooling context, or the
+            # runtime not yet threading OrderManager through) -- INACTIVE,
+            # never a spurious warning. This mirrors Rail A's own fail-safe
+            # "missing data -> inactive" posture, not fail-open.
+            return OpenDrawdownStatus(active=False, breached=False, reason="mark_price_provider_unavailable")
+
+        try:
+            trades = await self.trade_state_repository.get_recent_trades(limit=1000)
+        except Exception:
+            return OpenDrawdownStatus(active=False, breached=False, reason="pnl_query_failed")
+
+        open_live_trades = [trade for trade in trades if _is_open_live_trade(trade)]
+        if not open_live_trades:
+            # No open live positions: unrealized is unambiguously zero, no
+            # marks to fetch. Still evaluate against realized-only so a
+            # WARNING can never be silently skipped just because the book
+            # happens to be flat right now (the day MTM equals realized).
+            day_mtm = realized_pnl
+            warn_pct = self.effective_open_drawdown_warn_pct
+            warn_threshold = -(warn_pct / 100.0) * usable_budget
+            breached = day_mtm <= warn_threshold and not rail_a_already_breached
+            return OpenDrawdownStatus(
+                active=True,
+                breached=breached,
+                reason=OPEN_DRAWDOWN_WARNING_REASON if breached else None,
+                realized_usd=realized_pnl,
+                unrealized_open_usd=0.0,
+                day_mtm_usd=day_mtm,
+                warn_threshold_usd=round(warn_threshold, 2),
+                warn_pct=warn_pct,
+                usable_budget=usable_budget,
+                open_position_count=0,
+            )
+
+        unrealized_total = 0.0
+        priced_count = 0
+        for trade in open_live_trades:
+            if trade.option_symbol is None:
+                continue
+            try:
+                mark = await self._mark_price_provider(trade.option_symbol)
+            except Exception:
+                mark = None
+            pnl = _unrealized_pnl_usd(trade.entry_price, mark, trade.quantity)
+            if pnl is None:
+                # Missing mark for this one position -- fail-safe: exclude it
+                # from the sum rather than guessing/estimating. If EVERY open
+                # position is missing a mark, priced_count stays 0 and the
+                # whole check goes inactive below (never a spurious warning
+                # built from zero real data).
+                continue
+            unrealized_total += pnl
+            priced_count += 1
+
+        if priced_count == 0:
+            return OpenDrawdownStatus(active=False, breached=False, reason="no_priced_open_positions")
+
+        unrealized_total = round(unrealized_total, 2)
+        day_mtm = round(realized_pnl + unrealized_total, 2)
+        warn_pct = self.effective_open_drawdown_warn_pct
+        warn_threshold = -(warn_pct / 100.0) * usable_budget
+        breached = day_mtm <= warn_threshold and not rail_a_already_breached
+
+        return OpenDrawdownStatus(
+            active=True,
+            breached=breached,
+            reason=OPEN_DRAWDOWN_WARNING_REASON if breached else None,
+            realized_usd=realized_pnl,
+            unrealized_open_usd=unrealized_total,
+            day_mtm_usd=day_mtm,
+            warn_threshold_usd=round(warn_threshold, 2),
+            warn_pct=warn_pct,
+            usable_budget=usable_budget,
+            open_position_count=priced_count,
+        )
+
     async def book_actions(self) -> BookActionsResult:
         """Periodic/tick consult point: recompute Rail A and report a flatten decision.
 
@@ -408,10 +588,59 @@ class RiskManager:
                 level="error",
             )
 
+        # Operator audit P4 (2026-07-06): mark-to-market open-book WARNING.
+        # Only evaluated when Rail A itself is ACTIVE (a real usable_budget
+        # and realized P&L are already in hand from _compute_rail_a_status
+        # above) -- when Rail A is inactive (missing budget/pnl query
+        # failure/disabled), _compute_rail_a_status already emitted its own
+        # fail-safe warning and there is nothing safe to combine, so this
+        # stays untouched (open_drawdown=None on the result).
+        open_drawdown: OpenDrawdownStatus | None = None
+        if status.active:
+            open_drawdown = await self._compute_open_drawdown_status(
+                realized_pnl=status.realized_live_pnl_usd or 0.0,
+                usable_budget=status.usable_budget,
+                trade_date=status.trade_date,
+                rail_a_already_breached=status.halted,
+            )
+            if open_drawdown.active and open_drawdown.breached and not self._notified_open_drawdown_warning:
+                self._notified_open_drawdown_warning = True
+                await self.event_repository.append(
+                    OPEN_DRAWDOWN_WARNING_REASON,
+                    {
+                        "realized_usd": open_drawdown.realized_usd,
+                        "unrealized_open_usd": open_drawdown.unrealized_open_usd,
+                        "day_mtm_usd": open_drawdown.day_mtm_usd,
+                        "warn_threshold_usd": open_drawdown.warn_threshold_usd,
+                        "warn_pct": open_drawdown.warn_pct,
+                        "usable_budget": open_drawdown.usable_budget,
+                        "open_position_count": open_drawdown.open_position_count,
+                        "trade_date": status.trade_date,
+                    },
+                )
+                await self._notify(
+                    title="Rail A open-book mark-to-market WARNING",
+                    body=(
+                        f"Day mark-to-market P&L: ${open_drawdown.day_mtm_usd:.2f} "
+                        f"(realized ${open_drawdown.realized_usd:.2f} + unrealized open "
+                        f"${open_drawdown.unrealized_open_usd:.2f} across "
+                        f"{open_drawdown.open_position_count} open live position(s)) "
+                        f"<= warn threshold ${open_drawdown.warn_threshold_usd:.2f} "
+                        f"(usable budget ${open_drawdown.usable_budget:.2f}, "
+                        f"open_drawdown_warn_pct={open_drawdown.warn_pct}). "
+                        "WARNING ONLY -- no order has been placed, canceled, or "
+                        "suppressed. Realized-only Rail A has not itself halted; an "
+                        "open position is bleeding intraday and native protective "
+                        "stops remain the sole automatic guard on it."
+                    ),
+                    level="warning",
+                )
+
         return BookActionsResult(
             rail_a=status,
             should_flatten=self._session_flattened,
             flatten_reason=TIER2_FLATTEN_REASON if self._session_flattened else None,
+            open_drawdown=open_drawdown,
         )
 
     # ------------------------------------------------------------------ #
