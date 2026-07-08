@@ -3067,6 +3067,12 @@ class _QtyRecordingOrderManager(StubOrderManager):
         return PublicQuote(symbol=option_symbol, bid=2.0, ask=2.05, last=2.02, open_interest=500, outcome="SUCCESS")
 
 
+class _FailingPartialCloseOrderManager(_QtyRecordingOrderManager):
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        self.close_calls.append((option_symbol, int(quantity), exit_mode.value))
+        return OrderResult(order_id=None, error="broker rejected partial close")
+
+
 def _partial_supervisor(tmp_path):
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     om = _QtyRecordingOrderManager()
@@ -3122,6 +3128,81 @@ def test_partial_scale_closes_only_banked_qty_and_keeps_residual_live(tmp_path) 
     assert residual.exit_mode is None and residual.exit_order_id is None
     assert residual.stop_order_id == "STOP_RESIDUAL"
     assert om.stop_calls == [("QQQ260401P00556000", 1.5, 1)]
+
+
+def test_partial_scale_live_submit_failure_does_not_bank_or_reduce_position(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    om = _FailingPartialCloseOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="T_FAIL_PARTIAL",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                option_symbol="QQQ260401P00556000",
+                quantity=4,
+                entry_price=2.0,
+                status="open_protected",
+                entry_order_id="ENTRY_FULL",
+                stop_order_id="STOP_FULL",
+                stop_price=1.5,
+            )
+        )
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="T_FAIL_PARTIAL",
+        option_symbol="QQQ260401P00556000",
+        quantity=4,
+        entry_price=2.0,
+        source="live_open",
+        order_id="ENTRY_FULL",
+        stop_order_id="STOP_FULL",
+        stop_price=1.5,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = _partial_scale_decision(deployment.deployment_id, exit_quantity=3)
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.error == "broker rejected partial close"
+    assert om.close_calls == [("QQQ260401P00556000", 3, ExitMode.STRATEGY.value)]
+    # The bank did not happen, so protection is restored on the original full
+    # 4-lot position -- not a residual 1-lot.
+    assert om.stop_calls == [("QQQ260401P00556000", 1.5, 4)]
+    survivor = supervisor.planner.position_tracker.active_positions()[0]
+    assert survivor.quantity == 4
+    assert survivor.stop_order_id == "STOP_RESIDUAL"
+    assert survivor.exit_mode is None and survivor.exit_order_id is None
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        trade_row = conn.execute(
+            """
+            SELECT status, quantity, stop_order_id, stop_price
+            FROM trade_sessions
+            WHERE trade_id = 'T_FAIL_PARTIAL'
+            """
+        ).fetchone()
+        partial_count = conn.execute(
+            "SELECT COUNT(*) FROM trade_partial_fills WHERE trade_id = 'T_FAIL_PARTIAL'"
+        ).fetchone()[0]
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+
+    assert trade_row == ("open_protected", 4, "STOP_RESIDUAL", 1.5)
+    assert partial_count == 0
+    assert "exit_submission_failure" in event_types
+    assert "partial_scale_submission" not in event_types
 
 
 def test_partial_scale_dry_run_keeps_residual_and_places_no_orders(tmp_path) -> None:

@@ -2186,6 +2186,100 @@ class ExecutionSupervisor:
                         "error": error,
                     },
                 )
+                restored_position = updated_position
+                restored_stop_order_id = None
+                restore_error = None
+                if updated_position.option_symbol is not None and prior_stop_price is not None:
+                    stop_result = await self.planner.order_manager.place_stop_loss_order(
+                        updated_position.option_symbol,
+                        prior_stop_price,
+                        updated_position.quantity,
+                    )
+                    restored_stop_order_id = stop_result.order_id
+                    restore_error = stop_result.error
+                    if restored_stop_order_id is not None:
+                        restored_position = _replace_position(
+                            updated_position,
+                            stop_order_id=restored_stop_order_id,
+                            stop_price=prior_stop_price,
+                        )
+                    else:
+                        await self.event_repository.append(
+                            "runtime_issue",
+                            {
+                                "category": "protective_stop_failure",
+                                "symbol": updated_position.symbol,
+                                "deployment_id": deployment.deployment_id,
+                                "trade_id": updated_position.trade_id,
+                                "option_symbol": updated_position.option_symbol,
+                                "error": restore_error or "partial_scale_failed_restore_stop_rejected",
+                                "stage": "partial_scale_submission_failure_restore",
+                            },
+                        )
+                self.planner.position_tracker.open_position(
+                    restored_position.symbol,
+                    restored_position.deployment_id,
+                    trade_id=restored_position.trade_id,
+                    option_symbol=restored_position.option_symbol,
+                    quantity=restored_position.quantity,
+                    entry_price=restored_position.entry_price,
+                    underlying_entry_price=restored_position.underlying_entry_price,
+                    entry_timestamp=restored_position.entry_timestamp,
+                    source=restored_position.source,
+                    order_id=restored_position.order_id,
+                    stop_order_id=restored_position.stop_order_id,
+                    stop_price=restored_position.stop_price,
+                    target_order_id=restored_position.target_order_id,
+                    target_price=restored_position.target_price,
+                )
+                if restored_position.trade_id is not None and restored_position.option_symbol is not None:
+                    await self._upsert_trade_record(
+                        TradeRecord(
+                            trade_id=restored_position.trade_id,
+                            deployment_id=restored_position.deployment_id,
+                            symbol=restored_position.symbol,
+                            option_symbol=restored_position.option_symbol,
+                            quantity=restored_position.quantity,
+                            entry_price=restored_position.entry_price,
+                            underlying_entry_price=restored_position.underlying_entry_price,
+                            entry_timestamp=restored_position.entry_timestamp,
+                            status=_tracked_trade_status(restored_position),
+                            entry_order_id=restored_position.order_id,
+                            stop_order_id=restored_position.stop_order_id,
+                            stop_price=restored_position.stop_price,
+                            target_order_id=restored_position.target_order_id,
+                            target_price=restored_position.target_price,
+                        )
+                    )
+                transition = self.lifecycle_store.mark_open(
+                    restored_position.symbol,
+                    restored_position.deployment_id,
+                    option_symbol=restored_position.option_symbol,
+                    order_id=restored_position.stop_order_id or restored_position.order_id,
+                    protected=bool(restored_position.stop_order_id),
+                )
+                await self._emit_lifecycle_transition(
+                    transition,
+                    reason="partial_scale_failed_position_restored"
+                    if restored_position.stop_order_id
+                    else "partial_scale_failed_position_unprotected",
+                )
+                plan = ExitPlan(
+                    trade_id=restored_position.trade_id or restored_position.order_id or "UNKNOWN_TRADE",
+                    deployment_id=deployment.deployment_id,
+                    symbol=updated_position.symbol,
+                    option_symbol=updated_position.option_symbol,
+                    quantity=close_qty,
+                    action="square_off",
+                    reasons=decision.reason,
+                    dry_run=False,
+                    order_id=None,
+                    canceled_stop_order_id=canceled_stop_order_id,
+                    canceled_target_order_id=canceled_target_order_id,
+                    error=error or restore_error or "partial_scale_order_submit_failed",
+                )
+                await self.event_repository.append("exit_plan", asdict(plan))
+                return plan
 
         # ITEM B (2026-07-08 hygiene batch): durably record the banked leg's own
         # economics BEFORE the residual overwrites trade_sessions.quantity below.

@@ -11,6 +11,16 @@ from bhiksha.app.bootstrap import build_runtime
 from bhiksha.app.runtime import ReconciliationSnapshot, _frame_with_live_price
 from bhiksha.domain.models import Bar
 from bhiksha.state.position_tracker import PositionTracker, TrackedPosition
+from historical_config import historical_deployment
+
+
+def _runtime_deployment(runtime, *, symbol: str, fallback_id: str):
+    for deployment in runtime.deployments:
+        if deployment.symbol == symbol:
+            return deployment
+    deployment = historical_deployment(fallback_id)
+    runtime.deployments.append(deployment)
+    return deployment
 
 
 def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments() -> None:
@@ -47,10 +57,11 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
 
 def test_runtime_warmup_expands_for_hourly_market_impulse() -> None:
     runtime = build_runtime()
-    runtime.deployments[0].enabled = True
-    runtime.deployments[0].symbol = "MU"
-    runtime.deployments[0].strategy.key = "market_impulse"
-    runtime.deployments[0].strategy.params = {
+    deployment = _runtime_deployment(runtime, symbol="MU", fallback_id="market_impulse_qqq_short_v1")
+    deployment.enabled = True
+    deployment.symbol = "MU"
+    deployment.strategy.key = "market_impulse"
+    deployment.strategy.params = {
         "regime_timeframe": "1h",
         "vwma_periods": [10, 20, 40],
     }
@@ -436,7 +447,7 @@ def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> Non
 
 def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
     runtime = build_runtime()
-    deployment = next(deployment for deployment in runtime.deployments if deployment.symbol == "SPY")
+    deployment = _runtime_deployment(runtime, symbol="SPY", fallback_id="market_impulse_spy_short_v1")
     deployment.enabled = True
     snapshot = ReconciliationSnapshot()
 
