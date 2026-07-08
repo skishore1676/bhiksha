@@ -1873,6 +1873,192 @@ def test_execution_supervisor_closes_filled_pending_exit(tmp_path) -> None:
     )
 
 
+class ExitRepriceCancelRaceOrderManager(StubOrderManager):
+    """Reproduces the 2026-07-08 AMD live gap (workplan hygiene item A).
+
+    The FIRST exit order (``CLOSE_RACE_1``) genuinely fills at the broker, but
+    the pending-exit poller's status check lands one beat before that fill is
+    visible ("NEW"). The poller then sees the quote has moved and tries to
+    reprice: it cancels ``CLOSE_RACE_1`` -- but the broker refuses the cancel
+    because the order already filled (an "ambiguous cancel", reported here as
+    ``canceled=False``). Any duplicate close order the (unfixed) resubmit path
+    might place on top of an already-flat position is rejected by the broker,
+    exactly as production would reject it.
+    """
+
+    def __init__(self) -> None:
+        self.quote_calls = 0
+        self.status_calls: dict[str, int] = {}
+        self.cancel_calls: list[str] = []
+        self.close_orders_placed: list[str] = []
+        self._next_close_id = 0
+
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        del option_symbol, quantity, exit_mode, limit_price
+        self._next_close_id += 1
+        order_id = f"CLOSE_RACE_{self._next_close_id}"
+        self.close_orders_placed.append(order_id)
+
+        class Result:
+            pass
+
+        result = Result()
+        result.order_id = order_id
+        result.error = None
+        return result
+
+    async def get_option_quote(self, option_symbol):
+        self.quote_calls += 1
+        # Submission quote: bid 13.05. Reprice-check quote (and every quote
+        # after): bid moved to 13.55 -- a material change that arms the
+        # STRATEGY reprice branch.
+        bid = 13.05 if self.quote_calls == 1 else 13.55
+        return PublicQuote(
+            symbol=option_symbol,
+            bid=bid,
+            ask=bid + 0.05,
+            last=bid + 0.02,
+            open_interest=200,
+            outcome="SUCCESS",
+        )
+
+    async def get_order_status(self, order_id):
+        self.status_calls[order_id] = self.status_calls.get(order_id, 0) + 1
+        if order_id == "CLOSE_RACE_1":
+            if self.status_calls[order_id] == 1:
+                return "NEW", {"status": "NEW"}, None
+            return (
+                "FILLED",
+                {
+                    "orderId": "CLOSE_RACE_1",
+                    "instrument": {"symbol": "AMD260713P00500000", "type": "OPTION"},
+                    "status": "FILLED",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "1",
+                    "averagePrice": "13.55",
+                    "closedAt": "2026-07-08T14:05:00Z",
+                },
+                None,
+            )
+        # A resubmitted duplicate close on an already-flat position: the
+        # broker rejects it (there is nothing left to sell).
+        return "REJECTED", {"status": "REJECTED"}, None
+
+    async def cancel_order(self, order_id):
+        self.cancel_calls.append(order_id)
+        if order_id == "CLOSE_RACE_1":
+            # The broker refuses to cancel -- it already filled.
+            return False, "order_already_filled"
+        return True, None
+
+
+def test_execution_supervisor_exit_reprice_cancel_race_persists_fill_truth_for_target_1_partial_square_off(
+    tmp_path,
+) -> None:
+    """Item A (2026-07-08 hygiene batch): a 1-lot position where the profile's
+    ``target_1_partial`` rule fully banks the position (``_partial_quantity``
+    rounds up to the full quantity, so the FSM action is a full ``square_off``,
+    not a partial scale -- this mapping is by design). The exit fills, but a
+    reprice tick races the fill's cancel-confirmation. Before the fix, the
+    code blindly resubmitted a new close order on the now-flat position,
+    orphaning the ``exit_order_id`` that actually carried the fill -- so
+    ``exit_price``/``exit_filled_quantity``/``exit_filled_at`` never wrote
+    back even though the trade correctly reached ``status=closed`` and
+    ``exit_rule`` (persisted at submission time) survived. This mirrors the
+    real AMD deployment
+    (strategy_expand30_amd_mi_01_amd_short_live_row_2, entry 10.40,
+    AMD260713P00500000).
+    """
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    order_manager = ExitRepriceCancelRaceOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    from bhiksha.config.loader import load_deployments
+
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE_AMD",
+                deployment_id=deployment.deployment_id,
+                symbol="AMD",
+                option_symbol="AMD260713P00500000",
+                quantity=1,
+                entry_price=10.40,
+                entry_timestamp=datetime(2026, 7, 8, 13, 45, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY_AMD",
+            )
+        )
+    )
+    supervisor.planner.position_tracker.open_position(
+        "AMD",
+        deployment.deployment_id,
+        trade_id="TRADE_AMD",
+        option_symbol="AMD260713P00500000",
+        quantity=1,
+        entry_price=10.40,
+        source="live_open",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    # Mirrors profile_decision_to_exit_decision's real output for a 1-lot
+    # target_1_partial bank (profile_exit.py: bank_qty >= quantity -> the
+    # PARTIAL_SCALE branch is skipped and _full_exit fires with
+    # fsm_action=SQUARE_OFF). No "partial_scale" feature key -- this is a
+    # plain full square-off, not a partial scale.
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="AMD",
+        timestamp=datetime(2026, 7, 8, 14, 0, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_target_1_full"],
+        cancel_protection_orders=True,
+        features={
+            "profile_id": "amd_short_live",
+            "profile_rule": "target_1_partial",
+            "profile_fsm_action": "square_off",
+            "exit_quantity": 1,
+        },
+    )
+
+    submit_plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+    assert submit_plan is not None
+    assert submit_plan.order_id == "CLOSE_RACE_1"
+
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    assert len(plans) == 1
+    # The fix must resolve the race on a single poll -- no duplicate close
+    # order is ever placed on the now-flat position.
+    assert order_manager.close_orders_placed == ["CLOSE_RACE_1"]
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        row = conn.execute(
+            """
+            SELECT status, exit_order_id, exit_price, exit_filled_quantity, exit_filled_at, exit_rule
+            FROM trade_sessions
+            WHERE trade_id = 'TRADE_AMD'
+            """
+        ).fetchone()
+        event_types = [event[0] for event in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert row == (
+        "closed",
+        "CLOSE_RACE_1",
+        13.55,
+        1,
+        "2026-07-08T14:05:00+00:00",
+        "target_1_partial",
+    )
+    assert "exit_reprice_cancel_race_filled" in event_types
+
+
 def test_execution_supervisor_enriches_stop_filled_disappeared_position(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))

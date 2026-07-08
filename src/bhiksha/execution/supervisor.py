@@ -2748,6 +2748,104 @@ class ExecutionSupervisor:
                 first_error = cancel_error
         return updated, canceled_stop_order_id, canceled_target_order_id, first_error
 
+    async def _finalize_pending_exit_fill(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        exit_order_id: str | None,
+        status: str | None,
+        payload: dict | None,
+        now: datetime,
+        reason: str = "exit_filled",
+    ) -> ExitPlan:
+        """Close out a position whose exit order is confirmed FILLED and persist
+        the fill truth (exit_price/exit_filled_quantity/exit_filled_at).
+
+        ROOT CAUSE FIX (2026-07-08 hygiene batch, item A): this is the single
+        chokepoint for recording a genuine exit fill, shared by the routine
+        pending-exit FILLED poll AND the reprice cancel-race guard below
+        (``_cancel_exit_order_and_check_fill`` callers). Previously the
+        cancel-then-resubmit reprice paths did NOT check whether the order they
+        were about to supersede had already filled; when a cancel raced a real
+        fill (broker reports the cancel as failed/ambiguous *because* the order
+        already filled), the code blindly resubmitted a new close order,
+        overwriting ``exit_order_id`` with the new (non-filling) order and
+        permanently losing the reference to the order that actually filled the
+        position. The later broker-vanished reconciliation fallback
+        (``_mark_disappeared_trade_closed`` / ``_find_terminal_exit_order_payload``)
+        then had nothing left to find, so ``exit_price``/``exit_filled_quantity``/
+        ``exit_filled_at`` never wrote back even though ``status`` correctly
+        went to ``closed`` and ``exit_rule`` (persisted earlier, at submission
+        time) survived. Routing every confirmed fill through this one method
+        closes that gap regardless of which caller discovered it.
+        """
+        self.planner.position_tracker.close_position(
+            position.symbol,
+            position.deployment_id,
+            option_symbol=position.option_symbol,
+        )
+        self.clear_profile_exit_state(position)
+        if position.trade_id is not None:
+            await self._mark_trade_closed_with_exit_truth(
+                position.trade_id,
+                exit_order_id=exit_order_id,
+                status=status,
+                payload=payload,
+            )
+        transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
+        await self._emit_lifecycle_transition(transition, reason="exit_closed")
+        plan = ExitPlan(
+            trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+            deployment_id=deployment.deployment_id,
+            symbol=position.symbol,
+            option_symbol=position.option_symbol,
+            quantity=position.quantity,
+            action="square_off",
+            reasons=[reason],
+            dry_run=False,
+            order_id=exit_order_id,
+        )
+        await self.event_repository.append("exit_plan", asdict(plan))
+        await self._record_manual_status(
+            deployment,
+            stage="exit_closed",
+            writer_call=self.manual_status_writer.mark_closed(
+                deployment,
+                trade_id=position.trade_id,
+                note=reason,
+                event_at=now,
+            )
+            if self.manual_status_writer is not None
+            else None,
+        )
+        return plan
+
+    async def _cancel_exit_order_and_check_fill(
+        self, order_id: str
+    ) -> tuple[bool, str | None, str | None, dict | None]:
+        """Cancel a resting exit order and read back its status before treating
+        it as safely superseded (E1: exit-side cancel-race fill guard, mirrors
+        the entry-side ``_cancel_entry_order_and_check_fill``).
+
+        A broker cancel can report failure/ambiguity precisely *because* the
+        order already filled. Reading the status back after every cancel
+        attempt (not just on a failed ``canceled`` return) lets a reprice
+        caller detect that race and record the real fill instead of
+        resubmitting a duplicate close order that would orphan the true
+        ``exit_order_id``. Returns ``(canceled_ok, cancel_error, status, payload)``.
+        """
+        canceled_ok, cancel_error = await self.planner.order_manager.cancel_order(order_id)
+        try:
+            status, payload, status_error = await asyncio.wait_for(
+                self.planner.order_manager.get_order_status(order_id),
+                timeout=ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            status, payload, status_error = None, None, "cancel_status_readback_timeout"
+        del status_error  # diagnostics only; callers act on (status, payload)
+        return canceled_ok, cancel_error, status, payload
+
     async def manage_pending_exits(
         self,
         deployments_by_id: dict[str, DeploymentManifest],
@@ -2796,46 +2894,15 @@ class ExecutionSupervisor:
         )
         normalized = (status or "").upper()
         if normalized == "FILLED":
-            self.planner.position_tracker.close_position(
-                position.symbol,
-                position.deployment_id,
-                option_symbol=position.option_symbol,
-            )
-            self.clear_profile_exit_state(position)
-            if position.trade_id is not None:
-                await self._mark_trade_closed_with_exit_truth(
-                    position.trade_id,
-                    exit_order_id=position.exit_order_id,
-                    status=status,
-                    payload=payload,
-                )
-            transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
-            await self._emit_lifecycle_transition(transition, reason="exit_closed")
-            plan = ExitPlan(
-                trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
-                deployment_id=deployment.deployment_id,
-                symbol=position.symbol,
-                option_symbol=position.option_symbol,
-                quantity=position.quantity,
-                action="square_off",
-                reasons=["exit_filled"],
-                dry_run=False,
-                order_id=position.exit_order_id,
-            )
-            await self.event_repository.append("exit_plan", asdict(plan))
-            await self._record_manual_status(
+            return await self._finalize_pending_exit_fill(
                 deployment,
-                stage="exit_closed",
-                writer_call=self.manual_status_writer.mark_closed(
-                    deployment,
-                    trade_id=position.trade_id,
-                    note="exit_filled",
-                    event_at=now,
-                )
-                if self.manual_status_writer is not None
-                else None,
+                position,
+                exit_order_id=position.exit_order_id,
+                status=status,
+                payload=payload,
+                now=now,
+                reason="exit_filled",
             )
-            return plan
         if error and position.exit_order_id is not None:
             await self.event_repository.append(
                 "ambiguous_cancel",
@@ -2877,7 +2944,37 @@ class ExecutionSupervisor:
                         reason="exit_reprice",
                     )
                     if position.exit_order_id:
-                        canceled, replace_cancel_error = await self.planner.order_manager.cancel_order(position.exit_order_id)
+                        canceled, replace_cancel_error, race_status, race_payload = (
+                            await self._cancel_exit_order_and_check_fill(position.exit_order_id)
+                        )
+                        # E1: the order we were about to supersede may have already
+                        # filled (the cancel racing a genuine fill is exactly why a
+                        # broker reports it as failed/ambiguous). Record the real
+                        # fill instead of resubmitting a duplicate close order that
+                        # would orphan the true exit_order_id (see ROOT CAUSE FIX
+                        # note on _finalize_pending_exit_fill).
+                        if str(race_status or "").upper() == "FILLED":
+                            await self.event_repository.append(
+                                "exit_reprice_cancel_race_filled",
+                                {
+                                    "deployment_id": deployment.deployment_id,
+                                    "symbol": position.symbol,
+                                    "option_symbol": position.option_symbol,
+                                    "order_id": position.exit_order_id,
+                                    "reason": "exit_reprice",
+                                    "cancel_ok": canceled,
+                                    "cancel_error": replace_cancel_error,
+                                },
+                            )
+                            return await self._finalize_pending_exit_fill(
+                                deployment,
+                                replaced_position,
+                                exit_order_id=position.exit_order_id,
+                                status=race_status,
+                                payload=race_payload,
+                                now=now,
+                                reason="exit_reprice_cancel_race_filled",
+                            )
                         if not canceled and self._allows_exit_submission_before_cancel_confirmation():
                             await self.event_repository.append(
                                 "ambiguous_cancel",
@@ -2906,7 +3003,34 @@ class ExecutionSupervisor:
             if position.exit_mode == ExitMode.HARD_FLAT:
                 if position.exit_reprice_count == 0:
                     if position.exit_order_id:
-                        canceled, cancel_error = await self.planner.order_manager.cancel_order(position.exit_order_id)
+                        canceled, cancel_error, race_status, race_payload = (
+                            await self._cancel_exit_order_and_check_fill(position.exit_order_id)
+                        )
+                        # E1: same cancel-race fill guard as the STRATEGY branch
+                        # above — a hard-flat reprice must not orphan an
+                        # already-filled exit_order_id either.
+                        if str(race_status or "").upper() == "FILLED":
+                            await self.event_repository.append(
+                                "exit_reprice_cancel_race_filled",
+                                {
+                                    "deployment_id": deployment.deployment_id,
+                                    "symbol": position.symbol,
+                                    "option_symbol": position.option_symbol,
+                                    "order_id": position.exit_order_id,
+                                    "reason": "hard_flat_reprice",
+                                    "cancel_ok": canceled,
+                                    "cancel_error": cancel_error,
+                                },
+                            )
+                            return await self._finalize_pending_exit_fill(
+                                deployment,
+                                position,
+                                exit_order_id=position.exit_order_id,
+                                status=race_status,
+                                payload=race_payload,
+                                now=now,
+                                reason="exit_reprice_cancel_race_filled",
+                            )
                         if not canceled and self._allows_exit_submission_before_cancel_confirmation():
                             await self.event_repository.append(
                                 "ambiguous_cancel",
