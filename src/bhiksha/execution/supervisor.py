@@ -694,6 +694,7 @@ class ExecutionSupervisor:
                             entry_timestamp=plan.entry_timestamp,
                             status="pending_entry",
                             entry_order_id=plan.order_id,
+                            can_ladder=plan.quantity >= 2,
                         )
                     )
                     transition = self.lifecycle_store.begin_entry(
@@ -734,6 +735,7 @@ class ExecutionSupervisor:
                             entry_timestamp=plan.entry_timestamp,
                             status="open_unprotected",
                             entry_order_id="SHADOW_ENTRY",
+                            can_ladder=plan.quantity >= 2,
                         )
                     )
                     transition = self.lifecycle_store.mark_open(
@@ -773,6 +775,7 @@ class ExecutionSupervisor:
                             entry_timestamp=plan.entry_timestamp,
                             status="open_unprotected",
                             entry_order_id=plan.order_id,
+                            can_ladder=plan.quantity >= 2,
                         )
                     )
                     transition = self.lifecycle_store.mark_open(
@@ -861,6 +864,7 @@ class ExecutionSupervisor:
                     entry_timestamp=plan.entry_timestamp,
                     status="pending_entry_reconcile",
                     entry_order_id=plan.order_id,
+                    can_ladder=plan.quantity >= 2,
                 )
             )
             transition = self.lifecycle_store.mark_reconciliation_hold(
@@ -940,6 +944,15 @@ class ExecutionSupervisor:
                 stop_price=stop_price,
                 target_order_id=target_order_id,
                 target_price=target_price,
+                # ITEM D (2026-07-08 hygiene batch): tag ladder-capability at
+                # LIVE entry recording time, from the ORIGINAL filled quantity
+                # -- the T1 60/40 profile split needs >= 2 contracts (see
+                # _partial_quantity in profile_exit.py). This is a snapshot:
+                # trade_sessions.quantity is later overwritten to the residual
+                # by a partial bank, so it must be captured here, not derived
+                # from quantity at report time. Metadata only -- never read by
+                # order-management logic; the daily report is the consumer.
+                can_ladder=plan.quantity >= 2,
             )
         )
         if protection_error is not None:

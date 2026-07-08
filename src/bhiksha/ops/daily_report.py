@@ -192,7 +192,7 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
                     lane=position.get("lane", ""),
                     symbol=position.get("symbol", ""),
                     option=position.get("option_symbol") or "",
-                    qty=position.get("quantity") or 0,
+                    qty=position.get("qty_label", position.get("quantity") or 0),
                     status=position.get("status") or "",
                     entry=_fmt_money(position.get("entry_price")),
                     stop=_fmt_money(position.get("stop_price")),
@@ -218,7 +218,7 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
                     lane=trade.get("lane", ""),
                     symbol=trade.get("symbol", ""),
                     option=trade.get("option_symbol") or "",
-                    qty=trade.get("quantity") or 0,
+                    qty=trade.get("qty_label", trade.get("quantity") or 0),
                     entry=_fmt_money(trade.get("entry_price")),
                     exit_px=_fmt_money(trade.get("exit_price")),
                     exit=trade.get("exit_attribution") or "",
@@ -622,6 +622,7 @@ def _load_day_trades(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
         "exit_order_type",
         "exit_mode",
         "exit_rule",
+        "can_ladder",
     ]
     selected = [column for column in desired if column in columns]
     day_text = day.isoformat()
@@ -666,7 +667,24 @@ def _augment_trade(trade: dict[str, Any]) -> dict[str, Any]:
         "option_strike": _parse_option_strike(_maybe_str(trade.get("option_symbol"))),
         "protection_state": _protection_state(trade),
         "exit_attribution": _exit_attribution(trade),
+        "qty_label": _format_qty_label(_maybe_int(trade.get("quantity")), trade.get("can_ladder")),
     }
+
+
+def _format_qty_label(quantity: int | None, can_ladder: Any) -> str:
+    """ITEM D (2026-07-08 hygiene batch): mark a trade whose ORIGINAL entry
+    could not express the profile ladder (< 2 contracts -- the T1 60/40 split
+    needs >= 2, see ``can_ladder`` on ``TradeRecord``) so the month's
+    analytics can separate full-DNA trades from T1-only trades at a glance.
+    ``can_ladder`` is ``None`` for rows written before this migration --
+    rendered as a bare quantity rather than misrepresented as no-ladder.
+    """
+    qty = quantity if quantity is not None else 0
+    if can_ladder is None:
+        return str(qty)
+    if can_ladder in (0, False):
+        return f"{qty} (no-ladder)"
+    return str(qty)
 
 
 def _exit_attribution(trade: dict[str, Any]) -> str | None:

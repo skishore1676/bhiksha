@@ -289,6 +289,78 @@ def test_execution_supervisor_logs_protective_stop(tmp_path) -> None:
     assert [row[0] for row in rows] == ["entry_fill_check", "protective_stop_submission", "lifecycle_transition"]
 
 
+def test_execution_supervisor_tags_can_ladder_at_live_entry_and_survives_partial_residual(tmp_path) -> None:
+    """ITEM D (2026-07-08 hygiene batch): can_ladder = quantity >= 2 is tagged
+    at live entry recording time and, unlike quantity itself, must NOT be
+    clobbered when a later partial bank overwrites trade_sessions.quantity to
+    the residual (see the QQQ fixture in
+    test_partial_leg_pnl_fixture_qqq_t1_bank_then_runner_exit for that
+    overwrite happening).
+    """
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(StubOrderManager()),
+        event_repository=SQLiteEventRepository(str(tmp_path / "events.db")),
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+
+    # 1-lot live entry -> no-ladder.
+    one_lot_plan = TradePlan(
+        trade_id="TRADE_1LOT",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_1LOT",
+    )
+    asyncio.run(supervisor._protect_live_entry(one_lot_plan, deployment))
+
+    # 2-lot live entry -> ladder-capable.
+    two_lot_plan = TradePlan(
+        trade_id="TRADE_2LOT",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00559000",
+        quantity=2,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_2LOT",
+    )
+    asyncio.run(supervisor._protect_live_entry(two_lot_plan, deployment))
+
+    open_trades = {trade.trade_id: trade for trade in asyncio.run(trade_repo.get_open_trades())}
+    assert open_trades["TRADE_1LOT"].can_ladder is False
+    assert open_trades["TRADE_2LOT"].can_ladder is True
+
+    # A later upsert reflecting a reduced (partial-residual) quantity, WITHOUT
+    # re-stating can_ladder, must not erase the entry-time tag (COALESCE, same
+    # precedent as exit_rule).
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE_2LOT",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                option_symbol="QQQ260330P00559000",
+                quantity=1,
+                status="open_protected",
+            )
+        )
+    )
+    survivor = asyncio.run(trade_repo.get_open_trades())
+    residual = next(trade for trade in survivor if trade.trade_id == "TRADE_2LOT")
+    assert residual.quantity == 1  # the residual, not the original 2
+    assert residual.can_ladder is True  # the entry-time tag survives
+
+
 def test_execution_supervisor_reprices_unfilled_entry_before_protection(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=2, replacement_fill_price=2.88)

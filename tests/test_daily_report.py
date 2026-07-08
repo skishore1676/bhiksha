@@ -235,6 +235,82 @@ def test_daily_report_surfaces_open_positions_and_protection(tmp_path) -> None:
     assert "- LIVE QQQ qty 2: entry 3.80, stop 2.47, target 5.70, protected" in body
 
 
+# --------------------------------------------------------------------------- #
+# Item D (2026-07-08 hygiene batch): ladder-capability tag (can_ladder =
+# quantity >= 2 at live entry time) surfaced in the trades/open-positions
+# tables so the month's analytics can separate full-DNA trades from
+# T1-only (no-ladder) trades.
+# --------------------------------------------------------------------------- #
+
+
+def test_daily_report_flags_no_ladder_trades_in_qty_column(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        # 1-lot live entry: cannot express the T1 60/40 ladder.
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="amd-no-ladder",
+                deployment_id="amd_short_live",
+                symbol="AMD",
+                option_symbol="AMD260713P00500000",
+                quantity=1,
+                entry_price=10.40,
+                entry_timestamp=datetime(2026, 6, 3, 13, 45, tzinfo=UTC),
+                status="open_protected",
+                stop_order_id="STOP_AMD",
+                can_ladder=False,
+            )
+        )
+        # 2-lot live entry: full ladder DNA available.
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="qqq-full-dna",
+                deployment_id="qqq_live",
+                symbol="QQQ",
+                option_symbol="QQQ260612C00480000",
+                quantity=2,
+                entry_price=2.50,
+                entry_timestamp=datetime(2026, 6, 3, 13, 46, tzinfo=UTC),
+                status="open_protected",
+                stop_order_id="STOP_QQQ",
+                can_ladder=True,
+            )
+        )
+        # Pre-migration row: can_ladder never recorded -> must render as a
+        # bare quantity, never misrepresented as no-ladder.
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="legacy-unknown",
+                deployment_id="spy_live",
+                symbol="SPY",
+                option_symbol="SPY260612C00600000",
+                quantity=1,
+                entry_price=1.20,
+                entry_timestamp=datetime(2026, 6, 3, 13, 47, tzinfo=UTC),
+                status="open_protected",
+                stop_order_id="STOP_SPY",
+            )
+        )
+
+    asyncio.run(seed())
+
+    report = build_daily_report(db_path, trading_date="2026-06-03")
+    by_id = {trade["trade_id"]: trade for trade in report["trades"]}
+    assert by_id["amd-no-ladder"]["qty_label"] == "1 (no-ladder)"
+    assert by_id["qqq-full-dna"]["qty_label"] == "2"
+    assert by_id["legacy-unknown"]["qty_label"] == "1"
+
+    markdown = write_daily_report(db_path, output_dir=tmp_path / "reports", trading_date="2026-06-03").markdown_path.read_text(
+        encoding="utf-8"
+    )
+    assert "| live | AMD | AMD260713P00500000 | 1 (no-ladder) |" in markdown
+    assert "| live | QQQ | QQQ260612C00480000 | 2 |" in markdown
+    assert "| live | SPY | SPY260612C00600000 | 1 |" in markdown
+
+
 def test_daily_report_renders_concise_telegram_summary(tmp_path) -> None:
     report = {
         "trading_date": "2026-06-03",

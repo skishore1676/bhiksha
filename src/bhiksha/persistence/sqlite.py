@@ -230,6 +230,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_order_type TEXT,
                     exit_broker_payload TEXT,
                     exit_rule TEXT,
+                    can_ladder INTEGER,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -262,6 +263,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_broker_payload TEXT")
             if "exit_rule" not in existing_columns:
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_rule TEXT")
+            if "can_ladder" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN can_ladder INTEGER")
             # get_recent_trades orders by updated_at DESC on every risk-manager
             # consult (2-3x per entry attempt + once per bar); without this
             # index that is a full-table scan + temp b-tree sort that grows
@@ -312,8 +315,9 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                     entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                     exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                    exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     deployment_id=excluded.deployment_id,
                     symbol=excluded.symbol,
@@ -339,6 +343,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_order_type=COALESCE(excluded.exit_order_type, trade_sessions.exit_order_type),
                     exit_broker_payload=COALESCE(excluded.exit_broker_payload, trade_sessions.exit_broker_payload),
                     exit_rule=COALESCE(excluded.exit_rule, trade_sessions.exit_rule),
+                    can_ladder=COALESCE(excluded.can_ladder, trade_sessions.can_ladder),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -367,6 +372,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     record.exit_order_type,
                     json.dumps(record.exit_broker_payload, default=str) if record.exit_broker_payload is not None else None,
                     record.exit_rule,
+                    None if record.can_ladder is None else int(record.can_ladder),
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -423,7 +429,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder
                 FROM trade_sessions
                 WHERE status != 'closed'
                 ORDER BY updated_at DESC
@@ -438,7 +444,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder
                 FROM trade_sessions
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -768,6 +774,7 @@ def _trade_record_from_row(row) -> TradeRecord:
         exit_order_type=row[22] if len(row) > 22 else None,
         exit_broker_payload=json.loads(row[23]) if len(row) > 23 and row[23] else None,
         exit_rule=row[24] if len(row) > 24 else None,
+        can_ladder=(bool(row[25]) if row[25] is not None else None) if len(row) > 25 else None,
     )
 
 

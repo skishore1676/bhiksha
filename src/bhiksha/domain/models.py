@@ -169,6 +169,15 @@ class TradeRecord:
     # "target_1_partial"). None for a native/legacy thesis exit. Never read by
     # order-management logic — daily_report is the sole consumer (workplan #10).
     exit_rule: str | None = None
+    # ITEM D (2026-07-08 hygiene batch): whether the position, AT ENTRY, had
+    # enough size to express the profile ladder (the T1 60/40 split needs
+    # >= 2 contracts -- see _partial_quantity). Frozen once at entry time from
+    # the ORIGINAL quantity and preserved thereafter (COALESCE, like
+    # exit_rule) -- trade_sessions.quantity itself is overwritten to the
+    # residual after a partial bank, so it cannot be used at report time to
+    # recover this. None only for rows written before this migration.
+    # Metadata/reporting-only; never read by order-management logic.
+    can_ladder: bool | None = None
 
 
 @dataclass(slots=True, frozen=True)
