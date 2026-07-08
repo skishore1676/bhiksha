@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, PartialFillRecord, TradeRecord
+from bhiksha.options.chain_snapshot import ChainSnapshotAttempt
 
 
 class EventRepository(ABC):
@@ -206,3 +207,32 @@ class NullCashBudgetRepository(CashBudgetRepository):
     async def reservation_totals(self, trade_date: str) -> dict[str, float]:
         del trade_date
         return {"reserved": 0.0, "consumed": 0.0}
+
+
+class ChainSnapshotRepository(ABC):
+    """Persist the full candidate chain (per-contract, verdict-labeled) at
+    selection-attempt time -- see options/chain_snapshot.py for what gets
+    captured and why. Telemetry only: implementations must never let a
+    failure here propagate to the caller (the trade matters more than the
+    snapshot); callers still get an exception-free contract to rely on.
+    """
+
+    @abstractmethod
+    async def record_attempt(self, attempt: ChainSnapshotAttempt) -> None:
+        """Persist one selection attempt's summary row and per-contract rows."""
+
+    @abstractmethod
+    async def purge_older_than(self, cutoff: datetime) -> int:
+        """Delete snapshot rows created before ``cutoff``. Returns rows deleted."""
+
+
+class NullChainSnapshotRepository(ChainSnapshotRepository):
+    """No-op chain-snapshot repository for tests or callers that opt out."""
+
+    async def record_attempt(self, attempt: ChainSnapshotAttempt) -> None:
+        del attempt
+        return None
+
+    async def purge_older_than(self, cutoff: datetime) -> int:
+        del cutoff
+        return 0

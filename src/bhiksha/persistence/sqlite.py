@@ -12,7 +12,13 @@ from typing import Any, Callable, TypeVar
 
 from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, PartialFillRecord, TradeRecord
-from bhiksha.persistence.repository import CashBudgetRepository, EventRepository, TradeStateRepository
+from bhiksha.options.chain_snapshot import ChainSnapshotAttempt, ContractSnapshotRow
+from bhiksha.persistence.repository import (
+    CashBudgetRepository,
+    ChainSnapshotRepository,
+    EventRepository,
+    TradeStateRepository,
+)
 
 ReadResultT = TypeVar("ReadResultT")
 
@@ -792,6 +798,221 @@ class SQLiteCashBudgetRepository(CashBudgetRepository):
             if status in totals:
                 totals[status] = float(amount or 0.0)
         return totals
+
+
+class SQLiteChainSnapshotRepository(ChainSnapshotRepository):
+    """SQLite-backed storage for per-attempt option-chain snapshots.
+
+    Two tables, written together per attempt:
+      * ``option_chain_snapshot_attempts`` -- one row per attempt (the
+        request context: thresholds, totals, outcome).
+      * ``option_chain_snapshots`` -- one row per captured candidate contract
+        (bounded to the correct type + DTE window/nearest-after expiry, see
+        options/chain_snapshot.py), carrying that contract's verdict plus a
+        denormalized copy of the attempt's outcome for query convenience.
+
+    ``attempt.snapshot_id`` (the attempts table's primary key) is a fresh
+    ``uuid4`` generated once per ``plan_entry`` call (see
+    execution/planner.py) -- both inserts below are plain, unconditional
+    INSERTs on that assumption. A collision would raise before either table's
+    write commits (the transaction covers both), which the caller's
+    never-fail wrapper then drops as a whole rather than leaving a
+    summary/per-contract mismatch behind.
+    """
+
+    def __init__(self, db_path: str, *, backend: SQLiteBackend | None = None) -> None:
+        self.db_path = db_path
+        self.backend = backend or SQLiteBackend(db_path)
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+    async def record_attempt(self, attempt: ChainSnapshotAttempt) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._record_attempt_sync, attempt)
+
+    async def purge_older_than(self, cutoff: datetime) -> int:
+        await self._ensure_initialized()
+        return await self.backend.run_write(self._purge_older_than_sync, cutoff.isoformat())
+
+    async def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self.backend.run_write(self._init_db)
+            self._initialized = True
+
+    def _init_db(self) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS option_chain_snapshot_attempts (
+                    snapshot_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    allowed_contract_type TEXT NOT NULL,
+                    dte_min INTEGER NOT NULL,
+                    dte_max INTEGER NOT NULL,
+                    min_open_interest INTEGER NOT NULL,
+                    target_abs_delta_min REAL,
+                    target_abs_delta_max REAL,
+                    max_bid_ask_spread_pct REAL,
+                    dte_fallback_policy TEXT NOT NULL,
+                    nearest_after_dte INTEGER,
+                    total_candidates INTEGER NOT NULL,
+                    captured_candidates INTEGER NOT NULL,
+                    selector_empty INTEGER NOT NULL,
+                    selected_option_symbol TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_option_chain_snapshot_attempts_created_at "
+                "ON option_chain_snapshot_attempts(created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_option_chain_snapshot_attempts_symbol "
+                "ON option_chain_snapshot_attempts(symbol, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_option_chain_snapshot_attempts_deployment "
+                "ON option_chain_snapshot_attempts(deployment_id, created_at)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS option_chain_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    option_symbol TEXT NOT NULL,
+                    expiration_date TEXT,
+                    dte INTEGER,
+                    strike REAL,
+                    contract_type TEXT,
+                    open_interest INTEGER,
+                    delta REAL,
+                    bid REAL,
+                    ask REAL,
+                    spread_pct REAL,
+                    dte_in_window INTEGER NOT NULL,
+                    verdict TEXT NOT NULL,
+                    fallback_verdict TEXT,
+                    is_selected INTEGER NOT NULL,
+                    attempt_selected_option_symbol TEXT,
+                    attempt_selector_empty INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_option_chain_snapshots_snapshot_id "
+                "ON option_chain_snapshots(snapshot_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_option_chain_snapshots_created_at "
+                "ON option_chain_snapshots(created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_option_chain_snapshots_symbol "
+                "ON option_chain_snapshots(symbol, created_at)"
+            )
+            conn.commit()
+
+    def _record_attempt_sync(self, attempt: ChainSnapshotAttempt) -> None:
+        created_at = datetime.now(UTC).isoformat()
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO option_chain_snapshot_attempts (
+                    snapshot_id, created_at, deployment_id, symbol, lane, direction, allowed_contract_type,
+                    dte_min, dte_max, min_open_interest, target_abs_delta_min, target_abs_delta_max,
+                    max_bid_ask_spread_pct, dte_fallback_policy, nearest_after_dte, total_candidates,
+                    captured_candidates, selector_empty, selected_option_symbol
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt.snapshot_id,
+                    created_at,
+                    attempt.deployment_id,
+                    attempt.symbol,
+                    attempt.lane,
+                    attempt.direction,
+                    attempt.allowed_contract_type,
+                    attempt.dte_min,
+                    attempt.dte_max,
+                    attempt.min_open_interest,
+                    attempt.target_abs_delta_min,
+                    attempt.target_abs_delta_max,
+                    attempt.max_bid_ask_spread_pct,
+                    attempt.dte_fallback_policy,
+                    attempt.nearest_after_dte,
+                    attempt.total_candidates,
+                    attempt.captured_candidates,
+                    int(attempt.selector_empty),
+                    attempt.selected_option_symbol,
+                ),
+            )
+            if attempt.rows:
+                conn.executemany(
+                    """
+                    INSERT INTO option_chain_snapshots (
+                        snapshot_id, created_at, deployment_id, symbol, lane, option_symbol, expiration_date,
+                        dte, strike, contract_type, open_interest, delta, bid, ask, spread_pct, dte_in_window,
+                        verdict, fallback_verdict, is_selected, attempt_selected_option_symbol,
+                        attempt_selector_empty
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        _contract_row_params(attempt, row, created_at)
+                        for row in attempt.rows
+                    ],
+                )
+            conn.commit()
+
+    def _purge_older_than_sync(self, cutoff_iso: str) -> int:
+        with closing(self.backend.connect()) as conn:
+            contract_cursor = conn.execute(
+                "DELETE FROM option_chain_snapshots WHERE created_at < ?",
+                (cutoff_iso,),
+            )
+            attempt_cursor = conn.execute(
+                "DELETE FROM option_chain_snapshot_attempts WHERE created_at < ?",
+                (cutoff_iso,),
+            )
+            conn.commit()
+            return int(contract_cursor.rowcount or 0) + int(attempt_cursor.rowcount or 0)
+
+
+def _contract_row_params(attempt: ChainSnapshotAttempt, row: ContractSnapshotRow, created_at: str) -> tuple:
+    return (
+        attempt.snapshot_id,
+        created_at,
+        attempt.deployment_id,
+        attempt.symbol,
+        attempt.lane,
+        row.option_symbol,
+        row.expiration_date,
+        row.dte,
+        row.strike,
+        row.contract_type,
+        row.open_interest,
+        row.delta,
+        row.bid,
+        row.ask,
+        row.spread_pct,
+        int(row.dte_in_window),
+        row.verdict,
+        row.fallback_verdict,
+        int(row.is_selected),
+        attempt.selected_option_symbol,
+        int(attempt.selector_empty),
+    )
 
 
 def _trade_record_from_row(row) -> TradeRecord:

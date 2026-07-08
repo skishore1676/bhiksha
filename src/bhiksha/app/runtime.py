@@ -50,7 +50,13 @@ from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.ops.daily_report import write_daily_report
 from bhiksha.options.selectors import SelectorEmptyError
-from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
+from bhiksha.persistence.sqlite import (
+    SQLiteBackend,
+    SQLiteCashBudgetRepository,
+    SQLiteChainSnapshotRepository,
+    SQLiteEventRepository,
+    SQLiteTradeStateRepository,
+)
 from bhiksha.risk.cash_guard import CashGuard, trade_date_et
 from bhiksha.risk.plan_operator_defaults_source import PlanOperatorDefaultsSource
 from bhiksha.risk.risk_manager import RiskManager
@@ -67,6 +73,12 @@ _SELECTOR_EMPTY_EVENT_THROTTLE_SECONDS = 900.0
 # A broker-live lane that fails this many entry attempts without one
 # successful submission is escalated as a dead lane.
 _DEAD_LANE_FAILURE_THRESHOLD = 3
+# Chain-snapshot retention: option_chain_snapshots/option_chain_snapshot_attempts
+# rows older than this are swept once per run_session startup (the process is
+# launchd-restarted well inside this window, so a startup-only sweep keeps the
+# table bounded without a separate scheduled job). See
+# bhiksha.persistence.sqlite.SQLiteChainSnapshotRepository.purge_older_than.
+_CHAIN_SNAPSHOT_RETENTION_DAYS = 30
 
 
 async def record_signal_evaluation(event_repository, decision: SignalDecision) -> None:
@@ -234,6 +246,8 @@ class BhikshaRuntime:
         event_repository = SQLiteEventRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         trade_state_repository = SQLiteTradeStateRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         cash_budget_repository = SQLiteCashBudgetRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        chain_snapshot_repository = SQLiteChainSnapshotRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        await _sweep_chain_snapshot_retention_best_effort(chain_snapshot_repository, output=output)
         # Operator-sheet risk knobs: env > Operator_Defaults_v1 (via the
         # already-compiled active plan) > hardcoded default. See
         # bhiksha.risk.plan_operator_defaults_source for the sheet key
@@ -268,6 +282,7 @@ class BhikshaRuntime:
                 order_manager=order_manager,
                 repository=cash_budget_repository,
             ),
+            chain_snapshot_repository=chain_snapshot_repository,
         )
         manual_status_writer = await self._build_manual_status_writer(
             output=output,
@@ -1910,6 +1925,31 @@ async def _append_event_best_effort(
     except Exception as exc:
         if output is not None:
             output(f"RUNTIME_TELEMETRY_DROPPED event={event_type} error={exc}")
+
+
+async def _sweep_chain_snapshot_retention_best_effort(
+    chain_snapshot_repository,
+    *,
+    retention_days: int = _CHAIN_SNAPSHOT_RETENTION_DAYS,
+    now: datetime | None = None,
+    output: callable | None = None,
+) -> None:
+    """Delete option_chain_snapshot* rows older than ``retention_days``.
+
+    Runs once at ``run_session`` startup (the process restarts well inside
+    the retention window under launchd, so a startup-only sweep is enough --
+    see ``_CHAIN_SNAPSHOT_RETENTION_DAYS``). Never raises: a sweep failure
+    should not block startup, it just means the table grows a little more
+    until the next restart.
+    """
+    try:
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=retention_days)
+        deleted = await chain_snapshot_repository.purge_older_than(cutoff)
+        if output is not None and deleted:
+            output(f"CHAIN_SNAPSHOT_RETENTION_SWEEP deleted={deleted} cutoff={cutoff.isoformat()}")
+    except Exception as exc:
+        if output is not None:
+            output(f"CHAIN_SNAPSHOT_RETENTION_SWEEP_FAILED error={exc}")
 
 
 async def prefetch_cash_budget_day(
