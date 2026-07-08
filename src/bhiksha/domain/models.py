@@ -172,6 +172,44 @@ class TradeRecord:
 
 
 @dataclass(slots=True, frozen=True)
+class PartialFillRecord:
+    """One durable row per banked partial leg of a position (ITEM B, 2026-07-08
+    hygiene batch, exit-accounting audit).
+
+    A profile ladder can bank more than one partial over a position's life
+    (today only ``target_1_partial`` does), but ``trade_sessions`` holds only
+    the CURRENT residual ``quantity`` -- ``_handle_partial_scale_locked``
+    overwrites it on every bank, and ``mark_closed`` later records only the
+    RUNNER's own exit truth. Without a separate durable row, the banked leg's
+    fill price/quantity/timestamp has no home: only its ``order_id`` survives,
+    in the append-only ``partial_scale_submission`` event, with no fill
+    confirmation ever read back.
+
+    Per-leg P&L reconstruction with this table: original position size =
+    ``trade_sessions.quantity`` (final residual) + ``sum(closed_quantity)``
+    here; banked-leg P&L = ``(fill_price - entry_price) * closed_quantity``;
+    runner P&L is unchanged, from ``trade_sessions.exit_price`` /
+    ``trade_sessions.quantity`` (the residual) as before.
+    """
+
+    id: int | None
+    trade_id: str
+    deployment_id: str
+    symbol: str
+    option_symbol: str | None
+    closed_quantity: int
+    order_id: str | None
+    exit_rule: str | None
+    submitted_at: datetime | None
+    fill_price: float | None = None
+    fill_quantity: int | None = None
+    filled_at: datetime | None = None
+    order_status: str | None = None
+    order_type: str | None = None
+    broker_payload: dict[str, Any] | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class CashBudgetDay:
     trade_date: str
     account_type: str | None

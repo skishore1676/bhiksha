@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 
-from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, TradeRecord
+from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, PartialFillRecord, TradeRecord
 
 
 class EventRepository(ABC):
@@ -51,6 +51,32 @@ class TradeStateRepository(ABC):
     async def get_recent_trades(self, *, limit: int = 100) -> list[TradeRecord]:
         """Return recent trade sessions, including recently closed rows."""
 
+    @abstractmethod
+    async def record_partial_fill(self, record: PartialFillRecord) -> int:
+        """Persist a banked partial leg at submission time (ITEM B). Returns the row id."""
+
+    @abstractmethod
+    async def enrich_partial_fill(
+        self,
+        record_id: int,
+        *,
+        fill_price: float | None = None,
+        fill_quantity: int | None = None,
+        filled_at: datetime | None = None,
+        order_status: str | None = None,
+        order_type: str | None = None,
+        broker_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Backfill a banked partial leg's confirmed fill truth once known (ITEM B)."""
+
+    @abstractmethod
+    async def get_unconfirmed_partial_fills(self, *, limit: int = 200) -> list[PartialFillRecord]:
+        """Return banked partial legs still missing confirmed fill truth (ITEM B)."""
+
+    @abstractmethod
+    async def get_partial_fills(self, trade_id: str) -> list[PartialFillRecord]:
+        """Return every banked partial leg recorded for a trade (ITEM B, report reconstruction)."""
+
 
 class NullTradeStateRepository(TradeStateRepository):
     async def upsert_trade(self, record: TradeRecord) -> None:
@@ -85,6 +111,32 @@ class NullTradeStateRepository(TradeStateRepository):
 
     async def get_recent_trades(self, *, limit: int = 100) -> list[TradeRecord]:
         del limit
+        return []
+
+    async def record_partial_fill(self, record: PartialFillRecord) -> int:
+        del record
+        return 0
+
+    async def enrich_partial_fill(
+        self,
+        record_id: int,
+        *,
+        fill_price: float | None = None,
+        fill_quantity: int | None = None,
+        filled_at: datetime | None = None,
+        order_status: str | None = None,
+        order_type: str | None = None,
+        broker_payload: dict[str, Any] | None = None,
+    ) -> None:
+        del record_id, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload
+        return None
+
+    async def get_unconfirmed_partial_fills(self, *, limit: int = 200) -> list[PartialFillRecord]:
+        del limit
+        return []
+
+    async def get_partial_fills(self, trade_id: str) -> list[PartialFillRecord]:
+        del trade_id
         return []
 
 

@@ -2628,6 +2628,243 @@ def test_partial_scale_can_never_close_full_position(tmp_path) -> None:
     assert survivor.quantity == 4 and survivor.exit_mode is None
 
 
+class _QqqPartialLegFixtureOrderManager(StubOrderManager):
+    """ITEM B fixture (2026-07-08 hygiene batch): a genuine 2-lot partial bank
+    (T1 banks 1 of 2, unlike item A's 1-lot full-bank case) followed by the
+    runner's own full exit, mirroring the real QQQ same-day
+    ``high_water_giveback`` example the operator cited (exit 3.75).
+    """
+
+    def __init__(self) -> None:
+        self.close_calls: list[tuple[str, str, int]] = []
+        self._next_id = 0
+
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        del exit_mode, limit_price
+        self._next_id += 1
+        order_id = f"QQQ_CLOSE_{self._next_id}"
+        self.close_calls.append((order_id, option_symbol, int(quantity)))
+
+        class Result:
+            pass
+
+        result = Result()
+        result.order_id = order_id
+        result.error = None
+        return result
+
+    async def place_stop_loss_order(self, option_symbol, stop_price, quantity, *, order_id=None):
+        del option_symbol, stop_price, quantity, order_id
+
+        class Result:
+            pass
+
+        result = Result()
+        result.order_id = "STOP_RESIDUAL_QQQ"
+        result.error = None
+        return result
+
+    async def cancel_order(self, order_id):
+        del order_id
+        return True, None
+
+    async def get_option_quote(self, option_symbol):
+        return PublicQuote(symbol=option_symbol, bid=3.75, ask=3.80, last=3.78, open_interest=500, outcome="SUCCESS")
+
+    async def get_order_status(self, order_id):
+        if order_id == "QQQ_CLOSE_1":
+            # The banked T1 partial leg (1 of 2 contracts).
+            return (
+                "FILLED",
+                {
+                    "orderId": "QQQ_CLOSE_1",
+                    "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+                    "status": "FILLED",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "1",
+                    "averagePrice": "3.10",
+                    "closedAt": "2026-07-08T14:10:00Z",
+                },
+                None,
+            )
+        if order_id == "QQQ_CLOSE_2":
+            # The runner's own high_water_giveback full exit (matches the
+            # operator's cited real QQQ fill of 3.75).
+            return (
+                "FILLED",
+                {
+                    "orderId": "QQQ_CLOSE_2",
+                    "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+                    "status": "FILLED",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "1",
+                    "averagePrice": "3.75",
+                    "closedAt": "2026-07-08T14:45:00Z",
+                },
+                None,
+            )
+        return None, None, "unknown_order"
+
+
+def test_partial_leg_pnl_fixture_qqq_t1_bank_then_runner_exit(tmp_path) -> None:
+    """ITEM B (2026-07-08 hygiene batch): audit + fixture repro for whether a
+    banked partial leg's own economics survive durably.
+
+    Before this fix: trade_sessions held a SINGLE row per trade_id, and
+    ``_handle_partial_scale_locked`` overwrote ``quantity`` to the residual on
+    every bank -- the banked leg's fill price/quantity/timestamp existed
+    NOWHERE durable (only an unconfirmed order_id in the append-only
+    ``partial_scale_submission`` event). Weekly per-leg P&L reconstruction
+    could not recover the banked leg's contribution or even the position's
+    original size.
+
+    After this fix: ``trade_partial_fills`` holds one durably-enriched row per
+    banked leg; ``trade_sessions`` still holds the final (residual) state as
+    before. Together: original size = trade_sessions.quantity (final
+    residual, 1) + sum(trade_partial_fills.closed_quantity) (1) = 2.
+    """
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    order_manager = _QqqPartialLegFixtureOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE_QQQ_PARTIAL",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                option_symbol="QQQ260401P00556000",
+                quantity=2,
+                entry_price=2.50,
+                entry_timestamp=datetime(2026, 7, 8, 13, 30, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY_QQQ",
+                stop_order_id="STOP_FULL_QQQ",
+                stop_price=1.50,
+            )
+        )
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_QQQ_PARTIAL",
+        option_symbol="QQQ260401P00556000",
+        quantity=2,
+        entry_price=2.50,
+        source="live_open",
+        stop_order_id="STOP_FULL_QQQ",
+        stop_price=1.50,
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    # Mirrors profile_decision_to_exit_decision's real output for a genuine
+    # (bank_qty < quantity) T1 partial: PARTIAL_SCALE fsm_action -> the
+    # "partial_scale" feature IS set, unlike item A's 1-lot full-bank case.
+    partial_decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 7, 8, 14, 10, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_target_1_partial"],
+        cancel_protection_orders=True,
+        features={
+            "profile_id": "market_impulse_qqq",
+            "profile_rule": "target_1_partial",
+            "profile_fsm_action": "partial_scale",
+            "exit_quantity": 1,
+            "partial_scale": True,
+            "bank_quantity": 1,
+            "remaining_quantity": 1,
+        },
+    )
+
+    partial_plan = asyncio.run(supervisor.handle_exit(deployment, position, partial_decision, dry_run=False))
+    assert partial_plan is not None and partial_plan.quantity == 1
+    assert order_manager.close_calls == [("QQQ_CLOSE_1", "QQQ260401P00556000", 1)]
+
+    # sync_lifecycle's new _enrich_pending_partial_fills sweep backfills the
+    # banked leg's confirmed fill truth (mirrors _enrich_recent_closed_exit_truth).
+    asyncio.run(supervisor.sync_lifecycle())
+
+    residual = supervisor.planner.position_tracker.active_positions()[0]
+    assert residual.quantity == 1
+    assert residual.exit_mode is None and residual.exit_order_id is None
+
+    # Runner's own full exit (high_water_giveback -- NOT a partial).
+    runner_decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 7, 8, 14, 45, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_high_water_giveback:PATIENT"],
+        cancel_protection_orders=True,
+        features={"profile_id": "market_impulse_qqq", "profile_rule": "high_water_giveback"},
+    )
+    asyncio.run(supervisor.handle_exit(deployment, residual, runner_decision, dry_run=False))
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+    assert len(plans) == 1
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        trade_row = conn.execute(
+            """
+            SELECT status, quantity, entry_price, exit_order_id, exit_price, exit_filled_quantity,
+                   exit_filled_at, exit_rule
+            FROM trade_sessions
+            WHERE trade_id = 'TRADE_QQQ_PARTIAL'
+            """
+        ).fetchone()
+        partial_rows = conn.execute(
+            """
+            SELECT trade_id, closed_quantity, order_id, exit_rule, fill_price, fill_quantity, filled_at, order_status
+            FROM trade_partial_fills
+            WHERE trade_id = 'TRADE_QQQ_PARTIAL'
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+    # trade_sessions holds only the FINAL (residual) state -- the runner's own
+    # leg. quantity=1 (the residual, NOT the original 2); exit_price=3.75 is
+    # the runner's fill only.
+    assert trade_row == (
+        "closed",
+        1,
+        2.50,
+        "QQQ_CLOSE_2",
+        3.75,
+        1,
+        "2026-07-08T14:45:00+00:00",
+        "high_water_giveback",
+    )
+    # trade_partial_fills holds the banked leg's own durable economics --
+    # previously recorded nowhere.
+    assert partial_rows == [
+        (
+            "TRADE_QQQ_PARTIAL",
+            1,
+            "QQQ_CLOSE_1",
+            "target_1_partial",
+            3.10,
+            1,
+            "2026-07-08T14:10:00+00:00",
+            "FILLED",
+        )
+    ]
+    # Original position size is recoverable ONLY by combining both tables.
+    original_quantity = trade_row[1] + sum(row[1] for row in partial_rows)
+    assert original_quantity == 2
+
+
 def test_breakeven_stop_to_breakeven_moves_protective_stop(tmp_path) -> None:
     # H2: a STOP_TO_BREAKEVEN decision (action="hold", replacement_stop_price set)
     # must cancel/replace the live stop at the new price.

@@ -20,7 +20,7 @@ from bhiksha.config.models import AppConfig
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import ExitMode, SignalDirection
-from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
+from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
 from bhiksha.execution.pricing import select_entry_limit
@@ -2140,6 +2140,36 @@ class ExecutionSupervisor:
                     },
                 )
 
+        # ITEM B (2026-07-08 hygiene batch): durably record the banked leg's own
+        # economics BEFORE the residual overwrites trade_sessions.quantity below.
+        # Previously the only trace of this leg was an order_id in the
+        # append-only partial_scale_submission event, with no fill confirmation
+        # ever read back -- weekly per-leg P&L reconstruction had nothing durable
+        # to read. dry_run/shadow already computed a synthetic fill via
+        # _paper_exit_fill_details above; live legs are recorded unconfirmed here
+        # and backfilled by sync_lifecycle's _enrich_pending_partial_fills sweep
+        # once the broker confirms the fill (mirrors _enrich_recent_closed_exit_truth).
+        if updated_position.trade_id is not None and updated_position.option_symbol is not None:
+            await self.trade_state_repository.record_partial_fill(
+                PartialFillRecord(
+                    id=None,
+                    trade_id=updated_position.trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=updated_position.symbol,
+                    option_symbol=updated_position.option_symbol,
+                    closed_quantity=close_qty,
+                    order_id=order_id,
+                    exit_rule=exit_rule,
+                    submitted_at=datetime.now(UTC),
+                    fill_price=fill_details.get("exit_price") if dry_run else None,
+                    fill_quantity=fill_details.get("exit_filled_quantity") if dry_run else None,
+                    filled_at=fill_details.get("exit_filled_at") if dry_run else None,
+                    order_status=fill_details.get("exit_order_status") if dry_run else None,
+                    order_type=fill_details.get("exit_order_type") if dry_run else None,
+                    broker_payload=fill_details.get("exit_broker_payload") if dry_run else None,
+                )
+            )
+
         # The residual runner stays OPEN and MUST stay protected. A profile partial
         # cancels protection unconditionally (cancel_protection_orders=True), but
         # even when it does not we must never end with the residual naked OR with
@@ -3387,6 +3417,7 @@ class ExecutionSupervisor:
                     continue
                 await self._mark_disappeared_trade_closed(trade)
         await self._enrich_recent_closed_exit_truth(recent_trades)
+        await self._enrich_pending_partial_fills()
         for position in self.planner.position_tracker.active_positions():
             if position.trade_id is None or position.option_symbol is None:
                 continue
@@ -3497,6 +3528,53 @@ class ExecutionSupervisor:
                     "exit_order_id": exit_order_id,
                     "status": status,
                     "source": "recent_closed_retry",
+                    "payload": payload,
+                },
+            )
+
+    async def _enrich_pending_partial_fills(self) -> None:
+        """Backfill confirmed fill truth for banked partial legs (ITEM B).
+
+        ``_handle_partial_scale_locked`` fires the close order for a banked
+        partial without waiting for it to fill (the async pending-exit-poll
+        pattern used for full closes does not apply here -- a partial leg's
+        ``exit_order_id`` is deliberately not carried on the residual
+        position, see NEW-1/NEW-2 there). This sweep is the durable-side
+        equivalent of ``_enrich_recent_closed_exit_truth``: poll every
+        ``trade_partial_fills`` row still missing ``fill_price`` and record
+        the broker's confirmed fill once available. Paper/dry-run legs are
+        never polled -- their fill truth is written synchronously at
+        submission time (see ``_is_paper_order_id``).
+        """
+        pending = await self.trade_state_repository.get_unconfirmed_partial_fills()
+        for record in pending:
+            if record.id is None or record.order_id is None or _is_paper_order_id(record.order_id):
+                continue
+            status, payload, error = await self.planner.order_manager.get_order_status(record.order_id)
+            if error or payload is None:
+                continue
+            if not _is_filled_exit_order(payload, status=status, option_symbol=record.option_symbol):
+                continue
+            details = _exit_fill_details(payload, status=status)
+            await self.trade_state_repository.enrich_partial_fill(
+                record.id,
+                fill_price=details["exit_price"],
+                fill_quantity=details["exit_filled_quantity"],
+                filled_at=details["exit_filled_at"],
+                order_status=details["exit_order_status"],
+                order_type=details["exit_order_type"],
+                broker_payload=details["exit_broker_payload"],
+            )
+            await self.event_repository.append(
+                "partial_fill_enriched",
+                {
+                    "deployment_id": record.deployment_id,
+                    "symbol": record.symbol,
+                    "trade_id": record.trade_id,
+                    "option_symbol": record.option_symbol,
+                    "order_id": record.order_id,
+                    "closed_quantity": record.closed_quantity,
+                    "status": status,
                     "payload": payload,
                 },
             )
