@@ -1,10 +1,14 @@
 import asyncio
 from datetime import date, datetime
 
+import pytest
+
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionContractSnapshot, SignalDecision
 from bhiksha.execution.order_manager import PublicQuote, PreflightCheck
 from bhiksha.execution.planner import ExecutionPlanner
+from bhiksha.options.selectors import SelectorEmptyError
+from bhiksha.persistence.repository import ChainSnapshotRepository
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import PositionTracker
@@ -680,3 +684,150 @@ def test_execution_planner_auto_guard_skips_margin_accounts(monkeypatch, tmp_pat
     assert plan is not None
     assert plan.order_id == "OID123"
     assert order_manager.place_entry_order_calls == 1
+
+
+class SpyChainSnapshotRepository(ChainSnapshotRepository):
+    """Captures every recorded attempt in memory for assertions."""
+
+    def __init__(self) -> None:
+        self.attempts = []
+
+    async def record_attempt(self, attempt) -> None:
+        self.attempts.append(attempt)
+
+    async def purge_older_than(self, cutoff) -> int:
+        del cutoff
+        return 0
+
+
+class RaisingChainSnapshotRepository(ChainSnapshotRepository):
+    """Simulates a broken snapshot write to prove entry survives it."""
+
+    async def record_attempt(self, attempt) -> None:
+        del attempt
+        raise RuntimeError("disk full")
+
+    async def purge_older_than(self, cutoff) -> int:
+        del cutoff
+        raise RuntimeError("disk full")
+
+
+def _short_decision(deployment) -> SignalDecision:
+    return SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={},
+    )
+
+
+def test_execution_planner_records_chain_snapshot_on_successful_selection() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
+    snapshot_repository = SpyChainSnapshotRepository()
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+        chain_snapshot_repository=snapshot_repository,
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
+
+    assert plan is not None
+    assert len(snapshot_repository.attempts) == 1
+    attempt = snapshot_repository.attempts[0]
+    assert attempt.deployment_id == deployment.deployment_id
+    assert attempt.symbol == "QQQ"
+    assert attempt.lane == "dry_run"
+    assert attempt.selector_empty is False
+    assert attempt.selected_option_symbol == "QQQ260330P00558000"
+    assert len(attempt.rows) == 1
+    assert attempt.rows[0].is_selected is True
+    assert attempt.rows[0].verdict == "accepted"
+
+
+def test_execution_planner_records_chain_snapshot_on_selector_empty() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    # min_open_interest is 100 for this fixture deployment (see
+    # tests/fixtures/config/deployments/market_impulse_qqq_short_v1.yaml) --
+    # open_interest=5 forces every candidate to fail that filter.
+    chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
+    chain_service.get_chain = _low_oi_get_chain(chain_service)
+    snapshot_repository = SpyChainSnapshotRepository()
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+        chain_snapshot_repository=snapshot_repository,
+    )
+
+    with pytest.raises(SelectorEmptyError):
+        asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
+
+    assert len(snapshot_repository.attempts) == 1
+    attempt = snapshot_repository.attempts[0]
+    assert attempt.selector_empty is True
+    assert attempt.selected_option_symbol is None
+    assert len(attempt.rows) == 1
+    assert attempt.rows[0].verdict == "open_interest_below_min"
+    assert attempt.rows[0].is_selected is False
+
+
+def test_execution_planner_snapshot_repository_failure_does_not_break_entry() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+        chain_snapshot_repository=RaisingChainSnapshotRepository(),
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
+
+    assert plan is not None
+    assert plan.option_symbol == "QQQ260330P00558000"
+    assert plan.order_id == "DRY_RUN"
+
+
+def test_execution_planner_snapshot_repository_failure_does_not_mask_selector_empty() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
+    chain_service.get_chain = _low_oi_get_chain(chain_service)
+    planner = ExecutionPlanner(
+        chain_service=chain_service,
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+        chain_snapshot_repository=RaisingChainSnapshotRepository(),
+    )
+
+    with pytest.raises(SelectorEmptyError):
+        asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
+
+
+def _low_oi_get_chain(chain_service: StubChainService):
+    original_get_chain = StubChainService.get_chain
+
+    async def get_chain(symbol: str, **kwargs):
+        contracts = await original_get_chain(chain_service, symbol, **kwargs)
+        return [
+            OptionContractSnapshot(
+                option_symbol=contract.option_symbol,
+                underlying_symbol=contract.underlying_symbol,
+                contract_type=contract.contract_type,
+                expiration_date=contract.expiration_date,
+                dte=contract.dte,
+                strike=contract.strike,
+                delta=contract.delta,
+                bid=contract.bid,
+                ask=contract.ask,
+                open_interest=5,
+            )
+            for contract in contracts
+        ]
+
+    return get_chain
