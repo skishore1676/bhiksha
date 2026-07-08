@@ -216,6 +216,19 @@ class PartialFillRecord:
     order_status: str | None = None
     order_type: str | None = None
     broker_payload: dict[str, Any] | None = None
+    # Audit fix A.2 (2026-07-08): where this leg came from. "partial_scale" is
+    # a deliberate profile T1 bank (_handle_partial_scale_locked);
+    # "exit_cancel_race" is an involuntary partial discovered when a reprice
+    # cancel raced a working exit order (readback showed nonzero
+    # filledQuantity short of the full position).
+    origin: str = "partial_scale"
+    # Audit fix 3: enrichment-sweep bookkeeping. ``enrich_attempts`` counts
+    # unresolved polls; once it reaches the sweep's max (or the order reads
+    # back terminally dead with no fill) the row is marked abandoned with a
+    # reason and never re-polled -- the sweep must not retry forever against
+    # a degraded broker.
+    enrich_attempts: int = 0
+    abandoned_reason: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

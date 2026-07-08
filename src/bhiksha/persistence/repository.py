@@ -77,6 +77,14 @@ class TradeStateRepository(ABC):
     async def get_partial_fills(self, trade_id: str) -> list[PartialFillRecord]:
         """Return every banked partial leg recorded for a trade (ITEM B, report reconstruction)."""
 
+    @abstractmethod
+    async def increment_partial_fill_enrich_attempts(self, record_id: int) -> None:
+        """Count one unresolved enrichment poll against a pending partial leg (audit fix 3)."""
+
+    @abstractmethod
+    async def mark_partial_fill_abandoned(self, record_id: int, *, reason: str) -> None:
+        """Stop re-polling a partial leg that will never resolve, recording why (audit fix 3)."""
+
 
 class NullTradeStateRepository(TradeStateRepository):
     async def upsert_trade(self, record: TradeRecord) -> None:
@@ -138,6 +146,14 @@ class NullTradeStateRepository(TradeStateRepository):
     async def get_partial_fills(self, trade_id: str) -> list[PartialFillRecord]:
         del trade_id
         return []
+
+    async def increment_partial_fill_enrich_attempts(self, record_id: int) -> None:
+        del record_id
+        return None
+
+    async def mark_partial_fill_abandoned(self, record_id: int, *, reason: str) -> None:
+        del record_id, reason
+        return None
 
 
 class CashBudgetRepository(ABC):

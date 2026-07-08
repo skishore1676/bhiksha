@@ -191,6 +191,14 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         await self._ensure_initialized()
         return await self.backend.run_read(self._get_partial_fills_sync, trade_id)
 
+    async def increment_partial_fill_enrich_attempts(self, record_id: int) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._increment_partial_fill_enrich_attempts_sync, record_id)
+
+    async def mark_partial_fill_abandoned(self, record_id: int, *, reason: str) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._mark_partial_fill_abandoned_sync, record_id, reason)
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -297,11 +305,31 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     order_status TEXT,
                     order_type TEXT,
                     broker_payload TEXT,
+                    origin TEXT NOT NULL DEFAULT 'partial_scale',
+                    enrich_attempts INTEGER NOT NULL DEFAULT 0,
+                    abandoned_reason TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            # Audit fixes A.2/3 (2026-07-08): additive columns for a db created
+            # by the pre-audit revision of this same branch (IF-NOT-EXISTS
+            # pattern, matching trade_sessions above).
+            partial_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(trade_partial_fills)").fetchall()
+            }
+            if "origin" not in partial_columns:
+                conn.execute(
+                    "ALTER TABLE trade_partial_fills ADD COLUMN origin TEXT NOT NULL DEFAULT 'partial_scale'"
+                )
+            if "enrich_attempts" not in partial_columns:
+                conn.execute(
+                    "ALTER TABLE trade_partial_fills ADD COLUMN enrich_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "abandoned_reason" not in partial_columns:
+                conn.execute("ALTER TABLE trade_partial_fills ADD COLUMN abandoned_reason TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_partial_fills_trade_id ON trade_partial_fills(trade_id)"
             )
@@ -461,8 +489,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 INSERT INTO trade_partial_fills (
                     trade_id, deployment_id, symbol, option_symbol, closed_quantity, order_id, exit_rule,
                     submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    origin, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.trade_id,
@@ -479,6 +507,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     record.order_status,
                     record.order_type,
                     json.dumps(record.broker_payload, default=str) if record.broker_payload is not None else None,
+                    record.origin,
                     now,
                     now,
                 ),
@@ -527,9 +556,10 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             rows = conn.execute(
                 """
                 SELECT id, trade_id, deployment_id, symbol, option_symbol, closed_quantity, order_id, exit_rule,
-                       submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload
+                       submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload,
+                       origin, enrich_attempts, abandoned_reason
                 FROM trade_partial_fills
-                WHERE fill_price IS NULL
+                WHERE fill_price IS NULL AND abandoned_reason IS NULL
                 ORDER BY id ASC
                 LIMIT ?
                 """,
@@ -542,7 +572,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             rows = conn.execute(
                 """
                 SELECT id, trade_id, deployment_id, symbol, option_symbol, closed_quantity, order_id, exit_rule,
-                       submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload
+                       submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload,
+                       origin, enrich_attempts, abandoned_reason
                 FROM trade_partial_fills
                 WHERE trade_id = ?
                 ORDER BY id ASC
@@ -550,6 +581,22 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 (trade_id,),
             ).fetchall()
         return [_partial_fill_record_from_row(row) for row in rows]
+
+    def _increment_partial_fill_enrich_attempts_sync(self, record_id: int) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                "UPDATE trade_partial_fills SET enrich_attempts = enrich_attempts + 1, updated_at = ? WHERE id = ?",
+                (datetime.now(UTC).isoformat(), record_id),
+            )
+            conn.commit()
+
+    def _mark_partial_fill_abandoned_sync(self, record_id: int, reason: str) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                "UPDATE trade_partial_fills SET abandoned_reason = ?, updated_at = ? WHERE id = ?",
+                (reason, datetime.now(UTC).isoformat(), record_id),
+            )
+            conn.commit()
 
 
 class SQLiteCashBudgetRepository(CashBudgetRepository):
@@ -795,4 +842,7 @@ def _partial_fill_record_from_row(row) -> PartialFillRecord:
         order_status=row[12],
         order_type=row[13],
         broker_payload=json.loads(row[14]) if row[14] else None,
+        origin=(row[15] or "partial_scale") if len(row) > 15 else "partial_scale",
+        enrich_attempts=(row[16] or 0) if len(row) > 16 else 0,
+        abandoned_reason=row[17] if len(row) > 17 else None,
     )
