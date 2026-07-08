@@ -573,6 +573,97 @@ def test_daily_report_without_deployments_omits_relaxed_evidence_section(tmp_pat
     assert "Shadow Lanes on Relaxed Evidence" not in result.markdown_path.read_text(encoding="utf-8")
 
 
+# --------------------------------------------------------------------------- #
+# Item C (2026-07-08 hygiene batch): per-LIVE-lane entry_selector_empty count.
+# 2026-07-07 case: SMH's signal was live but the selector filtered out every
+# contract -- a filtered-out live signal must not masquerade as a quiet day.
+# --------------------------------------------------------------------------- #
+
+
+def test_daily_report_entry_selector_empty_by_deployment_flags_live_lanes(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        # LIVE lane (SMH) -- the selector filtered out every contract twice.
+        for _ in range(2):
+            await events.append(
+                "runtime_issue",
+                {
+                    "category": "entry_selector_empty",
+                    "deployment_id": "smh_live",
+                    "symbol": "SMH",
+                    "action": "entry",
+                    "error": "SelectorEmptyError: no contract passed the selector",
+                    "stage": "execution_runner",
+                },
+            )
+        # Shadow lane -- same category, must not be conflated with the live count.
+        await events.append(
+            "runtime_issue",
+            {
+                "category": "entry_selector_empty",
+                "deployment_id": "acme_shadow",
+                "symbol": "ACME",
+                "action": "entry",
+                "error": "SelectorEmptyError: no contract passed the selector",
+                "stage": "execution_runner",
+            },
+        )
+        # A different runtime_issue category must not be counted here.
+        await events.append(
+            "runtime_issue",
+            {"category": "dead_lane", "deployment_id": "smh_live", "symbol": "SMH", "error": "no fills"},
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE events SET created_at = '2026-07-07T14:00:00+00:00'")
+        conn.commit()
+
+    deployments = [
+        _minimal_deployment("smh_live", "SMH"),
+        DeploymentManifest(
+            deployment_id="acme_shadow",
+            enabled=True,
+            symbol="ACME",
+            strategy=StrategySpec(key="market_impulse", params={"direction": "short"}),
+            execution=ExecutionSpec(profile="default", shadow_only=True),
+            risk=RiskSpec(profile="default"),
+            source=SourceSpec(metadata={}),
+        ),
+    ]
+
+    report = build_daily_report(db_path, trading_date="2026-07-07", deployments=deployments)
+
+    assert report["provider_health"]["entry_selector_empty_by_deployment"] == [
+        {"deployment_id": "smh_live", "count": 2, "live": True},
+        {"deployment_id": "acme_shadow", "count": 1, "live": False},
+    ]
+    # dead_lane must still be counted separately in the existing summary, and
+    # entry_selector_empty must not double up with it.
+    assert report["provider_health"]["runtime_issue_counts"] == {"dead_lane": 1, "entry_selector_empty": 3}
+
+    markdown = write_daily_report(
+        db_path, output_dir=tmp_path / "reports", trading_date="2026-07-07", deployments=deployments
+    ).markdown_path.read_text(encoding="utf-8")
+    assert "## Entry Selector Empty (per lane)" in markdown
+    assert "`smh_live` [LIVE]: `2`" in markdown
+    assert "`acme_shadow` [shadow]: `1`" in markdown
+
+    telegram = render_daily_report_telegram_summary(report)
+    assert "LIVE entry_selector_empty: smh_live x2" in telegram
+    assert "acme_shadow" not in telegram  # shadow lane must not appear in the live-flagged watch line
+
+
+def test_daily_report_omits_entry_selector_empty_section_when_none_fired(tmp_path) -> None:
+    result = write_daily_report(tmp_path / "missing.db", output_dir=tmp_path / "reports", trading_date="2026-06-03")
+    assert result.report["provider_health"]["entry_selector_empty_by_deployment"] == []
+    assert "Entry Selector Empty" not in result.markdown_path.read_text(encoding="utf-8")
+    assert "entry_selector_empty" not in render_daily_report_telegram_summary(result.report)
+
+
 # --- Risk rails section tests (operator-audit P3) ---------------------------
 def test_daily_report_renders_risk_rails_section_from_startup_event_and_budget(tmp_path) -> None:
     db_path = tmp_path / "bhiksha.db"

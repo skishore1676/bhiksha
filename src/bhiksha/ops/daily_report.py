@@ -100,6 +100,7 @@ def build_daily_report(
             ).items()
         )
     )
+    entry_selector_empty_by_deployment = _entry_selector_empty_by_deployment(events, deployments)
 
     return {
         "trading_date": day.isoformat(),
@@ -110,6 +111,7 @@ def build_daily_report(
         "provider_health": {
             "reconciliation": provider_events,
             "runtime_issue_counts": runtime_issue_counts,
+            "entry_selector_empty_by_deployment": entry_selector_empty_by_deployment,
         },
         "trade_summary": {
             "live_count": len(live_trades),
@@ -249,6 +251,16 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Runtime Issues"])
         for category, count in sorted(runtime_issue_counts.items()):
             lines.append(f"- `{category}`: `{count}`")
+
+    # Item C (2026-07-08 hygiene batch): a filtered-out live signal (selector
+    # returned zero contracts) must never masquerade as a quiet day -- see the
+    # 2026-07-07 SMH case.
+    selector_empty_lanes = ((report.get("provider_health") or {}).get("entry_selector_empty_by_deployment") or [])
+    if selector_empty_lanes:
+        lines.extend(["", "## Entry Selector Empty (per lane)"])
+        for lane in selector_empty_lanes:
+            marker = "LIVE" if lane.get("live") else "shadow"
+            lines.append(f"- `{lane.get('deployment_id')}` [{marker}]: `{lane.get('count')}`")
 
     # --- Risk rails section (operator-audit P3) ---------------------------
     risk_rails = report.get("risk_rails")
@@ -390,6 +402,19 @@ def render_daily_report_telegram_summary(
         if more > 0:
             issue_text = f"{issue_text}, +{more} more"
         watch_items.append(f"Runtime issue: {issue_text}")
+    selector_empty_lanes = ((report.get("provider_health") or {}).get("entry_selector_empty_by_deployment") or [])
+    live_selector_empty_lanes = [lane for lane in selector_empty_lanes if lane.get("live")]
+    if live_selector_empty_lanes:
+        # Item C: surface LIVE lanes distinctly so a filtered-out live signal
+        # (2026-07-07 SMH) is never buried behind shadow-lane noise.
+        lane_text = ", ".join(
+            f"{_compact_deployment_id(lane.get('deployment_id'))} x{lane.get('count')}"
+            for lane in live_selector_empty_lanes[:3]
+        )
+        more = len(live_selector_empty_lanes) - 3
+        if more > 0:
+            lane_text = f"{lane_text}, +{more} more"
+        watch_items.append(f"LIVE entry_selector_empty: {lane_text}")
     risk_rails = report.get("risk_rails")
     if risk_rails:
         watch_items.append(
@@ -454,7 +479,11 @@ def _empty_report(day: date) -> dict[str, Any]:
         "db_path": "",
         "total_events": 0,
         "event_type_counts": {},
-        "provider_health": {"reconciliation": _empty_reconciliation(), "runtime_issue_counts": {}},
+        "provider_health": {
+            "reconciliation": _empty_reconciliation(),
+            "runtime_issue_counts": {},
+            "entry_selector_empty_by_deployment": [],
+        },
         "trade_summary": {
             "live_count": 0,
             "shadow_count": 0,
@@ -773,6 +802,46 @@ def _relaxed_evidence_lanes(
             continue
         lanes.append({"deployment_id": deployment_id, "evidence_gates_relaxed": list(gates)})
     return sorted(lanes, key=lambda lane: lane["deployment_id"])
+
+
+def _entry_selector_empty_by_deployment(
+    events: list[dict[str, Any]],
+    deployments: list["DeploymentManifest"] | None,
+) -> list[dict[str, Any]]:
+    """Per-deployment ``entry_selector_empty`` count, flagging LIVE lanes
+    distinctly (2026-07-08 hygiene batch, item C).
+
+    2026-07-07 case: SMH's signal was live and dispatched, but the selector
+    filtered out every contract, so no trade -- and no runtime_issue signal
+    -- ever reached the report at a per-lane granularity. A filtered-out live
+    signal must never masquerade as a quiet day. Reporting-only: this reads
+    the same ``runtime_issue``/``entry_selector_empty`` events daily_report
+    already aggregates into ``runtime_issue_counts``, just re-grouped by
+    deployment and cross-referenced against ``deployment.execution.shadow_only``
+    (the same live/shadow signal ``_relaxed_evidence_lanes`` already uses)
+    so a live lane's count is never buried among shadow-lane noise.
+    """
+    counts: Counter[str] = Counter()
+    for event in events:
+        if event["event_type"] != "runtime_issue":
+            continue
+        payload = event["payload"] or {}
+        if payload.get("category") != "entry_selector_empty":
+            continue
+        deployment_id = payload.get("deployment_id") or payload.get("symbol") or "UNKNOWN"
+        counts[str(deployment_id)] += 1
+    if not counts:
+        return []
+    live_deployment_ids = {
+        getattr(deployment, "deployment_id", None)
+        for deployment in (deployments or [])
+        if not getattr(getattr(deployment, "execution", None), "shadow_only", False)
+    }
+    rows = [
+        {"deployment_id": deployment_id, "count": count, "live": deployment_id in live_deployment_ids}
+        for deployment_id, count in counts.items()
+    ]
+    return sorted(rows, key=lambda row: (not row["live"], -row["count"], row["deployment_id"]))
 
 
 def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
