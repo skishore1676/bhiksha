@@ -20,7 +20,7 @@ from bhiksha.config.models import AppConfig
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import ExitMode, SignalDirection
-from bhiksha.domain.models import ExitDecision, ExitPlan, SignalDecision, TradePlan, TradeRecord
+from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
 from bhiksha.execution.pricing import select_entry_limit
@@ -40,6 +40,20 @@ from bhiksha.state.position_tracker import TrackedPosition
 from bhiksha.time_utils import parse_time_text
 
 ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
+
+# Audit fixes A.1/A.2 (2026-07-08): broker statuses that prove a canceled exit
+# order is DEAD (cannot fill any further). FILLED is handled separately as the
+# full-fill race. Anything else -- None/error/NEW/SUBMITTED/PARTIALLY_FILLED/
+# unknown -- means the order may still fill, so a reprice must not resubmit on
+# top of it without a clean cancel confirmation.
+_EXIT_ORDER_DEAD_STATUSES = frozenset({"CANCELED", "REJECTED", "EXPIRED"})
+
+# Audit fix 3 (2026-07-08): give-up ceiling for the partial-fill enrichment
+# sweep. One attempt is counted per unresolved poll (error/timeout/non-terminal
+# status); at the reconciliation cadence (~15s) 40 attempts is ~10 minutes of
+# retrying before the row is marked abandoned with a reason instead of being
+# re-polled forever against a degraded broker.
+_PARTIAL_FILL_ENRICH_MAX_ATTEMPTS = 40
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +85,26 @@ class _EntryCancelResult:
     @property
     def filled(self) -> bool:
         return str(self.status or "").upper() == "FILLED"
+
+
+@dataclass(frozen=True, slots=True)
+class _ExitCancelRaceOutcome:
+    """Verdict of ``_resolve_exit_cancel_for_reprice`` (audit fixes A.1/A.2).
+
+    * ``finalized`` -- the old order already filled the whole position; the
+      fill truth was recorded and ``plan`` carries the close. NO resubmit.
+    * ``resubmit`` -- safe to place the replacement order; ``position`` is the
+      position to resubmit with (quantity reduced to the residual when a
+      partial fill was detected and recorded).
+    * ``blocked`` -- the cancel is unconfirmed AND the readback could not prove
+      the order dead: resubmitting could double-sell, so the caller must skip
+      this cycle and let the pending-exit poller retry.
+    """
+
+    action: str
+    position: TrackedPosition | None = None
+    plan: ExitPlan | None = None
+    cancel_error: str | None = None
 
 
 class ExecutionSupervisor:
@@ -694,6 +728,7 @@ class ExecutionSupervisor:
                             entry_timestamp=plan.entry_timestamp,
                             status="pending_entry",
                             entry_order_id=plan.order_id,
+                            can_ladder=plan.quantity >= 2,
                         )
                     )
                     transition = self.lifecycle_store.begin_entry(
@@ -734,6 +769,7 @@ class ExecutionSupervisor:
                             entry_timestamp=plan.entry_timestamp,
                             status="open_unprotected",
                             entry_order_id="SHADOW_ENTRY",
+                            can_ladder=plan.quantity >= 2,
                         )
                     )
                     transition = self.lifecycle_store.mark_open(
@@ -773,6 +809,7 @@ class ExecutionSupervisor:
                             entry_timestamp=plan.entry_timestamp,
                             status="open_unprotected",
                             entry_order_id=plan.order_id,
+                            can_ladder=plan.quantity >= 2,
                         )
                     )
                     transition = self.lifecycle_store.mark_open(
@@ -861,6 +898,7 @@ class ExecutionSupervisor:
                     entry_timestamp=plan.entry_timestamp,
                     status="pending_entry_reconcile",
                     entry_order_id=plan.order_id,
+                    can_ladder=plan.quantity >= 2,
                 )
             )
             transition = self.lifecycle_store.mark_reconciliation_hold(
@@ -940,6 +978,15 @@ class ExecutionSupervisor:
                 stop_price=stop_price,
                 target_order_id=target_order_id,
                 target_price=target_price,
+                # ITEM D (2026-07-08 hygiene batch): tag ladder-capability at
+                # LIVE entry recording time, from the ORIGINAL filled quantity
+                # -- the T1 60/40 profile split needs >= 2 contracts (see
+                # _partial_quantity in profile_exit.py). This is a snapshot:
+                # trade_sessions.quantity is later overwritten to the residual
+                # by a partial bank, so it must be captured here, not derived
+                # from quantity at report time. Metadata only -- never read by
+                # order-management logic; the daily report is the consumer.
+                can_ladder=plan.quantity >= 2,
             )
         )
         if protection_error is not None:
@@ -2140,6 +2187,36 @@ class ExecutionSupervisor:
                     },
                 )
 
+        # ITEM B (2026-07-08 hygiene batch): durably record the banked leg's own
+        # economics BEFORE the residual overwrites trade_sessions.quantity below.
+        # Previously the only trace of this leg was an order_id in the
+        # append-only partial_scale_submission event, with no fill confirmation
+        # ever read back -- weekly per-leg P&L reconstruction had nothing durable
+        # to read. dry_run/shadow already computed a synthetic fill via
+        # _paper_exit_fill_details above; live legs are recorded unconfirmed here
+        # and backfilled by sync_lifecycle's _enrich_pending_partial_fills sweep
+        # once the broker confirms the fill (mirrors _enrich_recent_closed_exit_truth).
+        if updated_position.trade_id is not None and updated_position.option_symbol is not None:
+            await self.trade_state_repository.record_partial_fill(
+                PartialFillRecord(
+                    id=None,
+                    trade_id=updated_position.trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=updated_position.symbol,
+                    option_symbol=updated_position.option_symbol,
+                    closed_quantity=close_qty,
+                    order_id=order_id,
+                    exit_rule=exit_rule,
+                    submitted_at=datetime.now(UTC),
+                    fill_price=fill_details.get("exit_price") if dry_run else None,
+                    fill_quantity=fill_details.get("exit_filled_quantity") if dry_run else None,
+                    filled_at=fill_details.get("exit_filled_at") if dry_run else None,
+                    order_status=fill_details.get("exit_order_status") if dry_run else None,
+                    order_type=fill_details.get("exit_order_type") if dry_run else None,
+                    broker_payload=fill_details.get("exit_broker_payload") if dry_run else None,
+                )
+            )
+
         # The residual runner stays OPEN and MUST stay protected. A profile partial
         # cancels protection unconditionally (cancel_protection_orders=True), but
         # even when it does not we must never end with the residual naked OR with
@@ -2748,6 +2825,247 @@ class ExecutionSupervisor:
                 first_error = cancel_error
         return updated, canceled_stop_order_id, canceled_target_order_id, first_error
 
+    async def _finalize_pending_exit_fill(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        exit_order_id: str | None,
+        status: str | None,
+        payload: dict | None,
+        now: datetime,
+        reason: str = "exit_filled",
+    ) -> ExitPlan:
+        """Close out a position whose exit order is confirmed FILLED and persist
+        the fill truth (exit_price/exit_filled_quantity/exit_filled_at).
+
+        ROOT CAUSE FIX (2026-07-08 hygiene batch, item A): this is the single
+        chokepoint for recording a genuine exit fill, shared by the routine
+        pending-exit FILLED poll AND the reprice cancel-race guard below
+        (``_cancel_exit_order_and_check_fill`` callers). Previously the
+        cancel-then-resubmit reprice paths did NOT check whether the order they
+        were about to supersede had already filled; when a cancel raced a real
+        fill (broker reports the cancel as failed/ambiguous *because* the order
+        already filled), the code blindly resubmitted a new close order,
+        overwriting ``exit_order_id`` with the new (non-filling) order and
+        permanently losing the reference to the order that actually filled the
+        position. The later broker-vanished reconciliation fallback
+        (``_mark_disappeared_trade_closed`` / ``_find_terminal_exit_order_payload``)
+        then had nothing left to find, so ``exit_price``/``exit_filled_quantity``/
+        ``exit_filled_at`` never wrote back even though ``status`` correctly
+        went to ``closed`` and ``exit_rule`` (persisted earlier, at submission
+        time) survived. Routing every confirmed fill through this one method
+        closes that gap regardless of which caller discovered it.
+        """
+        self.planner.position_tracker.close_position(
+            position.symbol,
+            position.deployment_id,
+            option_symbol=position.option_symbol,
+        )
+        self.clear_profile_exit_state(position)
+        if position.trade_id is not None:
+            await self._mark_trade_closed_with_exit_truth(
+                position.trade_id,
+                exit_order_id=exit_order_id,
+                status=status,
+                payload=payload,
+            )
+        transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
+        await self._emit_lifecycle_transition(transition, reason="exit_closed")
+        plan = ExitPlan(
+            trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+            deployment_id=deployment.deployment_id,
+            symbol=position.symbol,
+            option_symbol=position.option_symbol,
+            quantity=position.quantity,
+            action="square_off",
+            reasons=[reason],
+            dry_run=False,
+            order_id=exit_order_id,
+        )
+        await self.event_repository.append("exit_plan", asdict(plan))
+        await self._record_manual_status(
+            deployment,
+            stage="exit_closed",
+            writer_call=self.manual_status_writer.mark_closed(
+                deployment,
+                trade_id=position.trade_id,
+                note=reason,
+                event_at=now,
+            )
+            if self.manual_status_writer is not None
+            else None,
+        )
+        return plan
+
+    async def _cancel_exit_order_and_check_fill(
+        self, order_id: str
+    ) -> tuple[bool, str | None, str | None, dict | None, str | None]:
+        """Cancel a resting exit order and read back its status before treating
+        it as safely superseded (E1: exit-side cancel-race fill guard, mirrors
+        the entry-side ``_cancel_entry_order_and_check_fill``).
+
+        A broker cancel can report failure/ambiguity precisely *because* the
+        order already filled. Reading the status back after every cancel
+        attempt (not just on a failed ``canceled`` return) lets a reprice
+        caller detect that race and record the real fill instead of
+        resubmitting a duplicate close order that would orphan the true
+        ``exit_order_id``. Returns
+        ``(canceled_ok, cancel_error, status, payload, status_error)``.
+        ``status_error`` is non-None when the readback itself failed
+        (``get_order_status`` swallows broker exceptions into an error string
+        -- it never raises) or timed out; audit fix A.1 requires the caller to
+        treat that as "order state unknown" and fail closed, and to log the
+        error rather than discard it.
+        """
+        canceled_ok, cancel_error = await self.planner.order_manager.cancel_order(order_id)
+        try:
+            status, payload, status_error = await asyncio.wait_for(
+                self.planner.order_manager.get_order_status(order_id),
+                timeout=ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            status, payload, status_error = None, None, "cancel_status_readback_timeout"
+        return canceled_ok, cancel_error, status, payload, status_error
+
+    async def _resolve_exit_cancel_for_reprice(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        exit_order_id: str,
+        reason: str,
+        now: datetime,
+    ) -> "_ExitCancelRaceOutcome":
+        """Cancel a resting exit order ahead of a reprice and decide whether
+        the reprice may proceed (audit fixes A.1 + A.2 on top of the item-A
+        cancel-race guard). Shared by the STRATEGY and HARD_FLAT branches of
+        ``_manage_pending_exit_locked``.
+
+        Decision ladder, strictest first:
+
+        1. FULL FILL (item A): readback shows ``FILLED``, or a dead order whose
+           ``filledQuantity`` covers the whole position -- record the fill truth
+           via ``_finalize_pending_exit_fill``; never resubmit.
+        2. BLOCKED (A.1, fail closed): the cancel was NOT cleanly confirmed AND
+           the readback did not cleanly prove the order dead (broker
+           error/timeout/``None``/non-terminal status such as
+           ``PARTIALLY_FILLED``). The order may still fill; resubmitting now is
+           the pre-audit blind-resubmit bug. Emit ``exit_reprice_blocked``
+           (including the previously-discarded ``status_error``) and skip this
+           cycle -- the pending-exit poller retries within
+           ``order_fill_poll_seconds`` (the fail-safe mirror of the entry
+           side's ``_cancel_entry_for_reprice_block``).
+        3. PARTIAL FILL (A.2, the consequential one): the order is dead (or the
+           cancel cleanly acked) with ``0 < filledQuantity < position.quantity``
+           -- the common real-broker outcome of a cancel racing a working
+           order. Durably record the filled leg in ``trade_partial_fills``
+           (origin="exit_cancel_race"; this path is distinct from the
+           deliberate ``_handle_partial_scale_locked`` banks) and return a
+           position carrying only the RESIDUAL quantity so the resubmit can
+           never oversell.
+        4. RESUBMIT: the order is confirmed dead unfilled, or the cancel was
+           cleanly confirmed -- safe to place the replacement order at full
+           quantity (pre-existing behavior).
+        """
+        canceled, cancel_error, status, payload, status_error = await self._cancel_exit_order_and_check_fill(
+            exit_order_id
+        )
+        normalized_status = str(status or "").upper()
+        filled_quantity = _maybe_int((payload or {}).get("filledQuantity"))
+
+        # 1. Full fill.
+        if normalized_status == "FILLED" or (filled_quantity is not None and filled_quantity >= position.quantity):
+            await self.event_repository.append(
+                "exit_reprice_cancel_race_filled",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "order_id": exit_order_id,
+                    "reason": reason,
+                    "cancel_ok": canceled,
+                    "cancel_error": cancel_error,
+                },
+            )
+            plan = await self._finalize_pending_exit_fill(
+                deployment,
+                position,
+                exit_order_id=exit_order_id,
+                status=status,
+                payload=payload,
+                now=now,
+                reason="exit_reprice_cancel_race_filled",
+            )
+            return _ExitCancelRaceOutcome(action="finalized", plan=plan)
+
+        # 2. A.1 fail closed: cancel unconfirmed and order not provably dead.
+        if not canceled and normalized_status not in _EXIT_ORDER_DEAD_STATUSES:
+            await self.event_repository.append(
+                "exit_reprice_blocked",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "order_id": exit_order_id,
+                    "reason": reason,
+                    "cancel_error": cancel_error,
+                    "status": status,
+                    "status_error": status_error,
+                },
+            )
+            return _ExitCancelRaceOutcome(action="blocked", cancel_error=cancel_error)
+
+        # 3. A.2 partial fill on a dead-or-cancel-acked order.
+        if filled_quantity is not None and 0 < filled_quantity < position.quantity:
+            residual_quantity = position.quantity - filled_quantity
+            details = _exit_fill_details(payload, status=status)
+            if position.trade_id is not None and position.option_symbol is not None:
+                await self.trade_state_repository.record_partial_fill(
+                    PartialFillRecord(
+                        id=None,
+                        trade_id=position.trade_id,
+                        deployment_id=deployment.deployment_id,
+                        symbol=position.symbol,
+                        option_symbol=position.option_symbol,
+                        closed_quantity=filled_quantity,
+                        order_id=exit_order_id,
+                        exit_rule=None,
+                        submitted_at=position.exit_submitted_at,
+                        fill_price=details["exit_price"],
+                        fill_quantity=details["exit_filled_quantity"] or filled_quantity,
+                        filled_at=details["exit_filled_at"],
+                        order_status=details["exit_order_status"],
+                        order_type=details["exit_order_type"],
+                        broker_payload=details["exit_broker_payload"],
+                        origin="exit_cancel_race",
+                    )
+                )
+            await self.event_repository.append(
+                "exit_cancel_race_partial_fill",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "order_id": exit_order_id,
+                    "reason": reason,
+                    "filled_quantity": filled_quantity,
+                    "residual_quantity": residual_quantity,
+                    "fill_price": details["exit_price"],
+                    "status": status,
+                    "cancel_ok": canceled,
+                    "cancel_error": cancel_error,
+                },
+            )
+            return _ExitCancelRaceOutcome(
+                action="resubmit",
+                position=_replace_position(position, quantity=residual_quantity),
+                cancel_error=cancel_error,
+            )
+
+        # 4. Confirmed dead unfilled, or cleanly canceled: full-quantity resubmit.
+        return _ExitCancelRaceOutcome(action="resubmit", position=position, cancel_error=cancel_error)
+
     async def manage_pending_exits(
         self,
         deployments_by_id: dict[str, DeploymentManifest],
@@ -2796,46 +3114,15 @@ class ExecutionSupervisor:
         )
         normalized = (status or "").upper()
         if normalized == "FILLED":
-            self.planner.position_tracker.close_position(
-                position.symbol,
-                position.deployment_id,
-                option_symbol=position.option_symbol,
-            )
-            self.clear_profile_exit_state(position)
-            if position.trade_id is not None:
-                await self._mark_trade_closed_with_exit_truth(
-                    position.trade_id,
-                    exit_order_id=position.exit_order_id,
-                    status=status,
-                    payload=payload,
-                )
-            transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
-            await self._emit_lifecycle_transition(transition, reason="exit_closed")
-            plan = ExitPlan(
-                trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
-                deployment_id=deployment.deployment_id,
-                symbol=position.symbol,
-                option_symbol=position.option_symbol,
-                quantity=position.quantity,
-                action="square_off",
-                reasons=["exit_filled"],
-                dry_run=False,
-                order_id=position.exit_order_id,
-            )
-            await self.event_repository.append("exit_plan", asdict(plan))
-            await self._record_manual_status(
+            return await self._finalize_pending_exit_fill(
                 deployment,
-                stage="exit_closed",
-                writer_call=self.manual_status_writer.mark_closed(
-                    deployment,
-                    trade_id=position.trade_id,
-                    note="exit_filled",
-                    event_at=now,
-                )
-                if self.manual_status_writer is not None
-                else None,
+                position,
+                exit_order_id=position.exit_order_id,
+                status=status,
+                payload=payload,
+                now=now,
+                reason="exit_filled",
             )
-            return plan
         if error and position.exit_order_id is not None:
             await self.event_repository.append(
                 "ambiguous_cancel",
@@ -2877,22 +3164,23 @@ class ExecutionSupervisor:
                         reason="exit_reprice",
                     )
                     if position.exit_order_id:
-                        canceled, replace_cancel_error = await self.planner.order_manager.cancel_order(position.exit_order_id)
-                        if not canceled and self._allows_exit_submission_before_cancel_confirmation():
-                            await self.event_repository.append(
-                                "ambiguous_cancel",
-                                {
-                                    "deployment_id": deployment.deployment_id,
-                                    "symbol": position.symbol,
-                                    "option_symbol": position.option_symbol,
-                                    "order_id": position.exit_order_id,
-                                    "kind": "exit",
-                                    "reason": "exit_reprice",
-                                    "error": replace_cancel_error,
-                                },
-                            )
+                        # E1 + audit A.1/A.2: cancel with fill-race, partial-fill,
+                        # and fail-closed handling -- see
+                        # _resolve_exit_cancel_for_reprice for the decision ladder.
+                        outcome = await self._resolve_exit_cancel_for_reprice(
+                            deployment,
+                            replaced_position,
+                            exit_order_id=position.exit_order_id,
+                            reason="exit_reprice",
+                            now=now,
+                        )
+                        if outcome.action == "finalized":
+                            return outcome.plan
+                        if outcome.action == "blocked":
+                            return None
+                        replaced_position = outcome.position or replaced_position
                         if cancel_error is None:
-                            cancel_error = replace_cancel_error
+                            cancel_error = outcome.cancel_error
                     _, plan = await self._submit_exit_request(
                         deployment,
                         replaced_position,
@@ -2905,28 +3193,33 @@ class ExecutionSupervisor:
                     return plan
             if position.exit_mode == ExitMode.HARD_FLAT:
                 if position.exit_reprice_count == 0:
+                    resubmit_position = position
+                    hard_flat_cancel_error = None
                     if position.exit_order_id:
-                        canceled, cancel_error = await self.planner.order_manager.cancel_order(position.exit_order_id)
-                        if not canceled and self._allows_exit_submission_before_cancel_confirmation():
-                            await self.event_repository.append(
-                                "ambiguous_cancel",
-                                {
-                                    "deployment_id": deployment.deployment_id,
-                                    "symbol": position.symbol,
-                                    "option_symbol": position.option_symbol,
-                                    "order_id": position.exit_order_id,
-                                    "kind": "exit",
-                                    "reason": "hard_flat_reprice",
-                                    "error": cancel_error,
-                                },
-                            )
+                        # E1 + audit A.1/A.2: same guard as the STRATEGY branch --
+                        # a hard-flat reprice must not orphan an already-filled
+                        # exit_order_id, oversell a partially-filled one, or
+                        # resubmit over an order in an unknown state.
+                        outcome = await self._resolve_exit_cancel_for_reprice(
+                            deployment,
+                            position,
+                            exit_order_id=position.exit_order_id,
+                            reason="hard_flat_reprice",
+                            now=now,
+                        )
+                        if outcome.action == "finalized":
+                            return outcome.plan
+                        if outcome.action == "blocked":
+                            return None
+                        resubmit_position = outcome.position or position
+                        hard_flat_cancel_error = outcome.cancel_error
                     _, plan = await self._submit_exit_request(
                         deployment,
-                        position,
+                        resubmit_position,
                         exit_mode=ExitMode.HARD_FLAT,
                         reason="hard_flat_reprice",
                         event_type="exit_reprice",
-                        inherited_error=cancel_error if 'cancel_error' in locals() else None,
+                        inherited_error=hard_flat_cancel_error,
                         submitted_at=position.exit_submitted_at,
                         increment_reprice=True,
                     )
@@ -3263,6 +3556,7 @@ class ExecutionSupervisor:
                     continue
                 await self._mark_disappeared_trade_closed(trade)
         await self._enrich_recent_closed_exit_truth(recent_trades)
+        await self._enrich_pending_partial_fills()
         for position in self.planner.position_tracker.active_positions():
             if position.trade_id is None or position.option_symbol is None:
                 continue
@@ -3376,6 +3670,116 @@ class ExecutionSupervisor:
                     "payload": payload,
                 },
             )
+
+    async def _enrich_pending_partial_fills(self) -> None:
+        """Backfill confirmed fill truth for banked partial legs (ITEM B).
+
+        ``_handle_partial_scale_locked`` fires the close order for a banked
+        partial without waiting for it to fill (the async pending-exit-poll
+        pattern used for full closes does not apply here -- a partial leg's
+        ``exit_order_id`` is deliberately not carried on the residual
+        position, see NEW-1/NEW-2 there). This sweep is the durable-side
+        equivalent of ``_enrich_recent_closed_exit_truth``: poll every
+        ``trade_partial_fills`` row still missing ``fill_price`` and record
+        the broker's confirmed fill once available. Paper/dry-run legs are
+        never polled -- their fill truth is written synchronously at
+        submission time (see ``_is_paper_order_id``).
+
+        Audit fix 3 hardening: this sweep runs inside ``sync_lifecycle`` under
+        the reconciliation ``sync_lock``, so every per-row status poll carries
+        a hard ``asyncio.wait_for`` timeout (the broker client's own timeout
+        is ~30s -- a degraded-broker episode across a row backlog would
+        otherwise stall reconciliation serially). Rows that will never resolve
+        get a terminal give-up state instead of being re-polled forever: a
+        dead-status readback with no fill abandons immediately
+        (``terminal_status:<STATUS>``); every other unresolved poll
+        (error/timeout/non-terminal or mismatched status) counts one attempt,
+        and hitting ``_PARTIAL_FILL_ENRICH_MAX_ATTEMPTS`` abandons with
+        ``max_poll_attempts:<last-error>``. Abandonment is durable
+        (``abandoned_reason``), excluded from future sweeps, and surfaced via
+        the ``partial_fill_enrich_abandoned`` event.
+        """
+        pending = await self.trade_state_repository.get_unconfirmed_partial_fills()
+        for record in pending:
+            if record.id is None or record.order_id is None or _is_paper_order_id(record.order_id):
+                continue
+            try:
+                status, payload, error = await asyncio.wait_for(
+                    self.planner.order_manager.get_order_status(record.order_id),
+                    timeout=ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                status, payload, error = None, None, "partial_fill_status_readback_timeout"
+            if error or payload is None:
+                await self._register_partial_fill_poll_failure(record, error=error or "missing_status_payload")
+                continue
+            normalized = str(status or payload.get("status") or "").upper()
+            details = _exit_fill_details(payload, status=status)
+            has_fill = details["exit_price"] is not None and bool(details["exit_filled_quantity"])
+            if _is_filled_exit_order(payload, status=status, option_symbol=record.option_symbol) or (
+                normalized in _EXIT_ORDER_DEAD_STATUSES and has_fill
+            ):
+                # Full fill, or a dead order that still filled part of the leg
+                # before dying -- record whatever truth the broker reports.
+                await self.trade_state_repository.enrich_partial_fill(
+                    record.id,
+                    fill_price=details["exit_price"],
+                    fill_quantity=details["exit_filled_quantity"],
+                    filled_at=details["exit_filled_at"],
+                    order_status=details["exit_order_status"],
+                    order_type=details["exit_order_type"],
+                    broker_payload=details["exit_broker_payload"],
+                )
+                await self.event_repository.append(
+                    "partial_fill_enriched",
+                    {
+                        "deployment_id": record.deployment_id,
+                        "symbol": record.symbol,
+                        "trade_id": record.trade_id,
+                        "option_symbol": record.option_symbol,
+                        "order_id": record.order_id,
+                        "closed_quantity": record.closed_quantity,
+                        "status": status,
+                        "payload": payload,
+                    },
+                )
+                continue
+            if normalized in _EXIT_ORDER_DEAD_STATUSES:
+                # Order died without any fill: it can never be enriched.
+                await self._abandon_partial_fill(record, reason=f"terminal_status:{normalized}")
+                continue
+            await self._register_partial_fill_poll_failure(
+                record, error=f"non_terminal_status:{normalized or 'unknown'}"
+            )
+
+    async def _register_partial_fill_poll_failure(self, record: PartialFillRecord, *, error: str) -> None:
+        """Count one unresolved enrichment poll; abandon at the ceiling (audit fix 3)."""
+        if record.id is None:
+            return
+        if record.enrich_attempts + 1 >= _PARTIAL_FILL_ENRICH_MAX_ATTEMPTS:
+            await self._abandon_partial_fill(record, reason=f"max_poll_attempts:{error}")
+            return
+        await self.trade_state_repository.increment_partial_fill_enrich_attempts(record.id)
+
+    async def _abandon_partial_fill(self, record: PartialFillRecord, *, reason: str) -> None:
+        """Durably stop re-polling a partial leg that will never resolve (audit fix 3)."""
+        if record.id is None:
+            return
+        await self.trade_state_repository.mark_partial_fill_abandoned(record.id, reason=reason)
+        await self.event_repository.append(
+            "partial_fill_enrich_abandoned",
+            {
+                "deployment_id": record.deployment_id,
+                "symbol": record.symbol,
+                "trade_id": record.trade_id,
+                "option_symbol": record.option_symbol,
+                "order_id": record.order_id,
+                "closed_quantity": record.closed_quantity,
+                "origin": record.origin,
+                "enrich_attempts": record.enrich_attempts,
+                "reason": reason,
+            },
+        )
 
     async def _find_terminal_exit_order_payload(self, trade: TradeRecord) -> tuple[str | None, str | None, dict | None]:
         seen: set[str] = set()

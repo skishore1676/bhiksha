@@ -169,6 +169,66 @@ class TradeRecord:
     # "target_1_partial"). None for a native/legacy thesis exit. Never read by
     # order-management logic — daily_report is the sole consumer (workplan #10).
     exit_rule: str | None = None
+    # ITEM D (2026-07-08 hygiene batch): whether the position, AT ENTRY, had
+    # enough size to express the profile ladder (the T1 60/40 split needs
+    # >= 2 contracts -- see _partial_quantity). Frozen once at entry time from
+    # the ORIGINAL quantity and preserved thereafter (COALESCE, like
+    # exit_rule) -- trade_sessions.quantity itself is overwritten to the
+    # residual after a partial bank, so it cannot be used at report time to
+    # recover this. None only for rows written before this migration.
+    # Metadata/reporting-only; never read by order-management logic.
+    can_ladder: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class PartialFillRecord:
+    """One durable row per banked partial leg of a position (ITEM B, 2026-07-08
+    hygiene batch, exit-accounting audit).
+
+    A profile ladder can bank more than one partial over a position's life
+    (today only ``target_1_partial`` does), but ``trade_sessions`` holds only
+    the CURRENT residual ``quantity`` -- ``_handle_partial_scale_locked``
+    overwrites it on every bank, and ``mark_closed`` later records only the
+    RUNNER's own exit truth. Without a separate durable row, the banked leg's
+    fill price/quantity/timestamp has no home: only its ``order_id`` survives,
+    in the append-only ``partial_scale_submission`` event, with no fill
+    confirmation ever read back.
+
+    Per-leg P&L reconstruction with this table: original position size =
+    ``trade_sessions.quantity`` (final residual) + ``sum(closed_quantity)``
+    here; banked-leg P&L = ``(fill_price - entry_price) * closed_quantity``;
+    runner P&L is unchanged, from ``trade_sessions.exit_price`` /
+    ``trade_sessions.quantity`` (the residual) as before.
+    """
+
+    id: int | None
+    trade_id: str
+    deployment_id: str
+    symbol: str
+    option_symbol: str | None
+    closed_quantity: int
+    order_id: str | None
+    exit_rule: str | None
+    submitted_at: datetime | None
+    fill_price: float | None = None
+    fill_quantity: int | None = None
+    filled_at: datetime | None = None
+    order_status: str | None = None
+    order_type: str | None = None
+    broker_payload: dict[str, Any] | None = None
+    # Audit fix A.2 (2026-07-08): where this leg came from. "partial_scale" is
+    # a deliberate profile T1 bank (_handle_partial_scale_locked);
+    # "exit_cancel_race" is an involuntary partial discovered when a reprice
+    # cancel raced a working exit order (readback showed nonzero
+    # filledQuantity short of the full position).
+    origin: str = "partial_scale"
+    # Audit fix 3: enrichment-sweep bookkeeping. ``enrich_attempts`` counts
+    # unresolved polls; once it reaches the sweep's max (or the order reads
+    # back terminally dead with no fill) the row is marked abandoned with a
+    # reason and never re-polled -- the sweep must not retry forever against
+    # a degraded broker.
+    enrich_attempts: int = 0
+    abandoned_reason: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from bhiksha.domain.enums import ExitMode
-from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, TradeRecord
+from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, PartialFillRecord, TradeRecord
 from bhiksha.persistence.repository import CashBudgetRepository, EventRepository, TradeStateRepository
 
 ReadResultT = TypeVar("ReadResultT")
@@ -36,10 +36,10 @@ class SQLiteBackend:
             await asyncio.to_thread(self._ensure_db_sync)
             self._db_initialized = True
 
-    async def run_write(self, operation: Callable[..., None], *args) -> None:
+    async def run_write(self, operation: Callable[..., ReadResultT], *args) -> ReadResultT:
         await self.ensure_db()
         async with self._write_lock:
-            await asyncio.to_thread(operation, *args)
+            return await asyncio.to_thread(operation, *args)
 
     async def run_read(self, operation: Callable[..., ReadResultT], *args) -> ReadResultT:
         await self.ensure_db()
@@ -156,6 +156,49 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         await self._ensure_initialized()
         return await self.backend.run_read(self._get_recent_trades_sync, limit)
 
+    async def record_partial_fill(self, record: PartialFillRecord) -> int:
+        await self._ensure_initialized()
+        return await self.backend.run_write(self._record_partial_fill_sync, record)
+
+    async def enrich_partial_fill(
+        self,
+        record_id: int,
+        *,
+        fill_price: float | None = None,
+        fill_quantity: int | None = None,
+        filled_at: datetime | None = None,
+        order_status: str | None = None,
+        order_type: str | None = None,
+        broker_payload: dict[str, Any] | None = None,
+    ) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(
+            self._enrich_partial_fill_sync,
+            record_id,
+            fill_price,
+            fill_quantity,
+            filled_at,
+            order_status,
+            order_type,
+            broker_payload,
+        )
+
+    async def get_unconfirmed_partial_fills(self, *, limit: int = 200) -> list[PartialFillRecord]:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_unconfirmed_partial_fills_sync, limit)
+
+    async def get_partial_fills(self, trade_id: str) -> list[PartialFillRecord]:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_partial_fills_sync, trade_id)
+
+    async def increment_partial_fill_enrich_attempts(self, record_id: int) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._increment_partial_fill_enrich_attempts_sync, record_id)
+
+    async def mark_partial_fill_abandoned(self, record_id: int, *, reason: str) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._mark_partial_fill_abandoned_sync, record_id, reason)
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -195,6 +238,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_order_type TEXT,
                     exit_broker_payload TEXT,
                     exit_rule TEXT,
+                    can_ladder INTEGER,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -227,12 +271,67 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_broker_payload TEXT")
             if "exit_rule" not in existing_columns:
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_rule TEXT")
+            if "can_ladder" not in existing_columns:
+                conn.execute("ALTER TABLE trade_sessions ADD COLUMN can_ladder INTEGER")
             # get_recent_trades orders by updated_at DESC on every risk-manager
             # consult (2-3x per entry attempt + once per bar); without this
             # index that is a full-table scan + temp b-tree sort that grows
             # with trade history (2026-07-02 audit finding).
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_sessions_updated_at ON trade_sessions(updated_at)"
+            )
+            # ITEM B (2026-07-08 hygiene batch): one durable row per banked
+            # partial leg. trade_sessions.quantity is overwritten to the
+            # residual on every partial bank (see
+            # ``_handle_partial_scale_locked``), so this is the only durable
+            # home for a banked leg's closed_quantity and its confirmed fill
+            # price/quantity/timestamp -- previously only an unfilled-truth
+            # order_id survived, in the append-only event log.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_partial_fills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    option_symbol TEXT,
+                    closed_quantity INTEGER NOT NULL,
+                    order_id TEXT,
+                    exit_rule TEXT,
+                    submitted_at TEXT,
+                    fill_price REAL,
+                    fill_quantity INTEGER,
+                    filled_at TEXT,
+                    order_status TEXT,
+                    order_type TEXT,
+                    broker_payload TEXT,
+                    origin TEXT NOT NULL DEFAULT 'partial_scale',
+                    enrich_attempts INTEGER NOT NULL DEFAULT 0,
+                    abandoned_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            # Audit fixes A.2/3 (2026-07-08): additive columns for a db created
+            # by the pre-audit revision of this same branch (IF-NOT-EXISTS
+            # pattern, matching trade_sessions above).
+            partial_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(trade_partial_fills)").fetchall()
+            }
+            if "origin" not in partial_columns:
+                conn.execute(
+                    "ALTER TABLE trade_partial_fills ADD COLUMN origin TEXT NOT NULL DEFAULT 'partial_scale'"
+                )
+            if "enrich_attempts" not in partial_columns:
+                conn.execute(
+                    "ALTER TABLE trade_partial_fills ADD COLUMN enrich_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "abandoned_reason" not in partial_columns:
+                conn.execute("ALTER TABLE trade_partial_fills ADD COLUMN abandoned_reason TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_partial_fills_trade_id ON trade_partial_fills(trade_id)"
             )
             conn.commit()
 
@@ -244,8 +343,9 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                     entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                     exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                    exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     deployment_id=excluded.deployment_id,
                     symbol=excluded.symbol,
@@ -271,6 +371,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_order_type=COALESCE(excluded.exit_order_type, trade_sessions.exit_order_type),
                     exit_broker_payload=COALESCE(excluded.exit_broker_payload, trade_sessions.exit_broker_payload),
                     exit_rule=COALESCE(excluded.exit_rule, trade_sessions.exit_rule),
+                    can_ladder=COALESCE(excluded.can_ladder, trade_sessions.can_ladder),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -299,6 +400,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     record.exit_order_type,
                     json.dumps(record.exit_broker_payload, default=str) if record.exit_broker_payload is not None else None,
                     record.exit_rule,
+                    None if record.can_ladder is None else int(record.can_ladder),
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -355,7 +457,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder
                 FROM trade_sessions
                 WHERE status != 'closed'
                 ORDER BY updated_at DESC
@@ -370,7 +472,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder
                 FROM trade_sessions
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -378,6 +480,123 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 (max(int(limit), 1),),
             ).fetchall()
         return [_trade_record_from_row(row) for row in rows]
+
+    def _record_partial_fill_sync(self, record: PartialFillRecord) -> int:
+        with closing(self.backend.connect()) as conn:
+            now = datetime.now(UTC).isoformat()
+            cursor = conn.execute(
+                """
+                INSERT INTO trade_partial_fills (
+                    trade_id, deployment_id, symbol, option_symbol, closed_quantity, order_id, exit_rule,
+                    submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload,
+                    origin, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.trade_id,
+                    record.deployment_id,
+                    record.symbol,
+                    record.option_symbol,
+                    record.closed_quantity,
+                    record.order_id,
+                    record.exit_rule,
+                    record.submitted_at.isoformat() if record.submitted_at is not None else None,
+                    record.fill_price,
+                    record.fill_quantity,
+                    record.filled_at.isoformat() if record.filled_at is not None else None,
+                    record.order_status,
+                    record.order_type,
+                    json.dumps(record.broker_payload, default=str) if record.broker_payload is not None else None,
+                    record.origin,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def _enrich_partial_fill_sync(
+        self,
+        record_id: int,
+        fill_price: float | None,
+        fill_quantity: int | None,
+        filled_at: datetime | None,
+        order_status: str | None,
+        order_type: str | None,
+        broker_payload: dict[str, Any] | None,
+    ) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE trade_partial_fills
+                SET fill_price = COALESCE(?, fill_price),
+                    fill_quantity = COALESCE(?, fill_quantity),
+                    filled_at = COALESCE(?, filled_at),
+                    order_status = COALESCE(?, order_status),
+                    order_type = COALESCE(?, order_type),
+                    broker_payload = COALESCE(?, broker_payload),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    fill_price,
+                    fill_quantity,
+                    filled_at.isoformat() if filled_at is not None else None,
+                    order_status,
+                    order_type,
+                    json.dumps(broker_payload, default=str) if broker_payload is not None else None,
+                    datetime.now(UTC).isoformat(),
+                    record_id,
+                ),
+            )
+            conn.commit()
+
+    def _get_unconfirmed_partial_fills_sync(self, limit: int) -> list[PartialFillRecord]:
+        with closing(self.backend.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, trade_id, deployment_id, symbol, option_symbol, closed_quantity, order_id, exit_rule,
+                       submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload,
+                       origin, enrich_attempts, abandoned_reason
+                FROM trade_partial_fills
+                WHERE fill_price IS NULL AND abandoned_reason IS NULL
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (max(int(limit), 1),),
+            ).fetchall()
+        return [_partial_fill_record_from_row(row) for row in rows]
+
+    def _get_partial_fills_sync(self, trade_id: str) -> list[PartialFillRecord]:
+        with closing(self.backend.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, trade_id, deployment_id, symbol, option_symbol, closed_quantity, order_id, exit_rule,
+                       submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload,
+                       origin, enrich_attempts, abandoned_reason
+                FROM trade_partial_fills
+                WHERE trade_id = ?
+                ORDER BY id ASC
+                """,
+                (trade_id,),
+            ).fetchall()
+        return [_partial_fill_record_from_row(row) for row in rows]
+
+    def _increment_partial_fill_enrich_attempts_sync(self, record_id: int) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                "UPDATE trade_partial_fills SET enrich_attempts = enrich_attempts + 1, updated_at = ? WHERE id = ?",
+                (datetime.now(UTC).isoformat(), record_id),
+            )
+            conn.commit()
+
+    def _mark_partial_fill_abandoned_sync(self, record_id: int, reason: str) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                "UPDATE trade_partial_fills SET abandoned_reason = ?, updated_at = ? WHERE id = ?",
+                (reason, datetime.now(UTC).isoformat(), record_id),
+            )
+            conn.commit()
 
 
 class SQLiteCashBudgetRepository(CashBudgetRepository):
@@ -602,4 +821,28 @@ def _trade_record_from_row(row) -> TradeRecord:
         exit_order_type=row[22] if len(row) > 22 else None,
         exit_broker_payload=json.loads(row[23]) if len(row) > 23 and row[23] else None,
         exit_rule=row[24] if len(row) > 24 else None,
+        can_ladder=(bool(row[25]) if row[25] is not None else None) if len(row) > 25 else None,
+    )
+
+
+def _partial_fill_record_from_row(row) -> PartialFillRecord:
+    return PartialFillRecord(
+        id=row[0],
+        trade_id=row[1],
+        deployment_id=row[2],
+        symbol=row[3],
+        option_symbol=row[4],
+        closed_quantity=row[5],
+        order_id=row[6],
+        exit_rule=row[7],
+        submitted_at=datetime.fromisoformat(row[8]) if row[8] else None,
+        fill_price=row[9],
+        fill_quantity=row[10],
+        filled_at=datetime.fromisoformat(row[11]) if row[11] else None,
+        order_status=row[12],
+        order_type=row[13],
+        broker_payload=json.loads(row[14]) if row[14] else None,
+        origin=(row[15] or "partial_scale") if len(row) > 15 else "partial_scale",
+        enrich_attempts=(row[16] or 0) if len(row) > 16 else 0,
+        abandoned_reason=row[17] if len(row) > 17 else None,
     )
