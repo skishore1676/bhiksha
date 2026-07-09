@@ -17,6 +17,7 @@ from bhiksha.market_data.trading_calendar import is_trading_day
 from bhiksha.ops.alerts import AlertMode, send_lathi_alert
 from bhiksha.ops.daily_report import render_daily_report_telegram_summary, write_daily_report
 from bhiksha.ops.launchd_status_store import write_latest_status
+from bhiksha.ops.shadow_ev_report import render_shadow_ev_report_telegram, write_shadow_ev_report
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
 from bhiksha.ops.weekly_scorecard import (
     render_weekly_scorecard_telegram_summary,
@@ -38,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
             "schwab-refresh",
             "session-report",
             "weekly-scorecard",
+            "shadow-ev-report",
         ],
     )
     parser.add_argument("--force", action="store_true", help="Run even when today is not a trading day")
@@ -79,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
             return _session_report_job(args)
         if args.job == "weekly-scorecard":
             return _weekly_scorecard_job(args)
+        if args.job == "shadow-ev-report":
+            return _shadow_ev_report_job(args)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
         alert = _send_failure_alert(args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc))
         _print_result({"job": args.job, "status": "failed", "error": str(exc), "alert": alert.to_dict()})
@@ -205,6 +209,42 @@ def _weekly_scorecard_job(args: argparse.Namespace) -> int:
             "week": f"{result.report['week_start']}..{result.report['week_end']}",
             "report_json": str(result.json_path),
             "report_markdown": str(result.markdown_path),
+            "alert": alert.to_dict(),
+        }
+    )
+    return 0 if ok else 2
+
+
+def _shadow_ev_report_job(args: argparse.Namespace) -> int:
+    runtime = build_runtime(active_plan_path=args.active_plan)
+    db_path = Path(runtime.app_config.sqlite_path)
+    output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
+    result = write_shadow_ev_report(db_path, output_dir=output_dir)
+    body = render_shadow_ev_report_telegram(result.report)
+    # Shadow lanes are paper marks. A negative paper book is signal, not a
+    # trading failure, so this report always publishes at info level and never
+    # masquerades as a Bhiksha failure alert.
+    alert = send_lathi_alert(
+        title=f"Bhiksha shadow-EV report {result.report['generated_date']}",
+        body=body,
+        level="info",
+        mode=args.alert_mode,
+        profile=args.alert_profile,
+        template="status",
+        link_preview="disabled",
+    )
+    ok = alert.ok or args.alert_mode == "off"
+    book_since = result.report["book"]["since"]
+    _print_result(
+        {
+            "job": args.job,
+            "status": "ok" if ok else "failed",
+            "report_json": str(result.json_path),
+            "report_markdown": str(result.markdown_path),
+            "since": result.report["since"],
+            "since_trades": book_since["trades"],
+            "since_pnl_usd": book_since["total_pnl_usd"],
+            "lanes_active_since": result.report["lane_count_active_since"],
             "alert": alert.to_dict(),
         }
     )
