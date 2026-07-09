@@ -21,6 +21,79 @@ from bhiksha.strategy.registry import default_strategy_registry
             },
         ),
         (
+            "market_impulse",
+            {
+                # mi-desc-high-close-semiconductors-m1__amd_short
+                "direction": "short",
+                "entry_mode": "close_location_reclaim",
+                "entry_buffer_minutes": 3,
+                "entry_window_minutes": 90,
+                "max_vma_excursion_pct": 0.002,
+                "min_close_location": 0.6,
+                "min_reclaim_margin_pct": 0.0,
+                "regime_timeframe": "5m",
+                "use_volume_filter": False,
+                "vwma_periods": [8, 21, 34],
+            },
+        ),
+        (
+            "market_impulse",
+            {
+                # mi-desc-shallow-spring-semiconductors-m1__amd_short
+                "direction": "short",
+                "entry_mode": "same_bar_shallow_reclaim",
+                "entry_buffer_minutes": 3,
+                "entry_window_minutes": 90,
+                "max_vma_excursion_pct": 0.0005,
+                "min_reclaim_margin_pct": 0.0002,
+                "regime_timeframe": "5m",
+                "use_volume_filter": False,
+                "vwma_periods": [8, 21, 34],
+            },
+        ),
+        (
+            "market_impulse",
+            {
+                # mi-desc-push-through-semiconductors-m1__smh_short
+                "direction": "short",
+                "entry_mode": "continuation_confirmation",
+                "confirmation_margin_pct": 0.0003,
+                "confirmation_type": "break_reclaim_high_low",
+                "confirmation_window_bars": 1,
+                "entry_buffer_minutes": 3,
+                "entry_window_minutes": 45,
+                "max_vma_excursion_pct": 0.002,
+                "min_reclaim_margin_pct": 0.0002,
+                "regime_timeframe": "5m",
+                "use_volume_filter": False,
+                "vwma_periods": [8, 21, 34],
+            },
+        ),
+        (
+            "compression_expansion_breakout",
+            {
+                # compression-breakout-current-basket-discovery__tsla_short
+                "direction": "short",
+                "breakout_lookback": 20,
+                "compression_factor": 0.7,
+                "compression_window": 15,
+                "use_volume_filter": True,
+                "velocity_periods_back": 3,
+            },
+        ),
+        (
+            "compression_expansion_breakout",
+            {
+                # vpoc-migration-discovery-01__amd_short
+                "direction": "short",
+                "breakout_lookback": 15,
+                "compression_factor": 0.7,
+                "compression_window": 30,
+                "use_volume_filter": False,
+                "velocity_periods_back": 5,
+            },
+        ),
+        (
             "jerk_pivot_momentum",
             {
                 "direction": "short",

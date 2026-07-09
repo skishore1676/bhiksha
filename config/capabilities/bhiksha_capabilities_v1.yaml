@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 supported_thesis_exit_policies:
   - fixed_rr_underlying
@@ -26,17 +26,52 @@ strategies:
           - ""
           - cross_reclaim
       close_location_reclaim:
-        status: unsupported
-        reason: runtime_adapter_not_implemented
+        status: supported
+        required_params:
+          - direction
+          - entry_buffer_minutes
+          - entry_window_minutes
+          - regime_timeframe
+          - vwma_periods
+          - min_close_location
+        optional_params:
+          - max_vma_excursion_pct
+          - min_reclaim_margin_pct
+        allowed_entry_modes:
+          - close_location_reclaim
       delayed_reclaim:
         status: unsupported
         reason: runtime_adapter_not_implemented
       same_bar_shallow_reclaim:
-        status: unsupported
-        reason: runtime_adapter_not_implemented
+        status: supported
+        required_params:
+          - direction
+          - entry_buffer_minutes
+          - entry_window_minutes
+          - regime_timeframe
+          - vwma_periods
+          - max_vma_excursion_pct
+        optional_params:
+          - min_reclaim_margin_pct
+          - min_close_location
+        allowed_entry_modes:
+          - same_bar_shallow_reclaim
       continuation_confirmation:
-        status: unsupported
-        reason: runtime_adapter_not_implemented
+        status: supported
+        required_params:
+          - direction
+          - entry_buffer_minutes
+          - entry_window_minutes
+          - regime_timeframe
+          - vwma_periods
+          - confirmation_type
+          - confirmation_window_bars
+        optional_params:
+          - confirmation_margin_pct
+          - max_vma_excursion_pct
+          - min_reclaim_margin_pct
+        allowed_entry_modes:
+          - continuation_confirmation
 
   opening_drive_classifier:
     default_variant: default
@@ -60,5 +95,17 @@ strategies:
     default_variant: default
     variants:
       default:
-        status: unsupported
-        reason: runtime_adapter_not_implemented
+        status: supported
+        required_params:
+          - direction
+          - breakout_lookback
+          - compression_factor
+          - compression_window
+          - velocity_periods_back
+        optional_params:
+          - use_volume_filter
+          - volume_ma_period
+          - volume_multiplier
+          - use_time_filter
+          - session_start
+          - session_end

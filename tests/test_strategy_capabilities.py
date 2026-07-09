@@ -24,21 +24,58 @@ def test_capability_manifest_marks_baseline_market_impulse_supported() -> None:
     assert capability.supported is True
 
 
-def test_capability_manifest_marks_market_impulse_descendant_unsupported() -> None:
+def test_capability_manifest_marks_market_impulse_descendants_supported() -> None:
+    manifest = load_capability_manifest()
+
+    for strategy_name, entry_mode in (
+        ("MI High Close Reclaim", "close_location_reclaim"),
+        ("MI Shallow Spring", "same_bar_shallow_reclaim"),
+        ("MI Push Through", "continuation_confirmation"),
+    ):
+        capability = evaluate_strategy_capability(
+            strategy_key="market_impulse",
+            strategy_name=strategy_name,
+            strategy_params={"entry_mode": entry_mode},
+            thesis_exit_policy="ma_trailing_underlying",
+            manifest=manifest,
+        )
+
+        assert capability.strategy_variant == entry_mode
+        assert capability.status == "supported"
+        assert capability.supported is True
+
+
+def test_capability_manifest_keeps_delayed_reclaim_unsupported() -> None:
     manifest = load_capability_manifest()
 
     capability = evaluate_strategy_capability(
         strategy_key="market_impulse",
-        strategy_name="MI High Close Reclaim",
-        strategy_params={"entry_mode": "close_location_reclaim", "min_close_location": 0.7},
+        strategy_name="MI Second Touch",
+        strategy_params={"entry_mode": "delayed_reclaim"},
         thesis_exit_policy="fixed_rr_underlying",
         manifest=manifest,
     )
 
-    assert capability.strategy_variant == "close_location_reclaim"
+    assert capability.strategy_variant == "delayed_reclaim"
     assert capability.status == "unsupported"
     assert capability.reason == "runtime_adapter_not_implemented"
     assert capability.supported is False
+
+
+def test_capability_manifest_marks_compression_expansion_breakout_supported() -> None:
+    manifest = load_capability_manifest()
+
+    capability = evaluate_strategy_capability(
+        strategy_key="compression_expansion_breakout",
+        strategy_name="Compression Expansion Breakout",
+        strategy_params={"breakout_lookback": 20, "compression_factor": 0.7, "compression_window": 15},
+        thesis_exit_policy="time_stop_underlying",
+        manifest=manifest,
+    )
+
+    assert capability.strategy_variant == "default"
+    assert capability.status == "supported"
+    assert capability.supported is True
 
 
 def test_capability_manifest_blocks_unknown_exit_policy() -> None:
