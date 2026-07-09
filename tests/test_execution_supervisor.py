@@ -3,6 +3,8 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 
+import pytest
+
 from bhiksha.config.models import AppConfig
 from bhiksha.app.event_bus import InMemoryEventBus
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
@@ -2925,6 +2927,464 @@ def test_partial_fill_abandonment_escalates_to_runtime_issue_in_daily_report(tmp
     markdown = render_daily_report_markdown(report)
     assert "## Runtime Issues" in markdown
     assert "`partial_fill_abandoned`: `1`" in markdown
+
+
+# --------------------------------------------------------------------------- #
+# Adversarial-audit regressions on the item-#21/#22 slice (2026-07-09). These
+# are the auditor's confirmed repros (r4a/r4b/r7/r5 + findings 3 and 4) with
+# INVERTED assertions: they assert the CORRECT behavior after the fixes.
+#
+# Root cause of r4a/r4b/r7 (audit finding 1): reconciliation
+# (_refresh_reconciliation, ~15s cadence and always at startup) replaces
+# tracker positions with the broker's LIVE quantity, which already excludes a
+# partially-filled lot. A guard comparing filledQuantity against
+# position.quantity therefore double-counts the fill. The fix keys both the
+# full-fill check and the residual on the dead order's OWN placed quantity
+# (payload["quantity"]), which the real broker order object carries.
+# --------------------------------------------------------------------------- #
+
+_RECON_OPTION = "AMD260713P00500000"
+
+
+class ReconciledDeadStatusOrderManager(StubOrderManager):
+    """Dead exit order DEAD_1 (CANCELED) whose payload carries the order's
+    OWN placed quantity alongside filledQuantity, as the real broker order
+    object does. Close orders auto-number CLOSE_1, CLOSE_2, ..."""
+
+    def __init__(self, *, placed_quantity: int, filled_quantity, include_fill_truth: bool = True):
+        self.close_orders: list[tuple[str, int]] = []
+        self._next = 0
+        self.dead_payload = {
+            "orderId": "DEAD_1",
+            "instrument": {"symbol": _RECON_OPTION, "type": "OPTION"},
+            "status": "CANCELED",
+            "side": "SELL",
+            "type": "LIMIT",
+            "openCloseIndicator": "CLOSE",
+            "quantity": str(placed_quantity),
+            "filledQuantity": filled_quantity,
+        }
+        if include_fill_truth:
+            self.dead_payload["averagePrice"] = "13.10"
+            self.dead_payload["closedAt"] = "2026-07-09T14:05:00Z"
+
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        del option_symbol, exit_mode, limit_price
+        self._next += 1
+        order_id = f"CLOSE_{self._next}"
+        self.close_orders.append((order_id, int(quantity)))
+        return OrderResult(order_id=order_id)
+
+    async def get_option_quote(self, option_symbol):
+        return PublicQuote(symbol=option_symbol, bid=13.05, ask=13.10, last=13.07, open_interest=200, outcome="SUCCESS")
+
+    async def get_order_status(self, order_id):
+        if order_id == "DEAD_1":
+            return "CANCELED", dict(self.dead_payload), None
+        return "NEW", {"status": "NEW"}, None
+
+    async def cancel_order(self, order_id):
+        del order_id
+        return True, None
+
+
+def _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, *, quantity, trade_id="TRADE_RECON"):
+    """Seed an exit_pending trade + tracked position whose resting exit order
+    is DEAD_1 (mirrors the auditor's harness)."""
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id=trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol="AMD",
+                option_symbol=_RECON_OPTION,
+                quantity=quantity,
+                entry_price=10.40,
+                entry_timestamp=datetime(2026, 7, 9, 13, 45, tzinfo=UTC),
+                status="exit_pending",
+                entry_order_id="ENTRY_RECON",
+                exit_order_id="DEAD_1",
+                exit_submitted_at=datetime(2026, 7, 9, 14, 0, tzinfo=UTC),
+                exit_mode=ExitMode.STRATEGY,
+            )
+        )
+    )
+    supervisor.planner.position_tracker.open_position(
+        "AMD",
+        deployment.deployment_id,
+        trade_id=trade_id,
+        option_symbol=_RECON_OPTION,
+        quantity=quantity,
+        entry_price=10.40,
+        source="live_open",
+        exit_order_id="DEAD_1",
+        exit_submitted_at=datetime(2026, 7, 9, 14, 0, tzinfo=UTC),
+        exit_mode=ExitMode.STRATEGY,
+    )
+
+
+def _reconciliation_shrunk_position(deployment, trade_repo, *, broker_quantity):
+    """Build the tracker position exactly as runtime._refresh_reconciliation
+    does after a restart or periodic pass: the broker's LIVE quantity (which
+    already excludes any filled lot), carrying exit state from the
+    exit_pending trade record."""
+    from bhiksha.state.reconciliation import reconcile_public_positions
+
+    trades = asyncio.run(trade_repo.get_recent_trades(limit=200))
+    positions = reconcile_public_positions(
+        [{
+            "instrument": {"symbol": _RECON_OPTION, "type": "OPTION"},
+            "quantity": str(broker_quantity),
+            "openedAt": "2026-07-09T13:45:00Z",
+        }],
+        [deployment],
+        orders=[],  # DEAD_1 is CANCELED at the broker -> not in open orders
+        known_trades=trades,
+    )
+    assert len(positions) == 1
+    return positions[0]
+
+
+def test_exit_dead_status_after_reconciliation_shrunk_quantity_resubmits_residual_not_finalize(tmp_path) -> None:
+    """Inverted r4a (audit finding 1): 2-lot exit order DEAD_1 dies with 1
+    filled; reconciliation has already replaced the tracker position with the
+    broker's live quantity = 1. Pre-fix the ladder read filled(1) >=
+    position.quantity(1) and spuriously FINALIZED -- closed trade, dropped
+    position, one live unprotected contract with no resting exit. Post-fix the
+    ladder keys on the order's placed quantity (2): partial fill, residual 1
+    resubmitted, trade stays exit_pending."""
+    om = ReconciledDeadStatusOrderManager(placed_quantity=2, filled_quantity="1")
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=2)
+
+    position = _reconciliation_shrunk_position(deployment, trade_repo, broker_quantity=1)
+    assert position.quantity == 1 and position.exit_order_id == "DEAD_1"
+    supervisor.planner.position_tracker.replace_positions([position])
+
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    # Inverted: a residual close order IS placed (pre-fix: none, spurious close).
+    assert om.close_orders == [("CLOSE_1", 1)]
+    assert len(plans) == 1 and plans[0].quantity == 1
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.quantity == 1 and tracked.exit_order_id == "CLOSE_1"
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        trade_row = conn.execute(
+            "SELECT status, quantity, exit_order_id FROM trade_sessions WHERE trade_id = 'TRADE_RECON'"
+        ).fetchone()
+        legs = conn.execute(
+            "SELECT order_id, closed_quantity, origin FROM trade_partial_fills WHERE trade_id = 'TRADE_RECON'"
+        ).fetchall()
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events").fetchall()]
+    # Inverted: trade is NOT closed; the filled leg is banked once.
+    assert trade_row == ("exit_pending", 1, "CLOSE_1")
+    assert legs == [("DEAD_1", 1, "exit_dead_status")]
+    assert "exit_dead_status_filled" not in event_types
+    assert "exit_dead_status_partial_fill" in event_types
+
+
+def test_exit_dead_status_after_reconciliation_shrunk_three_lot_covers_full_residual(tmp_path) -> None:
+    """Inverted r4b (audit finding 1, N=3): 3-lot order dies with 1 filled;
+    reconciliation already shrank the tracker to the broker's live 2. Pre-fix
+    residual = 2 - 1 = 1 (undersell: one live contract left with no exit and
+    no stop). Post-fix residual = placed(3) - filled(1) = 2: full coverage."""
+    om = ReconciledDeadStatusOrderManager(placed_quantity=3, filled_quantity="1")
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=3)
+
+    position = _reconciliation_shrunk_position(deployment, trade_repo, broker_quantity=2)
+    assert position.quantity == 2 and position.exit_order_id == "DEAD_1"
+    supervisor.planner.position_tracker.replace_positions([position])
+
+    asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    # Inverted: the replacement exit covers BOTH remaining contracts.
+    assert om.close_orders == [("CLOSE_1", 2)]
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.quantity == 2 and tracked.exit_order_id == "CLOSE_1"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        legs = conn.execute(
+            "SELECT order_id, closed_quantity, origin FROM trade_partial_fills WHERE trade_id = 'TRADE_RECON'"
+        ).fetchall()
+    # Leg bookkeeping accounts for all 3 lots: 1 banked + 2 covered.
+    assert legs == [("DEAD_1", 1, "exit_dead_status")]
+
+
+def test_exit_dead_status_residual_stays_managed_after_readoption_no_zombie(tmp_path) -> None:
+    """Inverted r7 (aftermath of r4a): with the finding-1 fix the trade is
+    never spuriously closed, so the next reconciliation pass re-adopts the
+    still-live lot as a fully MANAGED position -- live exit order id, exit_mode
+    set, still exit_pending -- instead of the pre-fix zombie (closed trade
+    flipped back to exit_pending carrying the dead order id with
+    exit_mode=None, unmanageable forever)."""
+    from bhiksha.state.reconciliation import reconcile_public_positions
+
+    om = ReconciledDeadStatusOrderManager(placed_quantity=2, filled_quantity="1")
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=2)
+
+    position = _reconciliation_shrunk_position(deployment, trade_repo, broker_quantity=1)
+    supervisor.planner.position_tracker.replace_positions([position])
+    asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+    assert om.close_orders == [("CLOSE_1", 1)]  # residual resubmitted, no finalize
+
+    # Next reconciliation pass (~15s later): broker still reports the lot.
+    trades = asyncio.run(trade_repo.get_recent_trades(limit=200))
+    readopted = reconcile_public_positions(
+        [{
+            "instrument": {"symbol": _RECON_OPTION, "type": "OPTION"},
+            "quantity": "1",
+            "openedAt": "2026-07-09T13:45:00Z",
+        }],
+        [deployment],
+        orders=[],
+        known_trades=trades,
+    )
+    assert len(readopted) == 1
+    live = readopted[0]
+    # Inverted zombie checks: LIVE order id (not the dead one), exit_mode set.
+    assert live.exit_order_id == "CLOSE_1"
+    assert live.exit_mode is not None
+    supervisor.planner.position_tracker.replace_positions([live])
+
+    # sync_lifecycle keeps the genuinely-pending trade exit_pending -- it never
+    # flips a closed trade back open, because the trade was never closed.
+    asyncio.run(supervisor.sync_lifecycle())
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        status = conn.execute(
+            "SELECT status FROM trade_sessions WHERE trade_id = 'TRADE_RECON'"
+        ).fetchone()[0]
+    assert status == "exit_pending"
+
+    # And the pending-exit loop still MANAGES the position (pre-fix zombie:
+    # exit_mode None dead-ended before any poll). The tick polls the live
+    # order and the residual lot keeps a resting exit order.
+    asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        polled = [
+            json.loads(row[0])["exit_order_id"]
+            for row in conn.execute("SELECT payload FROM events WHERE event_type = 'exit_pending_status'").fetchall()
+        ]
+    assert "CLOSE_1" in polled
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.quantity == 1 and tracked.exit_order_id is not None and tracked.exit_mode is not None
+
+
+def test_exit_reprice_cancel_race_uses_order_quantity_not_reconciled_position_quantity(tmp_path) -> None:
+    """Audit finding 1 applied to the merged reprice ladder
+    (_resolve_exit_cancel_for_reprice): same latent assumption, narrower race
+    window. A reconciliation-shrunk 1-lot position whose canceled 2-lot order
+    reports filledQuantity=1 must resolve as a PARTIAL with residual 1 (order
+    quantity 2 - filled 1), not a spurious full-fill finalize (pre-fix:
+    filled 1 >= position.quantity 1)."""
+    om = ReconciledDeadStatusOrderManager(placed_quantity=2, filled_quantity="1")
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=2)
+
+    position = _reconciliation_shrunk_position(deployment, trade_repo, broker_quantity=1)
+    assert position.quantity == 1
+    supervisor.planner.position_tracker.replace_positions([position])
+
+    outcome = asyncio.run(
+        supervisor._resolve_exit_cancel_for_reprice(
+            deployment,
+            position,
+            exit_order_id="DEAD_1",
+            reason="exit_reprice",
+            now=datetime(2026, 7, 9, 14, 6, tzinfo=UTC),
+        )
+    )
+
+    assert outcome.action == "resubmit"
+    assert outcome.position is not None and outcome.position.quantity == 1
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        legs = conn.execute(
+            "SELECT order_id, closed_quantity, origin FROM trade_partial_fills WHERE trade_id = 'TRADE_RECON'"
+        ).fetchall()
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events").fetchall()]
+    assert legs == [("DEAD_1", 1, "exit_cancel_race")]
+    assert "exit_reprice_cancel_race_filled" not in event_types
+    assert "exit_cancel_race_partial_fill" in event_types
+
+
+def test_dead_full_fill_exit_truth_reenriched_once_average_price_available(tmp_path) -> None:
+    """Inverted r5 (audit finding 2): a dead order that fully filled but whose
+    payload had no averagePrice yet finalizes with exit_price NULL (the truth
+    genuinely was not published). The closed-truth retry
+    (_enrich_recent_closed_exit_truth) must now accept the dead-with-fill
+    payload once the broker publishes the price -- pre-fix it only accepted
+    status==FILLED, so the NULL was permanent."""
+    om = ReconciledDeadStatusOrderManager(placed_quantity=2, filled_quantity="2", include_fill_truth=False)
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=2)
+
+    asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        row = conn.execute(
+            "SELECT status, exit_order_id, exit_price, exit_filled_quantity FROM trade_sessions WHERE trade_id = 'TRADE_RECON'"
+        ).fetchone()
+    assert row == ("closed", "DEAD_1", None, 2)  # finalized; price not yet published
+
+    # Broker publishes the fill economics on a later readback.
+    om.dead_payload["averagePrice"] = "13.10"
+    om.dead_payload["closedAt"] = "2026-07-09T14:05:00Z"
+
+    trades = asyncio.run(trade_repo.get_recent_trades(limit=10))
+    asyncio.run(supervisor._enrich_recent_closed_exit_truth(trades))
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        row = conn.execute(
+            "SELECT status, exit_order_id, exit_price, exit_filled_quantity, exit_filled_at FROM trade_sessions WHERE trade_id = 'TRADE_RECON'"
+        ).fetchone()
+        event_types = [r[0] for r in conn.execute("SELECT event_type FROM events").fetchall()]
+    # Inverted: the retry repaired the truth from the CANCELED-but-filled payload.
+    assert row == ("closed", "DEAD_1", 13.10, 2, "2026-07-09T14:05:00+00:00")
+    assert "exit_fill_enriched" in event_types
+
+
+def test_exit_dead_status_unparseable_filled_quantity_blocks_resubmit_and_escalates(tmp_path) -> None:
+    """Audit finding 3: a PRESENT but unparseable filledQuantity ("N/A") on a
+    dead exit order must NOT be treated as confirmed-unfilled (full resubmit =
+    potential oversell). The poll is skipped fail-closed, a runtime_issue
+    (category exit_fill_unparseable) is emitted, and the position keeps its
+    exit_order_id so the next poll re-reads the order."""
+    om = ReconciledDeadStatusOrderManager(placed_quantity=2, filled_quantity="N/A")
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=2)
+
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    # Fail closed: nothing resubmitted, nothing recorded, order left for re-read.
+    assert plans == []
+    assert om.close_orders == []
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.quantity == 2 and tracked.exit_order_id == "DEAD_1"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        issues = [
+            json.loads(row[0])
+            for row in conn.execute("SELECT payload FROM events WHERE event_type = 'runtime_issue'").fetchall()
+        ]
+        legs = conn.execute("SELECT id FROM trade_partial_fills").fetchall()
+        status = conn.execute(
+            "SELECT status FROM trade_sessions WHERE trade_id = 'TRADE_RECON'"
+        ).fetchone()[0]
+    assert legs == [] and status == "exit_pending"
+    assert len(issues) == 1
+    assert issues[0]["category"] == "exit_fill_unparseable"
+    assert issues[0]["order_id"] == "DEAD_1"
+    assert "N/A" in issues[0]["error"]
+    assert issues[0]["stage"] == "exit_dead_status_resubmit"
+
+    # The next poll retries (still blocked while the payload stays garbage).
+    asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+    assert om.close_orders == []
+    assert supervisor.planner.position_tracker.active_positions()[0].exit_order_id == "DEAD_1"
+
+
+def test_abandonment_escalation_survives_crash_at_durable_mark(tmp_path) -> None:
+    """Audit finding 4: the runtime_issue escalation must be appended BEFORE
+    the durable abandoned-mark. If the mark lands first and the process dies
+    before the events, the row is excluded from every future sweep and the
+    escalation is lost forever. Post-fix a crash at the mark leaves the row
+    pending: the next sweep redoes the abandonment (duplicate escalation
+    beats a lost one)."""
+
+    class CrashingMarkRepo(SQLiteTradeStateRepository):
+        crash = True
+
+        async def mark_partial_fill_abandoned(self, record_id, *, reason):
+            if self.crash:
+                raise RuntimeError("simulated crash at durable abandon mark")
+            await super().mark_partial_fill_abandoned(record_id, reason=reason)
+
+    class RejectedStatusOrderManager(StubOrderManager):
+        async def get_order_status(self, order_id):
+            return "REJECTED", {"status": "REJECTED"}, None
+
+    trade_repo = CrashingMarkRepo(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(RejectedStatusOrderManager()),
+        event_repository=SQLiteEventRepository(str(tmp_path / "events.db")),
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    _seed_partial_fill_record(trade_repo, order_id="CRASH_1")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(supervisor._enrich_pending_partial_fills())
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        issue_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'runtime_issue'"
+        ).fetchone()[0]
+        abandoned = conn.execute(
+            "SELECT abandoned_reason FROM trade_partial_fills WHERE order_id = 'CRASH_1'"
+        ).fetchone()[0]
+    # Escalation recorded even though the durable mark crashed; row NOT
+    # excluded, so the next sweep retries the abandonment.
+    assert issue_count == 1
+    assert abandoned is None
+
+    trade_repo.crash = False
+    asyncio.run(supervisor._enrich_pending_partial_fills())
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        issue_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'runtime_issue'"
+        ).fetchone()[0]
+        abandoned = conn.execute(
+            "SELECT abandoned_reason FROM trade_partial_fills WHERE order_id = 'CRASH_1'"
+        ).fetchone()[0]
+    assert issue_count == 2  # the tolerated duplicate
+    assert abandoned == "terminal_status:REJECTED"
 
 
 def test_execution_supervisor_enriches_stop_filled_disappeared_position(tmp_path) -> None:
