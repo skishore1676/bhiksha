@@ -255,6 +255,37 @@ def test_publish_lathi_review_routes_to_coding_agent_surface(monkeypatch, tmp_pa
     assert args[args.index("--artifact-id") + 1] == "artifacts/playbook/reports/trade_session_report_2026-07-09.md"
 
 
+def test_publish_lathi_review_absolutizes_relative_source(monkeypatch, tmp_path) -> None:
+    """The bus CLI runs with cwd switched to the lathi-bus checkout, so a
+    caller-relative source (the scheduled job passes the report's repo-relative
+    path) must reach the CLI as an absolute path or it resolves against the
+    wrong directory there. Regression for the oldmac deploy-verify failure."""
+    source = _make_report(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    relative_source = source.name  # relative to tmp_path cwd
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args, 0, stdout='{"review_id": "r", "note_path": "07 Agents/Coding/Inbox/r.md", "surface": "obsidian"}', stderr=""
+        )
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = publish_lathi_review(
+        source=relative_source,
+        title="t",
+        command=["lathi-bus"],
+        cwd="/somewhere/else",
+    )
+
+    assert result.ok is True
+    source_arg = calls[0][calls[0].index("--source") + 1]
+    assert Path(source_arg).is_absolute()
+    assert Path(source_arg) == source.resolve()
+
+
 def test_publish_lathi_review_honors_profile_env(monkeypatch, tmp_path) -> None:
     source = _make_report(tmp_path)
     calls: list[list[str]] = []

@@ -189,7 +189,10 @@ def publish_lathi_review(
         return ReviewPublishResult(mode="off")
 
     profile = profile or os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "coding-agent-northstar")
-    source_path = Path(source).expanduser()
+    # The bus CLI runs with cwd switched to the lathi-bus checkout (see
+    # _default_lathi_invocation), so a caller-relative source path would be
+    # resolved against the wrong directory there — absolutize it here.
+    source_path = Path(source).expanduser().resolve()
     if not source_path.is_file():
         return ReviewPublishResult(
             attempted=False,
