@@ -114,6 +114,16 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
         risk_class="operator_report",
         allowed_manual_actions=("session-report-now",),
     ),
+    LaunchdJobSpec(
+        label="com.bhiksha.shadow-ev-report",
+        runner_job="shadow-ev-report",
+        schedule=weekdays(15, 30),
+        schedule_label="Weekdays 15:30 CT (post-close)",
+        purpose="Send the daily shadow-EV report: per paper lane, which shadow strategies are earning promotion.",
+        skips_non_trading_days=True,
+        risk_class="operator_report",
+        allowed_manual_actions=("shadow-ev-report-now",),
+    ),
 )
 
 

@@ -42,6 +42,7 @@ manual Control Tower actions do not need to be duplicated in shell.
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop the live runtime. It does not skip non-trading days, so stale processes can still be cleaned up. |
 | `com.bhiksha.schwab-guard` | Weekdays 07:10 CT | Run the Schwab token guard; direct refresh first, browser-agent renewal only when needed. Skips non-trading days. |
 | `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send an intraday session report with open positions, realized P&L, protection state, provider/runtime issues, and recent trades early enough for manual action. Skips non-trading days. |
+| `com.bhiksha.shadow-ev-report` | Weekdays 15:30 CT (post-close) | Send the daily shadow-EV report: per paper (shadow) lane, realized paper EV over a rolling window and since the profile-exit anchor, win rate, avg win/loss, exit-rule mix, and an improving/degrading trend, so it is obvious which shadow strategies are earning promotion. Paper marks, not fills. Skips non-trading days. |
 
 Launchd cannot natively express market holidays, so the runner performs the
 trading-day check before doing work.
@@ -62,7 +63,14 @@ scripts/launchd/run_bhiksha_job.sh live-watchdog
 scripts/launchd/run_bhiksha_job.sh live-stop
 scripts/launchd/run_bhiksha_job.sh schwab-refresh
 scripts/launchd/run_bhiksha_job.sh session-report --report-label manual
+scripts/launchd/run_bhiksha_job.sh shadow-ev-report
 ```
+
+The shadow-EV report, like the session report, publishes through Lathi Bus's
+Telegram `status` template. Telegram gets the short per-lane card; the full
+markdown lands in `artifacts/playbook/reports/shadow_ev_report_<date>.md`. It is
+paper-marks only and always publishes at info level, so a losing shadow book is
+never rendered as a Bhiksha failure alert.
 
 Use `--force` to bypass the trading-day skip during testing:
 
@@ -164,4 +172,5 @@ com.bhiksha.live-watchdog
 com.bhiksha.live-stop
 com.bhiksha.schwab-guard
 com.bhiksha.session-report
+com.bhiksha.shadow-ev-report
 ```

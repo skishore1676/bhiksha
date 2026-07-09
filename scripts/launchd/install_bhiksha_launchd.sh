@@ -44,7 +44,8 @@ PY
       com.bhiksha.live-watchdog \
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
-      com.bhiksha.session-report
+      com.bhiksha.session-report \
+      com.bhiksha.shadow-ev-report
     do
       plist="$LAUNCHD_DIR/$label.plist"
       launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
@@ -60,7 +61,8 @@ PY
       com.bhiksha.live-watchdog \
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
-      com.bhiksha.session-report
+      com.bhiksha.session-report \
+      com.bhiksha.shadow-ev-report
     do
       launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
       rm -f "$LAUNCHD_DIR/$label.plist"
