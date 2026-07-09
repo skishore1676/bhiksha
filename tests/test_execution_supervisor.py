@@ -2608,6 +2608,325 @@ def test_partial_fill_enrich_sweep_records_partial_truth_from_dead_order(tmp_pat
     assert row == (3.05, 1, "CANCELED", None)
 
 
+# --------------------------------------------------------------------------- #
+# Item #21: filledQuantity guard on the THIRD resubmit site -- the dead-status
+# (REJECTED/CANCELED/EXPIRED) branch of _manage_pending_exit_locked. Mirrors
+# the reprice-cancel guard (_resolve_exit_cancel_for_reprice) so a partial fill
+# that a routine poll discovers on a now-dead order can never be resubmitted at
+# the stale full quantity (an oversell).
+# --------------------------------------------------------------------------- #
+
+
+class ExitDeadStatusPartialFillOrderManager(StubOrderManager):
+    """Item #21 repro: a resting 2-lot exit order that a routine poll finds
+    DEAD (CANCELED) AFTER one lot already filled (avg 13.10). Pre-fix the
+    dead-status branch resubmitted the STALE FULL quantity (2) -- an oversell
+    -- and permanently lost the 1-lot fill's price. The fix must record the
+    filled leg (origin="exit_dead_status") and resubmit the RESIDUAL (1) only."""
+
+    def __init__(self) -> None:
+        self.status_calls: dict[str, int] = {}
+        self.close_orders: list[tuple[str, int]] = []
+        self._next = 0
+
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        del option_symbol, exit_mode, limit_price
+        self._next += 1
+        order_id = f"CLOSE_DEAD_{self._next}"
+        self.close_orders.append((order_id, int(quantity)))
+        return OrderResult(order_id=order_id)
+
+    async def get_option_quote(self, option_symbol):
+        return PublicQuote(symbol=option_symbol, bid=13.05, ask=13.10, last=13.07, open_interest=200, outcome="SUCCESS")
+
+    async def get_order_status(self, order_id):
+        self.status_calls[order_id] = self.status_calls.get(order_id, 0) + 1
+        if order_id == "CLOSE_DEAD_1":
+            return (
+                "CANCELED",
+                {
+                    "orderId": "CLOSE_DEAD_1",
+                    "instrument": {"symbol": "AMD260713P00500000", "type": "OPTION"},
+                    "status": "CANCELED",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "1",
+                    "averagePrice": "13.10",
+                    "closedAt": "2026-07-09T14:05:00Z",
+                },
+                None,
+            )
+        return "NEW", {"status": "NEW"}, None
+
+    async def cancel_order(self, order_id):
+        del order_id
+        return True, None
+
+
+def test_exit_dead_status_partial_fill_records_leg_and_resubmits_residual_only(tmp_path) -> None:
+    """Item #21 (failing-first): a 2-lot exit order polls back CANCELED with
+    filledQuantity=1/avg 13.10. The fix must (a) durably record the 1-lot fill
+    in trade_partial_fills with origin="exit_dead_status" and (b) resubmit for
+    the RESIDUAL (1) only -- never the stale full 2 (an oversell attempt)."""
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    order_manager = ExitDeadStatusPartialFillOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE_AMD_DEAD",
+                deployment_id=deployment.deployment_id,
+                symbol="AMD",
+                option_symbol="AMD260713P00500000",
+                quantity=2,
+                entry_price=10.40,
+                entry_timestamp=datetime(2026, 7, 9, 13, 45, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY_AMD_DEAD",
+            )
+        )
+    )
+    supervisor.planner.position_tracker.open_position(
+        "AMD",
+        deployment.deployment_id,
+        trade_id="TRADE_AMD_DEAD",
+        option_symbol="AMD260713P00500000",
+        quantity=2,
+        entry_price=10.40,
+        source="live_open",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="AMD",
+        timestamp=datetime(2026, 7, 9, 14, 0, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_max_hold:3600s"],
+        cancel_protection_orders=True,
+    )
+
+    submit_plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+    assert submit_plan is not None
+    assert order_manager.close_orders == [("CLOSE_DEAD_1", 2)]
+
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    # (b) NO OVERSELL: the resubmit is sized to the residual (1), never the
+    # stale full quantity (2). Pre-fix this was [(CLOSE_DEAD_1, 2), (CLOSE_DEAD_2, 2)].
+    assert order_manager.close_orders == [("CLOSE_DEAD_1", 2), ("CLOSE_DEAD_2", 1)]
+    assert len(plans) == 1
+    assert plans[0].quantity == 1
+
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.quantity == 1
+    assert tracked.exit_order_id == "CLOSE_DEAD_2"
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        partial_rows = conn.execute(
+            """
+            SELECT trade_id, closed_quantity, order_id, fill_price, fill_quantity, filled_at, order_status, origin
+            FROM trade_partial_fills
+            WHERE trade_id = 'TRADE_AMD_DEAD'
+            """
+        ).fetchall()
+        trade_row = conn.execute(
+            "SELECT status, quantity, exit_order_id FROM trade_sessions WHERE trade_id = 'TRADE_AMD_DEAD'"
+        ).fetchone()
+        event_types = [event[0] for event in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+
+    # (a) The raced 1-lot fill's economics are durably recorded, tagged with
+    # the item-#21 origin (distinct from the reprice "exit_cancel_race" leg).
+    assert partial_rows == [
+        (
+            "TRADE_AMD_DEAD",
+            1,
+            "CLOSE_DEAD_1",
+            13.10,
+            1,
+            "2026-07-09T14:05:00+00:00",
+            "CANCELED",
+            "exit_dead_status",
+        )
+    ]
+    assert trade_row == ("exit_pending", 1, "CLOSE_DEAD_2")
+    assert "exit_dead_status_partial_fill" in event_types
+
+
+class ExitDeadStatusFullFillOrderManager(StubOrderManager):
+    """Item #21 defensive branch: a 1-lot exit order reads back DEAD (CANCELED)
+    but with filledQuantity covering the WHOLE position -- it actually filled
+    before dying. The fix must finalize the fill truth and NEVER resubmit a
+    duplicate close (which would orphan the true exit_order_id)."""
+
+    def __init__(self) -> None:
+        self.close_orders: list[tuple[str, int]] = []
+        self._next = 0
+
+    async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+        del option_symbol, exit_mode, limit_price
+        self._next += 1
+        order_id = f"CLOSE_FULL_{self._next}"
+        self.close_orders.append((order_id, int(quantity)))
+        return OrderResult(order_id=order_id)
+
+    async def get_option_quote(self, option_symbol):
+        return PublicQuote(symbol=option_symbol, bid=13.55, ask=13.60, last=13.57, open_interest=200, outcome="SUCCESS")
+
+    async def get_order_status(self, order_id):
+        if order_id == "CLOSE_FULL_1":
+            return (
+                "CANCELED",
+                {
+                    "orderId": "CLOSE_FULL_1",
+                    "instrument": {"symbol": "AMD260713P00500000", "type": "OPTION"},
+                    "status": "CANCELED",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "1",
+                    "averagePrice": "13.55",
+                    "closedAt": "2026-07-09T14:06:00Z",
+                },
+                None,
+            )
+        return "NEW", {"status": "NEW"}, None
+
+    async def cancel_order(self, order_id):
+        del order_id
+        return True, None
+
+
+def test_exit_dead_status_fully_filled_finalizes_and_does_not_resubmit(tmp_path) -> None:
+    """Item #21: a dead status whose filledQuantity covers the full position is
+    a completed exit -- finalize (record fill truth, mark trade closed) and
+    place NO second close order."""
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    order_manager = ExitDeadStatusFullFillOrderManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE_AMD_FULL",
+                deployment_id=deployment.deployment_id,
+                symbol="AMD",
+                option_symbol="AMD260713P00500000",
+                quantity=1,
+                entry_price=10.40,
+                entry_timestamp=datetime(2026, 7, 9, 13, 45, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY_AMD_FULL",
+            )
+        )
+    )
+    supervisor.planner.position_tracker.open_position(
+        "AMD",
+        deployment.deployment_id,
+        trade_id="TRADE_AMD_FULL",
+        option_symbol="AMD260713P00500000",
+        quantity=1,
+        entry_price=10.40,
+        source="live_open",
+    )
+    position = supervisor.planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="AMD",
+        timestamp=datetime(2026, 7, 9, 14, 0, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_max_hold:3600s"],
+        cancel_protection_orders=True,
+    )
+
+    asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+    assert order_manager.close_orders == [("CLOSE_FULL_1", 1)]
+
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    # NO resubmit: the dead order already filled the whole position.
+    assert order_manager.close_orders == [("CLOSE_FULL_1", 1)]
+    assert len(plans) == 1
+    assert supervisor.planner.position_tracker.active_positions() == []
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        row = conn.execute(
+            """
+            SELECT status, exit_order_id, exit_price, exit_filled_quantity, exit_filled_at
+            FROM trade_sessions
+            WHERE trade_id = 'TRADE_AMD_FULL'
+            """
+        ).fetchone()
+        event_types = [event[0] for event in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert row == ("closed", "CLOSE_FULL_1", 13.55, 1, "2026-07-09T14:06:00+00:00")
+    assert "exit_dead_status_filled" in event_types
+
+
+def test_partial_fill_abandonment_escalates_to_runtime_issue_in_daily_report(tmp_path) -> None:
+    """Item #22: a permanently-abandoned partial leg is silent fill-detail loss
+    that needs a human backfill. Besides the diagnostic
+    ``partial_fill_enrich_abandoned`` row, the abandonment must escalate as a
+    ``runtime_issue`` so daily_report aggregates it into ``runtime_issue_counts``
+    and RENDERS it -- not just an events-table row nobody reads."""
+    from bhiksha.ops.daily_report import build_daily_report, render_daily_report_markdown
+
+    class RejectedStatusOrderManager(StubOrderManager):
+        async def get_order_status(self, order_id):
+            return "REJECTED", {"status": "REJECTED"}, None
+
+    db_path = str(tmp_path / "events.db")
+    trade_repo = SQLiteTradeStateRepository(db_path)
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(RejectedStatusOrderManager()),
+        event_repository=SQLiteEventRepository(db_path),
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    _seed_partial_fill_record(trade_repo, order_id="ABANDON_1")
+
+    asyncio.run(supervisor._enrich_pending_partial_fills())
+
+    with sqlite3.connect(db_path) as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events").fetchall()]
+        runtime_issue_payloads = [
+            json.loads(row[0])
+            for row in conn.execute(
+                "SELECT payload FROM events WHERE event_type = 'runtime_issue'"
+            ).fetchall()
+        ]
+        # Pin the events to the report's trading day so the day-scoped loader picks them up.
+        conn.execute("UPDATE events SET created_at = '2026-07-09T14:00:00+00:00'")
+        conn.commit()
+
+    assert "partial_fill_enrich_abandoned" in event_types
+    assert len(runtime_issue_payloads) == 1
+    assert runtime_issue_payloads[0]["category"] == "partial_fill_abandoned"
+    assert runtime_issue_payloads[0]["error"] == "terminal_status:REJECTED"
+    assert runtime_issue_payloads[0]["stage"] == "partial_fill_enrichment_sweep"
+
+    report = build_daily_report(db_path, trading_date="2026-07-09")
+    assert report["provider_health"]["runtime_issue_counts"] == {"partial_fill_abandoned": 1}
+
+    markdown = render_daily_report_markdown(report)
+    assert "## Runtime Issues" in markdown
+    assert "`partial_fill_abandoned`: `1`" in markdown
+
+
 def test_execution_supervisor_enriches_stop_filled_disappeared_position(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
