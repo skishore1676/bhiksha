@@ -3197,16 +3197,21 @@ class ExecutionSupervisor:
         exactly one case -- an unparseable ``filledQuantity`` (audit finding 3
         below). The ladder:
 
-        0. BLOCKED (audit finding 3, fail closed): ``filledQuantity`` is
-           PRESENT in the payload but unparseable ("N/A", "", null). The
-           broker asserted a fill field we cannot read -- treating it as
-           "unfilled" and resubmitting the full quantity is a potential
-           oversell with no event trail. Emit a ``runtime_issue``
+        0. BLOCKED (audit finding 3, fail closed): ``filledQuantity`` carries
+           a NON-NULL value we cannot parse ("N/A", ""). The broker asserted
+           a fill field we cannot read -- treating it as "unfilled" and
+           resubmitting the full quantity is a potential oversell with no
+           event trail. Emit a ``runtime_issue``
            (category="exit_fill_unparseable") and skip this cycle; the
            pending-exit poller re-reads the order within
-           ``order_fill_poll_seconds``. A payload MISSING the key entirely
-           keeps the pre-existing full resubmit (matches the merged reprice
-           ladder).
+           ``order_fill_poll_seconds``. JSON null does NOT block (audit
+           round 2, 2026-07-09): null is Public's STANDARD zero-fill idiom on
+           order objects -- empirically every real zero-fill order reads
+           ``"filledQuantity": null`` (never key-absent, never "0") -- so
+           blocking on it would wedge every ordinary dead-unfilled exit
+           forever with an alert per poll. Null and a missing key both fall
+           through to step 3 (full resubmit, pre-#21 semantics, matching how
+           the merged reprice ladder treats a null fill everywhere else).
         1. FULL FILL: ``filledQuantity`` covers the order's OWN placed
            quantity (audit finding 1: NOT position.quantity -- reconciliation
            replaces tracker positions with the broker's live quantity, which
@@ -3222,17 +3227,18 @@ class ExecutionSupervisor:
            ``exit_cancel_race`` legs) and resubmit only the RESIDUAL (placed
            minus filled, audit finding 1) so the replacement can never
            oversell the position.
-        3. RESUBMIT: parseable zero fill, or ``filledQuantity`` key absent --
-           confirmed dead unfilled, resubmit the full quantity (pre-existing
-           behavior).
+        3. RESUBMIT: parseable zero fill, null fill (Public's zero-fill
+           idiom), or ``filledQuantity`` key absent -- confirmed dead
+           unfilled, resubmit the full quantity (pre-existing behavior).
         """
         payload_map = payload or {}
         raw_filled_quantity = payload_map.get("filledQuantity")
         filled_quantity = _maybe_int(raw_filled_quantity)
         order_quantity = _maybe_int(payload_map.get("quantity")) or position.quantity
 
-        # 0. Audit finding 3: fail closed on a present-but-unparseable fill.
-        if "filledQuantity" in payload_map and filled_quantity is None:
+        # 0. Audit finding 3 (narrowed in round 2): fail closed only on a
+        # present, NON-NULL, unparseable fill value. Null means zero fill.
+        if raw_filled_quantity is not None and filled_quantity is None:
             await self.event_repository.append(
                 "runtime_issue",
                 {

@@ -3330,6 +3330,50 @@ def test_exit_dead_status_unparseable_filled_quantity_blocks_resubmit_and_escala
     assert supervisor.planner.position_tracker.active_positions()[0].exit_order_id == "DEAD_1"
 
 
+def test_exit_dead_status_null_filled_quantity_is_zero_fill_full_resubmit_not_blocked(tmp_path) -> None:
+    """Inverted round-2 f3 (audit round 2, HIGH): JSON null is Public's
+    STANDARD zero-fill idiom on order objects -- empirically every real
+    zero-fill order reads "filledQuantity": null (never key-absent, never
+    "0"). A routine dead-UNFILLED exit order must therefore full-resubmit on
+    the first poll exactly as pre-#21, NOT wedge in the finding-3 blocked
+    path with a runtime_issue per 2s poll forever. Only genuinely garbled
+    NON-NULL values ("N/A", "") block."""
+    om = ReconciledDeadStatusOrderManager(placed_quantity=2, filled_quantity=None)
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(om),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=2)
+
+    for _ in range(3):
+        asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    # Inverted: full-quantity resubmit happened on the FIRST poll (no wedge),
+    # and the subsequent polls just watch the replacement order.
+    assert om.close_orders == [("CLOSE_1", 2)]
+    tracked = supervisor.planner.position_tracker.active_positions()[0]
+    assert tracked.quantity == 2 and tracked.exit_order_id == "CLOSE_1"
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        issue_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'runtime_issue'"
+        ).fetchone()[0]
+        legs = conn.execute("SELECT id FROM trade_partial_fills").fetchall()
+        status = conn.execute(
+            "SELECT status FROM trade_sessions WHERE trade_id = 'TRADE_RECON'"
+        ).fetchone()[0]
+    # Inverted: no alert flood (zero-fill is not an anomaly), no phantom leg,
+    # trade still legitimately exit_pending on the replacement order.
+    assert issue_count == 0
+    assert legs == []
+    assert status == "exit_pending"
+
+
 def test_abandonment_escalation_survives_crash_at_durable_mark(tmp_path) -> None:
     """Audit finding 4: the runtime_issue escalation must be appended BEFORE
     the durable abandoned-mark. If the mark lands first and the process dies
