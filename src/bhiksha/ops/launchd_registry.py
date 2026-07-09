@@ -50,6 +50,10 @@ def weekdays(hour: int, minute: int) -> tuple[ScheduleEntry, ...]:
     return tuple({"Weekday": day, "Hour": hour, "Minute": minute} for day in range(1, 6))
 
 
+def fridays(hour: int, minute: int) -> tuple[ScheduleEntry, ...]:
+    return ({"Weekday": 5, "Hour": hour, "Minute": minute},)
+
+
 def every_10_minutes(start_hour: int, start_minute: int, end_hour: int, end_minute: int) -> tuple[ScheduleEntry, ...]:
     entries: list[ScheduleEntry] = []
     hour, minute = start_hour, start_minute
@@ -113,6 +117,16 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
         skips_non_trading_days=True,
         risk_class="operator_report",
         allowed_manual_actions=("session-report-now",),
+    ),
+    LaunchdJobSpec(
+        label="com.bhiksha.weekly-scorecard",
+        runner_job="weekly-scorecard",
+        schedule=fridays(15, 20),
+        schedule_label="Fridays 15:20 CT (after close)",
+        purpose="Publish the weekly profile-vs-legacy scorecard (the month-test verdict).",
+        skips_non_trading_days=False,
+        risk_class="operator_report",
+        allowed_manual_actions=("weekly-scorecard-now",),
     ),
 )
 
