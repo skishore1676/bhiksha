@@ -3039,8 +3039,10 @@ class ExecutionSupervisor:
         Decision ladder, strictest first:
 
         1. FULL FILL (item A): readback shows ``FILLED``, or a dead order whose
-           ``filledQuantity`` covers the whole position -- record the fill truth
-           via ``_finalize_pending_exit_fill``; never resubmit.
+           ``filledQuantity`` covers the order's own placed quantity (audit
+           finding 1: NOT position.quantity, which reconciliation may have
+           already shrunk past the fill) -- record the fill truth via
+           ``_finalize_pending_exit_fill``; never resubmit.
         2. BLOCKED (A.1, fail closed): the cancel was NOT cleanly confirmed AND
            the readback did not cleanly prove the order dead (broker
            error/timeout/``None``/non-terminal status such as
@@ -3051,13 +3053,14 @@ class ExecutionSupervisor:
            ``order_fill_poll_seconds`` (the fail-safe mirror of the entry
            side's ``_cancel_entry_for_reprice_block``).
         3. PARTIAL FILL (A.2, the consequential one): the order is dead (or the
-           cancel cleanly acked) with ``0 < filledQuantity < position.quantity``
-           -- the common real-broker outcome of a cancel racing a working
-           order. Durably record the filled leg in ``trade_partial_fills``
-           (origin="exit_cancel_race"; this path is distinct from the
-           deliberate ``_handle_partial_scale_locked`` banks) and return a
-           position carrying only the RESIDUAL quantity so the resubmit can
-           never oversell.
+           cancel cleanly acked) with ``0 < filledQuantity <`` the order's own
+           placed quantity -- the common real-broker outcome of a cancel
+           racing a working order. Durably record the filled leg in
+           ``trade_partial_fills`` (origin="exit_cancel_race"; this path is
+           distinct from the deliberate ``_handle_partial_scale_locked``
+           banks) and return a position carrying only the RESIDUAL quantity
+           (placed minus filled, audit finding 1) so the resubmit can never
+           oversell.
         4. RESUBMIT: the order is confirmed dead unfilled, or the cancel was
            cleanly confirmed -- safe to place the replacement order at full
            quantity (pre-existing behavior).
@@ -3067,9 +3070,20 @@ class ExecutionSupervisor:
         )
         normalized_status = str(status or "").upper()
         filled_quantity = _maybe_int((payload or {}).get("filledQuantity"))
+        # Audit finding 1 (2026-07-09, shared with the dead-status ladder):
+        # compare filledQuantity against the dead order's OWN placed quantity,
+        # never position.quantity. Reconciliation (_refresh_reconciliation,
+        # ~15s cadence and always at startup) replaces tracker positions with
+        # the broker's live quantity -- which already EXCLUDES a
+        # partially-filled lot -- so subtracting the fill from
+        # position.quantity double-counts it (spurious finalize at N=2/1
+        # filled; residual undersell at N=3/1 filled). The payload carries the
+        # order's placed quantity; position.quantity is only the fallback for
+        # payloads that omit it (pre-fix behavior).
+        order_quantity = _maybe_int((payload or {}).get("quantity")) or position.quantity
 
         # 1. Full fill.
-        if normalized_status == "FILLED" or (filled_quantity is not None and filled_quantity >= position.quantity):
+        if normalized_status == "FILLED" or (filled_quantity is not None and filled_quantity >= order_quantity):
             await self.event_repository.append(
                 "exit_reprice_cancel_race_filled",
                 {
@@ -3110,9 +3124,10 @@ class ExecutionSupervisor:
             )
             return _ExitCancelRaceOutcome(action="blocked", cancel_error=cancel_error)
 
-        # 3. A.2 partial fill on a dead-or-cancel-acked order.
-        if filled_quantity is not None and 0 < filled_quantity < position.quantity:
-            residual_quantity = position.quantity - filled_quantity
+        # 3. A.2 partial fill on a dead-or-cancel-acked order. Residual is
+        # derived from the order's own placed quantity (audit finding 1).
+        if filled_quantity is not None and 0 < filled_quantity < order_quantity:
+            residual_quantity = order_quantity - filled_quantity
             details = _exit_fill_details(payload, status=status)
             if position.trade_id is not None and position.option_symbol is not None:
                 await self.trade_state_repository.record_partial_fill(
@@ -3159,6 +3174,160 @@ class ExecutionSupervisor:
 
         # 4. Confirmed dead unfilled, or cleanly canceled: full-quantity resubmit.
         return _ExitCancelRaceOutcome(action="resubmit", position=position, cancel_error=cancel_error)
+
+    async def _resolve_dead_status_exit_for_resubmit(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        exit_order_id: str,
+        status: str | None,
+        payload: dict | None,
+        now: datetime,
+    ) -> "_ExitCancelRaceOutcome":
+        """A resting exit order that a routine poll found DEAD
+        (REJECTED/CANCELED/EXPIRED) is about to be resubmitted. Before doing
+        so, consult the final broker payload's ``filledQuantity`` -- the same
+        guard the reprice-cancel sites (``_resolve_exit_cancel_for_reprice``)
+        already apply (audit A.2), extended here to the third resubmit site
+        (item #21).
+
+        Unlike the reprice sites this path issues NO cancel: the poll already
+        proved the order terminal, so there is nothing to cancel. It blocks in
+        exactly one case -- an unparseable ``filledQuantity`` (audit finding 3
+        below). The ladder:
+
+        0. BLOCKED (audit finding 3, fail closed): ``filledQuantity`` carries
+           a NON-NULL value we cannot parse ("N/A", ""). The broker asserted
+           a fill field we cannot read -- treating it as "unfilled" and
+           resubmitting the full quantity is a potential oversell with no
+           event trail. Emit a ``runtime_issue``
+           (category="exit_fill_unparseable") and skip this cycle; the
+           pending-exit poller re-reads the order within
+           ``order_fill_poll_seconds``. JSON null does NOT block (audit
+           round 2, 2026-07-09): null is Public's STANDARD zero-fill idiom on
+           order objects -- empirically every real zero-fill order reads
+           ``"filledQuantity": null`` (never key-absent, never "0") -- so
+           blocking on it would wedge every ordinary dead-unfilled exit
+           forever with an alert per poll. Null and a missing key both fall
+           through to step 3 (full resubmit, pre-#21 semantics, matching how
+           the merged reprice ladder treats a null fill everywhere else).
+        1. FULL FILL: ``filledQuantity`` covers the order's OWN placed
+           quantity (audit finding 1: NOT position.quantity -- reconciliation
+           replaces tracker positions with the broker's live quantity, which
+           already excludes the filled lot, so comparing against it
+           double-counts the fill: spurious finalize / orphaned live
+           contract). Record the fill truth via
+           ``_finalize_pending_exit_fill`` and never resubmit.
+        2. PARTIAL FILL (the consequential one, item #21): a dead order with
+           ``0 < filledQuantity <`` its placed quantity -- e.g. one lot fills
+           and the remainder is CANCELED/EXPIRED. Durably record the filled
+           leg in ``trade_partial_fills`` (origin="exit_dead_status", distinct
+           from the deliberate ``partial_scale`` banks and the reprice
+           ``exit_cancel_race`` legs) and resubmit only the RESIDUAL (placed
+           minus filled, audit finding 1) so the replacement can never
+           oversell the position.
+        3. RESUBMIT: parseable zero fill, null fill (Public's zero-fill
+           idiom), or ``filledQuantity`` key absent -- confirmed dead
+           unfilled, resubmit the full quantity (pre-existing behavior).
+        """
+        payload_map = payload or {}
+        raw_filled_quantity = payload_map.get("filledQuantity")
+        filled_quantity = _maybe_int(raw_filled_quantity)
+        order_quantity = _maybe_int(payload_map.get("quantity")) or position.quantity
+
+        # 0. Audit finding 3 (narrowed in round 2): fail closed only on a
+        # present, NON-NULL, unparseable fill value. Null means zero fill.
+        if raw_filled_quantity is not None and filled_quantity is None:
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": "exit_fill_unparseable",
+                    "symbol": position.symbol,
+                    "deployment_id": deployment.deployment_id,
+                    "trade_id": position.trade_id,
+                    "option_symbol": position.option_symbol,
+                    "order_id": exit_order_id,
+                    "status": status,
+                    "error": f"unparseable_filled_quantity:{raw_filled_quantity!r}",
+                    "stage": "exit_dead_status_resubmit",
+                },
+            )
+            return _ExitCancelRaceOutcome(action="blocked")
+
+        # 1. Full fill hidden behind a dead status.
+        if filled_quantity is not None and filled_quantity >= order_quantity:
+            await self.event_repository.append(
+                "exit_dead_status_filled",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "order_id": exit_order_id,
+                    "status": status,
+                    "filled_quantity": filled_quantity,
+                    "order_quantity": order_quantity,
+                },
+            )
+            plan = await self._finalize_pending_exit_fill(
+                deployment,
+                position,
+                exit_order_id=exit_order_id,
+                status=status,
+                payload=payload,
+                now=now,
+                reason="exit_dead_status_filled",
+            )
+            return _ExitCancelRaceOutcome(action="finalized", plan=plan)
+
+        # 2. Partial fill on a dead order: record the leg, resubmit the
+        # residual only. Residual = the order's own placed quantity minus the
+        # fill (audit finding 1), never position.quantity minus the fill.
+        if filled_quantity is not None and 0 < filled_quantity < order_quantity:
+            residual_quantity = order_quantity - filled_quantity
+            details = _exit_fill_details(payload, status=status)
+            if position.trade_id is not None and position.option_symbol is not None:
+                await self.trade_state_repository.record_partial_fill(
+                    PartialFillRecord(
+                        id=None,
+                        trade_id=position.trade_id,
+                        deployment_id=deployment.deployment_id,
+                        symbol=position.symbol,
+                        option_symbol=position.option_symbol,
+                        closed_quantity=filled_quantity,
+                        order_id=exit_order_id,
+                        exit_rule=None,
+                        submitted_at=position.exit_submitted_at,
+                        fill_price=details["exit_price"],
+                        fill_quantity=details["exit_filled_quantity"] or filled_quantity,
+                        filled_at=details["exit_filled_at"],
+                        order_status=details["exit_order_status"],
+                        order_type=details["exit_order_type"],
+                        broker_payload=details["exit_broker_payload"],
+                        origin="exit_dead_status",
+                    )
+                )
+            await self.event_repository.append(
+                "exit_dead_status_partial_fill",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "order_id": exit_order_id,
+                    "status": status,
+                    "filled_quantity": filled_quantity,
+                    "order_quantity": order_quantity,
+                    "residual_quantity": residual_quantity,
+                    "fill_price": details["exit_price"],
+                },
+            )
+            return _ExitCancelRaceOutcome(
+                action="resubmit",
+                position=_replace_position(position, quantity=residual_quantity),
+            )
+
+        # 3. Confirmed dead unfilled: full-quantity resubmit (pre-existing behavior).
+        return _ExitCancelRaceOutcome(action="resubmit", position=position)
 
     async def manage_pending_exits(
         self,
@@ -3232,9 +3401,33 @@ class ExecutionSupervisor:
             )
             return None
         if normalized in {"REJECTED", "CANCELED", "EXPIRED"} or position.exit_order_id is None:
+            resubmit_position = position
+            if position.exit_order_id is not None and normalized in _EXIT_ORDER_DEAD_STATUSES:
+                # Item #21: the dead-status readback may hide a partial fill
+                # (one lot filled, the remainder CANCELED/EXPIRED). Consult
+                # filledQuantity via the same guard ladder the reprice-cancel
+                # sites use before resubmitting -- otherwise the full stale
+                # quantity is resubmitted and the position is oversold.
+                outcome = await self._resolve_dead_status_exit_for_resubmit(
+                    deployment,
+                    position,
+                    exit_order_id=position.exit_order_id,
+                    status=status,
+                    payload=payload,
+                    now=now,
+                )
+                if outcome.action == "finalized":
+                    return outcome.plan
+                if outcome.action == "blocked":
+                    # Audit finding 3: filledQuantity present but unparseable
+                    # -- resubmitting could oversell. Skip this cycle; the
+                    # position keeps its exit_order_id so the next poll
+                    # re-reads the order.
+                    return None
+                resubmit_position = outcome.position or position
             _, plan = await self._submit_exit_request(
                 deployment,
-                position,
+                resubmit_position,
                 exit_mode=position.exit_mode,
                 reason="exit_resubmitted",
                 event_type="exit_resubmitted",
@@ -3856,10 +4049,41 @@ class ExecutionSupervisor:
         await self.trade_state_repository.increment_partial_fill_enrich_attempts(record.id)
 
     async def _abandon_partial_fill(self, record: PartialFillRecord, *, reason: str) -> None:
-        """Durably stop re-polling a partial leg that will never resolve (audit fix 3)."""
+        """Durably stop re-polling a partial leg that will never resolve (audit fix 3).
+
+        Item #22: an abandonment is permanent fill-detail loss that needs a
+        human backfill, so besides the diagnostic ``partial_fill_enrich_abandoned``
+        row it is ALSO escalated as a ``runtime_issue`` -- the one channel that
+        daily_report aggregates into ``runtime_issue_counts`` and surfaces in
+        the daily report and Telegram summary. Without this the loss stays
+        buried in the events table where nobody sees it. Category mirrors the
+        supervisor's own hardcoded-category convention (cf.
+        ``protective_stop_failure``).
+
+        Ordering (audit finding 4, 2026-07-09): both events are appended
+        BEFORE the durable ``mark_partial_fill_abandoned``. The mark is what
+        excludes the row from future sweeps -- if it landed first and the
+        process crashed before the events, the escalation would be lost
+        forever (the row is never re-visited). With the mark last, a crash
+        in between means the next sweep redoes the abandonment and re-emits:
+        a rare duplicate escalation beats a permanently lost one.
+        """
         if record.id is None:
             return
-        await self.trade_state_repository.mark_partial_fill_abandoned(record.id, reason=reason)
+        await self.event_repository.append(
+            "runtime_issue",
+            {
+                "category": "partial_fill_abandoned",
+                "symbol": record.symbol,
+                "deployment_id": record.deployment_id,
+                "trade_id": record.trade_id,
+                "option_symbol": record.option_symbol,
+                "order_id": record.order_id,
+                "closed_quantity": record.closed_quantity,
+                "error": reason,
+                "stage": "partial_fill_enrichment_sweep",
+            },
+        )
         await self.event_repository.append(
             "partial_fill_enrich_abandoned",
             {
@@ -3874,6 +4098,7 @@ class ExecutionSupervisor:
                 "reason": reason,
             },
         )
+        await self.trade_state_repository.mark_partial_fill_abandoned(record.id, reason=reason)
 
     async def _find_terminal_exit_order_payload(self, trade: TradeRecord) -> tuple[str | None, str | None, dict | None]:
         seen: set[str] = set()
@@ -3891,7 +4116,15 @@ class ExecutionSupervisor:
             status, payload, error = await self.planner.order_manager.get_order_status(order_id)
             if error or payload is None:
                 continue
-            if _is_filled_exit_order(payload, status=status, option_symbol=trade.option_symbol):
+            # Audit finding 2 (2026-07-09): a dead order (CANCELED/EXPIRED/
+            # REJECTED) that filled before dying carries real exit truth too --
+            # a finalize that ran before the broker published averagePrice
+            # would otherwise leave exit_price NULL forever, because this
+            # retry only accepted status==FILLED. Mirror the enrichment
+            # sweep's dead+has_fill rule (with the same identity checks).
+            if _is_filled_exit_order(payload, status=status, option_symbol=trade.option_symbol) or (
+                _is_dead_exit_order_with_fill(payload, status=status, option_symbol=trade.option_symbol)
+            ):
                 return order_id, status, payload
         return None, None, None
 
@@ -4541,6 +4774,28 @@ def _is_filled_exit_order(payload: dict[str, Any], *, status: str | None, option
     normalized_status = str(status or payload.get("status") or "").upper()
     if normalized_status != "FILLED":
         return False
+    return _matches_exit_order_identity(payload, option_symbol=option_symbol)
+
+
+def _is_dead_exit_order_with_fill(payload: dict[str, Any], *, status: str | None, option_symbol: str | None) -> bool:
+    """Audit finding 2 (2026-07-09): a terminally dead exit order
+    (CANCELED/EXPIRED/REJECTED) that reports a fill (price AND quantity, the
+    enrichment sweep's ``has_fill`` rule) still carries real exit truth --
+    the lot(s) that filled before the order died. Used by the closed-truth
+    retry (``_find_terminal_exit_order_payload``) so a trade finalized from a
+    dead payload published before ``averagePrice`` was available can be
+    re-enriched instead of keeping ``exit_price`` NULL forever."""
+    normalized_status = str(status or payload.get("status") or "").upper()
+    if normalized_status not in _EXIT_ORDER_DEAD_STATUSES:
+        return False
+    details = _exit_fill_details(payload, status=status)
+    if details["exit_price"] is None or not details["exit_filled_quantity"]:
+        return False
+    return _matches_exit_order_identity(payload, option_symbol=option_symbol)
+
+
+def _matches_exit_order_identity(payload: dict[str, Any], *, option_symbol: str | None) -> bool:
+    """Shared identity check: a SELL/CLOSE order for the expected contract."""
     side = str(payload.get("side") or payload.get("orderSide") or "").upper()
     open_close = str(payload.get("openCloseIndicator") or "").upper()
     instrument_symbol = normalize_option_symbol(str((payload.get("instrument") or {}).get("symbol", "")))

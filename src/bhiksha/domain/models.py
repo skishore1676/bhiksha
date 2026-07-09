@@ -220,7 +220,11 @@ class PartialFillRecord:
     # a deliberate profile T1 bank (_handle_partial_scale_locked);
     # "exit_cancel_race" is an involuntary partial discovered when a reprice
     # cancel raced a working exit order (readback showed nonzero
-    # filledQuantity short of the full position).
+    # filledQuantity short of the full position). "exit_dead_status" (item #21,
+    # 2026-07-09) is the same involuntary partial discovered by a routine poll
+    # that found the exit order terminally dead (REJECTED/CANCELED/EXPIRED)
+    # after a partial fill -- recorded before resubmitting the residual so the
+    # dead-status branch cannot oversell.
     origin: str = "partial_scale"
     # Audit fix 3: enrichment-sweep bookkeeping. ``enrich_attempts`` counts
     # unresolved polls; once it reaches the sweep's max (or the order reads
