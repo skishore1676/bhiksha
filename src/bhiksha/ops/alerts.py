@@ -40,6 +40,31 @@ class AlertResult:
         return asdict(self)
 
 
+ReviewMode = Literal["off", "on"]
+
+
+@dataclass(slots=True)
+class ReviewPublishResult:
+    """Outcome of projecting an artifact onto the Obsidian review surface."""
+
+    attempted: bool = False
+    ok: bool = False
+    mode: ReviewMode = "off"
+    profile: str | None = None
+    command: list[str] | None = None
+    cwd: str | None = None
+    return_code: int | None = None
+    review_id: str | None = None
+    note_path: str | None = None
+    surface: str | None = None
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def send_lathi_alert(
     *,
     title: str,
@@ -130,6 +155,131 @@ def send_lathi_alert(
         stdout_tail=_tail(_redact(completed.stdout)),
         stderr_tail=_tail(_redact(completed.stderr)),
     )
+
+
+def publish_lathi_review(
+    *,
+    source: str | Path,
+    title: str,
+    mode: ReviewMode = "on",
+    profile: str | None = None,
+    workspace_root: str | Path | None = None,
+    artifact_id: str | None = None,
+    owner_consumer: str = "bhiksha",
+    resume_command: str | None = None,
+    review_id: str | None = None,
+    command: list[str] | None = None,
+    cwd: str | Path | None = None,
+    timeout_seconds: float | None = None,
+) -> ReviewPublishResult:
+    """Project a reviewable artifact onto the Obsidian coding-agent surface.
+
+    Follows the ``lathi-review-bus`` contract: the default profile
+    ``coding-agent-northstar`` routes to folder ``07 Agents/Coding`` and the
+    published card carries an approve/archive decision affordance (the CLI's
+    ``publish`` default). Bhiksha owns the decision to publish and the artifact
+    body; Lathi Bus owns the vault surface.
+
+    Transport-graceful, mirroring ``send_lathi_alert``: a missing/unreachable
+    bus, a missing source file, or a non-zero CLI exit returns a non-ok result
+    with ``error`` set rather than raising, so a scheduled session-report job is
+    never failed by the review projection being unavailable.
+    """
+    if mode == "off":
+        return ReviewPublishResult(mode="off")
+
+    profile = profile or os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "coding-agent-northstar")
+    source_path = Path(source).expanduser()
+    if not source_path.is_file():
+        return ReviewPublishResult(
+            attempted=False,
+            ok=False,
+            mode=mode,
+            profile=profile,
+            error=f"source artifact not found: {source_path}",
+        )
+
+    if command is None:
+        command, cwd = _default_lathi_invocation(cwd)
+    cwd_path = Path(cwd).expanduser() if cwd else None
+
+    args = [
+        *command,
+        "publish",
+        "--profile",
+        profile,
+        "--source",
+        str(source_path),
+        "--title",
+        title,
+        "--owner-consumer",
+        owner_consumer,
+    ]
+    if workspace_root:
+        args.extend(["--workspace-root", str(Path(workspace_root).expanduser())])
+    if artifact_id:
+        args.extend(["--artifact-id", str(artifact_id)])
+    if resume_command:
+        args.extend(["--resume-command", resume_command])
+    if review_id:
+        args.extend(["--review-id", review_id])
+
+    try:
+        env = os.environ.copy()
+        _populate_secret_fallbacks(env)
+        completed = subprocess.run(  # noqa: S603
+            args,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(cwd_path) if cwd_path else None,
+            env=env,
+            timeout=timeout_seconds or float(os.getenv("BHIKSHA_ALERT_TIMEOUT_SECONDS", "30")),
+        )
+    except Exception as exc:
+        return ReviewPublishResult(
+            attempted=True,
+            ok=False,
+            mode=mode,
+            profile=profile,
+            command=args,
+            cwd=str(cwd_path) if cwd_path else None,
+            error=_redact(str(exc)),
+        )
+
+    receipt = _parse_lathi_receipt(completed.stdout)
+    note_path = _receipt_str(receipt.get("note_path"))
+    ok = completed.returncode == 0 and note_path is not None
+    return ReviewPublishResult(
+        attempted=True,
+        ok=ok,
+        mode=mode,
+        profile=profile,
+        command=args,
+        cwd=str(cwd_path) if cwd_path else None,
+        return_code=completed.returncode,
+        review_id=_receipt_str(receipt.get("review_id")),
+        note_path=note_path,
+        surface=_receipt_str(receipt.get("surface")),
+        stdout_tail=_tail(_redact(completed.stdout)),
+        stderr_tail=_tail(_redact(completed.stderr)),
+        error=None if ok else _publish_error(completed),
+    )
+
+
+def _publish_error(completed: subprocess.CompletedProcess[str]) -> str:
+    stderr_tail = _tail(_redact(completed.stderr)).strip()
+    if stderr_tail:
+        return stderr_tail
+    return f"publish returned code {completed.returncode} without a note_path"
+
+
+def _receipt_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _default_lathi_invocation(cwd: str | Path | None = None) -> tuple[list[str], str | Path | None]:

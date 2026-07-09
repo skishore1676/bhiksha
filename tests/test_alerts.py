@@ -2,7 +2,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from bhiksha.ops.alerts import _default_lathi_invocation, send_lathi_alert
+from bhiksha.ops.alerts import (
+    _default_lathi_invocation,
+    publish_lathi_review,
+    send_lathi_alert,
+)
 
 
 def test_send_lathi_alert_invokes_telegram_notify_with_redaction(monkeypatch) -> None:
@@ -194,3 +198,139 @@ def test_default_lathi_invocation_prefers_home_checkout_over_path_wrapper(monkey
 
     assert command == [str(python), "-m", "lathi_bus.cli"]
     assert cwd == repo
+
+
+# --- Obsidian coding-agent review surface (status-board #6) ------------------
+
+
+def _make_report(tmp_path: Path) -> Path:
+    source = tmp_path / "trade_session_report_2026-07-09.md"
+    source.write_text("# Bhiksha Trade Session - 2026-07-09\n\n- status: `GREEN`\n", encoding="utf-8")
+    return source
+
+
+def test_publish_lathi_review_routes_to_coding_agent_surface(monkeypatch, tmp_path) -> None:
+    source = _make_report(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=(
+                '{"review_id": "Bhiksha close session report - 2026-07-09", '
+                '"note_path": "07 Agents/Coding/Inbox/Bhiksha close session report.md", '
+                '"surface": "obsidian"}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = publish_lathi_review(
+        source=source,
+        title="Bhiksha close session report - 2026-07-09",
+        workspace_root="/repo",
+        artifact_id="artifacts/playbook/reports/trade_session_report_2026-07-09.md",
+        command=["lathi-bus"],
+    )
+
+    assert result.attempted is True
+    assert result.ok is True
+    assert result.review_id == "Bhiksha close session report - 2026-07-09"
+    assert result.note_path == "07 Agents/Coding/Inbox/Bhiksha close session report.md"
+    assert result.surface == "obsidian"
+    assert result.profile == "coding-agent-northstar"
+
+    args = calls[0]
+    # Route: publish subcommand onto the shared coding-agent profile/folder.
+    assert args[:2] == ["lathi-bus", "publish"]
+    assert args[args.index("--profile") + 1] == "coding-agent-northstar"
+    # Artifact: the actual on-disk markdown report is the published source.
+    assert args[args.index("--source") + 1] == str(source)
+    assert args[args.index("--title") + 1] == "Bhiksha close session report - 2026-07-09"
+    assert args[args.index("--owner-consumer") + 1] == "bhiksha"
+    assert args[args.index("--workspace-root") + 1] == "/repo"
+    assert args[args.index("--artifact-id") + 1] == "artifacts/playbook/reports/trade_session_report_2026-07-09.md"
+
+
+def test_publish_lathi_review_honors_profile_env(monkeypatch, tmp_path) -> None:
+    source = _make_report(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout='{"note_path": "x"}', stderr="")
+
+    monkeypatch.setenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "codex-northstar")
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = publish_lathi_review(source=source, title="t", command=["lathi-bus"])
+
+    assert result.profile == "codex-northstar"
+    assert calls[0][calls[0].index("--profile") + 1] == "codex-northstar"
+
+
+def test_publish_lathi_review_off_mode_is_noop(monkeypatch, tmp_path) -> None:
+    source = _make_report(tmp_path)
+
+    def fake_run(args, **kwargs):  # pragma: no cover - must never be called
+        raise AssertionError("subprocess.run should not run in off mode")
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = publish_lathi_review(source=source, title="t", mode="off", command=["lathi-bus"])
+
+    assert result.attempted is False
+    assert result.ok is False
+    assert result.mode == "off"
+
+
+def test_publish_lathi_review_missing_source_is_graceful(monkeypatch, tmp_path) -> None:
+    def fake_run(args, **kwargs):  # pragma: no cover - must never be called
+        raise AssertionError("subprocess.run should not run when source is missing")
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = publish_lathi_review(
+        source=tmp_path / "does-not-exist.md",
+        title="t",
+        command=["lathi-bus"],
+    )
+
+    assert result.attempted is False
+    assert result.ok is False
+    assert "not found" in (result.error or "")
+
+
+def test_publish_lathi_review_graceful_when_bus_unreachable(monkeypatch, tmp_path) -> None:
+    source = _make_report(tmp_path)
+
+    def fake_run(args, **kwargs):
+        raise FileNotFoundError("lathi-bus not installed")
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = publish_lathi_review(source=source, title="t", command=["lathi-bus"])
+
+    # No-bus path: attempted, non-ok, error captured, and NO exception raised.
+    assert result.attempted is True
+    assert result.ok is False
+    assert "lathi-bus not installed" in (result.error or "")
+
+
+def test_publish_lathi_review_nonzero_exit_is_not_ok(monkeypatch, tmp_path) -> None:
+    source = _make_report(tmp_path)
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 3, stdout="", stderr="vault locked")
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = publish_lathi_review(source=source, title="t", command=["lathi-bus"])
+
+    assert result.attempted is True
+    assert result.ok is False
+    assert result.return_code == 3
+    assert "vault locked" in (result.error or "")
