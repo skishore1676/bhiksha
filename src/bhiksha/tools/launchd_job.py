@@ -14,8 +14,19 @@ from zoneinfo import ZoneInfo
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.config.environment import load_dotenv
 from bhiksha.market_data.trading_calendar import is_trading_day
-from bhiksha.ops.alerts import AlertMode, send_lathi_alert
-from bhiksha.ops.daily_report import render_daily_report_telegram_summary, write_daily_report
+from loguru import logger
+
+from bhiksha.ops.alerts import (
+    AlertMode,
+    ReviewPublishResult,
+    publish_lathi_review,
+    send_lathi_alert,
+)
+from bhiksha.ops.daily_report import (
+    DailyReportWriteResult,
+    render_daily_report_telegram_summary,
+    write_daily_report,
+)
 from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
 
@@ -35,6 +46,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report-label", default="scheduled")
     parser.add_argument("--alert-mode", default=os.getenv("BHIKSHA_LAUNCHD_ALERT_MODE", "live"), choices=["off", "spool", "live"])
     parser.add_argument("--alert-profile", default=os.getenv("BHIKSHA_LATHI_PROFILE", "jarvis-northstar"))
+    parser.add_argument(
+        "--obsidian-review-mode",
+        default=os.getenv("BHIKSHA_SESSION_REPORT_OBSIDIAN_MODE", "on"),
+        choices=["off", "on"],
+        help=(
+            "Also project the session report onto the Obsidian coding-agent "
+            "review surface via Lathi Bus (approve/archive). Graceful no-op when "
+            "the bus is unreachable; never fails the report job."
+        ),
+    )
+    parser.add_argument(
+        "--obsidian-review-profile",
+        default=os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "coding-agent-northstar"),
+    )
     parser.add_argument("--action-id", default=os.getenv("BHIKSHA_ACTION_ID"))
     args = parser.parse_args(argv)
 
@@ -149,19 +174,68 @@ def _session_report_job(args: argparse.Namespace) -> int:
         template="status",
         link_preview="disabled",
     )
+    review = _publish_session_report_review(args, result, report_label)
     ok = alert.ok or args.alert_mode == "off"
-    _print_result(
-        {
-            "job": args.job,
-            "status": "ok" if ok else "failed",
-            "report_label": report_label,
-            "report_json": str(result.json_path),
-            "report_markdown": str(result.markdown_path),
-            "report_status": result.report.get("status"),
-            "alert": alert.to_dict(),
-        }
-    )
+    payload: dict = {
+        "job": args.job,
+        "status": "ok" if ok else "failed",
+        "report_label": report_label,
+        "report_json": str(result.json_path),
+        "report_markdown": str(result.markdown_path),
+        "report_status": result.report.get("status"),
+        "alert": alert.to_dict(),
+    }
+    if review is not None:
+        payload["obsidian_review"] = review.to_dict()
+    _print_result(payload)
     return 0 if ok else 2
+
+
+def _publish_session_report_review(
+    args: argparse.Namespace,
+    result: DailyReportWriteResult,
+    report_label: str,
+) -> ReviewPublishResult | None:
+    """Project the session report onto the Obsidian approve/archive surface.
+
+    Additive projection only: the Telegram alert remains the primary operator
+    channel and owns the report job's success. This publish is transport-graceful
+    and is deliberately isolated from the return code -- an unreachable review
+    bus logs a warning and is surfaced in the ``obsidian_review`` payload, but
+    never turns a healthy trading-report run into a failed launchd job.
+    """
+    mode = args.obsidian_review_mode
+    if mode == "off":
+        return None
+    trading_date = result.report.get("trading_date")
+    title = f"Bhiksha {report_label} session report - {trading_date}"
+    try:
+        review = publish_lathi_review(
+            source=result.markdown_path,
+            title=title,
+            mode=mode,
+            profile=args.obsidian_review_profile,
+            workspace_root=Path.cwd(),
+            artifact_id=_relative_artifact_id(result.markdown_path),
+            owner_consumer="bhiksha",
+        )
+    except Exception as exc:  # noqa: BLE001 - projection must never fail the job.
+        logger.warning("Obsidian session-report review projection crashed: {}", exc)
+        return ReviewPublishResult(attempted=True, ok=False, mode=mode, error=str(exc))
+    if not review.ok:
+        logger.warning(
+            "Obsidian session-report review not published (mode={}): {}",
+            mode,
+            review.error or "no note_path in receipt",
+        )
+    return review
+
+
+def _relative_artifact_id(markdown_path: Path) -> str:
+    try:
+        return str(markdown_path.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return str(markdown_path)
 
 
 def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
