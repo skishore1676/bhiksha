@@ -22,6 +22,7 @@ CENTRAL = ZoneInfo("America/Chicago")
 
 RUNNER_ACTIONS: dict[str, list[str]] = {
     "session-report-now": ["session-report", "--force", "--report-label", "manual"],
+    "weekly-scorecard-now": ["weekly-scorecard", "--force"],
     "schwab-guard-now": ["schwab-refresh", "--force"],
     "ensure-live-runtime": ["live-watchdog", "--force"],
 }

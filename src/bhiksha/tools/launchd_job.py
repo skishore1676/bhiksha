@@ -18,6 +18,10 @@ from bhiksha.ops.alerts import AlertMode, send_lathi_alert
 from bhiksha.ops.daily_report import render_daily_report_telegram_summary, write_daily_report
 from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
+from bhiksha.ops.weekly_scorecard import (
+    render_weekly_scorecard_telegram_summary,
+    write_weekly_scorecard,
+)
 
 CENTRAL = ZoneInfo("America/Chicago")
 
@@ -27,7 +31,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "job",
-        choices=["live-start", "live-watchdog", "live-stop", "schwab-refresh", "session-report"],
+        choices=[
+            "live-start",
+            "live-watchdog",
+            "live-stop",
+            "schwab-refresh",
+            "session-report",
+            "weekly-scorecard",
+        ],
     )
     parser.add_argument("--force", action="store_true", help="Run even when today is not a trading day")
     parser.add_argument("--repo-root", default=None)
@@ -66,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
             return _schwab_refresh_job(args)
         if args.job == "session-report":
             return _session_report_job(args)
+        if args.job == "weekly-scorecard":
+            return _weekly_scorecard_job(args)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
         alert = _send_failure_alert(args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc))
         _print_result({"job": args.job, "status": "failed", "error": str(exc), "alert": alert.to_dict()})
@@ -164,10 +177,47 @@ def _session_report_job(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def _weekly_scorecard_job(args: argparse.Namespace) -> int:
+    """Generate the weekly profile-vs-legacy scorecard (workplan #5) and publish
+    the compact operator card through Lathi Bus -- the exact transport path the
+    daily session report uses. The full markdown remains the detailed artifact.
+    The default window is Monday->today, so a Friday run covers the trade week.
+    """
+    runtime = build_runtime(active_plan_path=args.active_plan)
+    db_path = Path(runtime.app_config.sqlite_path)
+    output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
+    result = write_weekly_scorecard(db_path, output_dir=output_dir, deployments=runtime.deployments)
+    body = render_weekly_scorecard_telegram_summary(result.report, markdown_path=result.markdown_path)
+    alert = send_lathi_alert(
+        title="Bhiksha weekly scorecard",
+        body=body,
+        level="info",
+        mode=args.alert_mode,
+        profile=args.alert_profile,
+        template="status",
+        link_preview="disabled",
+    )
+    ok = alert.ok or args.alert_mode == "off"
+    _print_result(
+        {
+            "job": args.job,
+            "status": "ok" if ok else "failed",
+            "week": f"{result.report['week_start']}..{result.report['week_end']}",
+            "report_json": str(result.json_path),
+            "report_markdown": str(result.markdown_path),
+            "alert": alert.to_dict(),
+        }
+    )
+    return 0 if ok else 2
+
+
 def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
     if force:
         return False
-    if job == "live-stop":
+    # live-stop must always run so a stale process cannot survive; the weekly
+    # scorecard is the week's verdict and must publish even when the Friday it
+    # fires is itself a market holiday (the Mon-Fri window still had trading).
+    if job in {"live-stop", "weekly-scorecard"}:
         return False
     today = datetime.now(CENTRAL).date()
     return not is_trading_day(today)
