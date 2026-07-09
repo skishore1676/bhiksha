@@ -80,6 +80,8 @@ def required_warmup_trading_days_for_strategy(strategy_key: str, params: dict[st
         return _opening_drive_warmup_days(params)
     if strategy_key == "jerk_pivot_momentum":
         return _jerk_pivot_warmup_days(params)
+    if strategy_key == "compression_expansion_breakout":
+        return _compression_expansion_breakout_warmup_days(params)
     if strategy_key == "manual_breakout":
         return _manual_breakout_warmup_days(params)
     return 1
@@ -113,6 +115,20 @@ def _jerk_pivot_warmup_days(params: dict[str, Any]) -> int:
     kinematic_periods_back = max(int(params.get("kinematic_periods_back", 1)), 1)
     vpoc_minutes = int(params.get("vpoc_lookback_minutes", 240))
     bars_needed = max(vpoc_minutes, volume_ma_period, jerk_lookback + (3 * kinematic_periods_back))
+    return _bars_to_trading_days(bars_needed, 1) + 1
+
+
+def _compression_expansion_breakout_warmup_days(params: dict[str, Any]) -> int:
+    compression_window = int(params.get("compression_window", 20))
+    breakout_lookback = int(params.get("breakout_lookback", 20))
+    volume_ma_period = int(params.get("volume_ma_period", 20))
+    velocity_periods_back = max(int(params.get("velocity_periods_back", 1)), 1)
+    bars_needed = max(
+        compression_window * 3 + 1,
+        breakout_lookback + 1,
+        volume_ma_period,
+        velocity_periods_back + 1,
+    )
     return _bars_to_trading_days(bars_needed, 1) + 1
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from bhiksha.strategy.compression_expansion_breakout import CompressionExpansionBreakoutStrategy
 from bhiksha.strategy.elastic_band_reversion import ElasticBandReversionStrategy
 from bhiksha.strategy.base import StrategyPlugin
 from bhiksha.strategy.intraday_mean_reversion import IntradayMeanReversionStrategy
@@ -30,6 +31,7 @@ class StrategyRegistry:
 
 def default_strategy_registry() -> StrategyRegistry:
     registry = StrategyRegistry()
+    registry.register(CompressionExpansionBreakoutStrategy())
     registry.register(ElasticBandReversionStrategy())
     registry.register(IntradayMeanReversionStrategy())
     registry.register(JerkPivotMomentumStrategy())

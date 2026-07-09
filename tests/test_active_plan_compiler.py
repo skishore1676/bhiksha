@@ -1629,8 +1629,8 @@ def test_compile_active_plan_suppresses_unsupported_mala_strategy_variant(tmp_pa
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
     _write_catalog_entry(
-        catalog_root / "mi_high_close.yaml",
-        strategy_id="mi-desc-high-close-semiconductors-m1__amd_short",
+        catalog_root / "mi_second_touch.yaml",
+        strategy_id="mi-desc-second-touch-semiconductors-m1__amd_short",
         symbol="AMD",
     )
 
@@ -1640,16 +1640,17 @@ def test_compile_active_plan_suppresses_unsupported_mala_strategy_variant(tmp_pa
         rows=[
             {
                 "mala_handoff_version": "1",
-                "catalog_key": "mi-desc-high-close-semiconductors-m1__amd_short",
-                "hypothesis_id": "mi-desc-high-close-semiconductors-m1",
+                "catalog_key": "mi-desc-second-touch-semiconductors-m1__amd_short",
+                "hypothesis_id": "mi-desc-second-touch-semiconductors-m1",
                 "symbol": "AMD",
                 "direction": "short",
                 "strategy_key": "market_impulse",
-                "strategy_name": "MI High Close Reclaim",
+                "strategy_name": "MI Second Touch",
                 "strategy_params_json": json.dumps(
                     {
-                        "entry_mode": "close_location_reclaim",
-                        "min_close_location": 0.7,
+                        "entry_mode": "delayed_reclaim",
+                        "reclaim_window_bars": 3,
+                        "min_bars_after_pierce": 1,
                         "entry_buffer_minutes": 3,
                         "entry_window_minutes": 60,
                     }
@@ -1674,7 +1675,7 @@ def test_compile_active_plan_suppresses_unsupported_mala_strategy_variant(tmp_pa
             {
                 "enabled": "TRUE",
                 "authorization_mode": "shadow",
-                "strategy_id": "mi-desc-high-close-semiconductors-m1__amd_short",
+                "strategy_id": "mi-desc-second-touch-semiconductors-m1__amd_short",
             }
         ],
     )
@@ -1694,7 +1695,7 @@ def test_compile_active_plan_suppresses_unsupported_mala_strategy_variant(tmp_pa
 
     assert compiled.plan.deployments == []
     assert compiled.plan.summary["suppressed_count"] == 1
-    assert "unsupported_strategy_variant: market_impulse.close_location_reclaim" in compiled.plan.suppressed[0]["reason"]
+    assert "unsupported_strategy_variant: market_impulse.delayed_reclaim" in compiled.plan.suppressed[0]["reason"]
 
 
 def test_google_catalog_exit_controls_can_explicitly_enable_native_exit(tmp_path: Path) -> None:
