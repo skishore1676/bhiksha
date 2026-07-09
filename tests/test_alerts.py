@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from pathlib import Path
 
 from bhiksha.ops.alerts import _default_lathi_invocation, send_lathi_alert
@@ -159,7 +160,7 @@ def test_default_lathi_invocation_prefers_checkout_venv(monkeypatch, tmp_path) -
     assert cwd == repo
 
 
-def test_default_lathi_invocation_can_fall_back_to_python3(monkeypatch, tmp_path) -> None:
+def test_default_lathi_invocation_falls_back_to_current_python(monkeypatch, tmp_path) -> None:
     repo = tmp_path / "lathi-bus"
     (repo / "lathi_bus").mkdir(parents=True)
     (repo / "lathi_bus" / "cli.py").write_text("")
@@ -170,7 +171,7 @@ def test_default_lathi_invocation_can_fall_back_to_python3(monkeypatch, tmp_path
 
     command, cwd = _default_lathi_invocation(Path(repo))
 
-    assert command == ["python3", "-m", "lathi_bus.cli"]
+    assert command == [sys.executable, "-m", "lathi_bus.cli"]
     assert cwd == repo
 
 

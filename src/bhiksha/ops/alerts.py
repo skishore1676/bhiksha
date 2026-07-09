@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from typing import Any, Literal
 
 AlertMode = Literal["off", "spool", "live"]
@@ -150,7 +151,7 @@ def _lathi_bus_module_invocation(repo_root: Path) -> tuple[list[str], Path]:
     python = repo_root / ".venv" / "bin" / "python"
     if python.is_file() and os.access(python, os.X_OK):
         return [str(python), "-m", "lathi_bus.cli"], repo_root
-    return ["python3", "-m", "lathi_bus.cli"], repo_root
+    return [sys.executable, "-m", "lathi_bus.cli"], repo_root
 
 
 def _populate_secret_fallbacks(env: dict[str, str]) -> None:
