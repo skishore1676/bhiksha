@@ -8,9 +8,9 @@ real money on the Public.com API, deployed on the always-on Mac "oldmac" at
 `/Users/sunny/Documents/bhiksha` (that checkout IS production — its HEAD at the 08:20 CT
 live-start is what trades).
 
-**The system's brain lives in the sibling repo `mala_v2`** — read
-`mala_v2/AGENTS.md` and `mala_v2/docs/brain/INDEX.md` for architecture, operations,
-decisions, and current state before non-trivial work here.
+**The family brain lives in the private repo `tradelab`** (`~/code/tradelab` on both
+machines; migrated from mala_v2 on 2026-07-10) — read `tradelab/docs/brain/INDEX.md`
+for architecture, operations, decisions, and current state before non-trivial work here.
 
 Hard rules for this repo:
 - Money-path changes (order path, exits, risk, reconciliation, compiler gating) require
