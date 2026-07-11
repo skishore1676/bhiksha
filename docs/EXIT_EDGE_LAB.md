@@ -90,3 +90,86 @@ upstream derivation/provenance is not yet standardized. Before using cluster
 inference for promotion, define and version the clustering rule (for example,
 trading session plus correlated-underlying family) so relabeling cannot change
 the inference unit after results are visible.
+
+## Live observational tee (off by default)
+
+Bhiksha can opportunistically feed the prospective repository from option
+quotes the runtime already requested for management, protection, or repricing.
+This is an inline **tee of completed existing requests**, not a quote cache and
+not a new poller. It adds zero broker calls. The runtime thread performs only a
+bounded `put_nowait`; SQLite, replay, censoring, and status writes run on a
+daemon worker outside the symbol lock and money path.
+
+Eligibility is strict. A cohort is created only when the broker fill payload
+has `status=FILLED` and contains `averageFillPrice`/`averagePrice`, positive
+`filledQuantity`, and `filledAt` or Public's FILLED-order completion field
+`closedAt`, and the deployment carries a named profile. Plan price,
+requested quantity, submission time, `openedAt`, and `lastTradeTime` are never
+substituted. Every confirmed-fill attempt—including ineligible or queue-dropped
+attempts—is queued for `exit_edge_registration_attempts`, so missing cohorts
+remain visible in the denominator. Persistence failures are retained for
+in-session retry and surfaced in the health artifact; a permanent storage
+outage still requires reconciliation against Bhiksha's authoritative
+`entry_fill_check` history before inference.
+
+Quote timestamps are accepted only when Public identifies the field as
+`quoteTimestamp`. Generic response timestamps and trade timestamps do not prove
+the age of the bid/ask and censor the cohort. The recorder assigns a local
+sequence only after the observation enters its bounded queue; any active-cohort
+queue drop permanently censors the tape, so a synthetic contiguous sequence
+cannot hide missed observations. An unfinished cohort found after restart is
+censored as `restart_gap_unobserved_quotes`.
+
+This tee normally stops receiving marks when the actual position closes. It
+keeps the cohort open in case another existing request happens to fetch the
+same contract, but it does not add post-close calls. At session shutdown an
+unfinished case is explicitly censored as
+`no_post_exit_quote_source_session_shutdown_before_virtual_arms_terminal`.
+Therefore this integration is useful for opportunistic proof and health
+measurement; it is **not** guaranteed complete prospective collection. A
+separately budgeted low-priority quote source would require another approval.
+
+Enable persistently on oldmac only after syncing the reviewed commit, at a
+session boundary. The installer writes the flag into both the live-start and
+watchdog plists and creates an allowlisted, non-secret runtime marker consumed
+by `run_bhiksha_job.sh`. That marker preserves the mode for scheduled start,
+watchdog restart, Lathi ensure-running, and manual recovery. Generic installs
+remove the marker and remain off:
+
+```bash
+BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED=true \
+  scripts/launchd/install_bhiksha_launchd.sh install
+```
+
+An interactive `export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=true` can be used
+for a startup-only smoke, but it does not enable the scheduled launchd job and
+must not be treated as deployment proof. After install, inspect both plists,
+`artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled`, and a
+scheduled/recovery-context startup snapshot for
+`exit_edge_live_shadow_enabled=true` before claiming enablement.
+
+A live session writes the isolated
+database to `artifacts/observations/exit_edge_live.sqlite3` and atomic health
+readback to `artifacts/observations/exit_edge_live_status.json`. The status
+must say `mode=observational_shadow_only`, `enforcement_authority=false`, and
+`broker_calls_added=0`. Inspect `observed_quote_timestamp_fields`: if
+`quoteTimestamp` is absent, real quotes are truthfully censored and this tee
+cannot produce useful paired cases without a separately approved source.
+Disable by removing the environment variable (the
+checked-in config remains `false`).
+
+Generate the guarded repository report with:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bhiksha.tools.exit_edge_lab \
+  --live-db-path artifacts/observations/exit_edge_live.sqlite3 \
+  --output-dir artifacts/observations/exit_edge_readback
+```
+
+This report includes the confirmed-fill/eligible/registered denominator.
+`inference_eligible` remains false if any eligible registration is missing, any
+registered cohort is unfinished or censored, or there are no registered
+cohorts. In that state the confidence indicator is forcibly
+`live_collection_inference_blocked`, even if the successful subset looks
+directionally positive. Missing health readback, any storage failure, or any
+recorded observation drop also blocks inference.

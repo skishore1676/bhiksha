@@ -190,6 +190,16 @@ class AppConfig(BaseModel):
     bias_inputs_path: str = "config/bias_inputs.yaml"
     playbook_artifacts_dir: str = "artifacts/playbook"
     observation_reports_dir: str = "artifacts/observations"
+    # Prospective paired-exit collection is observational and OFF by default.
+    # It consumes only quotes already requested by the runtime and has no
+    # execution/risk authority.
+    exit_edge_live_shadow_enabled: bool = False
+    exit_edge_live_shadow_db_path: str = "artifacts/observations/exit_edge_live.sqlite3"
+    exit_edge_live_shadow_status_path: str = "artifacts/observations/exit_edge_live_status.json"
+    exit_edge_live_shadow_queue_capacity: int = Field(default=512, ge=1, le=100_000)
+    exit_edge_live_shadow_fill_latency_ms: int = Field(default=0, ge=0)
+    exit_edge_live_shadow_max_freshness_ms: int = Field(default=2_000, ge=0)
+    exit_edge_live_shadow_max_sequence_gap: int = Field(default=1, ge=1)
 
 
 class ProviderConfig(BaseModel):

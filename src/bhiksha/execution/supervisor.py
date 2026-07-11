@@ -120,6 +120,7 @@ class ExecutionSupervisor:
         trade_state_repository: TradeStateRepository | None = None,
         manual_status_writer: ManualSheetStatusWriter | None = None,
         reconcile_trigger: asyncio.Event | None = None,
+        exit_edge_recorder: Any | None = None,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
@@ -129,6 +130,7 @@ class ExecutionSupervisor:
         self.event_bus = event_bus
         self.manual_status_writer = manual_status_writer
         self.reconcile_trigger = reconcile_trigger
+        self.exit_edge_recorder = exit_edge_recorder
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._disabled_entry_deployments: set[str] = set()
@@ -140,6 +142,8 @@ class ExecutionSupervisor:
         self._profile_exit_states: dict[str, ProfileExitState] = {}
 
     async def close(self) -> None:
+        if self.exit_edge_recorder is not None:
+            self.exit_edge_recorder.close()
         await self.planner.close()
 
     # ------------------------------------------------------------------ #
@@ -930,6 +934,20 @@ class ExecutionSupervisor:
             "broker_average_fill_price": filled_entry_price,
         }
         plan = replace(plan, estimated_entry_price=filled_entry_price, risk_details=risk_details)
+        # Freeze the observational cohort only from CONFIRMED broker fill
+        # truth. This is a bounded queue write: no SQLite, await, replay, or
+        # broker call occurs on the entry/money path. Failure only affects the
+        # experiment's health/censor state.
+        if self.exit_edge_recorder is not None:
+            confirmed_price, confirmed_quantity, confirmed_at = _confirmed_entry_fill_facts(payload)
+            self.exit_edge_recorder.try_register_entry(
+                deployment=deployment,
+                trade_id=plan.trade_id,
+                option_symbol=plan.option_symbol,
+                entry_timestamp=confirmed_at,
+                entry_premium=confirmed_price,
+                quantity=confirmed_quantity,
+            )
         stop_result, stop_price, target_order_id, target_price = await self._arm_position_protection(
             deployment,
             option_symbol=plan.option_symbol,
@@ -4733,6 +4751,27 @@ def _filled_entry_price(payload: dict | None, *, fallback: float) -> float:
         if parsed is not None:
             return parsed
     return fallback
+
+
+def _confirmed_entry_fill_facts(
+    payload: dict | None,
+) -> tuple[float | None, int | None, datetime | None]:
+    """Strict experiment facts; unlike trading, never substitute plan estimates."""
+    if not payload:
+        return None, None, None
+    if str(payload.get("status") or "").upper() != "FILLED":
+        return None, None, None
+    price = None
+    for key in ("averageFillPrice", "averagePrice"):
+        price = _maybe_float(payload.get(key))
+        if price is not None:
+            break
+    quantity = _maybe_int(payload.get("filledQuantity"))
+    # Public's live FILLED order payload calls its order-completion timestamp
+    # ``closedAt`` (verified oldmac 2026-07-10). Prefer an explicit filledAt if
+    # the provider adds it; accept closedAt only under the FILLED status gate.
+    filled_at = _maybe_datetime(payload.get("filledAt") or payload.get("closedAt"))
+    return price, quantity, filled_at.astimezone(UTC) if filled_at is not None else None
 
 
 def _maybe_float(value) -> float | None:
