@@ -21,17 +21,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start", help="SQLite window start YYYY-MM-DD")
     parser.add_argument("--end", help="SQLite window end YYYY-MM-DD")
     parser.add_argument("--output-dir", default="exit_edge_lab_out")
-    parser.add_argument("--max-freshness-ms", type=int, default=2000)
-    parser.add_argument("--fill-latency-ms", type=int, default=0)
     args = parser.parse_args(argv)
 
     if args.fixture_json:
         cases = load_fixture_cases(args.fixture_json)
-        report = analyze_cases(
-            cases,
-            max_freshness_ms=args.max_freshness_ms,
-            fill_latency_ms=args.fill_latency_ms,
-        )
+        report = analyze_cases(cases)
     else:
         missing = [name for name in ("start", "end") if getattr(args, name) is None]
         if missing:

@@ -38,14 +38,19 @@ SCOPE_BOUNDARY = (
 FILL_MODEL = (
     "A trigger never fills on its triggering observation. Each long-option exit fills at the "
     "first later-sequence, fresh, non-crossed quote's executable bid after configured latency. "
-    "Mid, last, ask fallback, and last-mark imputation are forbidden."
+    "This is a modeled natural-bid fill with no displayed-size or slippage guarantee. Mid, last, "
+    "ask fallback, and last-mark imputation are forbidden."
 )
+EVALUATOR_VERSION = "profile-evaluator-v1"
+FILL_MODEL_VERSION = "next-fresh-natural-bid-v2"
+SQLITE_NONBLOCKING_TIMEOUT_SECONDS = 0.001
 
 
 @dataclass(slots=True, frozen=True)
 class QuoteTapeMark:
     sequence: int
     source: str
+    feed: str
     quote_at: datetime
     received_at: datetime
     bid: float | None
@@ -57,6 +62,7 @@ class QuoteTapeMark:
 class ExitEdgeCase:
     cohort_id: str
     trade_id: str
+    cluster_id: str
     deployment_id: str
     symbol: str
     option_symbol: str
@@ -66,8 +72,10 @@ class ExitEdgeCase:
     profile: ProfileExitFields
     profile_config: dict[str, Any]
     legacy_config: dict[str, Any]
-    policy_config_hash: str
+    experiment: dict[str, Any]
+    experiment_spec_hash: str
     quotes: tuple[QuoteTapeMark, ...]
+    persisted_censor_reason: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -92,24 +100,38 @@ class ProspectiveQuoteTapeRepository:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=SQLITE_NONBLOCKING_TIMEOUT_SECONDS)
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
     def initialize(self) -> None:
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS exit_edge_cohorts (
                   cohort_id TEXT PRIMARY KEY, trade_id TEXT NOT NULL UNIQUE,
+                  cluster_id TEXT NOT NULL,
                   deployment_id TEXT NOT NULL, symbol TEXT NOT NULL,
                   option_symbol TEXT NOT NULL, entry_timestamp TEXT NOT NULL,
                   entry_premium REAL NOT NULL, quantity INTEGER NOT NULL,
                   profile_config TEXT NOT NULL, legacy_config TEXT NOT NULL,
-                  policy_config_hash TEXT NOT NULL, created_at TEXT NOT NULL
+                  experiment_spec TEXT NOT NULL, experiment_spec_hash TEXT NOT NULL,
+                  quote_source TEXT NOT NULL, quote_feed TEXT NOT NULL,
+                  created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS exit_edge_quote_tape (
                   cohort_id TEXT NOT NULL, sequence INTEGER NOT NULL,
-                  source TEXT NOT NULL,
+                  source TEXT NOT NULL, feed TEXT NOT NULL,
                   quote_at TEXT NOT NULL, received_at TEXT NOT NULL,
                   bid REAL, ask REAL, last REAL, spread_pct REAL, freshness_ms REAL NOT NULL,
-                  PRIMARY KEY (cohort_id, sequence)
+                  PRIMARY KEY (cohort_id, sequence),
+                  FOREIGN KEY (cohort_id) REFERENCES exit_edge_cohorts(cohort_id)
+                );
+                CREATE TABLE IF NOT EXISTS exit_edge_censors (
+                  cohort_id TEXT PRIMARY KEY, reason TEXT NOT NULL,
+                  censored_at TEXT NOT NULL,
+                  FOREIGN KEY (cohort_id) REFERENCES exit_edge_cohorts(cohort_id)
                 );
                 """
             )
@@ -131,26 +153,32 @@ class ProspectiveQuoteTapeRepository:
     def register_cohort(self, payload: dict[str, Any]) -> None:
         profile = payload["profile"]
         legacy = payload["legacy"]
-        digest = policy_config_hash(profile, legacy)
+        experiment = _normalized_experiment(payload["experiment"])
+        digest = experiment_spec_hash(profile, legacy, experiment)
         values = (
-            str(payload["cohort_id"]), str(payload["trade_id"]), str(payload["deployment_id"]),
-            str(payload["symbol"]), str(payload["option_symbol"]),
+            str(payload["cohort_id"]), str(payload["trade_id"]), str(payload["cluster_id"]),
+            str(payload["deployment_id"]), str(payload["symbol"]), str(payload["option_symbol"]),
             _parse_datetime(payload["entry_timestamp"]).isoformat(), float(payload["entry_premium"]),
-            int(payload["quantity"]), _canonical_json(profile), _canonical_json(legacy), digest,
+            int(payload["quantity"]), _canonical_json(profile), _canonical_json(legacy),
+            _canonical_json(experiment), digest, experiment["quote_source"], experiment["quote_feed"],
             datetime.now(UTC).isoformat(),
         )
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             existing = conn.execute(
-                "SELECT trade_id, option_symbol, entry_premium, quantity, policy_config_hash "
+                "SELECT trade_id,cluster_id,deployment_id,symbol,option_symbol,entry_timestamp,"
+                "entry_premium,quantity,experiment_spec_hash,quote_source,quote_feed "
                 "FROM exit_edge_cohorts WHERE cohort_id=?", (values[0],)
             ).fetchone()
-            identity = (values[1], values[4], values[6], values[7], values[10])
+            identity = (
+                values[1], values[2], values[3], values[4], values[5], values[6],
+                values[7], values[8], values[12], values[13], values[14],
+            )
             if existing is not None:
                 if tuple(existing) != identity:
                     raise ValueError("cohort identity or frozen policy config changed")
                 return
             conn.execute(
-                "INSERT INTO exit_edge_cohorts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", values
+                "INSERT INTO exit_edge_cohorts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values
             )
 
     def try_append_quote(self, cohort_id: str, quote: QuoteTapeMark) -> bool:
@@ -168,12 +196,21 @@ class ProspectiveQuoteTapeRepository:
             else None
         )
         values = (
-            cohort_id, quote.sequence, quote.source, quote.quote_at.isoformat(), quote.received_at.isoformat(),
+            cohort_id, quote.sequence, quote.source, quote.feed,
+            quote.quote_at.isoformat(), quote.received_at.isoformat(),
             quote.bid, quote.ask, quote.last, spread_pct, freshness_ms,
         )
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
+            cohort = conn.execute(
+                "SELECT quote_source,quote_feed FROM exit_edge_cohorts WHERE cohort_id=?", (cohort_id,)
+            ).fetchone()
+            if cohort is None:
+                raise ValueError("orphan quote: cohort is not registered")
+            if tuple(cohort) != (quote.source, quote.feed):
+                raise ValueError("quote source/feed lineage changed")
             existing = conn.execute(
-                "SELECT source,quote_at,received_at,bid,ask,last,spread_pct,freshness_ms FROM exit_edge_quote_tape "
+                "SELECT source,feed,quote_at,received_at,bid,ask,last,spread_pct,freshness_ms "
+                "FROM exit_edge_quote_tape "
                 "WHERE cohort_id=? AND sequence=?", (cohort_id, quote.sequence)
             ).fetchone()
             if existing is not None:
@@ -185,10 +222,63 @@ class ProspectiveQuoteTapeRepository:
             ).fetchone()[0]
             if last_seq is not None and quote.sequence <= int(last_seq):
                 raise ValueError("out-of-order quote sequence")
-            conn.execute("INSERT INTO exit_edge_quote_tape VALUES (?,?,?,?,?,?,?,?,?,?)", values)
+            conn.execute("INSERT INTO exit_edge_quote_tape VALUES (?,?,?,?,?,?,?,?,?,?,?)", values)
+
+    def try_record_censor(self, cohort_id: str, reason: str) -> bool:
+        try:
+            self.record_censor(cohort_id, reason)
+            return True
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def record_censor(self, cohort_id: str, reason: str) -> None:
+        if not reason:
+            raise ValueError("censor reason is required")
+        with self._connect() as conn:
+            if conn.execute("SELECT 1 FROM exit_edge_cohorts WHERE cohort_id=?", (cohort_id,)).fetchone() is None:
+                raise ValueError("orphan censor: cohort is not registered")
+            existing = conn.execute("SELECT reason FROM exit_edge_censors WHERE cohort_id=?", (cohort_id,)).fetchone()
+            if existing is not None and existing[0] != reason:
+                raise ValueError("persisted censor reason is immutable")
+            conn.execute(
+                "INSERT OR IGNORE INTO exit_edge_censors VALUES (?,?,?)",
+                (cohort_id, reason, datetime.now(UTC).isoformat()),
+            )
+
+    def load_case(self, cohort_id: str) -> ExitEdgeCase:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cohort = conn.execute("SELECT * FROM exit_edge_cohorts WHERE cohort_id=?", (cohort_id,)).fetchone()
+            if cohort is None:
+                raise ValueError("cohort not found")
+            quotes = conn.execute(
+                "SELECT * FROM exit_edge_quote_tape WHERE cohort_id=? ORDER BY sequence", (cohort_id,)
+            ).fetchall()
+            censor = conn.execute("SELECT reason FROM exit_edge_censors WHERE cohort_id=?", (cohort_id,)).fetchone()
+        mapping = {
+            "cohort_id": cohort["cohort_id"], "trade_id": cohort["trade_id"],
+            "cluster_id": cohort["cluster_id"], "deployment_id": cohort["deployment_id"],
+            "symbol": cohort["symbol"], "option_symbol": cohort["option_symbol"],
+            "entry_timestamp": cohort["entry_timestamp"], "entry_premium": cohort["entry_premium"],
+            "quantity": cohort["quantity"], "profile": json.loads(cohort["profile_config"]),
+            "legacy": json.loads(cohort["legacy_config"]),
+            "experiment": json.loads(cohort["experiment_spec"]),
+            "experiment_spec_hash": cohort["experiment_spec_hash"],
+            "persisted_censor_reason": censor[0] if censor else None,
+            "quotes": [dict(row) for row in quotes],
+        }
+        return _case_from_mapping(mapping)
+
+
+def experiment_spec_hash(
+    profile: dict[str, Any], legacy: dict[str, Any], experiment: dict[str, Any],
+) -> str:
+    value = {"profile": profile, "legacy": legacy, "experiment": _normalized_experiment(experiment)}
+    return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
 
 
 def policy_config_hash(profile: dict[str, Any], legacy: dict[str, Any]) -> str:
+    """Compatibility helper for callers that only need a policy fingerprint."""
     return hashlib.sha256(_canonical_json({"profile": profile, "legacy": legacy}).encode()).hexdigest()
 
 
@@ -200,21 +290,18 @@ def load_fixture_cases(path: str | Path) -> list[ExitEdgeCase]:
     return [_case_from_mapping(item) for item in items]
 
 
-def analyze_cases(
-    cases: list[ExitEdgeCase], *, max_freshness_ms: int = 2_000,
-    max_sequence_gap: int = 1, fill_latency_ms: int = 0,
-) -> dict[str, Any]:
+def analyze_cases(cases: list[ExitEdgeCase]) -> dict[str, Any]:
     rows = [
-        _analyze_case(case, max_freshness_ms=max_freshness_ms,
-                      max_sequence_gap=max_sequence_gap, fill_latency_ms=fill_latency_ms)
+        _analyze_case(case)
         for case in cases
     ]
     paired = [row for row in rows if row["status"] == "paired"]
-    deltas = [float(row["paired_delta_pnl_usd"]) for row in paired]
+    specs = sorted({row["experiment_spec_hash"] for row in rows})
     return {
-        "schema_version": 2, "report_type": "prospective_paired_replay",
+        "schema_version": 3, "report_type": "prospective_paired_replay",
         "generated_at": datetime.now(UTC).isoformat(), "scope_boundary": SCOPE_BOUNDARY,
-        "fill_model": FILL_MODEL, "summary": _summary(deltas, len(rows)), "cases": rows,
+        "fill_model": FILL_MODEL, "experiment_spec_hashes": specs,
+        "summary": _summary(paired, len(rows), heterogeneous_specs=len(specs) > 1), "cases": rows,
     }
 
 
@@ -319,24 +406,42 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines = ["# Exit Edge Lab — Prospective Paired Replay", "", f"**Boundary:** {report['scope_boundary']}",
              "", f"**Fill model:** {report['fill_model']}", "", f"- Cases: {s['case_count']}",
              f"- Paired: {s['paired_count']}", f"- Insufficient: {s['insufficient_count']}",
+             f"- Labeled clusters: {s['cluster_count']}",
              f"- Mean profile-minus-legacy P&L: {s['mean_paired_delta_pnl_usd']}",
-             f"- Confidence: {s['confidence']['indicator']}", ""]
+             f"- Median cluster-uplift 95% lower bound: "
+             f"{s['confidence']['median_cluster_uplift_one_sided_95_lower_usd']}",
+             f"- Confidence: {s['confidence']['indicator']} — {s['confidence']['reason']}",
+             f"- Frozen experiment hashes: {', '.join(report['experiment_spec_hashes'])}", ""]
     return "\n".join(lines)
 
 
-def _analyze_case(case: ExitEdgeCase, *, max_freshness_ms: int, max_sequence_gap: int,
-                  fill_latency_ms: int) -> dict[str, Any]:
+def _analyze_case(case: ExitEdgeCase) -> dict[str, Any]:
+    max_freshness_ms = int(case.experiment["max_freshness_ms"])
+    max_sequence_gap = int(case.experiment["max_sequence_gap"])
+    fill_latency_ms = int(case.experiment["fill_latency_ms"])
     base = {"cohort_id": case.cohort_id, "trade_id": case.trade_id,
-            "deployment_id": case.deployment_id, "policy_config_hash": case.policy_config_hash,
+            "cluster_id": case.cluster_id, "deployment_id": case.deployment_id,
+            "experiment_spec": case.experiment,
+            "experiment_spec_hash": case.experiment_spec_hash,
             "quote_count": len(case.quotes)}
+    if case.persisted_censor_reason:
+        return {**base, "status": "insufficient_data",
+                "insufficient_reason": f"persisted_censor:{case.persisted_censor_reason}"}
     problem = _tape_problem(case, max_freshness_ms, max_sequence_gap)
     if problem:
         return {**base, "status": "insufficient_data", "insufficient_reason": problem}
     profile = _replay(case, "profile", fill_latency_ms, max_freshness_ms)
     legacy = _replay(case, "legacy", fill_latency_ms, max_freshness_ms)
-    bids = [q.bid for q in case.quotes if q.bid is not None and q.bid > 0]
-    row = {**base, "mfe_pct": round((max(bids)-case.entry_premium)/case.entry_premium*100, 2),
-           "mae_pct": round((min(bids)-case.entry_premium)/case.entry_premium*100, 2)}
+    terminal_at = max(
+        _parse_datetime(outcome.exit_timestamp) for outcome in (profile, legacy) if outcome is not None
+    ) if profile is not None or legacy is not None else None
+    bids = [q.bid for q in case.quotes if q.bid is not None and q.bid > 0
+            and q.quote_at >= case.entry_timestamp
+            and (terminal_at is None or q.received_at <= terminal_at)]
+    row = {**base,
+           "holding_window_end": terminal_at.isoformat() if terminal_at is not None else None,
+           "mfe_pct": round((max(bids)-case.entry_premium)/case.entry_premium*100, 2) if bids else None,
+           "mae_pct": round((min(bids)-case.entry_premium)/case.entry_premium*100, 2) if bids else None}
     if profile is None or legacy is None:
         missing = [name for name, value in (("profile", profile), ("legacy", legacy)) if value is None]
         return {**row, "status": "insufficient_data",
@@ -397,13 +502,26 @@ def _replay(case: ExitEdgeCase, policy: str, latency_ms: int, max_freshness_ms: 
 
 def _tape_problem(case: ExitEdgeCase, max_freshness_ms: int, max_sequence_gap: int) -> str | None:
     if case.entry_premium <= 0 or case.quantity <= 0: return "invalid_entry"
-    if policy_config_hash(case.profile_config, case.legacy_config) != case.policy_config_hash:
-        return "policy_config_hash_mismatch"
+    if experiment_spec_hash(case.profile_config, case.legacy_config, case.experiment) != case.experiment_spec_hash:
+        return "experiment_spec_hash_mismatch"
+    if (
+        case.experiment["evaluator_version"] != EVALUATOR_VERSION
+        or case.experiment["fill_model_version"] != FILL_MODEL_VERSION
+    ):
+        return "unsupported_evaluator_or_fill_model_version"
     if len(case.quotes) < 2: return "quote_tape_too_short_for_next_tick_fill"
     previous = None
     for quote in case.quotes:
         if not quote.source:
             return "missing_quote_source"
+        if not quote.feed:
+            return "missing_quote_feed"
+        if (quote.source, quote.feed) != (
+            case.experiment["quote_source"], case.experiment["quote_feed"]
+        ):
+            return "quote_source_or_feed_transition"
+        if quote.quote_at < case.entry_timestamp or quote.received_at < case.entry_timestamp:
+            return "quote_precedes_entry"
         if previous is not None:
             if quote.sequence <= previous.sequence: return "duplicate_or_out_of_order_sequence"
             if quote.sequence-previous.sequence > max_sequence_gap: return "sequence_gap"
@@ -423,14 +541,63 @@ def _executable(q: QuoteTapeMark, age_ms: float, limit: int) -> bool:
     return bool(q.bid is not None and q.bid > 0 and q.ask is not None and q.ask >= q.bid and 0 <= age_ms <= limit)
 
 
-def _summary(deltas: list[float], case_count: int) -> dict[str, Any]:
-    n=len(deltas); wins=sum(x>0 for x in deltas); low,high=_wilson(wins,n)
-    indicator="insufficient_sample" if n<8 else ("directional_profile_edge" if low>0.5 else "inconclusive")
-    return {"case_count":case_count,"paired_count":n,"insufficient_count":case_count-n,
-            "total_paired_delta_pnl_usd":round(sum(deltas),2) if deltas else None,
-            "mean_paired_delta_pnl_usd":round(fmean(deltas),2) if deltas else None,
-            "confidence":{"indicator":indicator,"positive_pairs":wins,
-                          "positive_pair_rate_wilson_95":[round(low,4),round(high,4)] if n else None}}
+def _summary(
+    paired: list[dict[str, Any]], case_count: int, *, heterogeneous_specs: bool,
+) -> dict[str, Any]:
+    deltas = [float(row["paired_delta_pnl_usd"]) for row in paired]
+    n = len(deltas); wins = sum(x > 0 for x in deltas); low, high = _wilson(wins, n)
+    clusters: dict[str, list[float]] = {}
+    for row, delta in zip(paired, deltas):
+        clusters.setdefault(str(row["cluster_id"]), []).append(delta)
+    cluster_uplifts = [fmean(values) for values in clusters.values()]
+    lower_bound = _one_sided_median_lower_bound(cluster_uplifts)
+    total = sum(deltas) if deltas else None
+    mean = fmean(deltas) if deltas else None
+    if heterogeneous_specs:
+        indicator = "heterogeneous_experiment_specs"
+        reason = "Cases with different frozen experiment specs cannot share an uplift estimate."
+    elif len(cluster_uplifts) < 8:
+        indicator = "insufficient_cluster_sample"
+        reason = "Fewer than 8 independent labeled clusters; no directional uplift claim."
+    elif lower_bound is not None and lower_bound > 0 and total is not None and total > 0 and mean is not None and mean > 0:
+        indicator = "directional_profile_uplift"
+        reason = "The one-sided 95% distribution-free lower bound on median cluster uplift is positive."
+    else:
+        indicator = "inconclusive"
+        reason = "The conservative cluster-uplift bound is nonpositive or aggregate uplift is nonpositive."
+    return {
+        "case_count": case_count, "paired_count": n, "insufficient_count": case_count-n,
+        "cluster_count": len(cluster_uplifts), "cluster_labels_present": all(row.get("cluster_id") for row in paired),
+        "homogeneous_experiment_spec": not heterogeneous_specs,
+        "total_paired_delta_pnl_usd": round(total, 2) if total is not None else None,
+        "mean_paired_delta_pnl_usd": round(mean, 2) if mean is not None else None,
+        "confidence": {
+            "indicator": indicator, "reason": reason,
+            "inference_unit": "cluster_mean_paired_pnl_usd",
+            "median_cluster_uplift_one_sided_95_lower_usd": round(lower_bound, 2) if lower_bound is not None else None,
+            "positive_pairs_descriptive_only": wins,
+            "positive_pair_rate_wilson_95_descriptive_only": [round(low,4),round(high,4)] if n else None,
+        },
+    }
+
+
+def _one_sided_median_lower_bound(values: list[float], alpha: float = 0.05) -> float | None:
+    """Distribution-free one-sided lower confidence bound for the population median."""
+    n = len(values)
+    if not n:
+        return None
+    chosen_k = 0
+    cumulative = 0.0
+    for failures in range(n):
+        cumulative += math.comb(n, failures) * (0.5 ** n)
+        candidate_k = failures + 1
+        if cumulative <= alpha:
+            chosen_k = candidate_k
+        else:
+            break
+    if chosen_k == 0:
+        return None
+    return sorted(values)[chosen_k - 1]
 
 
 def _wilson(k:int,n:int,z:float=1.96)->tuple[float,float]:
@@ -441,15 +608,36 @@ def _wilson(k:int,n:int,z:float=1.96)->tuple[float,float]:
 
 def _case_from_mapping(item: dict[str, Any]) -> ExitEdgeCase:
     profile=dict(item["profile"]); legacy=dict(item["legacy"])
-    digest=str(item.get("policy_config_hash") or policy_config_hash(profile,legacy))
-    return ExitEdgeCase(str(item["cohort_id"]),str(item["trade_id"]),str(item["deployment_id"]),
+    experiment = _normalized_experiment(item["experiment"])
+    digest=str(item.get("experiment_spec_hash") or experiment_spec_hash(profile,legacy,experiment))
+    return ExitEdgeCase(str(item["cohort_id"]),str(item["trade_id"]),str(item["cluster_id"]),str(item["deployment_id"]),
         str(item["symbol"]),str(item["option_symbol"]),_parse_datetime(item["entry_timestamp"]),
         float(item["entry_premium"]),int(item["quantity"]),
         ProfileExitFields.from_exit_params(str(profile.get("profile_exit_id") or "unknown_profile"),profile,
                                            fallback_stop_pct=float(profile.get("stop_loss_pct") or 0.45)),
-        profile,legacy,digest,tuple(QuoteTapeMark(int(q["sequence"]),str(q["source"]),_parse_datetime(q["quote_at"]),
+        profile,legacy,experiment,digest,tuple(QuoteTapeMark(int(q["sequence"]),str(q["source"]),str(q["feed"]),_parse_datetime(q["quote_at"]),
             _parse_datetime(q["received_at"]),_float_or_none(q.get("bid")),_float_or_none(q.get("ask")),
-            _float_or_none(q.get("last"))) for q in item.get("quotes",[])))
+            _float_or_none(q.get("last"))) for q in item.get("quotes",[])),
+        str(item["persisted_censor_reason"]) if item.get("persisted_censor_reason") else None)
+
+
+def _normalized_experiment(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "fill_latency_ms": int(value["fill_latency_ms"]),
+        "max_freshness_ms": int(value["max_freshness_ms"]),
+        "max_sequence_gap": int(value["max_sequence_gap"]),
+        "evaluator_version": str(value.get("evaluator_version") or EVALUATOR_VERSION),
+        "fill_model_version": str(value.get("fill_model_version") or FILL_MODEL_VERSION),
+        "quote_source": str(value["quote_source"]),
+        "quote_feed": str(value["quote_feed"]),
+    }
+    if not normalized["quote_source"] or not normalized["quote_feed"]:
+        raise ValueError("quote source/feed lineage is required")
+    if normalized["fill_latency_ms"] < 0 or normalized["max_freshness_ms"] < 0:
+        raise ValueError("experiment timing knobs must be nonnegative")
+    if normalized["max_sequence_gap"] < 1:
+        raise ValueError("max_sequence_gap must be positive")
+    return normalized
 
 
 def _canonical_json(value: Any)->str:return json.dumps(value,sort_keys=True,separators=(",",":"))
@@ -462,5 +650,5 @@ def _optional_datetime(value:Any)->datetime|None:return None if value in (None,"
 
 
 __all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","analyze_cases",
-         "build_historical_coverage_report","load_fixture_cases","policy_config_hash",
+         "build_historical_coverage_report","experiment_spec_hash","load_fixture_cases","policy_config_hash",
          "render_markdown","write_exit_edge_report"]
