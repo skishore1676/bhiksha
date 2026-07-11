@@ -35,6 +35,7 @@
         "quote_source": "public_cache",
         "quote_feed": "existing_position_quote_cache_v1"
       },
+      "experiment_spec_hash": "bc28b15f6a0eee11ad5503d09ce2b1ec48005701012941eed9d6d81fa76ae2e6",
       "quotes": [
         {"sequence": 1, "source": "public_cache", "feed": "existing_position_quote_cache_v1", "quote_at": "2026-07-09T14:00:15+00:00", "received_at": "2026-07-09T14:00:15.100000+00:00", "bid": 2.1, "ask": 2.15, "last": 2.12},
         {"sequence": 2, "source": "public_cache", "feed": "existing_position_quote_cache_v1", "quote_at": "2026-07-09T14:00:30+00:00", "received_at": "2026-07-09T14:00:30.100000+00:00", "bid": 2.7, "ask": 2.75, "last": 2.72},

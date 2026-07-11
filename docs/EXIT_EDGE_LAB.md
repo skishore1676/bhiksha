@@ -24,6 +24,10 @@ experiment spec. Each quote record must carry provider `quote_at`, local
 `received_at`, monotonic `sequence`, provider/cache `source` and `feed`, bid,
 ask, last, spread, and derived freshness.
 
+Prospective fixtures must carry that explicit precomputed hash. The loader never
+auto-signs an unhashed fixture, because doing so after a settings edit would make
+mutable analysis settings look frozen.
+
 The tape must continue after the first actual or virtual exit until both virtual
 arms terminate or the cohort is explicitly censored. The recorder consumes an
 existing quote cache/feed or an isolated low-priority quota; it must never add
@@ -80,3 +84,9 @@ explicit censor reasons. Win rate and its Wilson interval are descriptive only.
 Directional uplift requires at least eight labeled clusters, positive total and
 mean paired P&L, and a positive distribution-free one-sided 95% lower bound on
 median cluster uplift.
+
+Residual governance risk: `cluster_id` is immutable once registered, but its
+upstream derivation/provenance is not yet standardized. Before using cluster
+inference for promotion, define and version the clustering rule (for example,
+trading session plus correlated-underlying family) so relabeling cannot change
+the inference unit after results are visible.

@@ -131,6 +131,12 @@ def test_experiment_knobs_are_frozen_and_emitted(tmp_path: Path) -> None:
     assert row["insufficient_reason"] == "experiment_spec_hash_mismatch"
 
 
+def test_unhashed_fixture_cannot_auto_sign_itself(tmp_path: Path) -> None:
+    raw=_raw_case(); raw.pop("experiment_spec_hash")
+    with pytest.raises(ValueError, match="explicit experiment_spec_hash"):
+        _load(tmp_path,raw)
+
+
 def test_unsupported_or_heterogeneous_experiment_versions_cannot_aggregate(tmp_path: Path) -> None:
     raw=_raw_case(); raw["experiment"]["evaluator_version"]="future"
     raw["experiment_spec_hash"]=experiment_spec_hash(raw["profile"],raw["legacy"],raw["experiment"])
