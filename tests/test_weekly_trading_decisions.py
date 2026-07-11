@@ -66,6 +66,12 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     assert export["facts"][0]["lane"] == "shadow"
     assert export["facts"][0]["realized_pnl_usd"] == 50.0
 
+    rerun = write_weekly_trading_decisions(
+        db_path, output_dir=tmp_path / "reports", week_end="2026-07-10",
+    )
+    rerun_export = json.loads(rerun.facts_path.read_text(encoding="utf-8"))
+    assert rerun_export["receipt"]["sha256"] == export["receipt"]["sha256"]
+
 
 def test_weekly_publisher_binds_stable_review_id() -> None:
     source = Path("src/bhiksha/tools/launchd_job.py").read_text(encoding="utf-8")
