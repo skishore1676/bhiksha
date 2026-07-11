@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, date, datetime
 import json
+from pathlib import Path
 
 from bhiksha.domain.models import TradeRecord
 from bhiksha.ops.weekly_trading_decisions import (
@@ -64,3 +65,9 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     assert export["receipt"]["fact_count"] == 1
     assert export["facts"][0]["lane"] == "shadow"
     assert export["facts"][0]["realized_pnl_usd"] == 50.0
+
+
+def test_weekly_publisher_binds_stable_review_id() -> None:
+    source = Path("src/bhiksha/tools/launchd_job.py").read_text(encoding="utf-8")
+
+    assert 'review_id=result.report["artifact_id"]' in source
