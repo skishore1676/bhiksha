@@ -20,6 +20,7 @@ from typing import Any, TYPE_CHECKING
 from bhiksha.ops.shadow_ev_report import build_shadow_ev_report
 from bhiksha.ops.weekly_scorecard import (
     _augment_trade,
+    _data_quality_warnings,
     _deployment_lookup,
     _load_partials,
     _load_window_trades,
@@ -128,6 +129,7 @@ def build_trading_decision_export(
         source_hash = hashlib.sha256(json.dumps(source_payload, sort_keys=True, default=str).encode()).hexdigest()
         deployment_id = str(row.get("deployment_id") or "")
         exit_attribution = str(trade.get("exit_attribution") or "")
+        quality_warnings = _data_quality_warnings([trade])
         facts.append(
             {
                 "trade_id": str(row.get("trade_id")),
@@ -149,7 +151,7 @@ def build_trading_decision_export(
                 "return_pct": (float(trade.get("return_pct") or 0.0) / 100.0),
                 "exit_attribution": exit_attribution,
                 "exit_class": "profile" if exit_attribution.startswith("profile:") else "legacy",
-                "data_quality_status": "OK",
+                "data_quality_status": quality_warnings[0]["message"] if quality_warnings else "OK",
                 "source_receipt": f"{path.name}#trade_sessions/{row.get('trade_id')}",
                 "source_hash": f"sha256:{source_hash}",
                 "exported_at": exported_at,
