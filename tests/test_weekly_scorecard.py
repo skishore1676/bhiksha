@@ -253,6 +253,34 @@ def test_weekly_scorecard_mode_split_uses_manifest_then_trade_rows(tmp_path) -> 
     assert shadow_lane_nd["evidence_gates_relaxed"] is None
 
 
+def test_weekly_scorecard_does_not_relabel_historical_shadow_after_promotion(tmp_path) -> None:
+    db_path, trades = _repo(tmp_path)
+
+    async def seed() -> None:
+        await trades.upsert_trade(TradeRecord(
+            trade_id="historical-shadow", deployment_id="promoted_strategy", symbol="META",
+            option_symbol="META260713P00580000", quantity=1, entry_price=2.0,
+            entry_timestamp=datetime(2026, 7, 8, 14, 0, tzinfo=UTC),
+            status="open_protected", entry_order_id="SHADOW_ENTRY",
+        ))
+        await trades.mark_closed(
+            "historical-shadow", exit_order_id="DRY_RUN", exit_price=3.0,
+            exit_filled_quantity=1,
+            exit_filled_at=datetime(2026, 7, 8, 15, 0, tzinfo=UTC),
+            exit_order_status="FILLED", exit_order_type="PAPER",
+        )
+
+    asyncio.run(seed())
+    # Today's manifest says live, but immutable trade-time markers say shadow.
+    report = build_weekly_scorecard(
+        db_path, week_start="2026-07-06", week_end="2026-07-10",
+        deployments=[_deployment("promoted_strategy", "META", shadow=False)],
+    )
+
+    assert report["headline"]["shadow"]["total_pnl_usd"] == 100.0
+    assert report["headline"]["live"]["trades"] == 0
+
+
 # --------------------------------------------------------------------------- #
 # Profile vs legacy bucketing (a profile:<rule> final exit vs everything else).
 # --------------------------------------------------------------------------- #
