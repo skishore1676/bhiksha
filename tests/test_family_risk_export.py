@@ -57,6 +57,13 @@ def test_ambiguous_open_instrument_refuses_entire_export(tmp_path: Path) -> None
         build_export(db_path=db, account_cache=tmp_path / "missing", account_alias="x")
 
 
+@pytest.mark.parametrize("status", ["protection_failed_exit_pending", "critical_unprotected"])
+def test_high_risk_packet_lifecycle_states_remain_visible(tmp_path: Path, status: str) -> None:
+    db = tmp_path / "b.db"; _db(db, status=status)
+    payload = build_export(db_path=db, account_cache=tmp_path / "missing", account_alias="x")
+    assert [row["status"] for row in payload["trade_sessions"]] == [status]
+
+
 def test_atomic_writer_leaves_no_partial_file_on_replace_failure(tmp_path: Path, monkeypatch) -> None:
     out = tmp_path / "snapshot.json"
     out.write_text('{"old": true}\n')
