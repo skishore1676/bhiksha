@@ -609,7 +609,11 @@ def _wilson(k:int,n:int,z:float=1.96)->tuple[float,float]:
 def _case_from_mapping(item: dict[str, Any]) -> ExitEdgeCase:
     profile=dict(item["profile"]); legacy=dict(item["legacy"])
     experiment = _normalized_experiment(item["experiment"])
-    digest=str(item.get("experiment_spec_hash") or experiment_spec_hash(profile,legacy,experiment))
+    if not item.get("experiment_spec_hash"):
+        raise ValueError(
+            "prospective evidence requires an explicit experiment_spec_hash frozen at cohort creation"
+        )
+    digest=str(item["experiment_spec_hash"])
     return ExitEdgeCase(str(item["cohort_id"]),str(item["trade_id"]),str(item["cluster_id"]),str(item["deployment_id"]),
         str(item["symbol"]),str(item["option_symbol"]),_parse_datetime(item["entry_timestamp"]),
         float(item["entry_premium"]),int(item["quantity"]),
