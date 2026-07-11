@@ -21,7 +21,10 @@ from typing import Any
 
 SCHEMA = "family-risk-shadow/v1"
 _OCC = re.compile(r"^[A-Z.]+\d{6}([CP])\d{8}$")
-_DEFINITE_EXPOSURE_STATES = {"open_protected", "open_unprotected", "target_active", "exit_pending"}
+_DEFINITE_EXPOSURE_STATES = {
+    "open_protected", "open_unprotected", "target_active", "exit_pending",
+    "protection_failed_exit_pending", "critical_unprotected",
+}
 
 
 def build_export(
