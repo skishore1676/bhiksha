@@ -32,7 +32,8 @@ _DEFINITE_EXPOSURE_STATES = {
 # standard OCC regex above (adjusted-deliverable roots carry a numeric suffix and
 # are already rejected as non-unambiguous), so 100 is a fact here, not a guess.
 _CONTRACT_MULTIPLIER = 100
-_MULTIPLIER_PROVENANCE = "occ_standard_equity_option:100_shares_per_contract_app_convention"
+_MULTIPLIER_PROVENANCE = "app_standard_option_contract"
+_MULTIPLIER_PROVENANCE_DETAIL = "occ_standard_equity_option:100_shares_per_contract_app_convention"
 
 # App-owned static underlying -> correlation cluster map.  Deterministic and
 # documented, not inferred: an underlying absent from this map exports a null
@@ -169,6 +170,7 @@ def _map_row(row: dict[str, Any], *, broker_observed_at: str | None) -> dict[str
         "quantity": quantity,
         "contract_multiplier": _CONTRACT_MULTIPLIER,
         "multiplier_provenance": _MULTIPLIER_PROVENANCE,
+        "multiplier_provenance_detail": _MULTIPLIER_PROVENANCE_DETAIL,
         "entry_price": entry_price,
         "stop_price": stop_price,
         "risk_basis": "long_option_defined_risk",
@@ -267,8 +269,8 @@ def _latest_account_summary(conn: sqlite3.Connection) -> dict[str, Any] | None:
     return {
         "trade_date": row["trade_date"],
         "account_type": row["account_type"],
-        "assigned_capital_basis": "broker_cash_only_buying_power",
-        "assigned_capital": float(row["broker_cash_only_buying_power"]),
+        "assigned_capital_basis": "cash_guard_usable_daily_budget",
+        "assigned_capital": float(row["usable_budget"]),
         "broker_cash_only_buying_power": float(row["broker_cash_only_buying_power"]),
         "usable_daily_budget": float(row["usable_budget"]),
         "budget_buffer_pct": float(row["buffer_pct"]),
