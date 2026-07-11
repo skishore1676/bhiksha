@@ -85,8 +85,9 @@ def test_account_summary_reports_assigned_capital_without_broker_call(tmp_path: 
     payload = build_export(db_path=db, account_cache=tmp_path / "missing", account_alias="x",
                            now=datetime(2026, 7, 10, 20, 0, tzinfo=UTC))
     summary = payload["account_summary"]
-    assert summary["assigned_capital"] == 12000.0
-    assert summary["assigned_capital_basis"] == "broker_cash_only_buying_power"
+    assert summary["assigned_capital"] == 11400.0
+    assert summary["assigned_capital_basis"] == "cash_guard_usable_daily_budget"
+    assert summary["broker_cash_only_buying_power"] == 12000.0
     assert summary["usable_daily_budget"] == 11400.0
     assert summary["budget_buffer_pct"] == 0.05
     assert summary["account_type"] == "CASH"
@@ -106,6 +107,8 @@ def test_long_option_defined_risk_is_calculated(tmp_path: Path) -> None:
     db = tmp_path / "b.db"; _db(db)  # entry 1.5, stop 0.9, qty 2, mult 100
     payload = build_export(db_path=db, account_cache=tmp_path / "missing", account_alias="x")
     row = payload["trade_sessions"][0]
+    assert row["multiplier_provenance"] == "app_standard_option_contract"
+    assert row["multiplier_provenance_detail"].startswith("occ_standard_equity_option")
     assert row["long_option_capital"] == 300.0  # 1.5 * 2 * 100
     assert row["worst_case_loss"] == 300.0  # long option max loss == full premium
     assert row["planned_stop_loss"] == 120.0  # (1.5 - 0.9) * 2 * 100
