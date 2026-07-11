@@ -29,12 +29,7 @@ from bhiksha.ops.daily_report import (
     write_daily_report,
 )
 from bhiksha.ops.launchd_status_store import write_latest_status
-from bhiksha.ops.shadow_ev_report import render_shadow_ev_report_telegram, write_shadow_ev_report
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
-from bhiksha.ops.weekly_scorecard import (
-    render_weekly_scorecard_telegram_summary,
-    write_weekly_scorecard,
-)
 from bhiksha.ops.weekly_trading_decisions import (
     finalize_weekly_trading_decisions,
     write_weekly_trading_decisions,
@@ -54,8 +49,6 @@ def main(argv: list[str] | None = None) -> int:
             "live-stop",
             "schwab-refresh",
             "session-report",
-            "weekly-scorecard",
-            "shadow-ev-report",
             "weekly-trading-decisions",
         ],
     )
@@ -120,10 +113,6 @@ def main(argv: list[str] | None = None) -> int:
             return _schwab_refresh_job(args)
         if args.job == "session-report":
             return _session_report_job(args)
-        if args.job == "weekly-scorecard":
-            return _weekly_scorecard_job(args)
-        if args.job == "shadow-ev-report":
-            return _shadow_ev_report_job(args)
         if args.job == "weekly-trading-decisions":
             return _weekly_trading_decisions_job(args, repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
@@ -223,76 +212,6 @@ def _session_report_job(args: argparse.Namespace) -> int:
     if review is not None:
         payload["obsidian_review"] = review.to_dict()
     _print_result(payload)
-    return 0 if ok else 2
-
-
-def _weekly_scorecard_job(args: argparse.Namespace) -> int:
-    """Generate the weekly profile-vs-legacy scorecard (workplan #5) and publish
-    the compact operator card through Lathi Bus -- the exact transport path the
-    daily session report uses. The full markdown remains the detailed artifact.
-    The default window is Monday->today, so a Friday run covers the trade week.
-    """
-    runtime = build_runtime(active_plan_path=args.active_plan)
-    db_path = Path(runtime.app_config.sqlite_path)
-    output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
-    result = write_weekly_scorecard(db_path, output_dir=output_dir, deployments=runtime.deployments)
-    body = render_weekly_scorecard_telegram_summary(result.report, markdown_path=result.markdown_path)
-    alert = send_lathi_alert(
-        title="Bhiksha weekly scorecard",
-        body=body,
-        level="info",
-        mode=args.alert_mode,
-        profile=args.alert_profile,
-        template="status",
-        link_preview="disabled",
-    )
-    ok = alert.ok or args.alert_mode == "off"
-    _print_result(
-        {
-            "job": args.job,
-            "status": "ok" if ok else "failed",
-            "week": f"{result.report['week_start']}..{result.report['week_end']}",
-            "report_json": str(result.json_path),
-            "report_markdown": str(result.markdown_path),
-            "alert": alert.to_dict(),
-        }
-    )
-    return 0 if ok else 2
-
-
-def _shadow_ev_report_job(args: argparse.Namespace) -> int:
-    runtime = build_runtime(active_plan_path=args.active_plan)
-    db_path = Path(runtime.app_config.sqlite_path)
-    output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
-    result = write_shadow_ev_report(db_path, output_dir=output_dir)
-    body = render_shadow_ev_report_telegram(result.report)
-    # Shadow lanes are paper marks. A negative paper book is signal, not a
-    # trading failure, so this report always publishes at info level and never
-    # masquerades as a Bhiksha failure alert.
-    alert = send_lathi_alert(
-        title=f"Bhiksha shadow-EV report {result.report['generated_date']}",
-        body=body,
-        level="info",
-        mode=args.alert_mode,
-        profile=args.alert_profile,
-        template="status",
-        link_preview="disabled",
-    )
-    ok = alert.ok or args.alert_mode == "off"
-    book_since = result.report["book"]["since"]
-    _print_result(
-        {
-            "job": args.job,
-            "status": "ok" if ok else "failed",
-            "report_json": str(result.json_path),
-            "report_markdown": str(result.markdown_path),
-            "since": result.report["since"],
-            "since_trades": book_since["trades"],
-            "since_pnl_usd": book_since["total_pnl_usd"],
-            "lanes_active_since": result.report["lane_count_active_since"],
-            "alert": alert.to_dict(),
-        }
-    )
     return 0 if ok else 2
 
 
@@ -451,7 +370,7 @@ def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
     # live-stop must always run so a stale process cannot survive; the weekly
     # scorecard is the week's verdict and must publish even when the Friday it
     # fires is itself a market holiday (the Mon-Fri window still had trading).
-    if job in {"live-stop", "weekly-scorecard", "weekly-trading-decisions"}:
+    if job in {"live-stop", "weekly-trading-decisions"}:
         return False
     today = datetime.now(CENTRAL).date()
     return not is_trading_day(today)
