@@ -39,6 +39,19 @@ def test_bhiksha_launchd_installer_has_three_session_report_times() -> None:
     assert (14, 45) in times
 
 
+def test_bhiksha_launchd_has_one_friday_decision_review_and_no_duplicate_publishers() -> None:
+    jobs = {job.runner_job: job for job in active_launchd_jobs()}
+    weekly = jobs["weekly-trading-decisions"]
+
+    assert weekly.schedule == ({"Weekday": 5, "Hour": 16, "Minute": 0},)
+    assert weekly.skips_non_trading_days is False
+    assert "weekly-scorecard" not in jobs
+    assert "shadow-ev-report" not in jobs
+
+    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
+    assert "RETIRED $retired_label" in script
+
+
 def test_bhiksha_launchd_runner_points_at_bhiksha_policy_module() -> None:
     script = Path("scripts/launchd/run_bhiksha_job.sh").read_text(encoding="utf-8")
 

@@ -42,6 +42,7 @@ Bhiksha already owns the active launchd jobs:
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop stale live runtime. |
 | `com.bhiksha.schwab-guard` | Weekdays 07:10 CT | Validate or renew Schwab auth and alert when unusable. |
 | `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send intraday status, PnL, open positions, and runtime concerns. |
+| `com.bhiksha.weekly-trading-decisions` | Fridays 16:00 CT | Refresh the canonical workbook and publish one Obsidian decision review; no Telegram send. |
 
 The one command runner is:
 

@@ -60,14 +60,22 @@ PY
         ;;
     esac
     uid="$(id -u)"
+    # These calculators remain available as internal/manual tools, but their
+    # duplicate operator-facing schedules were replaced by the single Friday
+    # workbook-backed decision review.
+    for retired_label in com.bhiksha.weekly-scorecard com.bhiksha.shadow-ev-report
+    do
+      launchctl bootout "gui/$uid/$retired_label" >/dev/null 2>&1 || true
+      rm -f "$LAUNCHD_DIR/$retired_label.plist"
+      echo "RETIRED $retired_label"
+    done
     for label in \
       com.bhiksha.live-start \
       com.bhiksha.live-watchdog \
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
       com.bhiksha.session-report \
-      com.bhiksha.weekly-scorecard \
-      com.bhiksha.shadow-ev-report
+      com.bhiksha.weekly-trading-decisions
     do
       plist="$LAUNCHD_DIR/$label.plist"
       launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
@@ -84,6 +92,7 @@ PY
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
       com.bhiksha.session-report \
+      com.bhiksha.weekly-trading-decisions \
       com.bhiksha.weekly-scorecard \
       com.bhiksha.shadow-ev-report
     do

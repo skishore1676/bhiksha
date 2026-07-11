@@ -343,8 +343,11 @@ def _augment_trade(
 ) -> dict[str, Any]:
     realized, cost_basis, original_qty = _trade_pnl_and_basis(row, partials)
     deployment_id = _maybe_str(row.get("deployment_id"))
-    manifest_shadow = shadow_by_deployment.get(deployment_id) if deployment_id is not None else None
-    lane = "shadow" if (manifest_shadow if manifest_shadow is not None else _is_shadow_trade(row)) else "live"
+    # Lane is historical evidence, not current catalog state. A strategy may be
+    # promoted after this trade closes; using today's manifest would then
+    # rewrite a former shadow observation as a live fill. Trade-time order and
+    # deployment markers are immutable and therefore authoritative.
+    lane = "shadow" if _is_shadow_trade(row) else "live"
     is_open = _is_open_trade(row)
     exit_attribution = _exit_attribution(row)
     return_pct = None
