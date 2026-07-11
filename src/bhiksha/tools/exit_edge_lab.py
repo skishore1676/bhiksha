@@ -6,7 +6,9 @@ import argparse
 from pathlib import Path
 
 from bhiksha.ops.exit_edge_lab import (
+    ProspectiveQuoteTapeRepository,
     analyze_cases,
+    analyze_prospective_repository,
     build_historical_coverage_report,
     load_fixture_cases,
     write_exit_edge_report,
@@ -18,6 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--fixture-json", help="Pinned same-entry fixture with complete premium paths")
     source.add_argument("--db-path", help="Read-only Bhiksha SQLite snapshot")
+    source.add_argument("--live-db-path", help="Prospective live recorder SQLite database")
     parser.add_argument("--start", help="SQLite window start YYYY-MM-DD")
     parser.add_argument("--end", help="SQLite window end YYYY-MM-DD")
     parser.add_argument("--output-dir", default="exit_edge_lab_out")
@@ -26,6 +29,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.fixture_json:
         cases = load_fixture_cases(args.fixture_json)
         report = analyze_cases(cases)
+    elif args.live_db_path:
+        report = analyze_prospective_repository(
+            ProspectiveQuoteTapeRepository(args.live_db_path, read_only=True)
+        )
     else:
         missing = [name for name in ("start", "end") if getattr(args, name) is None]
         if missing:

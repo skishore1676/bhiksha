@@ -12,6 +12,7 @@ from bhiksha.ops.exit_edge_lab import (
     ProspectiveQuoteTapeRepository,
     QuoteTapeMark,
     analyze_cases,
+    analyze_prospective_repository,
     build_historical_coverage_report,
     experiment_spec_hash,
     load_fixture_cases,
@@ -217,6 +218,42 @@ def test_storage_failure_is_failure_isolated_for_live_caller(tmp_path: Path) -> 
     assert repo.try_initialize() is False
     assert repo.try_register_cohort(_raw_case()) is False
     assert live_decision == {"action":"square_off","timestamp":ENTRY.isoformat()}
+
+
+def test_live_repository_missing_registration_blocks_subset_inference(tmp_path: Path) -> None:
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "lab.db")
+    repo.initialize()
+    raw = _raw_case()
+    repo.register_cohort(raw)
+    case = _load(tmp_path, raw)[0]
+    for quote in case.quotes:
+        repo.append_quote(case.cohort_id, quote)
+    assert repo.try_record_registration_attempt({
+        "trade_id": "T1", "deployment_id": "qqq-live", "symbol": "QQQ",
+        "option_symbol": "OPT", "observed_at": ENTRY.isoformat(), "eligible": True,
+        "cohort_id": "C1", "outcome": "registered", "reason": None,
+    })
+    assert repo.try_record_registration_attempt({
+        "trade_id": "T2", "deployment_id": "qqq-live", "symbol": "QQQ",
+        "option_symbol": "OPT2", "observed_at": ENTRY.isoformat(), "eligible": True,
+        "cohort_id": "C2", "outcome": "registration_queue_full",
+        "reason": "cohort_registration_queue_full",
+    })
+    report = analyze_prospective_repository(repo)
+    summary = report["summary"]
+    assert summary["registration_denominator"]["eligible_attempts"] == 2
+    assert summary["registration_denominator"]["registered_cohorts"] == 1
+    assert summary["inference_eligible"] is False
+    assert summary["confidence"]["indicator"] == "live_collection_inference_blocked"
+    assert "eligible_registration_denominator_incomplete" in summary["inference_blockers"]
+
+
+def test_live_readback_repository_is_strictly_read_only_and_never_creates_typo(tmp_path: Path) -> None:
+    missing = tmp_path / "typo.db"
+    repo = ProspectiveQuoteTapeRepository(missing, read_only=True)
+    with pytest.raises((sqlite3.OperationalError, ValueError)):
+        repo.list_cohort_ids()
+    assert not missing.exists()
 
 
 def test_historical_mode_reports_coverage_only(tmp_path: Path) -> None:

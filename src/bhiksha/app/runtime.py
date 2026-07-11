@@ -49,6 +49,7 @@ from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_se
 from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.ops.daily_report import write_daily_report
+from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.sqlite import (
     SQLiteBackend,
@@ -262,7 +263,20 @@ class BhikshaRuntime:
         # integration: get_option_quote is the identical call
         # ExecutionSupervisor._manage_open_position_locked's ensure_quote()
         # already makes.
-        order_manager = OrderManager()
+        exit_edge_recorder = None
+        if self.app_config.exit_edge_live_shadow_enabled:
+            exit_edge_recorder = ExitEdgeLiveRecorder(
+                db_path=self.app_config.exit_edge_live_shadow_db_path,
+                status_path=self.app_config.exit_edge_live_shadow_status_path,
+                queue_capacity=self.app_config.exit_edge_live_shadow_queue_capacity,
+                fill_latency_ms=self.app_config.exit_edge_live_shadow_fill_latency_ms,
+                max_freshness_ms=self.app_config.exit_edge_live_shadow_max_freshness_ms,
+                max_sequence_gap=self.app_config.exit_edge_live_shadow_max_sequence_gap,
+            )
+            exit_edge_recorder.start()
+        order_manager = OrderManager(
+            quote_observer=exit_edge_recorder.observe_quote if exit_edge_recorder else None
+        )
 
         async def _mark_price_provider(option_symbol: str) -> float | None:
             quote = await order_manager.get_option_quote(option_symbol)
@@ -297,6 +311,7 @@ class BhikshaRuntime:
             trade_state_repository=trade_state_repository,
             manual_status_writer=manual_status_writer,
             reconcile_trigger=reconcile_trigger,
+            exit_edge_recorder=exit_edge_recorder,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker

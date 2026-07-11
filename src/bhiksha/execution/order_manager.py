@@ -8,6 +8,7 @@ import math
 import re
 import uuid
 from typing import Any
+from collections.abc import Callable
 
 import httpx
 from loguru import logger
@@ -45,6 +46,7 @@ class PublicQuote:
     last: float | None = None
     open_interest: int | None = None
     quote_timestamp: str | None = None
+    quote_timestamp_field: str | None = None
     outcome: str | None = None
 
     @property
@@ -98,10 +100,19 @@ class OrderManager:
     supports_concurrent_exit_orders = False
     allows_exit_submission_before_cancel_confirmation = True
 
-    def __init__(self, broker: PublicBrokerAdapter | None = None) -> None:
+    def __init__(
+        self,
+        broker: PublicBrokerAdapter | None = None,
+        *,
+        quote_observer: Callable[[str, PublicQuote, datetime], None] | None = None,
+    ) -> None:
         self.broker = broker or PublicBrokerAdapter()
         self._price_increments: dict[str, float] = {}
         self._underlying_price_increments: dict[str, float] = {}
+        # Observational tee only. The observer is called after an existing quote
+        # request completes and must be nonblocking; failures are isolated from
+        # the order/exit path.
+        self._quote_observer = quote_observer
 
     async def close(self) -> None:
         await self.broker.close()
@@ -114,15 +125,25 @@ class OrderManager:
         if not quotes:
             raise ValueError(f"No Public quote returned for {option_symbol}")
         quote = quotes[0]
-        return PublicQuote(
+        quote_timestamp, quote_timestamp_field = _quote_timestamp(quote)
+        result = PublicQuote(
             symbol=normalize_option_symbol(quote.get("instrument", {}).get("symbol", option_symbol)),
             bid=_maybe_float(quote.get("bid")),
             ask=_maybe_float(quote.get("ask")),
             last=_maybe_float(quote.get("last")),
             open_interest=_maybe_int(quote.get("openInterest")),
-            quote_timestamp=_quote_timestamp(quote),
+            quote_timestamp=quote_timestamp,
+            quote_timestamp_field=quote_timestamp_field,
             outcome=quote.get("outcome"),
         )
+        if self._quote_observer is not None:
+            try:
+                self._quote_observer(option_symbol, result, datetime.now(timezone.utc))
+            except Exception:
+                # Recorder health is owned by the observer. Quote consumers must
+                # receive the same result regardless of observational failures.
+                pass
+        return result
 
     async def preflight_entry(
         self,
@@ -417,12 +438,12 @@ def _maybe_int(value) -> int | None:
         return None
 
 
-def _quote_timestamp(quote: dict[str, Any]) -> str | None:
-    for key in ("timestamp", "quoteTimestamp", "lastTradeTime", "updatedAt", "asOf"):
+def _quote_timestamp(quote: dict[str, Any]) -> tuple[str | None, str | None]:
+    for key in ("quoteTimestamp", "timestamp", "lastTradeTime", "updatedAt", "asOf"):
         value = quote.get(key)
         if value is not None:
-            return str(value)
-    return None
+            return str(value), key
+    return None, None
 
 
 _PRICE_INCREMENT_RE = re.compile(r"(?:increment|increments)[^\$]*\$(?P<increment>\d+(?:\.\d+)?)", re.IGNORECASE)

@@ -97,15 +97,25 @@ class ProspectiveQuoteTapeRepository:
     censoring and are never raised into the caller's live decision path.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        self.read_only = bool(read_only)
 
     def _connect(self) -> sqlite3.Connection:
+        if self.read_only:
+            uri = f"file:{self.path.resolve()}?mode=ro"
+            conn = sqlite3.connect(
+                uri, uri=True, timeout=SQLITE_NONBLOCKING_TIMEOUT_SECONDS
+            )
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
         conn = sqlite3.connect(self.path, timeout=SQLITE_NONBLOCKING_TIMEOUT_SECONDS)
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def initialize(self) -> None:
+        if self.read_only:
+            raise ValueError("read-only prospective repository cannot initialize schema")
         with self._connect() as conn:
             conn.executescript(
                 """
@@ -132,6 +142,13 @@ class ProspectiveQuoteTapeRepository:
                   cohort_id TEXT PRIMARY KEY, reason TEXT NOT NULL,
                   censored_at TEXT NOT NULL,
                   FOREIGN KEY (cohort_id) REFERENCES exit_edge_cohorts(cohort_id)
+                );
+                CREATE TABLE IF NOT EXISTS exit_edge_registration_attempts (
+                  trade_id TEXT PRIMARY KEY, deployment_id TEXT NOT NULL,
+                  symbol TEXT NOT NULL, option_symbol TEXT NOT NULL,
+                  observed_at TEXT NOT NULL, eligible INTEGER NOT NULL,
+                  cohort_id TEXT, outcome TEXT NOT NULL, reason TEXT,
+                  persisted_at TEXT NOT NULL
                 );
                 """
             )
@@ -269,6 +286,68 @@ class ProspectiveQuoteTapeRepository:
         }
         return _case_from_mapping(mapping)
 
+    def list_cohort_ids(self) -> list[str]:
+        """Return persisted cohort identities for restart/readback recovery."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cohort_id FROM exit_edge_cohorts ORDER BY created_at, cohort_id"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def latest_sequence(self, cohort_id: str) -> int:
+        """Return the last durable quote sequence, or zero for a new tape."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(sequence) FROM exit_edge_quote_tape WHERE cohort_id=?",
+                (cohort_id,),
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def try_record_registration_attempt(self, payload: dict[str, Any]) -> bool:
+        try:
+            values = (
+                str(payload["trade_id"]), str(payload["deployment_id"]),
+                str(payload["symbol"]), str(payload["option_symbol"]),
+                _parse_datetime(payload["observed_at"]).isoformat(),
+                1 if bool(payload["eligible"]) else 0,
+                str(payload["cohort_id"]) if payload.get("cohort_id") else None,
+                str(payload["outcome"]),
+                str(payload["reason"]) if payload.get("reason") else None,
+                datetime.now(UTC).isoformat(),
+            )
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT deployment_id,symbol,option_symbol,observed_at,eligible,cohort_id "
+                    "FROM exit_edge_registration_attempts WHERE trade_id=?", (values[0],)
+                ).fetchone()
+                identity = values[1:7]
+                if existing is not None and tuple(existing) != identity:
+                    return False
+                conn.execute(
+                    "INSERT INTO exit_edge_registration_attempts VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(trade_id) DO UPDATE SET outcome=excluded.outcome, "
+                    "reason=excluded.reason, persisted_at=excluded.persisted_at",
+                    values,
+                )
+            return True
+        except (KeyError, OSError, sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def registration_summary(self) -> dict[str, int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), SUM(eligible), "
+                "SUM(CASE WHEN outcome='registered' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN outcome!='registered' THEN 1 ELSE 0 END) "
+                "FROM exit_edge_registration_attempts"
+            ).fetchone()
+        return {
+            "confirmed_fill_attempts": int(row[0] or 0),
+            "eligible_attempts": int(row[1] or 0),
+            "registered_cohorts": int(row[2] or 0),
+            "missing_or_ineligible_registrations": int(row[3] or 0),
+        }
+
 
 def experiment_spec_hash(
     profile: dict[str, Any], legacy: dict[str, Any], experiment: dict[str, Any],
@@ -303,6 +382,53 @@ def analyze_cases(cases: list[ExitEdgeCase]) -> dict[str, Any]:
         "fill_model": FILL_MODEL, "experiment_spec_hashes": specs,
         "summary": _summary(paired, len(rows), heterogeneous_specs=len(specs) > 1), "cases": rows,
     }
+
+
+def analyze_prospective_repository(
+    repository: ProspectiveQuoteTapeRepository,
+) -> dict[str, Any]:
+    """Build a live-store report with mandatory missingness/inference guards."""
+    cases = [repository.load_case(cohort_id) for cohort_id in repository.list_cohort_ids()]
+    report = analyze_cases(cases)
+    denominator = repository.registration_summary()
+    summary = report["summary"]
+    blockers: list[str] = []
+    if denominator["eligible_attempts"] != denominator["registered_cohorts"]:
+        blockers.append("eligible_registration_denominator_incomplete")
+    if summary["paired_count"] != denominator["registered_cohorts"]:
+        blockers.append("registered_cohorts_not_all_terminal_paired")
+    if denominator["registered_cohorts"] == 0:
+        blockers.append("no_registered_cohorts")
+    persisted_censors = sum(1 for case in cases if case.persisted_censor_reason)
+    if persisted_censors:
+        blockers.append("persisted_censor_present")
+    health_path = repository.path.with_name("exit_edge_live_status.json")
+    health: dict[str, Any] | None = None
+    try:
+        health = json.loads(health_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        blockers.append("live_health_readback_missing")
+    if health is not None:
+        if int(health.get("storage_failures") or 0) > 0:
+            blockers.append("live_health_storage_failure")
+        if int(health.get("dropped_observations") or 0) > 0:
+            blockers.append("live_health_observation_drop")
+        if int(health.get("missing_registration_attempts") or 0) > 0:
+            blockers.append("live_health_missing_registration")
+    inference_eligible = not blockers
+    summary["registration_denominator"] = denominator
+    summary["persisted_censor_count"] = persisted_censors
+    summary["inference_eligible"] = inference_eligible
+    summary["inference_blockers"] = blockers
+    summary["live_health_readback"] = health
+    if not inference_eligible:
+        summary["confidence"] = {
+            **summary["confidence"],
+            "indicator": "live_collection_inference_blocked",
+            "reason": "Live registration missingness or unfinished/censored cohorts block uplift inference.",
+        }
+    report["report_type"] = "prospective_live_repository_readback"
+    return report
 
 
 def build_historical_coverage_report(
@@ -412,6 +538,16 @@ def render_markdown(report: dict[str, Any]) -> str:
              f"{s['confidence']['median_cluster_uplift_one_sided_95_lower_usd']}",
              f"- Confidence: {s['confidence']['indicator']} — {s['confidence']['reason']}",
              f"- Frozen experiment hashes: {', '.join(report['experiment_spec_hashes'])}", ""]
+    if "registration_denominator" in s:
+        denominator = s["registration_denominator"]
+        lines.extend([
+            f"- Confirmed-fill attempts: {denominator['confirmed_fill_attempts']}",
+            f"- Eligible attempts: {denominator['eligible_attempts']}",
+            f"- Registered cohorts: {denominator['registered_cohorts']}",
+            f"- Inference eligible: {s['inference_eligible']}",
+            f"- Inference blockers: {', '.join(s['inference_blockers']) or 'none'}",
+            "",
+        ])
     return "\n".join(lines)
 
 
@@ -653,6 +789,6 @@ def _parse_datetime(value:Any)->datetime:
 def _optional_datetime(value:Any)->datetime|None:return None if value in (None,"") else _parse_datetime(value)
 
 
-__all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","analyze_cases",
+__all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","analyze_cases","analyze_prospective_repository",
          "build_historical_coverage_report","experiment_spec_hash","load_fixture_cases","policy_config_hash",
          "render_markdown","write_exit_edge_report"]
