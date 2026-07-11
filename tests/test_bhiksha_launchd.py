@@ -57,3 +57,12 @@ def test_bhiksha_launchd_runner_points_at_bhiksha_policy_module() -> None:
 
     assert "bhiksha.tools.launchd_job" in script
     assert "PYTHONPATH=src" in script
+
+
+def test_retired_weekly_calculators_are_not_live_publish_jobs() -> None:
+    source = Path("src/bhiksha/tools/launchd_job.py").read_text(encoding="utf-8")
+
+    assert '"weekly-scorecard"' not in source
+    assert '"shadow-ev-report"' not in source
+    assert "def _weekly_scorecard_job" not in source
+    assert "def _shadow_ev_report_job" not in source
