@@ -338,6 +338,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             workspace_root=Path.cwd(),
             artifact_id=result.report["artifact_id"],
             owner_consumer="bhiksha",
+            review_id=result.report["artifact_id"],
         )
     ok = args.weekly_review_mode == "off" or bool(review and review.ok)
     _print_result({
