@@ -157,7 +157,15 @@ def build_trading_decision_export(
         )
     daily_status = _daily_status_rows(report_dir, through)
     body = {"schema": "bhiksha.trading_decision_facts.v1", "generated_at": exported_at, "facts": facts, "daily_status": daily_status}
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    # The receipt identifies evidence, not run time. A retry with unchanged
+    # facts must reuse the same digest so the workbook and Obsidian card can be
+    # updated idempotently rather than creating weekly churn.
+    digest_payload = {
+        "schema": body["schema"],
+        "facts": [{key: value for key, value in fact.items() if key != "exported_at"} for fact in facts],
+        "daily_status": daily_status,
+    }
+    digest = hashlib.sha256(json.dumps(digest_payload, sort_keys=True, default=str).encode()).hexdigest()
     body["receipt"] = {"status": "ok", "sha256": digest, "fact_count": len(facts), "through": through.isoformat()}
     return body
 
