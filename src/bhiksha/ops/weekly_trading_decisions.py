@@ -175,8 +175,16 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
     headline = score.get("headline") or {}
     live = headline.get("live") or {}
     shadow = headline.get("shadow") or {}
-    candidates = ((score.get("promotion") or {}).get("candidates") or [])
-    near_misses = ((score.get("promotion") or {}).get("near_misses") or [])
+    promotion = score.get("promotion_candidates") or {}
+    candidates = promotion.get("candidates") or []
+    near_misses = promotion.get("near_misses") or []
+    negative_lanes = sorted(
+        (
+            lane for lane in (score.get("lanes") or [])
+            if (lane.get("closed") or 0) >= 2 and (lane.get("total_pnl_usd") or 0.0) < 0
+        ),
+        key=lambda lane: lane.get("total_pnl_usd") or 0.0,
+    )[:3]
     workbook = report.get("workbook_update") or {}
     lines = [
         f"# Weekly Trading Decisions — Performance, Promotions & Fixes — {report.get('week_end')}",
@@ -201,7 +209,16 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
     if near_misses:
         for lane in near_misses[:5]:
             lines.append(f"- **FIX OR OBSERVE:** `{lane.get('display_id')}` — `{lane.get('disqualified_by')}`.")
-    issues = sum((score.get("data_quality") or {}).values()) if isinstance(score.get("data_quality"), dict) else 0
+    near_miss_ids = {lane.get("deployment_id") for lane in near_misses}
+    for lane in negative_lanes:
+        if lane.get("deployment_id") in near_miss_ids:
+            continue
+        lines.append(
+            f"- **PERFORMANCE FIX REVIEW:** `{lane.get('display_id')}` ({lane.get('mode')}) — "
+            f"{lane.get('closed', 0)} closed, `${lane.get('total_pnl_usd', 0.0):.2f}`, "
+            f"avg return `{lane.get('avg_return_pct', 0.0):.1f}%`. Decide diagnose / keep observing / retire."
+        )
+    issues = len(score.get("data_quality_warnings") or [])
     lines.extend([
         f"- **SYSTEM HEALTH:** `{issues}` scorecard data-quality warnings. Decide whether any issue needs repair before next session.",
         "",

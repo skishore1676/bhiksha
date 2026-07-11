@@ -22,8 +22,13 @@ def test_weekly_decision_renderer_names_outcome_and_human_gate() -> None:
                 "live": {"trades": 3, "total_pnl_usd": 125.0},
                 "shadow": {"trades": 6, "total_pnl_usd": -20.0},
             },
-            "promotion": {"candidates": [], "near_misses": []},
-            "data_quality": {},
+            "promotion_candidates": {"candidates": [], "near_misses": []},
+            "data_quality_warnings": [],
+            "lanes": [{
+                "deployment_id": "weak-shadow", "display_id": "weak-shadow",
+                "mode": "shadow", "closed": 4, "total_pnl_usd": -300.0,
+                "avg_return_pct": -12.5,
+            }],
         },
     }
 
@@ -31,6 +36,8 @@ def test_weekly_decision_renderer_names_outcome_and_human_gate() -> None:
 
     assert markdown.startswith("# Weekly Trading Decisions — Performance, Promotions & Fixes")
     assert "no promotion decision is required" in markdown
+    assert "PERFORMANCE FIX REVIEW" in markdown
+    assert "diagnose / keep observing / retire" in markdown
     assert "workbook update: `ok`" in markdown
     assert "require Suman's explicit decision" in markdown
     json.dumps(report)
