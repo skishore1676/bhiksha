@@ -4,14 +4,16 @@ set -euo pipefail
 REPO_ROOT="${BHIKSHA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 LAUNCHD_DIR="${BHIKSHA_LAUNCHD_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${BHIKSHA_LAUNCHD_LOG_DIR:-$REPO_ROOT/artifacts/playbook/launchd}"
+RUNTIME_FLAG_DIR="${BHIKSHA_RUNTIME_FLAG_DIR:-$REPO_ROOT/artifacts/playbook/runtime_flags}"
 ACTION="${1:-install}"
 
-mkdir -p "$LAUNCHD_DIR" "$LOG_DIR"
+mkdir -p "$LAUNCHD_DIR" "$LOG_DIR" "$RUNTIME_FLAG_DIR"
 
 case "$ACTION" in
   install|"")
     python3 - "$REPO_ROOT" "$LAUNCHD_DIR" "$LOG_DIR" <<'PY'
 import plistlib
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +25,10 @@ sys.path.insert(0, str(repo / "src"))
 
 from bhiksha.ops.launchd_registry import active_launchd_jobs
 
+exit_edge_enabled = str(
+    os.environ.get("BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED", "")
+).strip().lower() in {"1", "true", "yes", "on"}
+
 for job in active_launchd_jobs():
     label = job.label
     plist = {
@@ -33,20 +39,43 @@ for job in active_launchd_jobs():
         "StandardOutPath": str(log_dir / f"{label}.out.log"),
         "StandardErrorPath": str(log_dir / f"{label}.err.log"),
     }
+    if label in {"com.bhiksha.live-start", "com.bhiksha.live-watchdog"} and exit_edge_enabled:
+        # Install-time opt-in becomes a persistent scheduled-context flag in
+        # the plist. Generic installs remain OFF; an interactive shell export
+        # alone never claims the Monday launchd job is enabled.
+        plist["EnvironmentVariables"] = {
+            "BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED": "true",
+        }
     path = launchd_dir / f"{label}.plist"
     path.write_bytes(plistlib.dumps(plist, sort_keys=True))
     path.chmod(0o600)
     print(f"WROTE {path}")
 PY
+    case "${BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED:-}" in
+      1|true|TRUE|yes|YES|on|ON)
+        touch "$RUNTIME_FLAG_DIR/exit_edge_live_shadow.enabled"
+        ;;
+      *)
+        rm -f "$RUNTIME_FLAG_DIR/exit_edge_live_shadow.enabled"
+        ;;
+    esac
     uid="$(id -u)"
+    # These calculators remain available as internal/manual tools, but their
+    # duplicate operator-facing schedules were replaced by the single Friday
+    # workbook-backed decision review.
+    for retired_label in com.bhiksha.weekly-scorecard com.bhiksha.shadow-ev-report
+    do
+      launchctl bootout "gui/$uid/$retired_label" >/dev/null 2>&1 || true
+      rm -f "$LAUNCHD_DIR/$retired_label.plist"
+      echo "RETIRED $retired_label"
+    done
     for label in \
       com.bhiksha.live-start \
       com.bhiksha.live-watchdog \
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
       com.bhiksha.session-report \
-      com.bhiksha.weekly-scorecard \
-      com.bhiksha.shadow-ev-report
+      com.bhiksha.weekly-trading-decisions
     do
       plist="$LAUNCHD_DIR/$label.plist"
       launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
@@ -63,6 +92,7 @@ PY
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
       com.bhiksha.session-report \
+      com.bhiksha.weekly-trading-decisions \
       com.bhiksha.weekly-scorecard \
       com.bhiksha.shadow-ev-report
     do

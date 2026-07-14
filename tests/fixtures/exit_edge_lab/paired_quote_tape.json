@@ -1,0 +1,48 @@
+{
+  "cases": [
+    {
+      "cohort_id": "fixture-qqq-1",
+      "trade_id": "fixture-trade-1",
+      "cluster_id": "2026-07-09:QQQ",
+      "deployment_id": "qqq-live",
+      "symbol": "QQQ",
+      "option_symbol": "QQQ260710P00713000",
+      "entry_timestamp": "2026-07-09T14:00:00+00:00",
+      "entry_premium": 2.0,
+      "quantity": 10,
+      "profile": {
+        "profile_exit_id": "profile__trend_continuation",
+        "initial_stop_pct": 0.35,
+        "premium_disaster_stop_pct": 0.35,
+        "target_1_r": 1.0,
+        "target_2_r": 2.0,
+        "target_1_quantity": 0.6,
+        "high_water_giveback_policy": "OFF",
+        "eod_flat": true,
+        "hard_flat_time_et": "15:55"
+      },
+      "legacy": {
+        "stop_loss_pct": 0.35,
+        "profit_target_pct": 0.35,
+        "hard_flat_time_et": "15:55"
+      },
+      "experiment": {
+        "fill_latency_ms": 0,
+        "max_freshness_ms": 2000,
+        "max_sequence_gap": 1,
+        "evaluator_version": "profile-evaluator-v1",
+        "fill_model_version": "next-fresh-natural-bid-v2",
+        "quote_source": "public_cache",
+        "quote_feed": "existing_position_quote_cache_v1"
+      },
+      "experiment_spec_hash": "bc28b15f6a0eee11ad5503d09ce2b1ec48005701012941eed9d6d81fa76ae2e6",
+      "quotes": [
+        {"sequence": 1, "source": "public_cache", "feed": "existing_position_quote_cache_v1", "quote_at": "2026-07-09T14:00:15+00:00", "received_at": "2026-07-09T14:00:15.100000+00:00", "bid": 2.1, "ask": 2.15, "last": 2.12},
+        {"sequence": 2, "source": "public_cache", "feed": "existing_position_quote_cache_v1", "quote_at": "2026-07-09T14:00:30+00:00", "received_at": "2026-07-09T14:00:30.100000+00:00", "bid": 2.7, "ask": 2.75, "last": 2.72},
+        {"sequence": 3, "source": "public_cache", "feed": "existing_position_quote_cache_v1", "quote_at": "2026-07-09T14:00:45+00:00", "received_at": "2026-07-09T14:00:45.100000+00:00", "bid": 2.75, "ask": 2.8, "last": 2.77},
+        {"sequence": 4, "source": "public_cache", "feed": "existing_position_quote_cache_v1", "quote_at": "2026-07-09T14:01:00+00:00", "received_at": "2026-07-09T14:01:00.100000+00:00", "bid": 3.4, "ask": 3.45, "last": 3.42},
+        {"sequence": 5, "source": "public_cache", "feed": "existing_position_quote_cache_v1", "quote_at": "2026-07-09T14:01:15+00:00", "received_at": "2026-07-09T14:01:15.100000+00:00", "bid": 3.35, "ask": 3.4, "last": 3.37}
+      ]
+    }
+  ]
+}

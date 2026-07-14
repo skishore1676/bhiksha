@@ -72,12 +72,13 @@ def build_daily_report(
         conn.row_factory = sqlite3.Row
         events = _load_day_events(conn, day)
         trades = _load_day_trades(conn, day)
+        partials_by_trade = _load_confirmed_partial_fills(conn, [trade.get("trade_id") for trade in trades])
         risk_rails = _risk_rails_summary(conn, day, events)
 
     event_counts = Counter(event["event_type"] for event in events)
     provider_events = _provider_events(events)
     lifecycle_events = _lifecycle_events(events)
-    trades = [_augment_trade(trade) for trade in trades]
+    trades = [_augment_trade(trade, partials_by_trade.get(str(trade.get("trade_id")), [])) for trade in trades]
     live_trades = [trade for trade in trades if trade["lane"] == "live"]
     shadow_trades = [trade for trade in trades if trade["lane"] == "shadow"]
     live_missing_exit_truth = _missing_exit_truth_count(live_trades)
@@ -660,18 +661,56 @@ def _load_day_trades(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
     return [dict(row) for row in rows]
 
 
-def _augment_trade(trade: dict[str, Any]) -> dict[str, Any]:
+def _load_confirmed_partial_fills(
+    conn: sqlite3.Connection,
+    trade_ids: list[str | None],
+) -> dict[str, list[dict[str, Any]]]:
+    ids = [str(trade_id) for trade_id in trade_ids if trade_id]
+    tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if not ids or "trade_partial_fills" not in tables:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT trade_id, closed_quantity, fill_quantity, fill_price, abandoned_reason
+        FROM trade_partial_fills
+        WHERE trade_id IN ({placeholders})
+        ORDER BY id
+        """,
+        ids,
+    ).fetchall()
+    result: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        result.setdefault(str(row["trade_id"]), []).append(dict(row))
+    return result
+
+
+def _augment_trade(trade: dict[str, Any], partials: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     entry = _maybe_float(trade.get("entry_price"))
     exit_price = _maybe_float(trade.get("exit_price"))
     quantity = _maybe_int(trade.get("exit_filled_quantity")) or _maybe_int(trade.get("quantity")) or 0
+    partial_pnl = 0.0
+    banked_quantity = 0
+    for partial in partials or []:
+        if partial.get("abandoned_reason"):
+            continue
+        fill_price = _maybe_float(partial.get("fill_price"))
+        fill_quantity = _maybe_int(partial.get("fill_quantity")) or _maybe_int(partial.get("closed_quantity")) or 0
+        if entry is None or fill_price is None or fill_quantity <= 0:
+            continue
+        partial_pnl += (fill_price - entry) * fill_quantity * 100
+        banked_quantity += fill_quantity
     realized = None
-    if entry is not None and exit_price is not None and quantity:
-        realized = _round_money((exit_price - entry) * quantity * 100)
+    if entry is not None and ((exit_price is not None and quantity) or banked_quantity):
+        final_pnl = (exit_price - entry) * quantity * 100 if exit_price is not None and quantity else 0.0
+        realized = _round_money(final_pnl + partial_pnl)
     lane = "shadow" if _is_shadow_trade(trade) else "live"
     return {
         **trade,
         "lane": lane,
         "realized_pnl_usd": realized,
+        "banked_partial_pnl_usd": _round_money(partial_pnl),
+        "banked_quantity": banked_quantity,
         "option_strike": _parse_option_strike(_maybe_str(trade.get("option_symbol"))),
         "protection_state": _protection_state(trade),
         "exit_attribution": _exit_attribution(trade),

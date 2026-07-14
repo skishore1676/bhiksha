@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from bhiksha.app.bootstrap import build_runtime
@@ -28,11 +29,10 @@ from bhiksha.ops.daily_report import (
     write_daily_report,
 )
 from bhiksha.ops.launchd_status_store import write_latest_status
-from bhiksha.ops.shadow_ev_report import render_shadow_ev_report_telegram, write_shadow_ev_report
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
-from bhiksha.ops.weekly_scorecard import (
-    render_weekly_scorecard_telegram_summary,
-    write_weekly_scorecard,
+from bhiksha.ops.weekly_trading_decisions import (
+    finalize_weekly_trading_decisions,
+    write_weekly_trading_decisions,
 )
 
 CENTRAL = ZoneInfo("America/Chicago")
@@ -49,8 +49,7 @@ def main(argv: list[str] | None = None) -> int:
             "live-stop",
             "schwab-refresh",
             "session-report",
-            "weekly-scorecard",
-            "shadow-ev-report",
+            "weekly-trading-decisions",
         ],
     )
     parser.add_argument("--force", action="store_true", help="Run even when today is not a trading day")
@@ -61,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alert-profile", default=os.getenv("BHIKSHA_LATHI_PROFILE", "jarvis-northstar"))
     parser.add_argument(
         "--obsidian-review-mode",
-        default=os.getenv("BHIKSHA_SESSION_REPORT_OBSIDIAN_MODE", "on"),
+        default=os.getenv("BHIKSHA_SESSION_REPORT_OBSIDIAN_MODE", "off"),
         choices=["off", "on"],
         help=(
             "Also project the session report onto the Obsidian coding-agent "
@@ -72,6 +71,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--obsidian-review-profile",
         default=os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "coding-agent-northstar"),
+    )
+    parser.add_argument(
+        "--weekly-review-mode",
+        default=os.getenv("BHIKSHA_WEEKLY_REVIEW_MODE", "on"),
+        choices=["off", "on"],
+    )
+    parser.add_argument(
+        "--workbook-update-mode",
+        default=os.getenv("BHIKSHA_WORKBOOK_UPDATE_MODE", "on"),
+        choices=["off", "on"],
     )
     parser.add_argument("--action-id", default=os.getenv("BHIKSHA_ACTION_ID"))
     args = parser.parse_args(argv)
@@ -104,10 +113,8 @@ def main(argv: list[str] | None = None) -> int:
             return _schwab_refresh_job(args)
         if args.job == "session-report":
             return _session_report_job(args)
-        if args.job == "weekly-scorecard":
-            return _weekly_scorecard_job(args)
-        if args.job == "shadow-ev-report":
-            return _shadow_ev_report_job(args)
+        if args.job == "weekly-trading-decisions":
+            return _weekly_trading_decisions_job(args, repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
         alert = _send_failure_alert(args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc))
         _print_result({"job": args.job, "status": "failed", "error": str(exc), "alert": alert.to_dict()})
@@ -208,74 +215,106 @@ def _session_report_job(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
-def _weekly_scorecard_job(args: argparse.Namespace) -> int:
-    """Generate the weekly profile-vs-legacy scorecard (workplan #5) and publish
-    the compact operator card through Lathi Bus -- the exact transport path the
-    daily session report uses. The full markdown remains the detailed artifact.
-    The default window is Monday->today, so a Friday run covers the trade week.
-    """
+def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) -> int:
+    """Refresh the ledger, then publish exactly one Obsidian decision packet."""
     runtime = build_runtime(active_plan_path=args.active_plan)
-    db_path = Path(runtime.app_config.sqlite_path)
     output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
-    result = write_weekly_scorecard(db_path, output_dir=output_dir, deployments=runtime.deployments)
-    body = render_weekly_scorecard_telegram_summary(result.report, markdown_path=result.markdown_path)
-    alert = send_lathi_alert(
-        title="Bhiksha weekly scorecard",
-        body=body,
-        level="info",
-        mode=args.alert_mode,
-        profile=args.alert_profile,
-        template="status",
-        link_preview="disabled",
+    result = write_weekly_trading_decisions(
+        Path(runtime.app_config.sqlite_path),
+        output_dir=output_dir,
+        deployments=runtime.deployments,
     )
-    ok = alert.ok or args.alert_mode == "off"
-    _print_result(
-        {
+    workbook = _update_trading_decision_ledger(args, result.facts_path, repo_root=repo_root)
+    result = finalize_weekly_trading_decisions(result, workbook)
+    if workbook.get("status") == "skipped" and args.weekly_review_mode == "off":
+        _print_result({
             "job": args.job,
-            "status": "ok" if ok else "failed",
-            "week": f"{result.report['week_start']}..{result.report['week_end']}",
+            "status": "ok",
+            "preview_only": True,
             "report_json": str(result.json_path),
             "report_markdown": str(result.markdown_path),
-            "alert": alert.to_dict(),
-        }
-    )
+            "facts_export": str(result.facts_path),
+            "telegram_sent": False,
+        })
+        return 0
+    if workbook.get("status") != "ok":
+        _print_result({
+            "job": args.job,
+            "status": "failed",
+            "reason": "workbook_update_failed",
+            "report_json": str(result.json_path),
+            "report_markdown": str(result.markdown_path),
+            "workbook_update": workbook,
+        })
+        return 2
+    review: ReviewPublishResult | None = None
+    if args.weekly_review_mode == "on":
+        review = publish_lathi_review(
+            source=result.markdown_path,
+            title=f"Weekly Trading Decisions — Performance, Promotions & Fixes — {result.report['week_end']}",
+            mode="on",
+            profile=args.obsidian_review_profile,
+            workspace_root=Path.cwd(),
+            artifact_id=result.report["artifact_id"],
+            owner_consumer="bhiksha",
+            review_id=result.report["artifact_id"],
+        )
+    ok = args.weekly_review_mode == "off" or bool(review and review.ok)
+    _print_result({
+        "job": args.job,
+        "status": "ok" if ok else "failed",
+        "artifact_id": result.report["artifact_id"],
+        "report_json": str(result.json_path),
+        "report_markdown": str(result.markdown_path),
+        "facts_export": str(result.facts_path),
+        "workbook_update": workbook,
+        "obsidian_review": review.to_dict() if review else None,
+        "telegram_sent": False,
+    })
     return 0 if ok else 2
 
 
-def _shadow_ev_report_job(args: argparse.Namespace) -> int:
-    runtime = build_runtime(active_plan_path=args.active_plan)
-    db_path = Path(runtime.app_config.sqlite_path)
-    output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
-    result = write_shadow_ev_report(db_path, output_dir=output_dir)
-    body = render_shadow_ev_report_telegram(result.report)
-    # Shadow lanes are paper marks. A negative paper book is signal, not a
-    # trading failure, so this report always publishes at info level and never
-    # masquerades as a Bhiksha failure alert.
-    alert = send_lathi_alert(
-        title=f"Bhiksha shadow-EV report {result.report['generated_date']}",
-        body=body,
-        level="info",
-        mode=args.alert_mode,
-        profile=args.alert_profile,
-        template="status",
-        link_preview="disabled",
+def _update_trading_decision_ledger(
+    args: argparse.Namespace,
+    facts_path: Path,
+    *,
+    repo_root: Path,
+) -> dict[str, Any]:
+    if args.workbook_update_mode == "off":
+        return {"status": "skipped", "reason": "workbook update intentionally disabled"}
+    command_text = os.getenv(
+        "BHIKSHA_WORKBOOK_UPDATE_COMMAND",
+        "/Users/sunny/code/tradelab/scripts/review/update_trading_decision_ledger.sh",
     )
-    ok = alert.ok or args.alert_mode == "off"
-    book_since = result.report["book"]["since"]
-    _print_result(
-        {
-            "job": args.job,
-            "status": "ok" if ok else "failed",
-            "report_json": str(result.json_path),
-            "report_markdown": str(result.markdown_path),
-            "since": result.report["since"],
-            "since_trades": book_since["trades"],
-            "since_pnl_usd": book_since["total_pnl_usd"],
-            "lanes_active_since": result.report["lane_count_active_since"],
-            "alert": alert.to_dict(),
+    command = [command_text, str(facts_path)]
+    completed = subprocess.run(
+        command,
+        check=False,
+        cwd=str(repo_root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=float(os.getenv("BHIKSHA_WORKBOOK_UPDATE_TIMEOUT_SECONDS", "180")),
+    )
+    receipt = _last_json_object(completed.stdout)
+    if completed.returncode != 0 or receipt.get("status") != "ok":
+        return {
+            "status": "failed",
+            "return_code": completed.returncode,
+            "error": receipt.get("error") or _tail(completed.stderr or completed.stdout),
         }
-    )
-    return 0 if ok else 2
+    return receipt
+
+
+def _last_json_object(text: str) -> dict[str, Any]:
+    for line in reversed(text.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _publish_session_report_review(
@@ -331,7 +370,7 @@ def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
     # live-stop must always run so a stale process cannot survive; the weekly
     # scorecard is the week's verdict and must publish even when the Friday it
     # fires is itself a market holiday (the Mon-Fri window still had trading).
-    if job in {"live-stop", "weekly-scorecard"}:
+    if job in {"live-stop", "weekly-trading-decisions"}:
         return False
     today = datetime.now(CENTRAL).date()
     return not is_trading_day(today)

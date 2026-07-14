@@ -17,3 +17,4 @@ entry_reprice_spread_pcts:
   - 0.50
   - 1.00
 deployment_selection_mode: prefer_generated
+exit_edge_live_shadow_enabled: false

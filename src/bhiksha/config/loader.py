@@ -252,6 +252,9 @@ def _enabled_generated_counts_by_symbol(deployments: list[DeploymentManifest]) -
 
 
 def _apply_app_env_overrides(payload: dict[str, Any]) -> None:
+    exit_edge_enabled = _env_bool("BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED")
+    if exit_edge_enabled is not None:
+        payload["exit_edge_live_shadow_enabled"] = exit_edge_enabled
     bool_value = _env_bool("BHIKSHA_ENTRY_REPRICE_ENABLED")
     if bool_value is not None:
         payload["entry_reprice_enabled"] = bool_value

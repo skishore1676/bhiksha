@@ -11,7 +11,7 @@ from bhiksha.config.models import (
     StrategySpec,
 )
 from bhiksha.domain.enums import ExitMode
-from bhiksha.domain.models import CashBudgetDay, TradeRecord
+from bhiksha.domain.models import CashBudgetDay, PartialFillRecord, TradeRecord
 from bhiksha.ops.daily_report import (
     build_daily_report,
     render_daily_report_markdown,
@@ -140,6 +140,43 @@ def test_daily_report_marks_closed_live_trade_with_missing_exit_truth_unknown(tm
     assert "live realized P&L: `unknown (1 missing exit fill)`" in markdown
     assert "live unknown (1 missing exit fill)" in telegram
     assert "P&L unknown" in telegram
+
+
+def test_daily_report_includes_banked_partial_fill_pnl(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(TradeRecord(
+            trade_id="ladder", deployment_id="qqq_live", symbol="QQQ",
+            option_symbol="QQQ260713P00560000", quantity=4, entry_price=1.94,
+            entry_timestamp=datetime(2026, 7, 9, 14, 0, tzinfo=UTC),
+            status="target_active", entry_order_id="LIVE_ENTRY", can_ladder=True,
+        ))
+        await trades.record_partial_fill(PartialFillRecord(
+            id=None, trade_id="ladder", deployment_id="qqq_live", symbol="QQQ",
+            option_symbol="QQQ260713P00560000", closed_quantity=6,
+            order_id="PARTIAL", exit_rule="target_1_partial",
+            submitted_at=datetime(2026, 7, 9, 14, 15, tzinfo=UTC),
+            fill_price=2.72, fill_quantity=6,
+            filled_at=datetime(2026, 7, 9, 14, 15, tzinfo=UTC),
+            order_status="FILLED", order_type="MARKET", origin="partial_scale",
+        ))
+        await trades.mark_closed(
+            "ladder", exit_order_id="RUNNER", exit_price=3.43,
+            exit_filled_quantity=4,
+            exit_filled_at=datetime(2026, 7, 9, 14, 30, tzinfo=UTC),
+            exit_order_status="FILLED", exit_order_type="LIMIT",
+            exit_rule="target_2_runner",
+        )
+
+    asyncio.run(seed())
+    report = build_daily_report(db_path, trading_date="2026-07-09")
+
+    assert report["trade_summary"]["live_realized_pnl_usd"] == 1064.0
+    assert report["trades"][0]["banked_partial_pnl_usd"] == 468.0
+    assert report["trades"][0]["banked_quantity"] == 6
 
 
 def test_daily_report_flags_only_implausible_underlying_to_strike_ratio(tmp_path) -> None:
