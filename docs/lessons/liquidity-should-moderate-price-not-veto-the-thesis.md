@@ -43,6 +43,10 @@ preflight, cash availability, and the lane's maximum trade premium. That last
 check matters because quantity was sized at the cheaper initial limit; without
 it, a later replacement could exceed the configured premium cap.
 
+The active-plan sync's lane-config snapshot must include these fields. A Sheet
+knob that changes trade economics but is absent from `LANE_CONFIG_CHANGED`
+creates a false clean readback even when compilation itself is correct.
+
 ## Apply It Next Time
 When a chain gate suppresses a sound thesis, first separate safety vetoes from
 execution-quality evidence. Preserve hard sanity bounds, turn relative quality

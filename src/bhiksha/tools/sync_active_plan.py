@@ -42,6 +42,14 @@ _LANE_CONFIG_FIELDS: tuple[tuple[str, str], ...] = (
     ("exit", "hard_flat_time_et"),
     ("risk", "max_trade_premium_usd"),
     ("execution", "shadow_only"),
+    ("execution", "min_open_interest"),
+    ("execution", "max_bid_ask_spread_pct"),
+    ("execution", "entry_pricing_spread_fraction"),
+    ("execution", "entry_pricing_oi_percentile_scale"),
+    ("execution", "entry_reprice_enabled"),
+    ("execution", "entry_reprice_checkpoints_seconds"),
+    ("execution", "entry_reprice_cancel_after_seconds"),
+    ("execution", "entry_reprice_spread_fractions"),
 )
 
 
@@ -191,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
                     f" profit_target_pct={lane.get('option_profit_target_pct')}"
                     f" use_profit_target={lane.get('use_profit_target')}"
                     f" max_trade_premium_usd={lane.get('max_trade_premium_usd')}"
+                    f" min_open_interest={lane.get('min_open_interest')}"
+                    f" max_spread_pct={lane.get('max_bid_ask_spread_pct')}"
+                    f" entry_fraction={lane.get('entry_pricing_spread_fraction')}"
+                    f" reprice_enabled={lane.get('entry_reprice_enabled')}"
+                    f" reprice_cancel_seconds={lane.get('entry_reprice_cancel_after_seconds')}"
                 )
             print(f"LANE_CONFIG_CHANGE_COUNT={len(result.lane_config_changes)}")
             for change in result.lane_config_changes:

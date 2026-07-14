@@ -166,6 +166,51 @@ def test_lane_config_snapshot_skips_malformed_deployments() -> None:
     assert snapshot["ok_lane"]["max_trade_premium_usd"] is None
 
 
+def test_lane_config_diff_surfaces_patient_entry_policy_changes() -> None:
+    before = lane_config_snapshot(
+        {
+            "deployments": [
+                {
+                    "deployment_id": "smh_lane",
+                    "symbol": "SMH",
+                    "execution": {
+                        "min_open_interest": 100,
+                        "max_bid_ask_spread_pct": 0.08,
+                    },
+                }
+            ]
+        }
+    )
+    after = lane_config_snapshot(
+        {
+            "deployments": [
+                {
+                    "deployment_id": "smh_lane",
+                    "symbol": "SMH",
+                    "execution": {
+                        "min_open_interest": 50,
+                        "max_bid_ask_spread_pct": 0.12,
+                        "entry_pricing_spread_fraction": 0.25,
+                        "entry_pricing_oi_percentile_scale": True,
+                        "entry_reprice_enabled": True,
+                        "entry_reprice_checkpoints_seconds": [60, 180],
+                        "entry_reprice_cancel_after_seconds": 300,
+                        "entry_reprice_spread_fractions": [0.50, 0.70],
+                    },
+                }
+            ]
+        }
+    )
+
+    changes = diff_lane_configs(before, after)
+
+    assert len(changes) == 1
+    assert changes[0]["deployment_id"] == "smh_lane"
+    fields = changes[0]["fields"]
+    assert fields["min_open_interest"] == {"before": 100, "after": 50}
+    assert fields["entry_reprice_spread_fractions"] == {"before": None, "after": [0.50, 0.70]}
+
+
 def test_sync_active_plan_logs_compile_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     log_dir = tmp_path / "logs"
     monkeypatch.setenv("GOOGLE_SHEET_ID", "spreadsheet123")
