@@ -101,12 +101,13 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
     LaunchdJobSpec(
         label="com.bhiksha.schwab-guard",
         runner_job="schwab-refresh",
-        schedule=weekdays(7, 10),
-        schedule_label="Weekdays 07:10 CT",
-        purpose="Run the Schwab token guard; browser renewal only when needed.",
+        schedule=weekdays(7, 10) + weekdays(15, 20),
+        schedule_label="Trading days 07:10 and 15:20 CT",
+        purpose="Verify premarket auth and renew after close before the next trading session.",
         skips_non_trading_days=True,
         risk_class="auth_maintenance",
-        allowed_manual_actions=("schwab-guard-now",),
+        allowed_manual_actions=("schwab-guard-now", "renew-schwab-access"),
+        requires_confirmation_actions=("renew-schwab-access",),
     ),
     LaunchdJobSpec(
         label="com.bhiksha.session-report",

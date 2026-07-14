@@ -1,6 +1,8 @@
 import asyncio
+from types import SimpleNamespace
 
-from bhiksha.ops.health import check_schwab_setup
+import bhiksha.ops.health as health
+from bhiksha.ops.health import check_schwab_setup, check_schwab_token_health
 from bhiksha.app.bootstrap import build_runtime
 
 
@@ -22,3 +24,16 @@ def test_schwab_setup_health_does_not_expose_authorize_url(monkeypatch) -> None:
     assert detail == "authorize_url_ready"
     assert "client_id" not in detail
     assert "https://" not in detail
+
+
+def test_schwab_health_blocks_token_that_will_fail_during_session(monkeypatch) -> None:
+    monkeypatch.setattr(
+        health,
+        "classify_schwab_token_state",
+        lambda settings: SimpleNamespace(state="refresh_token_near_expiry"),
+    )
+
+    ok, detail = asyncio.run(check_schwab_token_health())
+
+    assert ok is False
+    assert detail == "refresh_token_near_expiry"

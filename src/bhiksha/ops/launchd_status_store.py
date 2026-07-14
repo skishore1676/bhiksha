@@ -33,7 +33,22 @@ def write_latest_status(repo_root: Path, payload: dict[str, Any]) -> None:
         "label": spec.label if spec else None,
         "payload": payload,
     }
-    jobs[job_name] = recorded
+    previous = jobs.get(job_name) if isinstance(jobs.get(job_name), dict) else None
+    previous_payload = previous.get("payload") if isinstance(previous, dict) else None
+    preserve_auth_failure = (
+        job_name == "schwab-refresh"
+        and payload.get("status") == "skipped"
+        and isinstance(previous_payload, dict)
+        and previous_payload.get("status") == "failed"
+    )
+    if preserve_auth_failure:
+        jobs[job_name] = {
+            **previous,
+            "last_skip_at": recorded["recorded_at"],
+            "last_skip_payload": payload,
+        }
+    else:
+        jobs[job_name] = recorded
     current.update(
         {
             "generated_at": recorded["recorded_at"],

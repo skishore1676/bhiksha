@@ -8,6 +8,7 @@ Usage:
   scripts/schwab_refresh.sh url
   scripts/schwab_refresh.sh exchange '<returned_callback_url>'
   scripts/schwab_refresh.sh check
+  scripts/schwab_refresh.sh verify
 
 Run from the Bhiksha repo on the machine whose Schwab token file should be
 updated. On oldmac that is usually:
@@ -16,6 +17,7 @@ updated. On oldmac that is usually:
   scripts/schwab_refresh.sh url
   scripts/schwab_refresh.sh exchange 'https://127.0.0.1:8080/?code=...'
   scripts/schwab_refresh.sh check
+  scripts/schwab_refresh.sh verify
 USAGE
 }
 
@@ -69,6 +71,9 @@ print(f"CHECKED_AT={datetime.now(UTC).isoformat()}")
 if refresh_expired:
     raise SystemExit(2)
 PY
+    ;;
+  verify)
+    PYTHONPATH=src "$python_bin" -m bhiksha.tools.schwab_healthcheck QQQ IWM
     ;;
   -h|--help|help|"")
     usage

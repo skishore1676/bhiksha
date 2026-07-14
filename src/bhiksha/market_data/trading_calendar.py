@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from functools import lru_cache
+from zoneinfo import ZoneInfo
+
+
+CENTRAL = ZoneInfo("America/Chicago")
 
 
 SPECIAL_FULL_DAY_CLOSURES: frozenset[date] = frozenset(
@@ -80,6 +84,34 @@ def previous_trading_day(value: date) -> date:
     while not is_trading_day(candidate):
         candidate -= timedelta(days=1)
     return candidate
+
+
+def next_trading_day(value: date, *, include_today: bool = False) -> date:
+    candidate = value if include_today else value + timedelta(days=1)
+    while not is_trading_day(candidate):
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def next_trading_session_day(now: datetime) -> date:
+    """Return the current session premarket, otherwise the next NYSE session."""
+
+    local_now = now.astimezone(CENTRAL)
+    if is_trading_day(local_now.date()) and local_now.time() < time(15, 15):
+        return local_now.date()
+    return next_trading_day(local_now.date())
+
+
+def next_trading_session_required_through(now: datetime) -> datetime:
+    """Return the point through which a refresh token must remain usable.
+
+    The runtime starts before the open and can need fresh access tokens all day,
+    so the safe boundary is the next session's post-stop window, not merely the
+    08:20 startup instant.
+    """
+
+    session_day = next_trading_session_day(now)
+    return datetime.combine(session_day, time(15, 15), tzinfo=CENTRAL)
 
 
 def trading_days_ago(anchor: date, trading_days: int) -> date:

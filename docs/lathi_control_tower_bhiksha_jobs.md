@@ -40,7 +40,7 @@ Bhiksha already owns the active launchd jobs:
 | `com.bhiksha.live-start` | Weekdays 08:20 CT | Restart live runtime from active plan. |
 | `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is running. |
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop stale live runtime. |
-| `com.bhiksha.schwab-guard` | Weekdays 07:10 CT | Validate or renew Schwab auth and alert when unusable. |
+| `com.bhiksha.schwab-guard` | Trading days 07:10 and 15:20 CT | Verify premarket auth and renew after close when the token cannot survive the next full session. |
 | `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send intraday status, PnL, open positions, and runtime concerns. |
 | `com.bhiksha.weekly-trading-decisions` | Fridays 16:00 CT | Refresh the canonical workbook and publish one Obsidian decision review; no Telegram send. |
 
@@ -73,11 +73,11 @@ Implemented Bhiksha pieces:
 | --- | --- | --- |
 | `launchd_registry` | Implemented | `src/bhiksha/ops/launchd_registry.py` is now the shared registry for labels, schedules, risk classes, manual actions, and confirmation metadata. The launchd installer reads this registry instead of duplicating schedules. |
 | `launchd_status --json` | Implemented | `python -m bhiksha.tools.launchd_status --json` emits schema `bhiksha.launchd.status.v1`, one row per active `com.bhiksha.*` job, runtime status, latest report summary, Schwab guard summary, and transport rollup. |
-| `launchd_control --json` | Implemented | `python -m bhiksha.tools.launchd_control <action> --json` emits schema `bhiksha.launchd.control_result.v1` for `live-status`, `session-report-now`, `schwab-guard-now`, and `ensure-live-runtime`. |
+| `launchd_control --json` | Implemented | `python -m bhiksha.tools.launchd_control <action> --json` emits schema `bhiksha.launchd.control_result.v1` for `live-status`, `session-report-now`, `schwab-guard-now`, `renew-schwab-access`, and `ensure-live-runtime`. |
 | `latest_status.json` | Implemented | Every `bhiksha.tools.launchd_job` run attempts to update `artifacts/playbook/launchd/latest_status.json` with the latest non-secret job payload. Snapshot-write failure is observational and does not fail the trading-domain job. |
 | Action ids | Implemented | `launchd_control` creates or accepts `--action-id`; `launchd_job` echoes it into `BHIKSHA_LAUNCHD_JOB` payloads. |
 | Concurrency guard | Implemented | `launchd_control` uses per-action lock files under `artifacts/playbook/launchd/control_locks/` and refuses duplicate in-flight actions unless the lock is stale. |
-| Confirmation rule | Implemented | `ensure-live-runtime` refuses without `--confirm` when market is open or when it would start a stopped live runtime. |
+| Confirmation rule | Implemented | `ensure-live-runtime` refuses without `--confirm` when market is open or when it would start a stopped live runtime. `renew-schwab-access` always requires confirmation and never places orders. |
 | Transport/domain split | Implemented | Status output separates report/token domain health from Lathi Bus / Telegram transport health, so a GREEN report with failed Telegram delivery is visible as transport degraded, not a trading failure. |
 | Schedule semantics | Implemented | Status output exposes `schedule`, `next_fire`, `last_run_status`, and `last_run_at` separately. Lathi should render source `generated_at` as observation time only, never as last-run proof. |
 
@@ -270,7 +270,8 @@ Initial actions:
 | Action | Underlying Bhiksha behavior | Gate |
 | --- | --- | --- |
 | `session-report-now` | `run_bhiksha_job.sh session-report --force --report-label manual` | No extra gate. |
-| `schwab-guard-now` | `run_bhiksha_job.sh schwab-refresh --force` | No extra gate, but loud failure alert stays Bhiksha-owned. |
+| `schwab-guard-now` | `run_bhiksha_job.sh schwab-refresh --force --browser-renewal-mode off` | No extra gate; probe/direct-refresh only, never starts browser OAuth. Loud failure alert stays Bhiksha-owned. |
+| `renew-schwab-access` | `run_bhiksha_job.sh schwab-refresh --force --browser-renewal-mode force` | Always confirm; grants Schwab market-data access and never places orders. |
 | `ensure-live-runtime` | `run_bhiksha_job.sh live-watchdog --force` | Confirm when market is open or when the action would start a stopped live runtime. |
 | `live-status` | `python -m bhiksha.tools.server_session status` | Read-only. |
 
@@ -392,6 +393,7 @@ In phase 1, only low-risk external-source actions should be real buttons:
 - `live-status`;
 - `session-report-now`;
 - `schwab-guard-now`;
+- `renew-schwab-access`, with explicit OAuth confirmation;
 - `ensure-live-runtime`, only when Lathi can show the confirmation rule and
   Bhiksha can refuse unsafe or duplicate starts.
 
@@ -517,9 +519,9 @@ Operator result:
 
 Phase 1 is working when all of these are true on oldmac:
 
-1. `python -m bhiksha.tools.launchd_status --json` returns all five active
+1. `python -m bhiksha.tools.launchd_status --json` returns all six active
    `com.bhiksha.*` jobs with no secrets and valid JSON.
-2. Control Tower renders the five Bhiksha jobs under the trading group.
+2. Control Tower renders the six Bhiksha jobs under the trading group.
 3. `session-report-now` from Control Tower causes Bhiksha to send a Telegram
    session report using the Lathi Bus Telegram `status` template. The message is
    a compact operator card; the full markdown report remains the detailed audit
@@ -527,12 +529,14 @@ Phase 1 is working when all of these are true on oldmac:
    - a Bhiksha job result or report receipt;
    - a Lathi action journal entry.
 4. `schwab-guard-now` from Control Tower returns a healthy token receipt or a
-   loud Bhiksha-owned failure alert.
-5. `ensure-live-runtime` from Control Tower calls Bhiksha's watchdog path and
+   loud Bhiksha-owned failure alert, and never starts browser OAuth.
+5. `renew-schwab-access` is visible on the Schwab authentication unit, requires
+   confirmation, and cannot succeed without a new token plus QQQ/IWM checks.
+6. `ensure-live-runtime` from Control Tower calls Bhiksha's watchdog path and
    reports whether the live runtime is running.
-6. Existing launchd schedules still run without Lathi involvement.
-7. Old OpenClaw/browser-agent Bhiksha labels remain unloaded.
-8. No duplicate Telegram alerts are sent for a single failure.
+7. Existing launchd schedules still run without Lathi involvement.
+8. Old OpenClaw/browser-agent Bhiksha labels remain unloaded.
+9. No duplicate Telegram alerts are sent for a single failure.
 
 ### Phase 2 verification
 

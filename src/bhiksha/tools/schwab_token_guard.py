@@ -15,10 +15,15 @@ from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", default="premarket", choices=["premarket", "startup", "manual"])
+    parser.add_argument("--mode", default="premarket", choices=["premarket", "after_close", "startup", "manual"])
     parser.add_argument("--browser-renewal-mode", default="off", choices=["off", "auto", "force"])
     parser.add_argument("--browser-renewal-cmd", default=None, help="Shell command used to invoke browser renewal")
-    parser.add_argument("--refresh-lead-days", type=float, default=2.0)
+    parser.add_argument(
+        "--refresh-lead-days",
+        type=float,
+        default=None,
+        help="Optional extra wall-clock lead; the default is next-trading-session aware.",
+    )
     parser.add_argument("--receipt-dir", default="artifacts/playbook/schwab_token_guard")
     parser.add_argument("--no-receipt", action="store_true")
     parser.add_argument("--alert-mode", default="live", choices=["off", "spool", "live"])

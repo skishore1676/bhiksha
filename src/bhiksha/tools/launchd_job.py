@@ -53,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
         ],
     )
     parser.add_argument("--force", action="store_true", help="Run even when today is not a trading day")
+    parser.add_argument(
+        "--browser-renewal-mode",
+        default="auto",
+        choices=["off", "auto", "force"],
+        help="Schwab browser-renewal policy; force is reserved for a confirmed operator action.",
+    )
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--active-plan", default="artifacts/playbook/active_plan.json")
     parser.add_argument("--report-label", default="scheduled")
@@ -169,9 +175,13 @@ def _schwab_refresh_job(args: argparse.Namespace) -> int:
         "/Users/sunny/code/browser-agent/scripts/schwab-auto-refresh.sh",
     )
     command = ["/bin/bash", "-lc", browser_cmd] if browser_cmd else None
+    local_now = datetime.now(CENTRAL)
+    mode = "after_close" if local_now.hour >= 15 else "premarket"
+    if args.browser_renewal_mode == "force":
+        mode = "operator_reauth"
     result = run_schwab_token_guard_sync(
-        mode="premarket",
-        browser_renewal_mode="auto",
+        mode=mode,
+        browser_renewal_mode=args.browser_renewal_mode,
         browser_renewal_cmd=command,
         receipt_dir=Path("artifacts/playbook/schwab_token_guard"),
         alert_mode=args.alert_mode,

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, time
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import uuid
@@ -23,7 +24,8 @@ CENTRAL = ZoneInfo("America/Chicago")
 RUNNER_ACTIONS: dict[str, list[str]] = {
     "session-report-now": ["session-report", "--force", "--report-label", "manual"],
     "weekly-trading-decisions-now": ["weekly-trading-decisions", "--force"],
-    "schwab-guard-now": ["schwab-refresh", "--force"],
+    "schwab-guard-now": ["schwab-refresh", "--force", "--browser-renewal-mode", "off"],
+    "renew-schwab-access": ["schwab-refresh", "--force", "--browser-renewal-mode", "force"],
     "ensure-live-runtime": ["live-watchdog", "--force"],
 }
 
@@ -116,14 +118,10 @@ def _run_runner_action(
     lock: dict[str, Any],
 ) -> dict[str, Any]:
     command = ["scripts/launchd/run_bhiksha_job.sh", *RUNNER_ACTIONS[action], "--action-id", action_id]
-    completed = subprocess.run(  # noqa: S603
+    completed = _run_control_command(
         command,
-        check=False,
         cwd=str(repo_root),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=float(os.getenv("BHIKSHA_LAUNCHD_CONTROL_TIMEOUT_SECONDS", "900")),
+        timeout=float(os.getenv("BHIKSHA_LAUNCHD_CONTROL_TIMEOUT_SECONDS", "1200")),
     )
     payload = _parse_prefixed_json(completed.stdout, "BHIKSHA_LAUNCHD_JOB=")
     return _result(
@@ -142,6 +140,43 @@ def _run_runner_action(
         confirmation=confirmation,
         lock=lock,
     )
+
+
+def _run_control_command(command: list[str], *, cwd: str, timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run an owner action with a bounded process group and deterministic timeout."""
+
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(command, 127, "", str(exc))
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            stdout, stderr = process.communicate()
+        partial_stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        partial_stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        stdout = "\n".join(part for part in (partial_stdout, stdout) if part)
+        stderr = "\n".join(part for part in (partial_stderr, stderr, f"action timed out after {timeout:g}s") if part)
+        return subprocess.CompletedProcess(command, 124, stdout, stderr)
 
 
 def _live_status(*, repo_root: Path, action: str, action_id: str, started_at: str) -> dict[str, Any]:
@@ -163,6 +198,12 @@ def _live_status(*, repo_root: Path, action: str, action_id: str, started_at: st
 
 
 def _confirmation_requirement(action: str, *, repo_root: Path) -> dict[str, Any]:
+    if action == "renew-schwab-access":
+        return {
+            "required": True,
+            "reasons": ["grants_schwab_account_access"],
+            "detail": "Confirm a Schwab OAuth grant for market-data access. This action never places orders.",
+        }
     if action != "ensure-live-runtime":
         return {"required": False, "reasons": []}
     reasons = []

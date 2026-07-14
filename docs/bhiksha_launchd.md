@@ -40,7 +40,7 @@ manual Control Tower actions do not need to be duplicated in shell.
 | `com.bhiksha.live-start` | Weekdays 08:20 CT | Restart Bhiksha live runtime from the active plan. Skips non-trading days. |
 | `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is still running. Skips non-trading days. |
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop the live runtime. It does not skip non-trading days, so stale processes can still be cleaned up. |
-| `com.bhiksha.schwab-guard` | Weekdays 07:10 CT | Run the Schwab token guard; direct refresh first, browser-agent renewal only when needed. Skips non-trading days. |
+| `com.bhiksha.schwab-guard` | Trading days 07:10 and 15:20 CT | Verify premarket auth and, after close, renew whenever the token will not survive the next full trading session. Skips non-trading days. |
 | `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send an intraday session report with open positions, realized P&L, protection state, provider/runtime issues, and recent trades early enough for manual action. Skips non-trading days. |
 | `com.bhiksha.weekly-trading-decisions` | Fridays 16:00 CT (after close) | Refresh the canonical Trading Decision Ledger and publish one Obsidian review for performance, promotion decisions, and fixes. Shadow-EV and weekly-scorecard calculations are internal inputs; no Telegram send. |
 
@@ -104,7 +104,7 @@ python -m bhiksha.tools.launchd_status --json
 
 The status payload uses schema `bhiksha.launchd.status.v1` and includes:
 
-- all five active `com.bhiksha.*` jobs;
+- all six active `com.bhiksha.*` jobs;
 - launchd loaded/exit state where available;
 - latest `BHIKSHA_LAUNCHD_JOB` payloads;
 - report and Schwab guard summaries;
@@ -117,6 +117,7 @@ Manual actions for Control Tower go through:
 python -m bhiksha.tools.launchd_control live-status --json
 python -m bhiksha.tools.launchd_control session-report-now --json
 python -m bhiksha.tools.launchd_control schwab-guard-now --json
+python -m bhiksha.tools.launchd_control renew-schwab-access --confirm --json
 python -m bhiksha.tools.launchd_control ensure-live-runtime --json
 ```
 
@@ -132,12 +133,20 @@ the market is open or when it would start a stopped live runtime:
 python -m bhiksha.tools.launchd_control ensure-live-runtime --confirm --json
 ```
 
+`renew-schwab-access` always requires `--confirm`. It forces the headed browser
+OAuth path, requires a newly-issued refresh token, then verifies linked-account
+access plus QQQ/IWM quotes and option chains. It never places orders.
+`schwab-guard-now` is deliberately probe/direct-refresh only and never starts
+browser OAuth; a failed probe points the operator to the confirmed renewal
+action. Live startup uses the same session-aware token classification and stays
+blocked when authentication cannot remain trusted through the full session.
+
 ## Cutover Verification
 
 1. Install or reinstall Bhiksha-owned launchd jobs.
-2. Read back `launchctl list | grep bhiksha` and verify the five `com.bhiksha.*`
+2. Read back `launchctl list | grep bhiksha` and verify the six `com.bhiksha.*`
    labels are loaded.
-3. Run `python -m bhiksha.tools.launchd_status --json` and verify the five
+3. Run `python -m bhiksha.tools.launchd_status --json` and verify the six
    jobs appear with schema `bhiksha.launchd.status.v1`.
 4. Kickstart or manually run `com.bhiksha.session-report` and verify the Telegram
    report arrives through Lathi Bus.

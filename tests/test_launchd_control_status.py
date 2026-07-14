@@ -129,6 +129,148 @@ def test_launchd_control_requires_confirmation_for_live_ensure(monkeypatch, tmp_
     assert result["reason"] == "confirmation_required"
 
 
+def test_launchd_control_requires_confirmation_for_schwab_renewal(tmp_path) -> None:
+    result = launchd_control.run_control_action(
+        action="renew-schwab-access",
+        repo_root=tmp_path,
+        action_id="act-renew",
+        confirmed=False,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "confirmation_required"
+    assert result["confirmation"]["reasons"] == ["grants_schwab_account_access"]
+
+
+def test_launchd_control_confirmed_schwab_renewal_forces_browser(monkeypatch, tmp_path) -> None:
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='BHIKSHA_LAUNCHD_JOB={"job": "schwab-refresh", "status": "ok"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("bhiksha.tools.launchd_control._run_control_command", fake_run)
+
+    result = launchd_control.run_control_action(
+        action="renew-schwab-access",
+        repo_root=tmp_path,
+        action_id="act-renew",
+        confirmed=True,
+    )
+
+    assert result["ok"] is True
+    assert result["confirmed"] is True
+    assert result["command"][1:5] == ["schwab-refresh", "--force", "--browser-renewal-mode", "force"]
+
+
+def test_launchd_control_schwab_check_never_starts_browser(monkeypatch, tmp_path) -> None:
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout='BHIKSHA_LAUNCHD_JOB={"status":"ok"}\n', stderr="")
+
+    monkeypatch.setattr("bhiksha.tools.launchd_control._run_control_command", fake_run)
+
+    result = launchd_control.run_control_action(
+        action="schwab-guard-now",
+        repo_root=tmp_path,
+        action_id="act-check",
+    )
+
+    assert result["ok"] is True
+    assert result["command"][1:5] == ["schwab-refresh", "--force", "--browser-renewal-mode", "off"]
+
+
+def test_launchd_status_surfaces_schwab_auth_failure_and_confirmed_action(monkeypatch, tmp_path) -> None:
+    write_latest_status(
+        tmp_path,
+        {
+            "job": "schwab-refresh",
+            "status": "failed",
+            "result": {
+                "ok": False,
+                "attention_required": True,
+                "failure_kind": "schwab_authentication_expired",
+                "final": {"state": "refresh_token_expired"},
+            },
+        },
+    )
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 14, 16, 0, tzinfo=UTC),
+    )
+    guard = next(job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh")
+
+    assert guard["title"] == "Schwab authentication"
+    assert guard["lifecycle"] == "waiting_you"
+    assert guard["findings"] == ["Schwab authentication expired; renewal is required."]
+    assert "renew-schwab-access" in guard["available_actions"]
+    assert guard["action_requirements"]["renew-schwab-access"]["requires_confirmation"] is True
+    assert guard["action_requirements"]["renew-schwab-access"]["owner_confirmation_args"] == ["--confirm"]
+
+
+def test_launchd_status_treats_non_trading_day_schwab_skip_as_healthy(monkeypatch, tmp_path) -> None:
+    write_latest_status(
+        tmp_path,
+        {"job": "schwab-refresh", "status": "skipped", "reason": "non_trading_day"},
+    )
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 3, 13, 0, tzinfo=UTC),
+    )
+    guard = next(job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh")
+
+    assert guard["last"]["domain"] == {"ok": True, "status": "skipped", "reason": "non_trading_day"}
+    assert guard["findings"] == []
+
+
+def test_non_trading_day_skip_does_not_erase_unresolved_schwab_failure(monkeypatch, tmp_path) -> None:
+    failed = {
+        "job": "schwab-refresh",
+        "status": "failed",
+        "result": {
+            "ok": False,
+            "attention_required": True,
+            "failure_kind": "browser_renewal_failed",
+            "final": {"state": "refresh_token_near_expiry"},
+        },
+    }
+    write_latest_status(tmp_path, failed)
+    write_latest_status(tmp_path, {"job": "schwab-refresh", "status": "skipped", "reason": "non_trading_day"})
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 3, 13, 0, tzinfo=UTC),
+    )
+    guard = next(job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh")
+    stored = json.loads(latest_status_path(tmp_path).read_text(encoding="utf-8"))["jobs"]["schwab-refresh"]
+
+    assert guard["lifecycle"] == "waiting_you"
+    assert guard["findings"] == ["Automatic Schwab authentication renewal failed."]
+    assert stored["payload"]["status"] == "failed"
+    assert stored["last_skip_payload"]["status"] == "skipped"
+
+
 def test_launchd_control_refuses_duplicate_action(tmp_path) -> None:
     locks = control_lock_dir(tmp_path)
     locks.mkdir(parents=True)
@@ -179,7 +321,7 @@ def test_launchd_control_reclaims_stale_action_lock(monkeypatch, tmp_path) -> No
             stderr="",
         )
 
-    monkeypatch.setattr("bhiksha.tools.launchd_control.subprocess.run", fake_run)
+    monkeypatch.setattr("bhiksha.tools.launchd_control._run_control_command", fake_run)
 
     result = launchd_control.run_control_action(
         action="session-report-now",

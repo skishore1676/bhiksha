@@ -39,6 +39,16 @@ def test_bhiksha_launchd_installer_has_three_session_report_times() -> None:
     assert (14, 45) in times
 
 
+def test_schwab_guard_has_premarket_and_after_close_checks() -> None:
+    jobs = {job.runner_job: job for job in active_launchd_jobs()}
+    guard = jobs["schwab-refresh"]
+    times = {(entry["Hour"], entry["Minute"]) for entry in guard.schedule}
+
+    assert times == {(7, 10), (15, 20)}
+    assert "renew-schwab-access" in guard.allowed_manual_actions
+    assert "renew-schwab-access" in guard.requires_confirmation_actions
+
+
 def test_bhiksha_launchd_has_one_friday_decision_review_and_no_duplicate_publishers() -> None:
     jobs = {job.runner_job: job for job in active_launchd_jobs()}
     weekly = jobs["weekly-trading-decisions"]

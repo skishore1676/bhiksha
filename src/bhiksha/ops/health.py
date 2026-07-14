@@ -12,9 +12,9 @@ from bhiksha.execution.brokers.public.client import PublicApiClient
 from bhiksha.execution.brokers.public.auth import get_access_token
 from bhiksha.execution.brokers.public.account import get_accounts, get_portfolio
 from bhiksha.execution.brokers.public.settings import PublicBrokerSettings
-from bhiksha.integrations.schwab.auth import build_authorize_url, refresh_token_is_expired
+from bhiksha.integrations.schwab.auth import build_authorize_url
 from bhiksha.integrations.schwab.settings import SchwabSettings
-from bhiksha.integrations.schwab.token_store import read_tokens
+from bhiksha.ops.schwab_token_guard import classify_schwab_token_state
 
 
 async def check_public_auth() -> tuple[bool, str]:
@@ -75,14 +75,11 @@ async def check_schwab_setup() -> tuple[bool, str]:
 
 
 async def check_schwab_token_health() -> tuple[bool, str]:
-    """Check if Schwab refresh token is valid (not expired). Long-term health safeguard."""
+    """Check that Schwab auth remains usable through the required live session."""
     try:
         settings = SchwabSettings.from_env()
-        tokens = read_tokens(settings.token_file)
-        if not tokens:
-            return False, "token_file_missing"
-        if refresh_token_is_expired(tokens):
-            return False, "refresh_token_expired"
-        return True, "token_valid"
+        snapshot = classify_schwab_token_state(settings)
+        ok = snapshot.state in {"healthy", "access_token_stale"}
+        return ok, "token_valid_for_session" if ok else snapshot.state
     except Exception as exc:
         return False, str(exc)

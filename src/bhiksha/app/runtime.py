@@ -29,9 +29,7 @@ from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.position_monitor import PositionMonitor
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
-from bhiksha.integrations.schwab.auth import refresh_token_is_expired
 from bhiksha.integrations.schwab.settings import SchwabSettings
-from bhiksha.integrations.schwab.token_store import read_tokens
 from bhiksha.market_data.bar_store import RollingBarStore
 from bhiksha.market_data.adapters.polygon import PolygonBarSource
 from bhiksha.market_data.adapters.public import PublicBarSource
@@ -46,6 +44,7 @@ from bhiksha.market_data.warmup import (
     legacy_effective_warmup_trading_days,
 )
 from bhiksha.ops.health import check_polygon, check_public_auth, check_schwab_setup, check_schwab_token_health
+from bhiksha.ops.schwab_token_guard import classify_schwab_token_state
 from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.ops.daily_report import write_daily_report
@@ -440,14 +439,14 @@ class BhikshaRuntime:
             # PRE-WARMUP TOKEN HEALTH CHECK (near-term fix)
             if "schwab" in {self.provider_config.underlying_live_primary, warmup_provider}:
                 settings = SchwabSettings.from_env()
-                tokens = read_tokens(settings.token_file)
-                if not tokens or refresh_token_is_expired(tokens):
+                token_snapshot = classify_schwab_token_state(settings)
+                if token_snapshot.state not in {"healthy", "access_token_stale"}:
                     raise RuntimeError(
-                        "Schwab refresh token has expired before warmup. "
+                        f"Schwab authentication is not safe through the trading session ({token_snapshot.state}). "
                         "Run: PYTHONPATH=src .venv/bin/python -m bhiksha.tools.schwab_auth url\n"
                         "Then: PYTHONPATH=src .venv/bin/python -m bhiksha.tools.schwab_auth exchange '<callback_url>'"
                     )
-                output("TOKEN_HEALTH Schwab tokens are valid")
+                output("TOKEN_HEALTH Schwab authentication is valid through the trading session")
 
             warmup_days_by_symbol = self.warmup_trading_days_by_symbol()
             for symbol in symbols:

@@ -90,9 +90,11 @@ def build_status_snapshot(
             if isinstance(latest_payload, dict) and not isinstance(latest_record, dict):
                 latest_record = {"recorded_at": _file_mtime_iso(spec.stdout_log(repo_root))}
         last = _last_job_view(latest_record, latest_payload)
+        findings = _job_findings(last)
         jobs.append(
             {
                 "label": spec.label,
+                "title": "Schwab authentication" if spec.runner_job == "schwab-refresh" else spec.label,
                 "runner_job": spec.runner_job,
                 "kind": "external_launchd_job",
                 "serves_job": "C",
@@ -106,6 +108,7 @@ def build_status_snapshot(
                 "risk_class": spec.risk_class,
                 "available_actions": list(spec.allowed_manual_actions),
                 "requires_confirmation_actions": list(spec.requires_confirmation_actions),
+                "action_requirements": _action_requirements(spec.requires_confirmation_actions),
                 "command": ["scripts/launchd/run_bhiksha_job.sh", *spec.runner_args()],
                 "logs": {
                     "stdout": str(spec.stdout_log(repo_root)),
@@ -117,6 +120,8 @@ def build_status_snapshot(
                 "last_run_status": _last_run_status(last),
                 "last_run_at": last.get("recorded_at") if isinstance(last, dict) else None,
                 "transport_status": _last_transport_status(last),
+                "findings": findings,
+                "lifecycle": "waiting_you" if findings and spec.runner_job == "schwab-refresh" else None,
             }
         )
 
@@ -248,6 +253,48 @@ def _last_transport_status(last: dict[str, Any] | None) -> str | None:
     return transport.get("status")
 
 
+def _action_requirements(actions: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    requirements: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        if action == "renew-schwab-access":
+            requirements[action] = {
+                "requires_confirmation": True,
+                "label": "Renew Schwab access",
+                "reason": "Confirm a Schwab OAuth grant for market-data access. This action never places orders.",
+                "owner_confirmation_args": ["--confirm"],
+            }
+        else:
+            requirements[action] = {
+                "requires_confirmation": True,
+                "reason": "Confirm because this action can affect the live trading runtime.",
+            }
+    return requirements
+
+
+def _job_findings(last: dict[str, Any] | None) -> list[str]:
+    if not isinstance(last, dict):
+        return []
+    domain = last.get("domain") if isinstance(last.get("domain"), dict) else {}
+    if domain.get("ok") is not False:
+        return []
+    failure_kind = str(domain.get("failure_kind") or "")
+    status = str(domain.get("status") or "unknown")
+    messages = {
+        "schwab_authentication_expired": "Schwab authentication expired; renewal is required.",
+        "schwab_authentication_renewal_required": "Schwab authentication will not survive the next trading session.",
+        "schwab_authentication_unavailable": "Schwab authentication is unavailable; renewal is required.",
+        "browser_renewal_failed": "Automatic Schwab authentication renewal failed.",
+        "schwab_access_refresh_failed": "Schwab access-token refresh failed.",
+    }
+    if failure_kind in messages:
+        return [messages[failure_kind]]
+    if status == "refresh_token_expired":
+        return ["Schwab authentication expired; renewal is required."]
+    if status == "refresh_token_near_expiry":
+        return ["Schwab authentication will not survive the next trading session."]
+    return [f"Domain health failed: {status}"]
+
+
 def _next_fire(schedule: tuple[dict[str, int], ...], *, now: datetime) -> str | None:
     """Return the next scheduled launchd fire time in Central time.
 
@@ -294,9 +341,17 @@ def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
             ok = payload.get("status") == "ok"
         return {"ok": ok, "status": status or payload.get("status"), "reason": "session_report"}
     if payload.get("job") == "schwab-refresh":
+        if payload.get("status") == "skipped":
+            return {"ok": True, "status": "skipped", "reason": payload.get("reason") or "non_trading_day"}
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         final = result.get("final") if isinstance(result.get("final"), dict) else {}
-        return {"ok": bool(result.get("ok")), "status": final.get("state"), "reason": "schwab_token_guard"}
+        return {
+            "ok": bool(result.get("ok")),
+            "status": final.get("state"),
+            "reason": "schwab_token_guard",
+            "attention_required": bool(result.get("attention_required", not result.get("ok"))),
+            "failure_kind": result.get("failure_kind"),
+        }
     return {"ok": payload.get("status") == "ok", "status": payload.get("status"), "reason": payload.get("reason")}
 
 
