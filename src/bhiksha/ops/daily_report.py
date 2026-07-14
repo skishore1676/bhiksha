@@ -104,6 +104,7 @@ def build_daily_report(
         )
     )
     entry_selector_empty_by_deployment = _entry_selector_empty_by_deployment(events, deployments)
+    entry_profile_comparison = _entry_profile_comparison_summary(events)
 
     return {
         "trading_date": day.isoformat(),
@@ -135,6 +136,7 @@ def build_daily_report(
         "lifecycle": lifecycle_events,
         "data_quality_warnings": data_quality_warnings,
         "profile_exit_summary": profile_exit_summary,
+        "entry_profile_comparison": entry_profile_comparison,
         "relaxed_evidence_lanes": relaxed_evidence_lanes,
         "risk_rails": risk_rails,
         "status": _report_status(
@@ -251,6 +253,31 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         for lane in relaxed_lanes:
             gates = ", ".join(lane.get("evidence_gates_relaxed") or [])
             lines.append(f"- `{lane.get('deployment_id')}` [{gates}]")
+
+    profile_comparisons = report.get("entry_profile_comparison") or []
+    if profile_comparisons:
+        lines.extend(
+            [
+                "",
+                "## Entry Profile Quote Comparison",
+                "",
+                "| Lane | Active | Candidate | Samples | Blocked | Avg savings vs ask | Avg fraction |",
+                "|---|---|---|---:|---:|---:|---:|",
+            ]
+        )
+        for lane in profile_comparisons:
+            for profile_name, profile in sorted((lane.get("profiles") or {}).items()):
+                lines.append(
+                    "| {lane} | {active} | {profile_name} | {samples} | {blocked} | {savings} | {fraction} |".format(
+                        lane=lane.get("deployment_id") or "",
+                        active=lane.get("active_profile") or "legacy",
+                        profile_name=profile_name,
+                        samples=profile.get("sample_count", 0),
+                        blocked=profile.get("blocked_count", 0),
+                        savings=_fmt_money(profile.get("average_savings_vs_ask")),
+                        fraction=_fmt_decimal(profile.get("average_effective_spread_fraction")),
+                    )
+                )
 
     runtime_issue_counts = ((report.get("provider_health") or {}).get("runtime_issue_counts") or {})
     if runtime_issue_counts:
@@ -509,6 +536,7 @@ def _empty_report(day: date) -> dict[str, Any]:
         "lifecycle": {},
         "data_quality_warnings": [],
         "profile_exit_summary": {"count": 0, "rule_counts": {}},
+        "entry_profile_comparison": [],
         "relaxed_evidence_lanes": [],
         "risk_rails": None,
         "status": {"level": "NO_DATA", "reason": "db_missing"},
@@ -530,6 +558,68 @@ def _load_day_events(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
         payload = _safe_json(row["payload"])
         events.append({"created_at": row["created_at"], "event_type": row["event_type"], "payload": payload})
     return events
+
+
+def _entry_profile_comparison_summary(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    lanes: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("event_type") != "trade_plan":
+            continue
+        payload = event.get("payload") or {}
+        pricing = (payload.get("risk_details") or {}).get("entry_pricing") or {}
+        comparison = pricing.get("initial_profile_comparison") or {}
+        deployment_id = str(payload.get("deployment_id") or "")
+        if not deployment_id or not isinstance(comparison, dict):
+            continue
+        lane = lanes.setdefault(
+            deployment_id,
+            {
+                "deployment_id": deployment_id,
+                "symbol": payload.get("symbol"),
+                "active_profile_counts": Counter(),
+                "profiles": {},
+            },
+        )
+        lane["active_profile_counts"][str(pricing.get("entry_execution_profile") or "legacy")] += 1
+        for profile_name, evidence in comparison.items():
+            if not isinstance(evidence, dict):
+                continue
+            profile = lane["profiles"].setdefault(
+                str(profile_name),
+                {"sample_count": 0, "blocked_count": 0, "savings": [], "fractions": []},
+            )
+            profile["sample_count"] += 1
+            if evidence.get("block_reasons"):
+                profile["blocked_count"] += 1
+            savings = _maybe_float(evidence.get("savings_vs_ask"))
+            if savings is not None:
+                profile["savings"].append(savings)
+            fraction = _maybe_float(evidence.get("effective_spread_fraction"))
+            if fraction is not None:
+                profile["fractions"].append(fraction)
+
+    result: list[dict[str, Any]] = []
+    for deployment_id, lane in sorted(lanes.items()):
+        profiles = {}
+        for profile_name, profile in sorted(lane["profiles"].items()):
+            profiles[profile_name] = {
+                "sample_count": profile["sample_count"],
+                "blocked_count": profile["blocked_count"],
+                "average_savings_vs_ask": _average_or_none(profile["savings"]),
+                "average_effective_spread_fraction": _average_or_none(profile["fractions"], digits=4),
+            }
+        active_counts = lane["active_profile_counts"]
+        active_profile = active_counts.most_common(1)[0][0] if active_counts else "legacy"
+        result.append(
+            {
+                "deployment_id": deployment_id,
+                "symbol": lane["symbol"],
+                "active_profile": active_profile,
+                "active_profile_counts": dict(sorted(active_counts.items())),
+                "profiles": profiles,
+            }
+        )
+    return result
 
 
 # --- Risk rails section (operator-audit P3) -------------------------------
@@ -1099,9 +1189,20 @@ def _round_money(value: float) -> float:
     return round(float(value), 2)
 
 
+def _average_or_none(values: list[float], *, digits: int = 2) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), digits)
+
+
 def _fmt_money(value: Any) -> str:
     number = _maybe_float(value)
     return "" if number is None else f"{number:.2f}"
+
+
+def _fmt_decimal(value: Any) -> str:
+    number = _maybe_float(value)
+    return "" if number is None else f"{number:.4f}"
 
 
 # --- Risk rails formatting helpers (operator-audit P3) ---------------------

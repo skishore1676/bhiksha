@@ -8,6 +8,23 @@ from typing import Any, Literal
 from bhiksha.execution.order_manager import PublicQuote, round_price
 
 EntryPricingMode = Literal["passive", "balanced", "urgent", "cross"]
+EntryExecutionProfileName = Literal["patient", "balanced", "urgent"]
+
+
+@dataclass(frozen=True, slots=True)
+class EntryExecutionProfile:
+    name: EntryExecutionProfileName
+    initial_spread_fraction: float
+    reprice_checkpoints_seconds: tuple[int, ...]
+    reprice_spread_fractions: tuple[float, ...]
+    cancel_after_seconds: int
+
+
+ENTRY_EXECUTION_PROFILES: dict[EntryExecutionProfileName, EntryExecutionProfile] = {
+    "patient": EntryExecutionProfile("patient", 0.25, (60, 180), (0.50, 0.70), 300),
+    "balanced": EntryExecutionProfile("balanced", 0.35, (30, 90), (0.60, 0.85), 150),
+    "urgent": EntryExecutionProfile("urgent", 0.50, (15, 30), (0.80, 1.00), 60),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +146,53 @@ def select_entry_limit(
         limit_price=round_price(max(0.01, min(limit_price, ask))),
         block_reasons=[],
     )
+
+
+def get_entry_execution_profile(value: Any) -> EntryExecutionProfile | None:
+    normalized = str(value or "").strip().lower()
+    return ENTRY_EXECUTION_PROFILES.get(normalized)  # type: ignore[arg-type]
+
+
+def resolve_initial_spread_fraction(
+    execution_params: dict[str, Any],
+) -> tuple[float | None, EntryExecutionProfile | None]:
+    profile = get_entry_execution_profile(execution_params.get("entry_execution_profile"))
+    explicit = _optional_fraction(execution_params.get("entry_pricing_spread_fraction"))
+    if explicit is not None:
+        return explicit, profile
+    return (profile.initial_spread_fraction if profile is not None else None), profile
+
+
+def build_entry_profile_comparison(
+    quote: PublicQuote,
+    execution_params: dict[str, Any],
+    *,
+    open_interest_percentile: float | None,
+) -> dict[str, dict[str, Any]]:
+    """Price all named profiles from one quote without granting order authority."""
+    comparison: dict[str, dict[str, Any]] = {}
+    for name, profile in ENTRY_EXECUTION_PROFILES.items():
+        effective_fraction = scale_spread_fraction(
+            profile.initial_spread_fraction,
+            enabled=True,
+            open_interest_percentile=open_interest_percentile,
+        )
+        params = {**execution_params, "entry_pricing_spread_fraction": effective_fraction}
+        result = select_entry_limit(quote, params)
+        savings_vs_ask = None
+        if result.limit_price is not None and quote.ask is not None:
+            savings_vs_ask = round_price(float(quote.ask) - result.limit_price)
+        comparison[name] = {
+            "base_spread_fraction": profile.initial_spread_fraction,
+            "effective_spread_fraction": effective_fraction,
+            "quote_limit_price": result.limit_price,
+            "savings_vs_ask": savings_vs_ask,
+            "block_reasons": list(result.block_reasons),
+            "reprice_checkpoints_seconds": list(profile.reprice_checkpoints_seconds),
+            "reprice_spread_fractions": list(profile.reprice_spread_fractions),
+            "cancel_after_seconds": profile.cancel_after_seconds,
+        }
+    return comparison
 
 
 def quote_mid(quote: PublicQuote) -> float | None:

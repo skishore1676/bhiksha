@@ -222,6 +222,30 @@ def test_execution_planner_scales_initial_spread_fraction_by_chain_oi_percentile
     assert plan.risk_details["entry_pricing"]["policy"]["spread_fraction"] == 0.25
 
 
+def test_execution_planner_named_patient_profile_sets_authoritative_price_and_comparisons():
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = deployment.model_copy(
+        update={
+            "execution": deployment.execution.model_copy(
+                update={"entry_execution_profile": "patient", "entry_pricing_spread_fraction": None}
+            )
+        }
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
+
+    pricing = plan.risk_details["entry_pricing"]
+    assert plan.estimated_entry_price == 2.75
+    assert pricing["entry_execution_profile"] == "patient"
+    assert pricing["initial_profile_comparison"]["balanced"]["quote_limit_price"] == 2.77
+    assert pricing["initial_profile_comparison"]["urgent"]["quote_limit_price"] == 2.80
+
+
 def test_execution_planner_allow_nearest_after_extends_chain_lookup_and_records_selection_details():
     deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = deployment.model_copy(

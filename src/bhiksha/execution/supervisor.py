@@ -23,7 +23,13 @@ from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
-from bhiksha.execution.pricing import scale_spread_fraction, select_entry_limit
+from bhiksha.execution.pricing import (
+    EntryPricingResult,
+    build_entry_profile_comparison,
+    get_entry_execution_profile,
+    scale_spread_fraction,
+    select_entry_limit,
+)
 from bhiksha.execution.profile_exit import (
     ProfileExitFields,
     ProfileExitState,
@@ -1178,7 +1184,10 @@ class ExecutionSupervisor:
         else:
             pricing_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
                 spread_fraction,
-                enabled=deployment.execution.entry_pricing_oi_percentile_scale,
+                enabled=(
+                    deployment.execution.entry_pricing_oi_percentile_scale
+                    or get_entry_execution_profile(deployment.execution.entry_execution_profile) is not None
+                ),
                 open_interest_percentile=_risk_open_interest_percentile(plan),
             )
         try:
@@ -1190,12 +1199,13 @@ class ExecutionSupervisor:
                 attempt=attempt,
                 reason=f"entry_reprice_quote_unavailable:{exc}",
             )
+        pricing_evidence = _entry_pricing_evidence(pricing, deployment, plan)
         if pricing.block_reasons or pricing.limit_price is None:
             return await self._cancel_entry_for_reprice_block(
                 plan,
                 attempt=attempt,
                 reason="entry_reprice_quote_blocked:" + ",".join(pricing.block_reasons or ["missing_limit"]),
-                pricing_evidence=pricing.evidence(),
+                pricing_evidence=pricing_evidence,
             )
 
         try:
@@ -1205,7 +1215,7 @@ class ExecutionSupervisor:
                 plan,
                 attempt=attempt,
                 reason=f"entry_reprice_preflight_failed:{exc}",
-                pricing_evidence=pricing.evidence(),
+                pricing_evidence=pricing_evidence,
             )
         final_limit_price = float(preflight.payload["limitPrice"])
         max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
@@ -1216,7 +1226,7 @@ class ExecutionSupervisor:
                 attempt=attempt,
                 reason="entry_reprice_above_max_trade_premium",
                 pricing_evidence={
-                    **pricing.evidence(),
+                    **pricing_evidence,
                     "preflight_limit_price": final_limit_price,
                     "repriced_premium": repriced_premium,
                     "max_trade_premium_usd": max_trade_premium,
@@ -1248,7 +1258,7 @@ class ExecutionSupervisor:
                     "attempt": attempt,
                     "cancel_ok": cancel_result.cancel_ok,
                     "cancel_error": cancel_result.cancel_error,
-                    "pricing_evidence": pricing.evidence(),
+                    "pricing_evidence": pricing_evidence,
                     "payload": cancel_result.payload or {},
                 },
             )
@@ -1264,7 +1274,7 @@ class ExecutionSupervisor:
                     "error": cancel_result.cancel_error,
                     "status": cancel_result.status,
                     "status_error": cancel_result.status_error,
-                    "pricing_evidence": pricing.evidence(),
+                    "pricing_evidence": pricing_evidence,
                 },
             )
             return _EntryRepriceResult(plan=plan, error=f"entry_reprice_cancel_failed:{cancel_result.cancel_error}")
@@ -1313,7 +1323,7 @@ class ExecutionSupervisor:
             )
 
         pricing_evidence = {
-            **pricing.evidence(),
+            **pricing_evidence,
             "preflight_limit_price": final_limit_price,
             "preflight_increment": preflight.current_increment,
             "preflight_buying_power_requirement": preflight.buying_power_requirement,
@@ -4745,18 +4755,35 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
 
 def _entry_reprice_enabled(app_config: AppConfig, deployment: DeploymentManifest) -> bool:
     lane_value = deployment.execution.entry_reprice_enabled
-    return app_config.entry_reprice_enabled if lane_value is None else lane_value
+    if lane_value is not None:
+        return lane_value
+    if get_entry_execution_profile(deployment.execution.entry_execution_profile) is not None:
+        return True
+    return app_config.entry_reprice_enabled
 
 
 def _entry_reprice_cancel_after_seconds(app_config: AppConfig, deployment: DeploymentManifest) -> int:
     lane_value = deployment.execution.entry_reprice_cancel_after_seconds
-    return max(int(app_config.entry_reprice_cancel_after_seconds if lane_value is None else lane_value), 0)
+    profile = get_entry_execution_profile(deployment.execution.entry_execution_profile)
+    if lane_value is not None:
+        value = lane_value
+    elif profile is not None:
+        value = profile.cancel_after_seconds
+    else:
+        value = app_config.entry_reprice_cancel_after_seconds
+    return max(int(value), 0)
 
 
 def _entry_reprice_checkpoints(app_config: AppConfig, deployment: DeploymentManifest) -> list[int]:
     cancel_after = _entry_reprice_cancel_after_seconds(app_config, deployment)
     lane_values = deployment.execution.entry_reprice_checkpoints_seconds
-    source = app_config.entry_reprice_checkpoints_seconds if lane_values is None else lane_values
+    profile = get_entry_execution_profile(deployment.execution.entry_execution_profile)
+    if lane_values is not None:
+        source = lane_values
+    elif profile is not None:
+        source = profile.reprice_checkpoints_seconds
+    else:
+        source = app_config.entry_reprice_checkpoints_seconds
     checkpoints = sorted({max(int(value), 0) for value in source})
     return [value for value in checkpoints if value < cancel_after]
 
@@ -4771,10 +4798,38 @@ def _entry_reprice_spread_pct(app_config: AppConfig, attempt: int) -> float:
 
 def _entry_reprice_spread_fraction(deployment: DeploymentManifest, attempt: int) -> float | None:
     values = deployment.execution.entry_reprice_spread_fractions
+    if values is None:
+        profile = get_entry_execution_profile(deployment.execution.entry_execution_profile)
+        values = list(profile.reprice_spread_fractions) if profile is not None else None
     if not values:
         return None
     index = max(attempt - 1, 0)
     return float(values[index] if index < len(values) else values[-1])
+
+
+def _entry_pricing_evidence(
+    pricing: EntryPricingResult,
+    deployment: DeploymentManifest,
+    plan: TradePlan,
+) -> dict[str, Any]:
+    profile = get_entry_execution_profile(deployment.execution.entry_execution_profile)
+    prior_pricing = plan.risk_details.get("entry_pricing")
+    prior_comparison = (
+        prior_pricing.get("initial_profile_comparison") if isinstance(prior_pricing, dict) else None
+    )
+    return {
+        **pricing.evidence(),
+        "entry_execution_profile": profile.name if profile is not None else "legacy",
+        "initial_profile_comparison": (
+            prior_comparison
+            if isinstance(prior_comparison, dict)
+            else build_entry_profile_comparison(
+                pricing.quote,
+                deployment.execution.model_dump(),
+                open_interest_percentile=_risk_open_interest_percentile(plan),
+            )
+        ),
+    }
 
 
 def _risk_open_interest_percentile(plan: TradePlan) -> float | None:

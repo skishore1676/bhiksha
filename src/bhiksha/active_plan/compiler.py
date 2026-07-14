@@ -1066,6 +1066,7 @@ def _google_catalog_entry_payload(
         ),
     }
     execution_default_fields = {
+        "entry_execution_profile": _coerce_text,
         "entry_pricing_spread_fraction": _coerce_float,
         "entry_pricing_oi_percentile_scale": _coerce_bool,
         "entry_reprice_enabled": _coerce_bool,
@@ -1991,6 +1992,14 @@ def _coerce_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_text(value: Any) -> str | None:
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+    text = str(normalized).strip().lower()
+    return text or None
 
 
 def _coerce_int(value: Any) -> int | None:

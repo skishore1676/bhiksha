@@ -104,6 +104,64 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
     assert report["status"] == {"level": "YELLOW", "reason": "provider_warning"}
 
 
+def test_daily_report_summarizes_entry_profile_quote_comparisons(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await events.append(
+            "trade_plan",
+            {
+                "deployment_id": "smh_live",
+                "symbol": "SMH",
+                "risk_details": {
+                    "entry_pricing": {
+                        "entry_execution_profile": "patient",
+                        "initial_profile_comparison": {
+                            "patient": {
+                                "effective_spread_fraction": 0.125,
+                                "savings_vs_ask": 0.17,
+                                "block_reasons": [],
+                            },
+                            "balanced": {
+                                "effective_spread_fraction": 0.175,
+                                "savings_vs_ask": 0.16,
+                                "block_reasons": [],
+                            },
+                            "urgent": {
+                                "effective_spread_fraction": 0.25,
+                                "savings_vs_ask": None,
+                                "block_reasons": ["public_spread_above_maximum"],
+                            },
+                        },
+                    }
+                },
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE events SET created_at = '2026-07-13T15:00:00+00:00'")
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-07-13")
+
+    comparison = report["entry_profile_comparison"][0]
+    assert comparison["deployment_id"] == "smh_live"
+    assert comparison["active_profile"] == "patient"
+    assert comparison["profiles"]["patient"] == {
+        "sample_count": 1,
+        "blocked_count": 0,
+        "average_savings_vs_ask": 0.17,
+        "average_effective_spread_fraction": 0.125,
+    }
+    assert comparison["profiles"]["urgent"]["blocked_count"] == 1
+    markdown = render_daily_report_markdown(report)
+    assert "## Entry Profile Quote Comparison" in markdown
+    assert "| smh_live | patient | balanced | 1 | 0 | 0.16 | 0.1750 |" in markdown
+
+
 def test_daily_report_marks_closed_live_trade_with_missing_exit_truth_unknown(tmp_path) -> None:
     db_path = tmp_path / "bhiksha.db"
     backend = SQLiteBackend(str(db_path))

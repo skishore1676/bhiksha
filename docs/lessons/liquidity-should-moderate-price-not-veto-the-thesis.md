@@ -8,6 +8,8 @@ refs:
   - src/bhiksha/options/selectors.py
   - src/bhiksha/execution/pricing.py
   - src/bhiksha/execution/supervisor.py
+  - src/bhiksha/ops/daily_report.py
+  - src/bhiksha/tools/sync_active_plan.py
   - docs/lessons/sheet-is-the-operator-control-surface.md
 ---
 
@@ -32,11 +34,12 @@ edge depends on immediate entry. Missing percentile evidence must become
 bid-only, never an implicit permission to chase.
 
 ## Specifics
-The Sheet controls an opt-in ladder through `execution_overrides`: initial
-`entry_pricing_spread_fraction`, OI scaling, reprice checkpoints and fractions,
-and a final cancel deadline. Fraction `0` means bid, `0.5` means mid, and `1`
-means ask. Existing lanes retain their legacy global pricing unless explicitly
-overridden.
+The Sheet controls an opt-in ladder through a named `entry_execution_profile`:
+`patient`, `balanced`, or `urgent`. Each profile bundles an initial spread
+fraction, OI-percentile scaling, reprice checkpoints and fractions, and a final
+cancel deadline. Fraction `0` means bid, `0.5` means mid, and `1` means ask.
+Explicit lane values override the bundle where supported. Existing lanes retain
+their legacy global pricing unless a profile is explicitly selected.
 
 Each replacement still rechecks quote quality, cancel/status races, broker
 preflight, cash availability, and the lane's maximum trade premium. That last
@@ -47,8 +50,16 @@ The active-plan sync's lane-config snapshot must include these fields. A Sheet
 knob that changes trade economics but is absent from `LANE_CONFIG_CHANGED`
 creates a false clean readback even when compilation itself is correct.
 
+Every quoted entry records all three candidate initial limits from the same
+quote, even when the lane remains on legacy execution. This is counterfactual
+quote evidence, not fill evidence. Preserve that initial comparison across
+later reprices; replacing it with a later quote silently invalidates the
+comparison. The daily report may aggregate savings versus ask and blocked
+counts, but promotion still requires actual fill and missed-trade review.
+
 ## Apply It Next Time
 When a chain gate suppresses a sound thesis, first separate safety vetoes from
 execution-quality evidence. Preserve hard sanity bounds, turn relative quality
 into price or patience, expose the policy in the operator Sheet, and record the
-effective value on every order attempt.
+effective value on every order attempt. Roll a new profile out one lane at a
+time while recording counterfactuals for the rest.

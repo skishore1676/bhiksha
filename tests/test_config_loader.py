@@ -346,6 +346,39 @@ def test_load_deployments_rejects_mismatched_patient_entry_ladder(tmp_path: Path
         load_deployments(root)
 
 
+def test_load_deployments_rejects_partial_named_profile_ladder_override(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_qqq")
+    payload["execution"].update(
+        {
+            "entry_execution_profile": "balanced",
+            "entry_reprice_checkpoints_seconds": [30, 90],
+        }
+    )
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="must include matching spread fractions"):
+        load_deployments(root)
+
+
+def test_load_deployments_rejects_named_profile_checkpoint_at_profile_deadline(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_qqq")
+    payload["execution"].update(
+        {
+            "entry_execution_profile": "balanced",
+            "entry_reprice_checkpoints_seconds": [30, 150],
+            "entry_reprice_spread_fractions": [0.60, 0.85],
+        }
+    )
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="before the cancel deadline"):
+        load_deployments(root)
+
+
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str = "QQQ") -> None:
     payload = _manifest_dict(deployment_id, symbol=symbol)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

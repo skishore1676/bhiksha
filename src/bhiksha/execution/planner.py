@@ -8,7 +8,12 @@ import uuid
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import OrderManager, OrderResult
-from bhiksha.execution.pricing import scale_spread_fraction, select_entry_limit
+from bhiksha.execution.pricing import (
+    build_entry_profile_comparison,
+    resolve_initial_spread_fraction,
+    scale_spread_fraction,
+    select_entry_limit,
+)
 from bhiksha.market_data.session import as_et_time
 from bhiksha.options.chain_service import OptionChainService
 from bhiksha.options.chain_snapshot import build_chain_snapshot
@@ -162,15 +167,23 @@ class ExecutionPlanner:
                 entry_timestamp=decision.timestamp,
             )
         execution_params = deployment.execution.model_dump()
-        base_spread_fraction = deployment.execution.entry_pricing_spread_fraction
+        base_spread_fraction, active_entry_profile = resolve_initial_spread_fraction(execution_params)
         if base_spread_fraction is not None:
             execution_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
                 base_spread_fraction,
-                enabled=deployment.execution.entry_pricing_oi_percentile_scale,
+                enabled=deployment.execution.entry_pricing_oi_percentile_scale or active_entry_profile is not None,
                 open_interest_percentile=selection.open_interest_percentile,
             )
         pricing = select_entry_limit(quote, execution_params)
-        pricing_evidence = pricing.evidence()
+        pricing_evidence = {
+            **pricing.evidence(),
+            "entry_execution_profile": active_entry_profile.name if active_entry_profile is not None else "legacy",
+            "initial_profile_comparison": build_entry_profile_comparison(
+                quote,
+                deployment.execution.model_dump(),
+                open_interest_percentile=selection.open_interest_percentile,
+            ),
+        }
         entry_price = pricing.limit_price
         if pricing.block_reasons:
             return TradePlan(

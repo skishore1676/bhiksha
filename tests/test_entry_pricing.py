@@ -1,7 +1,14 @@
 import pytest
 
 from bhiksha.execution.order_manager import PublicQuote
-from bhiksha.execution.pricing import EntryPricingPolicy, scale_spread_fraction, select_entry_limit
+from bhiksha.execution.pricing import (
+    ENTRY_EXECUTION_PROFILES,
+    EntryPricingPolicy,
+    build_entry_profile_comparison,
+    resolve_initial_spread_fraction,
+    scale_spread_fraction,
+    select_entry_limit,
+)
 
 
 def test_urgent_entry_pricing_improves_inside_wider_spread() -> None:
@@ -60,3 +67,36 @@ def test_oi_percentile_scaling_never_makes_fraction_more_aggressive() -> None:
     assert scale_spread_fraction(0.70, enabled=True, open_interest_percentile=0.25) == pytest.approx(0.175)
     assert scale_spread_fraction(0.70, enabled=True, open_interest_percentile=None) == 0.0
     assert scale_spread_fraction(0.70, enabled=False, open_interest_percentile=0.25) == 0.70
+
+
+def test_named_entry_profiles_have_distinct_bounded_ladders() -> None:
+    assert ENTRY_EXECUTION_PROFILES["patient"].reprice_checkpoints_seconds == (60, 180)
+    assert ENTRY_EXECUTION_PROFILES["balanced"].reprice_spread_fractions == (0.60, 0.85)
+    assert ENTRY_EXECUTION_PROFILES["urgent"].cancel_after_seconds == 60
+
+
+def test_entry_profile_comparison_prices_all_profiles_without_order_authority() -> None:
+    comparison = build_entry_profile_comparison(
+        PublicQuote(symbol="SMH260717P00280000", bid=2.70, ask=2.90, last=2.80, open_interest=5310),
+        {"min_open_interest": 50, "max_bid_ask_spread_pct": 0.12},
+        open_interest_percentile=0.50,
+    )
+
+    assert set(comparison) == {"patient", "balanced", "urgent"}
+    assert comparison["patient"]["quote_limit_price"] == 2.73
+    assert comparison["balanced"]["quote_limit_price"] == 2.74
+    assert comparison["urgent"]["quote_limit_price"] == 2.75
+    assert comparison["patient"]["effective_spread_fraction"] == 0.125
+
+
+def test_explicit_initial_fraction_overrides_named_profile_default() -> None:
+    fraction, profile = resolve_initial_spread_fraction(
+        {
+            "entry_execution_profile": "patient",
+            "entry_pricing_spread_fraction": 0.40,
+        }
+    )
+
+    assert profile is not None
+    assert profile.name == "patient"
+    assert fraction == 0.40

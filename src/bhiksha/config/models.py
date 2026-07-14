@@ -224,6 +224,7 @@ class ExecutionSpec(BaseModel):
     target_abs_delta_max: float | None = None
     min_open_interest: int = 0
     max_bid_ask_spread_pct: float | None = None
+    entry_execution_profile: Literal["patient", "balanced", "urgent"] | None = None
     entry_pricing_mode: Literal["passive", "balanced", "urgent", "cross"] = "urgent"
     entry_pricing_urgent_spread_pct: float = 0.25
     entry_pricing_passive_spread_pct: float = 0.25
@@ -284,6 +285,12 @@ class ExecutionSpec(BaseModel):
     def validate_patient_entry_policy(self) -> "ExecutionSpec":
         checkpoints = self.entry_reprice_checkpoints_seconds
         fractions = self.entry_reprice_spread_fractions
+        profile_cancel_after: int | None = None
+        if self.entry_execution_profile is not None:
+            from bhiksha.execution.pricing import get_entry_execution_profile
+
+            profile = get_entry_execution_profile(self.entry_execution_profile)
+            profile_cancel_after = profile.cancel_after_seconds if profile is not None else None
         if checkpoints is not None:
             if any(value < 0 for value in checkpoints):
                 raise ValueError("entry_reprice_checkpoints_seconds must be non-negative")
@@ -293,8 +300,15 @@ class ExecutionSpec(BaseModel):
             raise ValueError("entry_reprice_spread_fractions must stay between bid (0) and ask (1)")
         if checkpoints is not None and fractions is not None and len(checkpoints) != len(fractions):
             raise ValueError("entry_reprice checkpoints and spread fractions must have equal lengths")
-        if self.entry_reprice_cancel_after_seconds is not None and checkpoints:
-            if checkpoints[-1] >= self.entry_reprice_cancel_after_seconds:
+        if self.entry_execution_profile is not None and (checkpoints is None) != (fractions is None):
+            raise ValueError("named entry profile checkpoint overrides must include matching spread fractions")
+        effective_cancel_after = (
+            self.entry_reprice_cancel_after_seconds
+            if self.entry_reprice_cancel_after_seconds is not None
+            else profile_cancel_after
+        )
+        if effective_cancel_after is not None and checkpoints:
+            if checkpoints[-1] >= effective_cancel_after:
                 raise ValueError("entry_reprice checkpoints must occur before the cancel deadline")
         return self
 

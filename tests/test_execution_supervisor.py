@@ -11,7 +11,13 @@ from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, Trad
 from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.order_manager import OrderResult, PreflightCheck, PublicQuote
-from bhiksha.execution.supervisor import ExecutionSupervisor
+from bhiksha.execution.supervisor import (
+    ExecutionSupervisor,
+    _entry_reprice_cancel_after_seconds,
+    _entry_reprice_checkpoints,
+    _entry_reprice_enabled,
+    _entry_reprice_spread_fraction,
+)
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.lifecycle import TradeLifecycleStore
 from bhiksha.state.position_tracker import PositionTracker
@@ -440,7 +446,16 @@ def test_execution_supervisor_uses_lane_patient_reprice_policy_when_global_polic
         quantity=1,
         estimated_entry_price=2.70,
         risk_reasons=["approved"],
-        risk_details={"open_interest_percentile": 0.50},
+        risk_details={
+            "open_interest_percentile": 0.50,
+            "entry_pricing": {
+                "initial_profile_comparison": {
+                    "patient": {"quote_limit_price": 2.71},
+                    "balanced": {"quote_limit_price": 2.73},
+                    "urgent": {"quote_limit_price": 2.75},
+                }
+            },
+        },
         dry_run=False,
         order_id="ENTRY123",
     )
@@ -450,6 +465,42 @@ def test_execution_supervisor_uses_lane_patient_reprice_policy_when_global_polic
     assert protected.order_id != "ENTRY123"
     assert order_manager.entry_calls[0][1] == 2.73
     assert protected.risk_details["entry_pricing"]["policy"]["spread_fraction"] == 0.125
+    assert protected.risk_details["entry_pricing"]["initial_profile_comparison"] == {
+        "patient": {"quote_limit_price": 2.71},
+        "balanced": {"quote_limit_price": 2.73},
+        "urgent": {"quote_limit_price": 2.75},
+    }
+
+
+def test_named_patient_profile_resolves_full_lane_policy_when_global_policy_is_off() -> None:
+    app_config = AppConfig(entry_reprice_enabled=False)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = deployment.model_copy(
+        update={
+            "execution": deployment.execution.model_copy(
+                update={
+                    "entry_execution_profile": "patient",
+                    "entry_reprice_enabled": None,
+                    "entry_reprice_checkpoints_seconds": None,
+                    "entry_reprice_cancel_after_seconds": None,
+                    "entry_reprice_spread_fractions": None,
+                }
+            )
+        }
+    )
+
+    assert _entry_reprice_enabled(app_config, deployment) is True
+    assert _entry_reprice_checkpoints(app_config, deployment) == [60, 180]
+    assert _entry_reprice_cancel_after_seconds(app_config, deployment) == 300
+    assert _entry_reprice_spread_fraction(deployment, 1) == 0.50
+    assert _entry_reprice_spread_fraction(deployment, 2) == 0.70
+
+    disabled = deployment.model_copy(
+        update={
+            "execution": deployment.execution.model_copy(update={"entry_reprice_enabled": False})
+        }
+    )
+    assert _entry_reprice_enabled(app_config, disabled) is False
 
 
 def test_execution_supervisor_lane_cancel_deadline_removes_unfilled_order(tmp_path) -> None:

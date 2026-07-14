@@ -40,6 +40,7 @@ def test_compile_active_plan_from_csv_supports_strategy_and_manual_same_symbol(t
                     {
                         "dte_min": 1,
                         "dte_max": 5,
+                        "entry_execution_profile": "patient",
                         "entry_pricing_spread_fraction": 0.25,
                         "entry_pricing_oi_percentile_scale": True,
                         "entry_reprice_enabled": True,
@@ -85,6 +86,7 @@ def test_compile_active_plan_from_csv_supports_strategy_and_manual_same_symbol(t
     assert strategy.execution.shadow_only is False
     assert strategy.execution.dte_min == 1
     assert strategy.execution.dte_max == 5
+    assert strategy.execution.entry_execution_profile == "patient"
     assert strategy.execution.entry_pricing_spread_fraction == 0.25
     assert strategy.execution.entry_pricing_oi_percentile_scale is True
     assert strategy.execution.entry_reprice_enabled is True
@@ -1161,6 +1163,7 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "target_pullback_restore_progress_pct", "value": "0.75"},
             {"section": "default", "key": "min_open_interest", "value": "25"},
             {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
+            {"section": "default", "key": "entry_execution_profile", "value": "balanced"},
             {"section": "default", "key": "entry_pricing_spread_fraction", "value": "0.25"},
             {"section": "default", "key": "entry_pricing_oi_percentile_scale", "value": "TRUE"},
             {"section": "default", "key": "entry_reprice_enabled", "value": "TRUE"},
@@ -1215,6 +1218,7 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.execution.target_abs_delta_max == 0.40
     assert deployment.execution.min_open_interest == 25
     assert deployment.execution.max_bid_ask_spread_pct == 0.10
+    assert deployment.execution.entry_execution_profile == "balanced"
     assert deployment.execution.entry_pricing_spread_fraction == 0.25
     assert deployment.execution.entry_pricing_oi_percentile_scale is True
     assert deployment.execution.entry_reprice_enabled is True

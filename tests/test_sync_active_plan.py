@@ -190,6 +190,7 @@ def test_lane_config_diff_surfaces_patient_entry_policy_changes() -> None:
                     "execution": {
                         "min_open_interest": 50,
                         "max_bid_ask_spread_pct": 0.12,
+                        "entry_execution_profile": "patient",
                         "entry_pricing_spread_fraction": 0.25,
                         "entry_pricing_oi_percentile_scale": True,
                         "entry_reprice_enabled": True,
@@ -208,7 +209,56 @@ def test_lane_config_diff_surfaces_patient_entry_policy_changes() -> None:
     assert changes[0]["deployment_id"] == "smh_lane"
     fields = changes[0]["fields"]
     assert fields["min_open_interest"] == {"before": 100, "after": 50}
+    assert fields["entry_execution_profile"] == {"before": None, "after": "patient"}
     assert fields["entry_reprice_spread_fractions"] == {"before": None, "after": [0.50, 0.70]}
+    assert after["smh_lane"]["effective_entry_pricing_spread_fraction"] == 0.25
+    assert after["smh_lane"]["effective_entry_reprice_checkpoints_seconds"] == [60, 180]
+
+
+def test_named_patient_profile_replaces_explicit_ladder_without_changing_effective_policy() -> None:
+    before = lane_config_snapshot(
+        {
+            "deployments": [
+                {
+                    "deployment_id": "smh_lane",
+                    "execution": {
+                        "entry_pricing_spread_fraction": 0.25,
+                        "entry_pricing_oi_percentile_scale": True,
+                        "entry_reprice_enabled": True,
+                        "entry_reprice_checkpoints_seconds": [60, 180],
+                        "entry_reprice_cancel_after_seconds": 300,
+                        "entry_reprice_spread_fractions": [0.50, 0.70],
+                    },
+                }
+            ]
+        }
+    )
+    after = lane_config_snapshot(
+        {
+            "deployments": [
+                {
+                    "deployment_id": "smh_lane",
+                    "execution": {"entry_execution_profile": "patient"},
+                }
+            ]
+        }
+    )
+
+    changes = diff_lane_configs(before, after)
+
+    assert len(changes) == 1
+    fields = changes[0]["fields"]
+    assert fields["entry_execution_profile"] == {"before": None, "after": "patient"}
+    assert fields["entry_pricing_spread_fraction"] == {"before": 0.25, "after": None}
+    for field in (
+        "effective_entry_pricing_spread_fraction",
+        "effective_entry_pricing_oi_percentile_scale",
+        "effective_entry_reprice_enabled",
+        "effective_entry_reprice_checkpoints_seconds",
+        "effective_entry_reprice_cancel_after_seconds",
+        "effective_entry_reprice_spread_fractions",
+    ):
+        assert field not in fields
 
 
 def test_sync_active_plan_logs_compile_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

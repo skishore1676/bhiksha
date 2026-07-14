@@ -15,6 +15,7 @@ from typing import Iterator
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
+from bhiksha.execution.pricing import resolve_initial_spread_fraction
 from bhiksha.strategy.capabilities import CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST_PATH
 from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
 
@@ -42,6 +43,7 @@ _LANE_CONFIG_FIELDS: tuple[tuple[str, str], ...] = (
     ("exit", "hard_flat_time_et"),
     ("risk", "max_trade_premium_usd"),
     ("execution", "shadow_only"),
+    ("execution", "entry_execution_profile"),
     ("execution", "min_open_interest"),
     ("execution", "max_bid_ask_spread_pct"),
     ("execution", "entry_pricing_spread_fraction"),
@@ -66,6 +68,29 @@ def lane_config_snapshot(plan: dict[str, object]) -> dict[str, dict[str, object]
         for domain, field in _LANE_CONFIG_FIELDS:
             payload = deployment.get(domain)
             lane[field] = payload.get(field) if isinstance(payload, dict) else None
+        execution = deployment.get("execution")
+        if isinstance(execution, dict):
+            initial_fraction, profile = resolve_initial_spread_fraction(execution)
+            lane["effective_entry_pricing_spread_fraction"] = initial_fraction
+            lane["effective_entry_pricing_oi_percentile_scale"] = bool(
+                execution.get("entry_pricing_oi_percentile_scale") or profile is not None
+            )
+            lane["effective_entry_reprice_enabled"] = _first_not_none(
+                execution.get("entry_reprice_enabled"),
+                True if profile is not None else None,
+            )
+            lane["effective_entry_reprice_checkpoints_seconds"] = _first_not_none(
+                execution.get("entry_reprice_checkpoints_seconds"),
+                list(profile.reprice_checkpoints_seconds) if profile is not None else None,
+            )
+            lane["effective_entry_reprice_cancel_after_seconds"] = _first_not_none(
+                execution.get("entry_reprice_cancel_after_seconds"),
+                profile.cancel_after_seconds if profile is not None else None,
+            )
+            lane["effective_entry_reprice_spread_fractions"] = _first_not_none(
+                execution.get("entry_reprice_spread_fractions"),
+                list(profile.reprice_spread_fractions) if profile is not None else None,
+            )
         lanes[deployment_id] = lane
     return lanes
 
@@ -102,6 +127,10 @@ def _read_previous_lane_config(path: Path) -> dict[str, dict[str, object]]:
         return lane_config_snapshot(json.loads(path.read_text(encoding="utf-8")))
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _first_not_none(*values: object) -> object | None:
+    return next((value for value in values if value is not None), None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -201,7 +230,9 @@ def main(argv: list[str] | None = None) -> int:
                     f" max_trade_premium_usd={lane.get('max_trade_premium_usd')}"
                     f" min_open_interest={lane.get('min_open_interest')}"
                     f" max_spread_pct={lane.get('max_bid_ask_spread_pct')}"
+                    f" entry_profile={lane.get('entry_execution_profile')}"
                     f" entry_fraction={lane.get('entry_pricing_spread_fraction')}"
+                    f" effective_entry_fraction={lane.get('effective_entry_pricing_spread_fraction')}"
                     f" reprice_enabled={lane.get('entry_reprice_enabled')}"
                     f" reprice_cancel_seconds={lane.get('entry_reprice_cancel_after_seconds')}"
                 )
