@@ -1065,6 +1065,21 @@ def _google_catalog_entry_payload(
             0.20,
         ),
     }
+    execution_default_fields = {
+        "entry_pricing_spread_fraction": _coerce_float,
+        "entry_pricing_oi_percentile_scale": _coerce_bool,
+        "entry_reprice_enabled": _coerce_bool,
+        "entry_reprice_checkpoints_seconds": _coerce_int_list,
+        "entry_reprice_cancel_after_seconds": _coerce_int,
+        "entry_reprice_spread_fractions": _coerce_float_list,
+    }
+    for key, coercer in execution_default_fields.items():
+        value = _first_not_none(
+            coercer(vehicle_mapping.get(key)),
+            coercer(defaults.get(key)) if use_defaults else None,
+        )
+        if value is not None:
+            execution_payload[key] = value
     dte_range = _compact_numeric_range_text(vehicle_mapping.get("dte") or vehicle_mapping.get("dte_target"))
     if dte_range is not None:
         execution_payload["dte"] = dte_range
@@ -1985,6 +2000,26 @@ def _coerce_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_int_list(value: Any) -> list[int] | None:
+    normalized = _normalize_value(value)
+    if not isinstance(normalized, list):
+        return None
+    parsed = [_coerce_int(item) for item in normalized]
+    if any(item is None for item in parsed):
+        return None
+    return [int(item) for item in parsed if item is not None]
+
+
+def _coerce_float_list(value: Any) -> list[float] | None:
+    normalized = _normalize_value(value)
+    if not isinstance(normalized, list):
+        return None
+    parsed = [_coerce_float(item) for item in normalized]
+    if any(item is None for item in parsed):
+        return None
+    return [float(item) for item in parsed if item is not None]
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

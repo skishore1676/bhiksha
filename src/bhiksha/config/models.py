@@ -228,8 +228,14 @@ class ExecutionSpec(BaseModel):
     entry_pricing_urgent_spread_pct: float = 0.25
     entry_pricing_passive_spread_pct: float = 0.25
     entry_pricing_cross_tight_spread_pct: float = 0.03
+    entry_pricing_spread_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+    entry_pricing_oi_percentile_scale: bool = False
     entry_pricing_require_two_sided_quote: bool = True
     entry_pricing_require_open_interest: bool = True
+    entry_reprice_enabled: bool | None = None
+    entry_reprice_checkpoints_seconds: list[int] | None = None
+    entry_reprice_cancel_after_seconds: int | None = Field(default=None, ge=0)
+    entry_reprice_spread_fractions: list[float] | None = None
     entry_window_start_et: str | None = None
     entry_window_end_et: str | None = None
     shadow_only: bool = False
@@ -273,6 +279,24 @@ class ExecutionSpec(BaseModel):
         _validate_optional_time_field(normalized, "entry_window_start_et")
         _validate_optional_time_field(normalized, "entry_window_end_et")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_patient_entry_policy(self) -> "ExecutionSpec":
+        checkpoints = self.entry_reprice_checkpoints_seconds
+        fractions = self.entry_reprice_spread_fractions
+        if checkpoints is not None:
+            if any(value < 0 for value in checkpoints):
+                raise ValueError("entry_reprice_checkpoints_seconds must be non-negative")
+            if checkpoints != sorted(set(checkpoints)):
+                raise ValueError("entry_reprice_checkpoints_seconds must be sorted and unique")
+        if fractions is not None and any(value < 0.0 or value > 1.0 for value in fractions):
+            raise ValueError("entry_reprice_spread_fractions must stay between bid (0) and ask (1)")
+        if checkpoints is not None and fractions is not None and len(checkpoints) != len(fractions):
+            raise ValueError("entry_reprice checkpoints and spread fractions must have equal lengths")
+        if self.entry_reprice_cancel_after_seconds is not None and checkpoints:
+            if checkpoints[-1] >= self.entry_reprice_cancel_after_seconds:
+                raise ValueError("entry_reprice checkpoints must occur before the cancel deadline")
+        return self
 
 
 class RiskSpec(BaseModel):

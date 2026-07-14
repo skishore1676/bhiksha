@@ -69,6 +69,8 @@ def test_single_leg_selector_prefers_contract_near_target_delta() -> None:
 
     assert selected.option_symbol == "QQQ250331P00099000"
     assert selected.contract_type == "PUT"
+    assert selected.open_interest == 500
+    assert selected.open_interest_percentile == pytest.approx(2 / 3)
 
 
 def test_single_leg_selector_empty_reports_filter_breakdown() -> None:

@@ -23,7 +23,7 @@ from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
-from bhiksha.execution.pricing import select_entry_limit
+from bhiksha.execution.pricing import scale_spread_fraction, select_entry_limit
 from bhiksha.execution.profile_exit import (
     ProfileExitFields,
     ProfileExitState,
@@ -1050,7 +1050,7 @@ class ExecutionSupervisor:
         plan: TradePlan,
         deployment: DeploymentManifest,
     ) -> "_EntryWaitResult":
-        if not self.app_config.entry_reprice_enabled:
+        if not _entry_reprice_enabled(self.app_config, deployment):
             return await self._wait_for_entry_fill_once(
                 plan,
                 timeout_seconds=self.app_config.order_fill_timeout_seconds,
@@ -1059,7 +1059,8 @@ class ExecutionSupervisor:
 
         started_at = datetime.now(UTC)
         active_plan = plan
-        checkpoints = _entry_reprice_checkpoints(self.app_config)
+        cancel_after_seconds = _entry_reprice_cancel_after_seconds(self.app_config, deployment)
+        checkpoints = _entry_reprice_checkpoints(self.app_config, deployment)
         for attempt, checkpoint_seconds in enumerate(checkpoints, start=1):
             wait_seconds = _remaining_seconds(started_at, checkpoint_seconds)
             result = await self._wait_for_entry_fill_once(
@@ -1089,7 +1090,7 @@ class ExecutionSupervisor:
 
         result = await self._wait_for_entry_fill_once(
             active_plan,
-            timeout_seconds=_remaining_seconds(started_at, self.app_config.entry_reprice_cancel_after_seconds),
+            timeout_seconds=_remaining_seconds(started_at, cancel_after_seconds),
             reprice_attempt=len(checkpoints),
         )
         if result.filled or _terminal_entry_error(result.error):
@@ -1103,7 +1104,7 @@ class ExecutionSupervisor:
                     "deployment_id": active_plan.deployment_id,
                     "trade_id": active_plan.trade_id,
                     "order_id": active_plan.order_id,
-                    "cancel_after_seconds": self.app_config.entry_reprice_cancel_after_seconds,
+                    "cancel_after_seconds": cancel_after_seconds,
                     "cancel_ok": cancel_result.cancel_ok,
                     "cancel_error": cancel_result.cancel_error,
                     "payload": cancel_result.payload or {},
@@ -1121,7 +1122,7 @@ class ExecutionSupervisor:
                 "deployment_id": active_plan.deployment_id,
                 "trade_id": active_plan.trade_id,
                 "order_id": active_plan.order_id,
-                "cancel_after_seconds": self.app_config.entry_reprice_cancel_after_seconds,
+                "cancel_after_seconds": cancel_after_seconds,
                 "cancel_ok": cancel_result.cancel_ok,
                 "cancel_error": cancel_result.cancel_error,
                 "status": cancel_result.status,
@@ -1171,7 +1172,15 @@ class ExecutionSupervisor:
         attempt: int,
     ) -> "_EntryRepriceResult":
         pricing_params = deployment.execution.model_dump()
-        pricing_params["entry_pricing_urgent_spread_pct"] = _entry_reprice_spread_pct(self.app_config, attempt)
+        spread_fraction = _entry_reprice_spread_fraction(deployment, attempt)
+        if spread_fraction is None:
+            pricing_params["entry_pricing_urgent_spread_pct"] = _entry_reprice_spread_pct(self.app_config, attempt)
+        else:
+            pricing_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
+                spread_fraction,
+                enabled=deployment.execution.entry_pricing_oi_percentile_scale,
+                open_interest_percentile=_risk_open_interest_percentile(plan),
+            )
         try:
             quote = await self.planner.order_manager.get_option_quote(plan.option_symbol)
             pricing = select_entry_limit(quote, pricing_params)
@@ -1199,6 +1208,20 @@ class ExecutionSupervisor:
                 pricing_evidence=pricing.evidence(),
             )
         final_limit_price = float(preflight.payload["limitPrice"])
+        max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
+        repriced_premium = final_limit_price * plan.quantity * 100
+        if repriced_premium > max_trade_premium:
+            return await self._cancel_entry_for_reprice_block(
+                plan,
+                attempt=attempt,
+                reason="entry_reprice_above_max_trade_premium",
+                pricing_evidence={
+                    **pricing.evidence(),
+                    "preflight_limit_price": final_limit_price,
+                    "repriced_premium": repriced_premium,
+                    "max_trade_premium_usd": max_trade_premium,
+                },
+            )
         required_cash = max(
             preflight.buying_power_requirement or 0.0,
             preflight.estimated_cost or 0.0,
@@ -4720,9 +4743,21 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
     return round_price(candidate)
 
 
-def _entry_reprice_checkpoints(app_config: AppConfig) -> list[int]:
-    cancel_after = max(int(app_config.entry_reprice_cancel_after_seconds), 0)
-    checkpoints = sorted({max(int(value), 0) for value in app_config.entry_reprice_checkpoints_seconds})
+def _entry_reprice_enabled(app_config: AppConfig, deployment: DeploymentManifest) -> bool:
+    lane_value = deployment.execution.entry_reprice_enabled
+    return app_config.entry_reprice_enabled if lane_value is None else lane_value
+
+
+def _entry_reprice_cancel_after_seconds(app_config: AppConfig, deployment: DeploymentManifest) -> int:
+    lane_value = deployment.execution.entry_reprice_cancel_after_seconds
+    return max(int(app_config.entry_reprice_cancel_after_seconds if lane_value is None else lane_value), 0)
+
+
+def _entry_reprice_checkpoints(app_config: AppConfig, deployment: DeploymentManifest) -> list[int]:
+    cancel_after = _entry_reprice_cancel_after_seconds(app_config, deployment)
+    lane_values = deployment.execution.entry_reprice_checkpoints_seconds
+    source = app_config.entry_reprice_checkpoints_seconds if lane_values is None else lane_values
+    checkpoints = sorted({max(int(value), 0) for value in source})
     return [value for value in checkpoints if value < cancel_after]
 
 
@@ -4732,6 +4767,22 @@ def _entry_reprice_spread_pct(app_config: AppConfig, attempt: int) -> float:
         return 1.0
     index = max(attempt - 1, 0)
     return values[index] if index < len(values) else values[-1]
+
+
+def _entry_reprice_spread_fraction(deployment: DeploymentManifest, attempt: int) -> float | None:
+    values = deployment.execution.entry_reprice_spread_fractions
+    if not values:
+        return None
+    index = max(attempt - 1, 0)
+    return float(values[index] if index < len(values) else values[-1])
+
+
+def _risk_open_interest_percentile(plan: TradePlan) -> float | None:
+    value = plan.risk_details.get("open_interest_percentile")
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _remaining_seconds(started_at: datetime, target_elapsed_seconds: int) -> int:

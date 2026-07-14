@@ -8,7 +8,7 @@ import uuid
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
 from bhiksha.execution.order_manager import OrderManager, OrderResult
-from bhiksha.execution.pricing import select_entry_limit
+from bhiksha.execution.pricing import scale_spread_fraction, select_entry_limit
 from bhiksha.market_data.session import as_et_time
 from bhiksha.options.chain_service import OptionChainService
 from bhiksha.options.chain_snapshot import build_chain_snapshot
@@ -162,6 +162,13 @@ class ExecutionPlanner:
                 entry_timestamp=decision.timestamp,
             )
         execution_params = deployment.execution.model_dump()
+        base_spread_fraction = deployment.execution.entry_pricing_spread_fraction
+        if base_spread_fraction is not None:
+            execution_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
+                base_spread_fraction,
+                enabled=deployment.execution.entry_pricing_oi_percentile_scale,
+                open_interest_percentile=selection.open_interest_percentile,
+            )
         pricing = select_entry_limit(quote, execution_params)
         pricing_evidence = pricing.evidence()
         entry_price = pricing.limit_price
@@ -511,14 +518,20 @@ def _risk_profile_for_deployment(
 
 
 def _selection_details(selection) -> dict:
-    if selection.dte_fallback_policy is None:
-        return {}
-    return {
-        "dte_fallback_policy": selection.dte_fallback_policy,
-        "requested_dte_min": selection.requested_dte_min,
-        "requested_dte_max": selection.requested_dte_max,
-        "selected_dte": selection.dte,
+    details = {
+        "selected_open_interest": selection.open_interest,
+        "open_interest_percentile": selection.open_interest_percentile,
     }
+    if selection.dte_fallback_policy is not None:
+        details.update(
+            {
+                "dte_fallback_policy": selection.dte_fallback_policy,
+                "requested_dte_min": selection.requested_dte_min,
+                "requested_dte_max": selection.requested_dte_max,
+                "selected_dte": selection.dte,
+            }
+        )
+    return details
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:

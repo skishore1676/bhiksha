@@ -117,6 +117,16 @@ class SingleLegOptionSelector:
             ),
         )
         chosen = ranked[0]
+        percentile_cohort = [
+            contract
+            for contract in desired_contracts
+            if contract.open_interest is not None
+            and (
+                contract.dte == chosen.dte
+                if fallback_policy_applied
+                else dte_min <= contract.dte <= dte_max
+            )
+        ]
         return OptionSelection(
             option_symbol=chosen.option_symbol,
             contract_type=chosen.contract_type,
@@ -125,6 +135,8 @@ class SingleLegOptionSelector:
             bid=chosen.bid,
             ask=chosen.ask,
             strike=chosen.strike,
+            open_interest=chosen.open_interest,
+            open_interest_percentile=self._open_interest_percentile(chosen, percentile_cohort),
             dte_fallback_policy=fallback_policy_applied,
             requested_dte_min=dte_min if fallback_policy_applied else None,
             requested_dte_max=dte_max if fallback_policy_applied else None,
@@ -197,3 +209,17 @@ class SingleLegOptionSelector:
     def _nearest_after_dte(contracts: list[OptionContractSnapshot], *, dte_max: int) -> int | None:
         later_dtes = sorted({contract.dte for contract in contracts if contract.dte > dte_max})
         return later_dtes[0] if later_dtes else None
+
+    @staticmethod
+    def _open_interest_percentile(
+        chosen: OptionContractSnapshot,
+        cohort: list[OptionContractSnapshot],
+    ) -> float | None:
+        if chosen.open_interest is None or not cohort:
+            return None
+        at_or_below = sum(
+            1
+            for contract in cohort
+            if contract.open_interest is not None and contract.open_interest <= chosen.open_interest
+        )
+        return at_or_below / len(cohort)

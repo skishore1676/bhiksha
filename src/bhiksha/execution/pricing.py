@@ -16,6 +16,7 @@ class EntryPricingPolicy:
     urgent_spread_pct: float = 0.25
     passive_spread_pct: float = 0.25
     cross_tight_spread_pct: float = 0.03
+    spread_fraction: float | None = None
     require_two_sided_quote: bool = True
     require_open_interest: bool = True
 
@@ -41,6 +42,9 @@ class EntryPricingPolicy:
             cross_tight_spread_pct=_as_float(
                 _first_present(raw, "entry_pricing_cross_tight_spread_pct", "cross_tight_spread_pct"),
                 0.03,
+            ),
+            spread_fraction=_optional_fraction(
+                _first_present(raw, "entry_pricing_spread_fraction", "spread_fraction")
             ),
             require_two_sided_quote=_as_bool(
                 _first_present(raw, "entry_pricing_require_two_sided_quote", "require_two_sided_quote"),
@@ -104,7 +108,9 @@ def select_entry_limit(
     spread = ask - bid
     mid = (bid + ask) / 2.0
 
-    if active_policy.mode == "cross" or (
+    if active_policy.spread_fraction is not None:
+        limit_price = bid + spread * active_policy.spread_fraction
+    elif active_policy.mode == "cross" or (
         active_policy.mode == "urgent"
         and quote.spread_pct is not None
         and quote.spread_pct <= active_policy.cross_tight_spread_pct
@@ -135,6 +141,15 @@ def quote_spread_abs(quote: PublicQuote) -> float | None:
     if quote.bid is None or quote.ask is None:
         return None
     return round_price(float(quote.ask) - float(quote.bid))
+
+
+def scale_spread_fraction(base_fraction: float, *, enabled: bool, open_interest_percentile: float | None) -> float:
+    """Moderate bid-to-ask movement using current-chain liquidity evidence."""
+    base = max(0.0, min(float(base_fraction), 1.0))
+    if not enabled:
+        return base
+    percentile = 0.0 if open_interest_percentile is None else float(open_interest_percentile)
+    return base * max(0.0, min(percentile, 1.0))
 
 
 def _quote_blocks(quote: PublicQuote, execution_params: dict[str, Any], policy: EntryPricingPolicy) -> list[str]:
@@ -170,6 +185,13 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _optional_fraction(value: Any) -> float | None:
+    parsed = _optional_float(value)
+    if parsed is None or parsed < 0.0 or parsed > 1.0:
+        return None
+    return parsed
 
 
 def _first_present(raw: dict[str, Any], *keys: str) -> Any:

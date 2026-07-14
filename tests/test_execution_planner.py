@@ -196,6 +196,32 @@ def test_execution_planner_creates_dry_run_trade_plan():
     assert plan.risk_details["entry_pricing"]["mid"] == 2.80
 
 
+def test_execution_planner_scales_initial_spread_fraction_by_chain_oi_percentile():
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = deployment.model_copy(
+        update={
+            "execution": deployment.execution.model_copy(
+                update={
+                    "entry_pricing_spread_fraction": 0.25,
+                    "entry_pricing_oi_percentile_scale": True,
+                }
+            )
+        }
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31),
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
+
+    assert plan is not None
+    assert plan.estimated_entry_price == 2.75
+    assert plan.risk_details["open_interest_percentile"] == 1.0
+    assert plan.risk_details["entry_pricing"]["policy"]["spread_fraction"] == 0.25
+
+
 def test_execution_planner_allow_nearest_after_extends_chain_lookup_and_records_selection_details():
     deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = deployment.model_copy(
@@ -612,6 +638,8 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
         "entry_price": 9.1,
         "min_contract_cost": 910.0,
         "entry_pricing": plan.risk_details["entry_pricing"],
+        "selected_open_interest": 500,
+        "open_interest_percentile": 1.0,
     }
     assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 9.1
 
@@ -653,6 +681,8 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
         "buffer_pct": 0.05,
         "account_type": "CASH",
         "cash_guard_mode": "on",
+        "selected_open_interest": 500,
+        "open_interest_percentile": 1.0,
     }
     assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.85
     assert order_manager.place_entry_order_calls == 0

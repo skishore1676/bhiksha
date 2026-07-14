@@ -36,7 +36,18 @@ def test_compile_active_plan_from_csv_supports_strategy_and_manual_same_symbol(t
                 "max_trade_premium_usd": "200",
                 "entry_window_start_et": "09:40",
                 "notes": "primary opening lane",
-                "execution_overrides": json.dumps({"dte_min": 1, "dte_max": 5}),
+                "execution_overrides": json.dumps(
+                    {
+                        "dte_min": 1,
+                        "dte_max": 5,
+                        "entry_pricing_spread_fraction": 0.25,
+                        "entry_pricing_oi_percentile_scale": True,
+                        "entry_reprice_enabled": True,
+                        "entry_reprice_checkpoints_seconds": [60, 180],
+                        "entry_reprice_cancel_after_seconds": 300,
+                        "entry_reprice_spread_fractions": [0.50, 0.70],
+                    }
+                ),
             },
             {
                 "row_id": "spy_breakout_manual",
@@ -74,6 +85,12 @@ def test_compile_active_plan_from_csv_supports_strategy_and_manual_same_symbol(t
     assert strategy.execution.shadow_only is False
     assert strategy.execution.dte_min == 1
     assert strategy.execution.dte_max == 5
+    assert strategy.execution.entry_pricing_spread_fraction == 0.25
+    assert strategy.execution.entry_pricing_oi_percentile_scale is True
+    assert strategy.execution.entry_reprice_enabled is True
+    assert strategy.execution.entry_reprice_checkpoints_seconds == [60, 180]
+    assert strategy.execution.entry_reprice_cancel_after_seconds == 300
+    assert strategy.execution.entry_reprice_spread_fractions == [0.50, 0.70]
     assert strategy.execution.entry_window_start_et == "09:40"
     assert strategy.risk.max_trade_premium_usd == 200
     assert strategy.source.origin == "active_sheet_strategy"
@@ -1144,6 +1161,12 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "target_pullback_restore_progress_pct", "value": "0.75"},
             {"section": "default", "key": "min_open_interest", "value": "25"},
             {"section": "default", "key": "max_bid_ask_spread_pct", "value": "0.10"},
+            {"section": "default", "key": "entry_pricing_spread_fraction", "value": "0.25"},
+            {"section": "default", "key": "entry_pricing_oi_percentile_scale", "value": "TRUE"},
+            {"section": "default", "key": "entry_reprice_enabled", "value": "TRUE"},
+            {"section": "default", "key": "entry_reprice_checkpoints_seconds", "value": "[60, 180]"},
+            {"section": "default", "key": "entry_reprice_cancel_after_seconds", "value": "300"},
+            {"section": "default", "key": "entry_reprice_spread_fractions", "value": "[0.50, 0.70]"},
             {"section": "default", "key": "dte_fallback_policy", "value": "allow_nearest_after"},
             {"section": "default", "key": "max_open_positions_total", "value": "4"},
             {"section": "default", "key": "max_open_positions_per_symbol", "value": "2"},
@@ -1192,6 +1215,12 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.execution.target_abs_delta_max == 0.40
     assert deployment.execution.min_open_interest == 25
     assert deployment.execution.max_bid_ask_spread_pct == 0.10
+    assert deployment.execution.entry_pricing_spread_fraction == 0.25
+    assert deployment.execution.entry_pricing_oi_percentile_scale is True
+    assert deployment.execution.entry_reprice_enabled is True
+    assert deployment.execution.entry_reprice_checkpoints_seconds == [60, 180]
+    assert deployment.execution.entry_reprice_cancel_after_seconds == 300
+    assert deployment.execution.entry_reprice_spread_fractions == [0.50, 0.70]
     assert deployment.execution.dte_fallback_policy == "allow_nearest_after"
     assert deployment.execution.entry_window_start_et == "09:30"
     assert deployment.execution.entry_window_end_et == "16:00"

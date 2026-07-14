@@ -1,5 +1,7 @@
+import pytest
+
 from bhiksha.execution.order_manager import PublicQuote
-from bhiksha.execution.pricing import EntryPricingPolicy, select_entry_limit
+from bhiksha.execution.pricing import EntryPricingPolicy, scale_spread_fraction, select_entry_limit
 
 
 def test_urgent_entry_pricing_improves_inside_wider_spread() -> None:
@@ -42,3 +44,19 @@ def test_balanced_entry_pricing_uses_mid() -> None:
     )
 
     assert result.limit_price == 2.80
+
+
+def test_explicit_spread_fraction_prices_from_bid_toward_ask() -> None:
+    result = select_entry_limit(
+        PublicQuote(symbol="SMH260717P00280000", bid=2.70, ask=2.90, last=2.80, open_interest=5310),
+        {"entry_pricing_spread_fraction": 0.25},
+    )
+
+    assert result.limit_price == 2.75
+    assert result.evidence()["policy"]["spread_fraction"] == 0.25
+
+
+def test_oi_percentile_scaling_never_makes_fraction_more_aggressive() -> None:
+    assert scale_spread_fraction(0.70, enabled=True, open_interest_percentile=0.25) == pytest.approx(0.175)
+    assert scale_spread_fraction(0.70, enabled=True, open_interest_percentile=None) == 0.0
+    assert scale_spread_fraction(0.70, enabled=False, open_interest_percentile=0.25) == 0.70
