@@ -148,16 +148,13 @@ def _apply_live_start_recovery(jobs: list[dict[str, Any]], runtime_status: dict[
 
     The failed scheduled start remains the job's historical last-run result.
     Current health becomes armed only when the runtime started after that
-    failure and a still-later watchdog run confirmed it healthy.
+    failure and a still-later watchdog run confirmed it healthy. After the
+    session boundary, a successful stop receipt for that same PID preserves
+    the recovery proof without pretending the runtime is still running.
     """
 
     runtime = runtime_status.get("status") if isinstance(runtime_status, dict) else None
-    if (
-        runtime_status.get("ok") is not True
-        or not isinstance(runtime, dict)
-        or runtime.get("running") is not True
-        or runtime.get("live") is not True
-    ):
+    if runtime_status.get("ok") is not True or not isinstance(runtime, dict):
         return
 
     by_runner = {str(job.get("runner_job") or ""): job for job in jobs}
@@ -172,40 +169,65 @@ def _apply_live_start_recovery(jobs: list[dict[str, Any]], runtime_status: dict[
         return
 
     watchdog_runtime = _watchdog_runtime_status(watchdog)
-    if (
-        watchdog_runtime.get("running") is not True
-        or watchdog_runtime.get("live") is not True
-        or watchdog_runtime.get("pid") != runtime.get("pid")
-    ):
+    if watchdog_runtime.get("running") is not True or watchdog_runtime.get("live") is not True:
         return
 
     failed_at = _parse_timestamp(live_start.get("last_run_at"))
-    runtime_started_at = _parse_timestamp(runtime.get("started_at"))
     watchdog_runtime_started_at = _parse_timestamp(watchdog_runtime.get("started_at"))
     watchdog_at = _parse_timestamp(watchdog.get("last_run_at"))
     if (
         failed_at is None
-        or runtime_started_at is None
         or watchdog_runtime_started_at is None
         or watchdog_at is None
     ):
         return
-    if watchdog_runtime_started_at != runtime_started_at:
+    if watchdog_runtime_started_at <= failed_at or watchdog_at < watchdog_runtime_started_at:
         return
-    if runtime_started_at <= failed_at or watchdog_at < runtime_started_at:
+
+    recovery_state: str
+    summary: str
+    updated_at = str(watchdog.get("last_run_at"))
+    if runtime.get("running") is True:
+        runtime_started_at = _parse_timestamp(runtime.get("started_at"))
+        if (
+            runtime.get("live") is not True
+            or watchdog_runtime.get("pid") != runtime.get("pid")
+            or runtime_started_at != watchdog_runtime_started_at
+        ):
+            return
+        recovery_state = "running"
+        summary = "Recovered by live watchdog; the live runtime is running."
+    elif runtime.get("running") is False:
+        live_stop = by_runner.get("live-stop")
+        stop_domain = _job_domain(live_stop) if live_stop is not None else {}
+        stop_runtime = _watchdog_runtime_status(live_stop) if live_stop is not None else {}
+        stop_at = _parse_timestamp(live_stop.get("last_run_at")) if live_stop is not None else None
+        if (
+            stop_domain.get("ok") is not True
+            or stop_runtime.get("action") != "stopped"
+            or stop_runtime.get("running") is not False
+            or stop_runtime.get("pid") != watchdog_runtime.get("pid")
+            or stop_at is None
+            or stop_at <= watchdog_at
+        ):
+            return
+        recovery_state = "stopped_cleanly"
+        summary = "Recovered by live watchdog; the live runtime later stopped cleanly at session close."
+        updated_at = str(live_stop.get("last_run_at"))
+    else:
         return
 
     failure_reason = _historical_failure_reason(live_start)
     live_start["lifecycle"] = "armed"
     live_start["findings"] = []
-    live_start["summary"] = "Recovered by live watchdog; the live runtime is running."
+    live_start["summary"] = summary
     live_start["details"] = [
         {
             "kind": "runtime_recovery",
             "title": "Recovered by live watchdog",
             "surface": "Bhiksha live runtime",
-            "status": f"running; prior start failed: {failure_reason}",
-            "updated_at": str(watchdog.get("last_run_at")),
+            "status": f"{recovery_state}; prior start failed: {failure_reason}",
+            "updated_at": updated_at,
             "review_ref": f"scheduled start failed at {live_start.get('last_run_at')}",
         }
     ]
