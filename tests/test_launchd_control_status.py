@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 import json
 import subprocess
 
+import pytest
+
 from bhiksha.ops.launchd_registry import control_lock_dir, latest_status_path
 from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.tools import launchd_control, launchd_status
@@ -54,6 +56,194 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     assert session_job["transport_status"] == "degraded"
     assert session_job["next_fire"].startswith("2026-06-30T11:45:00")
     assert snapshot["transport"]["status"] == "degraded"
+
+
+def test_launchd_status_arms_failed_start_after_later_watchdog_recovery(monkeypatch, tmp_path) -> None:
+    payload = {
+        "schema": "bhiksha.launchd.latest_status.v1",
+        "generated_at": "2026-07-14T17:50:00+00:00",
+        "jobs": {
+            "live-start": {
+                "recorded_at": "2026-07-14T13:20:15+00:00",
+                "label": "com.bhiksha.live-start",
+                "payload": {
+                    "job": "live-start",
+                    "status": "failed",
+                    "stderr_tail": "RuntimeError: Startup health check failed for: schwab_token",
+                },
+            },
+            "live-watchdog": {
+                "recorded_at": "2026-07-14T17:50:01+00:00",
+                "label": "com.bhiksha.live-watchdog",
+                "payload": {
+                    "job": "live-watchdog",
+                    "status": "ok",
+                    "stdout_tail": (
+                        'RUNTIME_STATUS={"running": true, "live": true, "pid": 36355, '
+                        '"started_at": "2026-07-14T17:40:01+00:00"}'
+                    ),
+                },
+            },
+        },
+    }
+    latest_status_path(tmp_path).parent.mkdir(parents=True)
+    latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {
+            "ok": True,
+            "status": {
+                "running": True,
+                "live": True,
+                "pid": 36355,
+                "started_at": "2026-07-14T17:40:01+00:00",
+            },
+        },
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 14, 17, 55, tzinfo=UTC),
+    )
+    live_start = next(job for job in snapshot["jobs"] if job["runner_job"] == "live-start")
+
+    assert live_start["lifecycle"] == "armed"
+    assert live_start["findings"] == []
+    assert live_start["summary"] == "Recovered by live watchdog; the live runtime is running."
+    assert live_start["last_run_status"] == "failed"
+    assert live_start["last_run_at"] == "2026-07-14T13:20:15+00:00"
+    assert live_start["last"]["domain"]["ok"] is False
+    assert live_start["details"] == [
+        {
+            "kind": "runtime_recovery",
+            "title": "Recovered by live watchdog",
+            "surface": "Bhiksha live runtime",
+            "status": "running; prior start failed: Startup health check failed for: schwab_token",
+            "updated_at": "2026-07-14T17:50:01+00:00",
+            "review_ref": "scheduled start failed at 2026-07-14T13:20:15+00:00",
+        }
+    ]
+
+
+def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery(monkeypatch, tmp_path) -> None:
+    payload = {
+        "schema": "bhiksha.launchd.latest_status.v1",
+        "generated_at": "2026-07-14T13:25:00+00:00",
+        "jobs": {
+            "live-start": {
+                "recorded_at": "2026-07-14T13:20:15+00:00",
+                "label": "com.bhiksha.live-start",
+                "payload": {"job": "live-start", "status": "failed"},
+            },
+            "live-watchdog": {
+                "recorded_at": "2026-07-14T13:30:01+00:00",
+                "label": "com.bhiksha.live-watchdog",
+                "payload": {
+                    "job": "live-watchdog",
+                    "status": "ok",
+                    "stdout_tail": (
+                        'RUNTIME_STATUS={"running": true, "live": true, "pid": 36355, '
+                        '"started_at": "2026-07-14T13:40:00+00:00"}'
+                    ),
+                },
+            },
+        },
+    }
+    latest_status_path(tmp_path).parent.mkdir(parents=True)
+    latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {
+            "ok": True,
+            "status": {
+                "running": True,
+                "live": True,
+                "pid": 36355,
+                "started_at": "2026-07-14T13:40:00+00:00",
+            },
+        },
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 14, 13, 25, tzinfo=UTC),
+    )
+    live_start = next(job for job in snapshot["jobs"] if job["runner_job"] == "live-start")
+
+    assert live_start["lifecycle"] is None
+    assert live_start["findings"] == ["Domain health failed: failed"]
+    assert "summary" not in live_start
+    assert "details" not in live_start
+
+
+@pytest.mark.parametrize(
+    "runtime_status",
+    [
+        {
+            "ok": False,
+            "status": {
+                "running": True,
+                "live": True,
+                "pid": 36355,
+                "started_at": "2026-07-14T17:40:01+00:00",
+            },
+        },
+        {
+            "ok": True,
+            "status": {
+                "running": True,
+                "live": False,
+                "pid": 36355,
+                "started_at": "2026-07-14T17:40:01+00:00",
+            },
+        },
+        {
+            "ok": True,
+            "status": {
+                "running": True,
+                "pid": 36355,
+                "started_at": "2026-07-14T17:40:01+00:00",
+            },
+        },
+    ],
+)
+def test_live_start_recovery_requires_successful_explicit_live_runtime_probe(runtime_status) -> None:
+    jobs = [
+        {
+            "runner_job": "live-start",
+            "last_run_at": "2026-07-14T13:20:15+00:00",
+            "last_run_status": "failed",
+            "last": {
+                "domain": {"ok": False, "status": "failed"},
+                "payload": {"job": "live-start", "status": "failed"},
+            },
+            "findings": ["Domain health failed: failed"],
+            "lifecycle": None,
+        },
+        {
+            "runner_job": "live-watchdog",
+            "label": "com.bhiksha.live-watchdog",
+            "last_run_at": "2026-07-14T17:50:01+00:00",
+            "last": {
+                "domain": {"ok": True, "status": "ok"},
+                "payload": {
+                    "stdout_tail": (
+                        'RUNTIME_STATUS={"running": true, "live": true, "pid": 36355, '
+                        '"started_at": "2026-07-14T17:40:01+00:00"}'
+                    )
+                },
+            },
+        },
+    ]
+
+    launchd_status._apply_live_start_recovery(jobs, runtime_status)
+
+    assert jobs[0]["lifecycle"] is None
+    assert jobs[0]["findings"] == ["Domain health failed: failed"]
 
 
 def test_runtime_status_parses_payload_and_returns_dict(monkeypatch, tmp_path) -> None:

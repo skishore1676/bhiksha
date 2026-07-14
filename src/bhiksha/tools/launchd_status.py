@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,7 @@ def build_status_snapshot(
         )
 
     runtime_status = _runtime_status(repo_root=repo_root, deadline=deadline)
+    _apply_live_start_recovery(jobs, runtime_status)
     return {
         "schema": "bhiksha.launchd.status.v1",
         "generated_at": generated_at.isoformat(),
@@ -139,6 +141,124 @@ def build_status_snapshot(
         "schwab_token_guard": {"latest": _latest_schwab_summary(repo_root)},
         "transport": _transport_rollup(jobs),
     }
+
+
+def _apply_live_start_recovery(jobs: list[dict[str, Any]], runtime_status: dict[str, Any]) -> None:
+    """Clear current start attention only after a later watchdog recovery.
+
+    The failed scheduled start remains the job's historical last-run result.
+    Current health becomes armed only when the runtime started after that
+    failure and a still-later watchdog run confirmed it healthy.
+    """
+
+    runtime = runtime_status.get("status") if isinstance(runtime_status, dict) else None
+    if (
+        runtime_status.get("ok") is not True
+        or not isinstance(runtime, dict)
+        or runtime.get("running") is not True
+        or runtime.get("live") is not True
+    ):
+        return
+
+    by_runner = {str(job.get("runner_job") or ""): job for job in jobs}
+    live_start = by_runner.get("live-start")
+    watchdog = by_runner.get("live-watchdog")
+    if live_start is None or watchdog is None:
+        return
+
+    start_domain = _job_domain(live_start)
+    watchdog_domain = _job_domain(watchdog)
+    if start_domain.get("ok") is not False or watchdog_domain.get("ok") is not True:
+        return
+
+    watchdog_runtime = _watchdog_runtime_status(watchdog)
+    if (
+        watchdog_runtime.get("running") is not True
+        or watchdog_runtime.get("live") is not True
+        or watchdog_runtime.get("pid") != runtime.get("pid")
+    ):
+        return
+
+    failed_at = _parse_timestamp(live_start.get("last_run_at"))
+    runtime_started_at = _parse_timestamp(runtime.get("started_at"))
+    watchdog_runtime_started_at = _parse_timestamp(watchdog_runtime.get("started_at"))
+    watchdog_at = _parse_timestamp(watchdog.get("last_run_at"))
+    if (
+        failed_at is None
+        or runtime_started_at is None
+        or watchdog_runtime_started_at is None
+        or watchdog_at is None
+    ):
+        return
+    if watchdog_runtime_started_at != runtime_started_at:
+        return
+    if runtime_started_at <= failed_at or watchdog_at < runtime_started_at:
+        return
+
+    failure_reason = _historical_failure_reason(live_start)
+    live_start["lifecycle"] = "armed"
+    live_start["findings"] = []
+    live_start["summary"] = "Recovered by live watchdog; the live runtime is running."
+    live_start["details"] = [
+        {
+            "kind": "runtime_recovery",
+            "title": "Recovered by live watchdog",
+            "surface": "Bhiksha live runtime",
+            "status": f"running; prior start failed: {failure_reason}",
+            "updated_at": str(watchdog.get("last_run_at")),
+            "review_ref": f"scheduled start failed at {live_start.get('last_run_at')}",
+        }
+    ]
+
+
+def _job_domain(job: dict[str, Any]) -> dict[str, Any]:
+    last = job.get("last") if isinstance(job.get("last"), dict) else {}
+    domain = last.get("domain") if isinstance(last.get("domain"), dict) else {}
+    return domain
+
+
+def _watchdog_runtime_status(job: dict[str, Any]) -> dict[str, Any]:
+    last = job.get("last") if isinstance(job.get("last"), dict) else {}
+    payload = last.get("payload") if isinstance(last.get("payload"), dict) else {}
+    stdout_tail = str(payload.get("stdout_tail") or "")
+    for line in reversed(stdout_tail.splitlines()):
+        if not line.startswith("RUNTIME_STATUS="):
+            continue
+        try:
+            parsed = json.loads(line.split("=", 1)[1])
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+_STARTUP_HEALTH_FAILURE_RE = re.compile(r"Startup health check failed for:\s*([A-Za-z0-9_, -]+)")
+
+
+def _historical_failure_reason(job: dict[str, Any]) -> str:
+    last = job.get("last") if isinstance(job.get("last"), dict) else {}
+    payload = last.get("payload") if isinstance(last.get("payload"), dict) else {}
+    failure_text = "\n".join(
+        str(payload.get(key) or "")
+        for key in ("error", "stderr_tail", "stdout_tail")
+    )
+    match = _STARTUP_HEALTH_FAILURE_RE.search(failure_text)
+    if match:
+        return f"Startup health check failed for: {match.group(1).strip()}"
+    findings = [str(item) for item in job.get("findings") or [] if str(item).strip()]
+    return findings[0] if findings else f"status {job.get('last_run_status') or 'failed'}"
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _launchd_state(*, deadline: _Deadline | None = None) -> dict[str, dict[str, Any]]:
