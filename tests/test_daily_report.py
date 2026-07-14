@@ -104,6 +104,44 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
     assert report["status"] == {"level": "YELLOW", "reason": "provider_warning"}
 
 
+def test_daily_report_marks_closed_live_trade_with_missing_exit_truth_unknown(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="NVDA-RACE",
+                deployment_id="nvda_live",
+                symbol="NVDA",
+                option_symbol="NVDA260722P00200000",
+                quantity=8,
+                entry_price=2.18,
+                underlying_entry_price=207.59,
+                entry_timestamp=datetime(2026, 7, 13, 13, 52, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY-NVDA-RACE",
+                stop_order_id="STOP-NVDA-RACE",
+                stop_price=1.42,
+            )
+        )
+        await trades.mark_closed("NVDA-RACE", exit_rule="no_progress")
+
+    asyncio.run(seed())
+    report = build_daily_report(db_path, trading_date="2026-07-13")
+
+    assert report["trade_summary"]["live_realized_pnl_usd"] is None
+    assert report["trade_summary"]["live_missing_exit_truth_count"] == 1
+    assert report["status"] == {"level": "YELLOW", "reason": "data_quality_warning"}
+    assert report["data_quality_warnings"][0]["category"] == "live_exit_truth_missing"
+    markdown = render_daily_report_markdown(report)
+    telegram = render_daily_report_telegram_summary(report)
+    assert "live realized P&L: `unknown (1 missing exit fill)`" in markdown
+    assert "live unknown (1 missing exit fill)" in telegram
+    assert "P&L unknown" in telegram
+
+
 def test_daily_report_flags_only_implausible_underlying_to_strike_ratio(tmp_path) -> None:
     db_path = tmp_path / "bhiksha.db"
     backend = SQLiteBackend(str(db_path))

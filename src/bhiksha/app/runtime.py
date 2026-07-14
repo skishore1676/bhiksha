@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -1423,6 +1423,10 @@ class BhikshaRuntime:
                 output(f"RECONCILIATION_WARNING reason={reason} failures={consecutive_failures} error={exc}")
             return
         async with sync_lock:
+            tracker_positions = _preserve_newer_pending_exit_state(
+                tracker_positions,
+                supervisor.planner.position_tracker.active_positions(),
+            )
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
             await supervisor.sync_lifecycle()
             reconciliation_snapshot.positions = list(tracker_positions)
@@ -1911,6 +1915,71 @@ def _merge_tracked_positions(
         key = (position.trade_id, position.deployment_id, position.option_symbol)
         merged[key] = position
     return list(merged.values())
+
+
+def _preserve_newer_pending_exit_state(
+    broker_positions: list[TrackedPosition],
+    current_positions: list[TrackedPosition],
+) -> list[TrackedPosition]:
+    """Merge exits submitted while an older broker snapshot was in flight.
+
+    Reconciliation fetches the portfolio before taking ``sync_lock``. A close
+    can therefore be submitted after that fetch starts but before its result
+    commits. The broker snapshot and its durable-trade read are then older than
+    the tracker and must not erase the pending exit that prevents duplicate
+    closes and carries eventual fill identity.
+    """
+    current_by_identity = {
+        (position.trade_id, position.deployment_id, position.option_symbol): position
+        for position in current_positions
+        if position.trade_id is not None and position.option_symbol is not None
+    }
+    merged: list[TrackedPosition] = []
+    for broker_position in broker_positions:
+        identity = (
+            broker_position.trade_id,
+            broker_position.deployment_id,
+            broker_position.option_symbol,
+        )
+        current = current_by_identity.get(identity)
+        if current is None or not _position_has_pending_exit(current):
+            merged.append(broker_position)
+            continue
+        if _pending_exit_is_at_least_as_new(broker_position, current):
+            merged.append(broker_position)
+            continue
+        merged.append(
+            replace(
+                broker_position,
+                stop_order_id=current.stop_order_id,
+                stop_price=current.stop_price,
+                target_order_id=current.target_order_id,
+                target_price=current.target_price,
+                target_activation_price=current.target_activation_price,
+                target_activation_high_price=current.target_activation_high_price,
+                target_activated_at=current.target_activated_at,
+                exit_order_id=current.exit_order_id,
+                exit_limit_price=current.exit_limit_price,
+                exit_submitted_at=current.exit_submitted_at,
+                exit_mode=current.exit_mode,
+                exit_reprice_count=current.exit_reprice_count,
+            )
+        )
+    return merged
+
+
+def _position_has_pending_exit(position: TrackedPosition) -> bool:
+    return any((position.exit_order_id, position.exit_submitted_at, position.exit_mode))
+
+
+def _pending_exit_is_at_least_as_new(broker_position: TrackedPosition, current: TrackedPosition) -> bool:
+    if not _position_has_pending_exit(broker_position):
+        return False
+    if current.exit_submitted_at is None:
+        return True
+    if broker_position.exit_submitted_at is None:
+        return False
+    return broker_position.exit_submitted_at >= current.exit_submitted_at
 
 
 async def _append_event_best_effort(

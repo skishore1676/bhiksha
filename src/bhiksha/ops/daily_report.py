@@ -80,6 +80,8 @@ def build_daily_report(
     trades = [_augment_trade(trade) for trade in trades]
     live_trades = [trade for trade in trades if trade["lane"] == "live"]
     shadow_trades = [trade for trade in trades if trade["lane"] == "shadow"]
+    live_missing_exit_truth = _missing_exit_truth_count(live_trades)
+    shadow_missing_exit_truth = _missing_exit_truth_count(shadow_trades)
     open_positions = [trade for trade in trades if _is_open_trade(trade)]
     live_open_positions = [trade for trade in open_positions if trade["lane"] == "live"]
     shadow_open_positions = [trade for trade in open_positions if trade["lane"] == "shadow"]
@@ -119,9 +121,12 @@ def build_daily_report(
             "live_open_count": len(live_open_positions),
             "shadow_open_count": len(shadow_open_positions),
             "total_open_count": len(open_positions),
-            "live_realized_pnl_usd": _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in live_trades)),
-            "shadow_realized_pnl_usd": _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in shadow_trades)),
-            "total_realized_pnl_usd": _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in trades)),
+            "live_realized_pnl_usd": _complete_realized_pnl(live_trades),
+            "shadow_realized_pnl_usd": _complete_realized_pnl(shadow_trades),
+            "total_realized_pnl_usd": _complete_realized_pnl(trades),
+            "live_missing_exit_truth_count": live_missing_exit_truth,
+            "shadow_missing_exit_truth_count": shadow_missing_exit_truth,
+            "total_missing_exit_truth_count": live_missing_exit_truth + shadow_missing_exit_truth,
         },
         "open_position_summary": open_position_summary,
         "open_positions": open_positions,
@@ -152,9 +157,9 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"- shadow trades: `{summary.get('shadow_count', 0)}`",
         f"- open live positions: `{summary.get('live_open_count', 0)}`",
         f"- open shadow positions: `{summary.get('shadow_open_count', 0)}`",
-        f"- live realized P&L: `${summary.get('live_realized_pnl_usd', 0.0):.2f}`",
-        f"- shadow realized P&L: `${summary.get('shadow_realized_pnl_usd', 0.0):.2f}`",
-        f"- total realized P&L: `${summary.get('total_realized_pnl_usd', 0.0):.2f}`",
+        f"- live realized P&L: `{_summary_pnl_text(summary, 'live')}`",
+        f"- shadow realized P&L: `{_summary_pnl_text(summary, 'shadow')}`",
+        f"- total realized P&L: `{_summary_pnl_text(summary, 'total')}`",
         f"- reconciliation warnings: `{provider.get('warning_count', 0)}`",
         f"- reconciliation degraded: `{provider.get('degraded_count', 0)}`",
         f"- reconciliation blocking: `{provider.get('blocking_count', 0)}`",
@@ -346,9 +351,9 @@ def render_daily_report_telegram_summary(
         ),
         (
             "- P&L: "
-            f"live ${summary.get('live_realized_pnl_usd', 0.0):.2f} "
+            f"live {_summary_pnl_text(summary, 'live')} "
             f"({summary.get('live_count', 0)} trades), "
-            f"shadow ${summary.get('shadow_realized_pnl_usd', 0.0):.2f} "
+            f"shadow {_summary_pnl_text(summary, 'shadow')} "
             f"({summary.get('shadow_count', 0)} trades)"
         ),
         (
@@ -429,13 +434,13 @@ def render_daily_report_telegram_summary(
         lines.extend(["", "Recent closes"])
         for trade in closed_trades[:3]:
             lines.append(
-                "- {lane} {symbol} qty {qty}: {entry}->{exit}, P&L ${pnl}".format(
+                "- {lane} {symbol} qty {qty}: {entry}->{exit}, P&L {pnl}".format(
                     lane=str(trade.get("lane", "")).upper(),
                     symbol=trade.get("symbol", ""),
                     qty=trade.get("quantity") or 0,
                     entry=_fmt_money(trade.get("entry_price")) or "?",
                     exit=_fmt_money(trade.get("exit_price")) or "?",
-                    pnl=_fmt_money(trade.get("realized_pnl_usd")) or "0.00",
+                    pnl=_pnl_text(trade.get("realized_pnl_usd")),
                 )
             )
         if len(closed_trades) > 3:
@@ -490,6 +495,9 @@ def _empty_report(day: date) -> dict[str, Any]:
             "live_realized_pnl_usd": 0.0,
             "shadow_realized_pnl_usd": 0.0,
             "total_realized_pnl_usd": 0.0,
+            "live_missing_exit_truth_count": 0,
+            "shadow_missing_exit_truth_count": 0,
+            "total_missing_exit_truth_count": 0,
             "live_open_count": 0,
             "shadow_open_count": 0,
             "total_open_count": 0,
@@ -669,6 +677,37 @@ def _augment_trade(trade: dict[str, Any]) -> dict[str, Any]:
         "exit_attribution": _exit_attribution(trade),
         "qty_label": _format_qty_label(_maybe_int(trade.get("quantity")), trade.get("can_ladder")),
     }
+
+
+def _missing_exit_truth_count(trades: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for trade in trades
+        if not _is_open_trade(trade)
+        and _maybe_float(trade.get("entry_price")) is not None
+        and (_maybe_int(trade.get("quantity")) or 0) > 0
+        and _maybe_float(trade.get("realized_pnl_usd")) is None
+    )
+
+
+def _complete_realized_pnl(trades: list[dict[str, Any]]) -> float | None:
+    if _missing_exit_truth_count(trades):
+        return None
+    return _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in trades))
+
+
+def _summary_pnl_text(summary: dict[str, Any], lane: str) -> str:
+    missing = _maybe_int(summary.get(f"{lane}_missing_exit_truth_count")) or 0
+    value = _maybe_float(summary.get(f"{lane}_realized_pnl_usd"))
+    if missing:
+        noun = "fill" if missing == 1 else "fills"
+        return f"unknown ({missing} missing exit {noun})"
+    return f"${value or 0.0:.2f}"
+
+
+def _pnl_text(value: Any) -> str:
+    formatted = _fmt_money(value)
+    return f"${formatted}" if formatted else "unknown"
 
 
 def _format_qty_label(quantity: int | None, can_ladder: Any) -> str:
@@ -865,6 +904,23 @@ def _entry_selector_empty_by_deployment(
 def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
     for trade in trades:
+        if (
+            trade.get("lane") == "live"
+            and not _is_open_trade(trade)
+            and _maybe_float(trade.get("entry_price")) is not None
+            and (_maybe_int(trade.get("quantity")) or 0) > 0
+            and _maybe_float(trade.get("exit_price")) is None
+        ):
+            warnings.append(
+                {
+                    "category": "live_exit_truth_missing",
+                    "trade_id": trade.get("trade_id"),
+                    "deployment_id": trade.get("deployment_id"),
+                    "symbol": trade.get("symbol"),
+                    "option_symbol": trade.get("option_symbol"),
+                    "message": "closed live trade is missing confirmed exit fill truth; realized P&L is unknown",
+                }
+            )
         underlying = _maybe_float(trade.get("underlying_entry_price"))
         strike = _maybe_float(trade.get("option_strike"))
         if underlying is None or strike is None or strike <= 0:

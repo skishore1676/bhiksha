@@ -3506,6 +3506,81 @@ def test_execution_supervisor_enriches_stop_filled_disappeared_position(tmp_path
     assert "exit_fill_enriched" in event_types
 
 
+def test_execution_supervisor_enriches_fast_filled_pending_exit_after_position_disappears(tmp_path) -> None:
+    db_path = tmp_path / "events.db"
+    repo = SQLiteEventRepository(str(db_path))
+    trade_repo = SQLiteTradeStateRepository(str(db_path))
+    order_manager = StatusMapOrderManager(
+        {
+            "EXIT-NVDA-RACE": (
+                "FILLED",
+                {
+                    "orderId": "EXIT-NVDA-RACE",
+                    "instrument": {"symbol": "NVDA260722P00200000", "type": "OPTION"},
+                    "status": "FILLED",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "openCloseIndicator": "CLOSE",
+                    "filledQuantity": "8",
+                    "averagePrice": "2.07",
+                    "closedAt": "2026-07-13T14:38:06Z",
+                },
+                None,
+            )
+        }
+    )
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="NVDA-RACE",
+                deployment_id="nvda_live",
+                symbol="NVDA",
+                option_symbol="NVDA260722P00200000",
+                quantity=8,
+                entry_price=2.18,
+                entry_timestamp=datetime(2026, 7, 13, 13, 52, tzinfo=UTC),
+                status="exit_pending",
+                entry_order_id="ENTRY-NVDA-RACE",
+                exit_order_id="EXIT-NVDA-RACE",
+                exit_limit_price=2.07,
+                exit_submitted_at=datetime(2026, 7, 13, 14, 38, 5, tzinfo=UTC),
+                exit_mode=ExitMode.STRATEGY,
+                exit_rule="no_progress",
+            )
+        )
+    )
+
+    # The broker position is already absent; only durable exit identity can
+    # recover the terminal fill instead of recording an unknown close.
+    asyncio.run(supervisor.sync_lifecycle())
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT status, exit_order_id, exit_price, exit_filled_quantity,
+                   exit_filled_at, exit_order_status, exit_rule
+            FROM trade_sessions
+            WHERE trade_id = 'NVDA-RACE'
+            """
+        ).fetchone()
+
+    assert row == (
+        "closed",
+        "EXIT-NVDA-RACE",
+        2.07,
+        8,
+        "2026-07-13T14:38:06+00:00",
+        "FILLED",
+        "no_progress",
+    )
+
+
 def test_execution_supervisor_arms_virtual_profit_target_when_broker_supports_single_exit_order(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     supervisor = ExecutionSupervisor(

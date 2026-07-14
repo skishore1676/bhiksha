@@ -360,16 +360,56 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     entry_price=excluded.entry_price,
                     underlying_entry_price=excluded.underlying_entry_price,
                     entry_timestamp=excluded.entry_timestamp,
-                    status=excluded.status,
+                    status=CASE
+                        WHEN trade_sessions.status='exit_pending'
+                             AND excluded.status IN ('open_protected', 'open_unprotected')
+                             AND excluded.exit_order_id IS NULL
+                             AND excluded.exit_submitted_at IS NULL
+                             AND excluded.exit_mode IS NULL
+                        THEN trade_sessions.status
+                        ELSE excluded.status
+                    END,
                     entry_order_id=excluded.entry_order_id,
                     stop_order_id=excluded.stop_order_id,
                     stop_price=excluded.stop_price,
                     target_order_id=excluded.target_order_id,
                     target_price=excluded.target_price,
-                    exit_order_id=excluded.exit_order_id,
-                    exit_limit_price=excluded.exit_limit_price,
-                    exit_submitted_at=excluded.exit_submitted_at,
-                    exit_mode=excluded.exit_mode,
+                    exit_order_id=CASE
+                        WHEN trade_sessions.status='exit_pending'
+                             AND excluded.status IN ('open_protected', 'open_unprotected')
+                             AND excluded.exit_order_id IS NULL
+                             AND excluded.exit_submitted_at IS NULL
+                             AND excluded.exit_mode IS NULL
+                        THEN trade_sessions.exit_order_id
+                        ELSE excluded.exit_order_id
+                    END,
+                    exit_limit_price=CASE
+                        WHEN trade_sessions.status='exit_pending'
+                             AND excluded.status IN ('open_protected', 'open_unprotected')
+                             AND excluded.exit_order_id IS NULL
+                             AND excluded.exit_submitted_at IS NULL
+                             AND excluded.exit_mode IS NULL
+                        THEN trade_sessions.exit_limit_price
+                        ELSE excluded.exit_limit_price
+                    END,
+                    exit_submitted_at=CASE
+                        WHEN trade_sessions.status='exit_pending'
+                             AND excluded.status IN ('open_protected', 'open_unprotected')
+                             AND excluded.exit_order_id IS NULL
+                             AND excluded.exit_submitted_at IS NULL
+                             AND excluded.exit_mode IS NULL
+                        THEN trade_sessions.exit_submitted_at
+                        ELSE excluded.exit_submitted_at
+                    END,
+                    exit_mode=CASE
+                        WHEN trade_sessions.status='exit_pending'
+                             AND excluded.status IN ('open_protected', 'open_unprotected')
+                             AND excluded.exit_order_id IS NULL
+                             AND excluded.exit_submitted_at IS NULL
+                             AND excluded.exit_mode IS NULL
+                        THEN trade_sessions.exit_mode
+                        ELSE excluded.exit_mode
+                    END,
                     exit_price=COALESCE(excluded.exit_price, trade_sessions.exit_price),
                     exit_filled_quantity=COALESCE(excluded.exit_filled_quantity, trade_sessions.exit_filled_quantity),
                     exit_filled_at=COALESCE(excluded.exit_filled_at, trade_sessions.exit_filled_at),

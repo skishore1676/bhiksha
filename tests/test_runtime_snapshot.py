@@ -9,9 +9,14 @@ import yaml
 
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.app.runtime import ReconciliationSnapshot, _frame_with_live_price
-from bhiksha.domain.models import Bar
+from bhiksha.domain.enums import ExitMode
+from bhiksha.domain.models import Bar, TradeRecord
 from bhiksha.state.position_tracker import PositionTracker, TrackedPosition
 from historical_config import historical_deployment
+
+
+async def _async_noop(*args, **kwargs) -> None:
+    del args, kwargs
 
 
 def _runtime_deployment(runtime, *, symbol: str, fallback_id: str):
@@ -521,6 +526,118 @@ def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
     assert snapshot.last_error is None
     assert supervisor.sync_calls == 1
     assert len(snapshot.positions) == 1
+
+
+def test_runtime_refresh_reconciliation_preserves_newer_pending_exit() -> None:
+    """A portfolio fetch started before an exit must not commit stale state over it."""
+    runtime = build_runtime()
+    deployment = _runtime_deployment(runtime, symbol="SPY", fallback_id="market_impulse_spy_short_v1")
+    deployment.enabled = True
+    snapshot = ReconciliationSnapshot()
+    submitted_at = datetime(2026, 7, 13, 14, 38, 5, tzinfo=UTC)
+    stale_trade = TradeRecord(
+        trade_id="ENTRY-NVDA-RACE",
+        deployment_id=deployment.deployment_id,
+        symbol="SPY",
+        option_symbol="SPY260717P00555000",
+        quantity=8,
+        entry_price=2.18,
+        entry_timestamp=datetime(2026, 7, 13, 13, 52, tzinfo=UTC),
+        status="open_protected",
+        entry_order_id="ENTRY-NVDA-RACE",
+        stop_order_id="STOP-NVDA-RACE",
+        stop_price=1.42,
+    )
+
+    class StubBroker:
+        async def get_portfolio(self) -> dict:
+            return {
+                "positions": [
+                    {
+                        "instrument": {"symbol": "SPY260717P00555000", "type": "OPTION"},
+                        "quantity": "8",
+                        "openedAt": "2026-07-13T13:52:00Z",
+                        "costBasis": {"unitCost": "2.18"},
+                    }
+                ],
+                # The portfolio sees the limit, but the separately fetched trade
+                # row is still stale and would misclassify it as a profit target.
+                "orders": [
+                    {
+                        "orderId": "STOP-NVDA-RACE",
+                        "instrument": {"symbol": "SPY260717P00555000", "type": "OPTION"},
+                        "side": "SELL",
+                        "status": "NEW",
+                        "type": "STOP",
+                        "stopPrice": "1.42",
+                    },
+                    {
+                        "orderId": "EXIT-NVDA-RACE",
+                        "instrument": {"symbol": "SPY260717P00555000", "type": "OPTION"},
+                        "side": "SELL",
+                        "status": "NEW",
+                        "type": "LIMIT",
+                        "limitPrice": "2.07",
+                    },
+                ],
+            }
+
+    class StubTradeStateRepository:
+        async def get_recent_trades(self, *, limit: int = 100) -> list[TradeRecord]:
+            del limit
+            return [stale_trade]
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.event_repository = type("Repo", (), {"append": _async_noop})()
+            self.trade_state_repository = StubTradeStateRepository()
+            self.planner = type("Planner", (), {"position_tracker": PositionTracker()})()
+            self.synced_position: TrackedPosition | None = None
+
+        async def sync_lifecycle(self) -> None:
+            self.synced_position = self.planner.position_tracker.active_positions()[0]
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position, dry_run
+            return None
+
+    supervisor = StubSupervisor()
+    supervisor.planner.position_tracker.open_position(
+        "SPY",
+        deployment.deployment_id,
+        trade_id=stale_trade.trade_id,
+        option_symbol=stale_trade.option_symbol,
+        quantity=8,
+        entry_price=2.18,
+        entry_timestamp=stale_trade.entry_timestamp,
+        source="live_open",
+        order_id=stale_trade.entry_order_id,
+        stop_order_id=stale_trade.stop_order_id,
+        stop_price=stale_trade.stop_price,
+        exit_order_id="EXIT-NVDA-RACE",
+        exit_limit_price=2.07,
+        exit_submitted_at=submitted_at,
+        exit_mode=ExitMode.STRATEGY,
+    )
+
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=StubBroker(),
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=lambda _: None,
+            reason="exit_submitted",
+        )
+    )
+
+    assert supervisor.synced_position is not None
+    assert supervisor.synced_position.exit_order_id == "EXIT-NVDA-RACE"
+    assert supervisor.synced_position.exit_limit_price == 2.07
+    assert supervisor.synced_position.exit_submitted_at == submitted_at
+    assert supervisor.synced_position.exit_mode == ExitMode.STRATEGY
+    assert supervisor.synced_position.target_order_id is None
+    assert snapshot.positions[0].exit_order_id == "EXIT-NVDA-RACE"
 
 
 def test_runtime_reconciliation_staleness_blocks_live_entries() -> None:

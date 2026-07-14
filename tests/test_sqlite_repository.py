@@ -130,6 +130,51 @@ def test_trade_state_mark_closed_persists_exit_fill_truth(tmp_path) -> None:
     assert "averagePrice" in row[7]
 
 
+def test_trade_upsert_does_not_regress_pending_exit_to_stale_open_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "runtime.db"
+    repo = SQLiteTradeStateRepository(str(db_path))
+    submitted_at = datetime(2026, 7, 13, 14, 38, 5, tzinfo=UTC)
+
+    async def run() -> None:
+        await repo.upsert_trade(
+            TradeRecord(
+                trade_id="NVDA-RACE",
+                deployment_id="nvda_live",
+                symbol="NVDA",
+                option_symbol="NVDA260722P00200000",
+                quantity=8,
+                entry_price=2.18,
+                status="exit_pending",
+                entry_order_id="ENTRY-NVDA-RACE",
+                exit_order_id="EXIT-NVDA-RACE",
+                exit_limit_price=2.07,
+                exit_submitted_at=submitted_at,
+            )
+        )
+        # Mirrors the stale reconciliation upsert that landed after the exit.
+        await repo.upsert_trade(
+            TradeRecord(
+                trade_id="NVDA-RACE",
+                deployment_id="nvda_live",
+                symbol="NVDA",
+                option_symbol="NVDA260722P00200000",
+                quantity=8,
+                entry_price=2.18,
+                status="open_protected",
+                entry_order_id="ENTRY-NVDA-RACE",
+                stop_order_id="STOP-NVDA-RACE",
+            )
+        )
+
+    asyncio.run(run())
+
+    record = asyncio.run(repo.get_recent_trades(limit=1))[0]
+    assert record.status == "exit_pending"
+    assert record.exit_order_id == "EXIT-NVDA-RACE"
+    assert record.exit_limit_price == 2.07
+    assert record.exit_submitted_at == submitted_at
+
+
 def test_sqlite_event_repository_does_not_leak_file_descriptors(tmp_path) -> None:
     before = _open_fd_count()
     if before is None:
