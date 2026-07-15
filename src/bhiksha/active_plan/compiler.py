@@ -17,6 +17,7 @@ import yaml
 
 from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
+from bhiksha.execution.pricing import resolve_entry_reprice_max_chase_pct
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.strategy.capabilities import (
@@ -823,7 +824,9 @@ def _compile_strategy_row(
     payload = _catalog_entry_payload(entry)
     payload["deployment_id"] = effective_row.row_id
     payload["enabled"] = effective_row.enabled
-    payload["execution"] = _apply_execution_overrides(payload["execution"], effective_row)
+    payload["execution"] = _materialize_entry_profile_defaults(
+        _apply_execution_overrides(payload["execution"], effective_row)
+    )
     payload["risk"] = _apply_risk_overrides(payload["risk"], effective_row)
     payload["exit"] = _apply_exit_overrides(payload["exit"], effective_row)
     payload["strategy"]["params"] = _deep_merge(payload["strategy"]["params"], effective_row.strategy_params_override)
@@ -902,7 +905,9 @@ def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:
     if row.close_by_factor is not None:
         payload["strategy"]["params"]["close_by_factor"] = row.close_by_factor
 
-    payload["execution"] = _apply_execution_overrides(payload["execution"], row)
+    payload["execution"] = _materialize_entry_profile_defaults(
+        _apply_execution_overrides(payload["execution"], row)
+    )
     payload["risk"] = _apply_risk_overrides(payload["risk"], row)
     payload["exit"] = _apply_exit_overrides(payload["exit"], row)
     payload["source"] = _merge_source_metadata(payload["source"], row=row, origin="active_sheet_manual")
@@ -969,7 +974,9 @@ def _compile_manual_breakout_row(row: ActivePlanSheetRow) -> DeploymentManifest:
     if row.close_by_factor is not None:
         payload["strategy"]["params"]["close_by_factor"] = row.close_by_factor
 
-    payload["execution"] = _apply_execution_overrides(payload["execution"], row)
+    payload["execution"] = _materialize_entry_profile_defaults(
+        _apply_execution_overrides(payload["execution"], row)
+    )
     payload["risk"] = _apply_risk_overrides(payload["risk"], row)
     payload["exit"] = _apply_exit_overrides(payload["exit"], row)
     payload["source"] = _merge_source_metadata(payload["source"], row=row, origin="active_sheet_manual")
@@ -1073,6 +1080,7 @@ def _google_catalog_entry_payload(
         "entry_reprice_checkpoints_seconds": _coerce_int_list,
         "entry_reprice_cancel_after_seconds": _coerce_int,
         "entry_reprice_spread_fractions": _coerce_float_list,
+        "entry_reprice_max_chase_pct": _coerce_float,
     }
     for key, coercer in execution_default_fields.items():
         value = _first_not_none(
@@ -1380,6 +1388,15 @@ def _apply_execution_overrides(section: dict[str, Any], row: ActivePlanSheetRow)
         updated["entry_window_start_et"] = row.entry_window_start_et
     if row.entry_window_end_et is not None:
         updated["entry_window_end_et"] = row.entry_window_end_et
+    return updated
+
+
+def _materialize_entry_profile_defaults(section: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(section)
+    if updated.get("entry_reprice_max_chase_pct") is None:
+        resolved = resolve_entry_reprice_max_chase_pct(updated)
+        if resolved is not None:
+            updated["entry_reprice_max_chase_pct"] = resolved
     return updated
 
 

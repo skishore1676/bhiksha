@@ -18,12 +18,13 @@ class EntryExecutionProfile:
     reprice_checkpoints_seconds: tuple[int, ...]
     reprice_spread_fractions: tuple[float, ...]
     cancel_after_seconds: int
+    max_chase_pct: float
 
 
 ENTRY_EXECUTION_PROFILES: dict[EntryExecutionProfileName, EntryExecutionProfile] = {
-    "patient": EntryExecutionProfile("patient", 0.25, (60, 180), (0.50, 0.70), 300),
-    "balanced": EntryExecutionProfile("balanced", 0.35, (30, 90), (0.60, 0.85), 150),
-    "urgent": EntryExecutionProfile("urgent", 0.50, (15, 30), (0.80, 1.00), 60),
+    "patient": EntryExecutionProfile("patient", 0.25, (60, 180), (0.50, 0.70), 300, 0.10),
+    "balanced": EntryExecutionProfile("balanced", 0.35, (30, 90), (0.60, 0.85), 150, 0.15),
+    "urgent": EntryExecutionProfile("urgent", 0.50, (15, 30), (0.80, 1.00), 60, 0.25),
 }
 
 
@@ -163,6 +164,14 @@ def resolve_initial_spread_fraction(
     return (profile.initial_spread_fraction if profile is not None else None), profile
 
 
+def resolve_entry_reprice_max_chase_pct(execution_params: dict[str, Any]) -> float | None:
+    explicit = _optional_fraction(execution_params.get("entry_reprice_max_chase_pct"))
+    if explicit is not None:
+        return explicit
+    profile = get_entry_execution_profile(execution_params.get("entry_execution_profile"))
+    return profile.max_chase_pct if profile is not None else None
+
+
 def build_entry_profile_comparison(
     quote: PublicQuote,
     execution_params: dict[str, Any],
@@ -191,6 +200,7 @@ def build_entry_profile_comparison(
             "reprice_checkpoints_seconds": list(profile.reprice_checkpoints_seconds),
             "reprice_spread_fractions": list(profile.reprice_spread_fractions),
             "cancel_after_seconds": profile.cancel_after_seconds,
+            "max_chase_pct": profile.max_chase_pct,
         }
     return comparison
 

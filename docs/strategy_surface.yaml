@@ -73,6 +73,15 @@ shared_parameters:
       bhiksha_path: execution.max_bid_ask_spread_pct
       type: float
       description: Rejects option contracts whose quoted spread exceeds this percentage.
+    - id: entry_execution_profile
+      bhiksha_path: execution.entry_execution_profile
+      type: enum
+      allowed_values: [patient, balanced, urgent]
+      description: Selects the initial limit, reprice schedule, final timeout, and default upward chase cap.
+    - id: entry_reprice_max_chase_pct
+      bhiksha_path: execution.entry_reprice_max_chase_pct
+      type: float
+      description: Overrides the profile cap on upward repricing measured from the original submitted limit.
     - id: entry_window_start_et
       bhiksha_path: execution.entry_window_start_et
       type: hh:mm

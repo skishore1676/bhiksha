@@ -242,6 +242,8 @@ def test_execution_planner_named_patient_profile_sets_authoritative_price_and_co
     pricing = plan.risk_details["entry_pricing"]
     assert plan.estimated_entry_price == 2.75
     assert pricing["entry_execution_profile"] == "patient"
+    assert pricing["entry_reprice_max_chase_pct"] == 0.10
+    assert pricing["initial_limit_price"] == 2.75
     assert pricing["initial_profile_comparison"]["balanced"]["quote_limit_price"] == 2.77
     assert pricing["initial_profile_comparison"]["urgent"]["quote_limit_price"] == 2.80
 

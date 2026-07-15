@@ -197,6 +197,7 @@ def test_lane_config_diff_surfaces_patient_entry_policy_changes() -> None:
                         "entry_reprice_checkpoints_seconds": [60, 180],
                         "entry_reprice_cancel_after_seconds": 300,
                         "entry_reprice_spread_fractions": [0.50, 0.70],
+                        "entry_reprice_max_chase_pct": 0.08,
                     },
                 }
             ]
@@ -211,8 +212,10 @@ def test_lane_config_diff_surfaces_patient_entry_policy_changes() -> None:
     assert fields["min_open_interest"] == {"before": 100, "after": 50}
     assert fields["entry_execution_profile"] == {"before": None, "after": "patient"}
     assert fields["entry_reprice_spread_fractions"] == {"before": None, "after": [0.50, 0.70]}
+    assert fields["entry_reprice_max_chase_pct"] == {"before": None, "after": 0.08}
     assert after["smh_lane"]["effective_entry_pricing_spread_fraction"] == 0.25
     assert after["smh_lane"]["effective_entry_reprice_checkpoints_seconds"] == [60, 180]
+    assert after["smh_lane"]["effective_entry_reprice_max_chase_pct"] == 0.08
 
 
 def test_named_patient_profile_replaces_explicit_ladder_without_changing_effective_policy() -> None:
@@ -228,6 +231,7 @@ def test_named_patient_profile_replaces_explicit_ladder_without_changing_effecti
                         "entry_reprice_checkpoints_seconds": [60, 180],
                         "entry_reprice_cancel_after_seconds": 300,
                         "entry_reprice_spread_fractions": [0.50, 0.70],
+                        "entry_reprice_max_chase_pct": 0.10,
                     },
                 }
             ]
@@ -257,8 +261,43 @@ def test_named_patient_profile_replaces_explicit_ladder_without_changing_effecti
         "effective_entry_reprice_checkpoints_seconds",
         "effective_entry_reprice_cancel_after_seconds",
         "effective_entry_reprice_spread_fractions",
+        "effective_entry_reprice_max_chase_pct",
     ):
         assert field not in fields
+
+
+def test_materialized_profile_cap_surfaces_new_runtime_semantics() -> None:
+    before = lane_config_snapshot(
+        {
+            "deployments": [
+                {
+                    "deployment_id": "smh_lane",
+                    "execution": {"entry_execution_profile": "patient"},
+                }
+            ]
+        }
+    )
+    after = lane_config_snapshot(
+        {
+            "deployments": [
+                {
+                    "deployment_id": "smh_lane",
+                    "execution": {
+                        "entry_execution_profile": "patient",
+                        "entry_reprice_max_chase_pct": 0.10,
+                    },
+                }
+            ]
+        }
+    )
+
+    changes = diff_lane_configs(before, after)
+
+    assert changes[0]["fields"]["entry_reprice_max_chase_pct"] == {
+        "before": None,
+        "after": 0.10,
+    }
+    assert "effective_entry_reprice_max_chase_pct" not in changes[0]["fields"]
 
 
 def test_sync_active_plan_logs_compile_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

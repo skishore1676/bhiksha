@@ -10,6 +10,7 @@ from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradeP
 from bhiksha.execution.order_manager import OrderManager, OrderResult
 from bhiksha.execution.pricing import (
     build_entry_profile_comparison,
+    resolve_entry_reprice_max_chase_pct,
     resolve_initial_spread_fraction,
     scale_spread_fraction,
     select_entry_limit,
@@ -178,6 +179,10 @@ class ExecutionPlanner:
         pricing_evidence = {
             **pricing.evidence(),
             "entry_execution_profile": active_entry_profile.name if active_entry_profile is not None else "legacy",
+            "entry_reprice_max_chase_pct": resolve_entry_reprice_max_chase_pct(
+                deployment.execution.model_dump()
+            ),
+            "initial_limit_price": pricing.limit_price,
             "initial_profile_comparison": build_entry_profile_comparison(
                 quote,
                 deployment.execution.model_dump(),
@@ -375,6 +380,7 @@ class ExecutionPlanner:
         pricing_evidence = {
             **pricing_evidence,
             "preflight_limit_price": final_limit_price,
+            "initial_limit_price": final_limit_price,
             "preflight_increment": preflight.current_increment,
             "preflight_buying_power_requirement": preflight.buying_power_requirement,
             "preflight_estimated_cost": preflight.estimated_cost,

@@ -27,6 +27,7 @@ from bhiksha.execution.pricing import (
     EntryPricingResult,
     build_entry_profile_comparison,
     get_entry_execution_profile,
+    resolve_entry_reprice_max_chase_pct,
     scale_spread_fraction,
     select_entry_limit,
 )
@@ -53,6 +54,7 @@ ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
 # unknown -- means the order may still fill, so a reprice must not resubmit on
 # top of it without a clean cancel confirmation.
 _EXIT_ORDER_DEAD_STATUSES = frozenset({"CANCELED", "REJECTED", "EXPIRED"})
+_ENTRY_ORDER_DEAD_STATUSES = _EXIT_ORDER_DEAD_STATUSES
 
 # Audit fix 3 (2026-07-08): give-up ceiling for the partial-fill enrichment
 # sweep. One attempt is counted per unresolved poll (error/timeout/non-terminal
@@ -84,13 +86,54 @@ class _EntryRepriceResult:
 class _EntryCancelResult:
     cancel_ok: bool
     cancel_error: str | None
+    order_quantity: int
     status: str | None = None
     payload: dict | None = None
     status_error: str | None = None
 
     @property
+    def normalized_status(self) -> str:
+        return str(self.status or (self.payload or {}).get("status") or "").upper()
+
+    @property
+    def reported_filled_quantity(self) -> int | None:
+        return _maybe_int((self.payload or {}).get("filledQuantity"))
+
+    @property
+    def fill_quantity_ambiguous(self) -> bool:
+        payload = self.payload or {}
+        if "filledQuantity" not in payload:
+            return False
+        raw_value = payload.get("filledQuantity")
+        if raw_value is None or raw_value == "":
+            return False
+        reported = self.reported_filled_quantity
+        if reported is None or reported < 0 or reported > self.order_quantity:
+            return True
+        return self.normalized_status == "FILLED" and reported != self.order_quantity
+
+    @property
+    def confirmed_filled_quantity(self) -> int | None:
+        reported = self.reported_filled_quantity
+        if self.fill_quantity_ambiguous:
+            return None
+        if self.normalized_status == "FILLED":
+            return self.order_quantity
+        if self.normalized_status in _ENTRY_ORDER_DEAD_STATUSES and reported is not None and reported > 0:
+            return reported
+        return None
+
+    @property
     def filled(self) -> bool:
-        return str(self.status or "").upper() == "FILLED"
+        return self.confirmed_filled_quantity is not None
+
+    @property
+    def safe_to_replace_or_close(self) -> bool:
+        return (
+            self.normalized_status in _ENTRY_ORDER_DEAD_STATUSES
+            and not self.fill_quantity_ambiguous
+            and (self.reported_filled_quantity or 0) <= 0
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1104,6 +1147,7 @@ class ExecutionSupervisor:
 
         cancel_result = await self._cancel_entry_order_and_check_fill(active_plan)
         if cancel_result.filled:
+            filled_plan = _entry_plan_from_cancel_fill(active_plan, cancel_result)
             await self.event_repository.append(
                 "entry_reprice_cancel_race_filled",
                 {
@@ -1113,11 +1157,13 @@ class ExecutionSupervisor:
                     "cancel_after_seconds": cancel_after_seconds,
                     "cancel_ok": cancel_result.cancel_ok,
                     "cancel_error": cancel_result.cancel_error,
+                    "filled_quantity": cancel_result.confirmed_filled_quantity,
+                    "original_quantity": active_plan.quantity,
                     "payload": cancel_result.payload or {},
                 },
             )
             return _EntryWaitResult(
-                plan=active_plan,
+                plan=filled_plan,
                 filled=True,
                 payload=cancel_result.payload,
                 error=None,
@@ -1133,15 +1179,23 @@ class ExecutionSupervisor:
                 "cancel_error": cancel_result.cancel_error,
                 "status": cancel_result.status,
                 "status_error": cancel_result.status_error,
+                "safe_to_close": cancel_result.safe_to_replace_or_close,
                 "payload": result.payload or {},
             },
+        )
+        safe_to_close = cancel_result.safe_to_replace_or_close
+        final_error = (
+            "entry_reprice_cancel_after_timeout"
+            if safe_to_close
+            else "entry_reprice_final_cancel_unconfirmed:"
+            + str(cancel_result.status_error or cancel_result.status or cancel_result.cancel_error or "unknown")
         )
         return _EntryWaitResult(
             plan=active_plan,
             filled=False,
             payload=result.payload,
-            error="entry_reprice_cancel_after_timeout" if cancel_result.cancel_ok else f"entry_reprice_final_cancel_failed:{cancel_result.cancel_error}",
-            cancelled_without_fill=cancel_result.cancel_ok,
+            error=final_error,
+            cancelled_without_fill=safe_to_close,
         )
 
     async def _wait_for_entry_fill_once(
@@ -1218,6 +1272,36 @@ class ExecutionSupervisor:
                 pricing_evidence=pricing_evidence,
             )
         final_limit_price = float(preflight.payload["limitPrice"])
+        pricing_evidence = {
+            **pricing_evidence,
+            "preflight_limit_price": final_limit_price,
+            "preflight_increment": preflight.current_increment,
+            "preflight_buying_power_requirement": preflight.buying_power_requirement,
+            "preflight_estimated_cost": preflight.estimated_cost,
+        }
+        reference_limit_price = _entry_reprice_reference_limit_price(plan)
+        max_chase_pct = resolve_entry_reprice_max_chase_pct(deployment.execution.model_dump())
+        if reference_limit_price is not None and max_chase_pct is not None:
+            max_chase_price = round_price(reference_limit_price * (1.0 + max_chase_pct))
+            is_upward_reprice = final_limit_price > plan.estimated_entry_price + 1e-9
+            if is_upward_reprice and final_limit_price > max_chase_price + 1e-9:
+                await self.event_repository.append(
+                    "entry_reprice_chase_guard_resting",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "trade_id": plan.trade_id,
+                        "order_id": plan.order_id,
+                        "attempt": attempt,
+                        "decision": "rest_existing_order",
+                        "current_limit_price": plan.estimated_entry_price,
+                        "reference_limit_price": reference_limit_price,
+                        "proposed_limit_price": final_limit_price,
+                        "max_chase_pct": max_chase_pct,
+                        "max_chase_price": max_chase_price,
+                        "pricing_evidence": pricing_evidence,
+                    },
+                )
+                return _EntryRepriceResult(plan=plan)
         max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
         repriced_premium = final_limit_price * plan.quantity * 100
         if repriced_premium > max_trade_premium:
@@ -1239,16 +1323,7 @@ class ExecutionSupervisor:
         )
         cancel_result = await self._cancel_entry_order_and_check_fill(plan)
         if cancel_result.filled:
-            filled_price = _filled_entry_price(cancel_result.payload, fallback=plan.estimated_entry_price)
-            filled_plan = replace(
-                plan,
-                estimated_entry_price=filled_price,
-                risk_details={
-                    **dict(plan.risk_details),
-                    "entry_reprice_cancel_race_filled": True,
-                    "broker_average_fill_price": filled_price,
-                },
-            )
+            filled_plan = _entry_plan_from_cancel_fill(plan, cancel_result)
             await self.event_repository.append(
                 "entry_reprice_cancel_race_filled",
                 {
@@ -1258,14 +1333,16 @@ class ExecutionSupervisor:
                     "attempt": attempt,
                     "cancel_ok": cancel_result.cancel_ok,
                     "cancel_error": cancel_result.cancel_error,
+                    "filled_quantity": cancel_result.confirmed_filled_quantity,
+                    "original_quantity": plan.quantity,
                     "pricing_evidence": pricing_evidence,
                     "payload": cancel_result.payload or {},
                 },
             )
             return _EntryRepriceResult(plan=filled_plan, filled=True, payload=cancel_result.payload)
-        if not cancel_result.cancel_ok:
+        if not cancel_result.safe_to_replace_or_close:
             await self.event_repository.append(
-                "entry_reprice_cancel_failed",
+                "entry_reprice_cancel_unconfirmed",
                 {
                     "deployment_id": plan.deployment_id,
                     "trade_id": plan.trade_id,
@@ -1274,10 +1351,13 @@ class ExecutionSupervisor:
                     "error": cancel_result.cancel_error,
                     "status": cancel_result.status,
                     "status_error": cancel_result.status_error,
+                    "filled_quantity": cancel_result.reported_filled_quantity,
+                    "fill_quantity_ambiguous": cancel_result.fill_quantity_ambiguous,
                     "pricing_evidence": pricing_evidence,
                 },
             )
-            return _EntryRepriceResult(plan=plan, error=f"entry_reprice_cancel_failed:{cancel_result.cancel_error}")
+            cancel_state = cancel_result.status_error or cancel_result.status or cancel_result.cancel_error or "unknown"
+            return _EntryRepriceResult(plan=plan, error=f"entry_reprice_cancel_unconfirmed:{cancel_state}")
 
         cash_guard_details: dict[str, object] = {}
         if getattr(self.planner, "cash_guard", None) is not None:
@@ -1322,13 +1402,6 @@ class ExecutionSupervisor:
                 cancelled_without_fill=True,
             )
 
-        pricing_evidence = {
-            **pricing_evidence,
-            "preflight_limit_price": final_limit_price,
-            "preflight_increment": preflight.current_increment,
-            "preflight_buying_power_requirement": preflight.buying_power_requirement,
-            "preflight_estimated_cost": preflight.estimated_cost,
-        }
         risk_details = {
             **dict(plan.risk_details),
             "entry_pricing": pricing_evidence,
@@ -1403,16 +1476,7 @@ class ExecutionSupervisor:
     ) -> "_EntryRepriceResult":
         cancel_result = await self._cancel_entry_order_and_check_fill(plan)
         if cancel_result.filled:
-            filled_price = _filled_entry_price(cancel_result.payload, fallback=plan.estimated_entry_price)
-            filled_plan = replace(
-                plan,
-                estimated_entry_price=filled_price,
-                risk_details={
-                    **dict(plan.risk_details),
-                    "entry_reprice_cancel_race_filled": True,
-                    "broker_average_fill_price": filled_price,
-                },
-            )
+            filled_plan = _entry_plan_from_cancel_fill(plan, cancel_result)
             await self.event_repository.append(
                 "entry_reprice_cancel_race_filled",
                 {
@@ -1423,6 +1487,8 @@ class ExecutionSupervisor:
                     "reason": reason,
                     "cancel_ok": cancel_result.cancel_ok,
                     "cancel_error": cancel_result.cancel_error,
+                    "filled_quantity": cancel_result.confirmed_filled_quantity,
+                    "original_quantity": plan.quantity,
                     "pricing_evidence": pricing_evidence or {},
                     "payload": cancel_result.payload or {},
                 },
@@ -1440,13 +1506,18 @@ class ExecutionSupervisor:
                 "cancel_error": cancel_result.cancel_error,
                 "status": cancel_result.status,
                 "status_error": cancel_result.status_error,
+                "safe_to_close": cancel_result.safe_to_replace_or_close,
+                "filled_quantity": cancel_result.reported_filled_quantity,
+                "fill_quantity_ambiguous": cancel_result.fill_quantity_ambiguous,
                 "pricing_evidence": pricing_evidence or {},
             },
         )
+        safe_to_close = cancel_result.safe_to_replace_or_close
+        cancel_state = cancel_result.status_error or cancel_result.status or cancel_result.cancel_error or "unknown"
         return _EntryRepriceResult(
             plan=plan,
-            error=reason if cancel_result.cancel_ok else f"entry_reprice_block_cancel_failed:{cancel_result.cancel_error}",
-            cancelled_without_fill=cancel_result.cancel_ok,
+            error=reason if safe_to_close else f"entry_reprice_block_cancel_unconfirmed:{cancel_state}",
+            cancelled_without_fill=safe_to_close,
         )
 
     async def _cancel_entry_order_and_check_fill(self, plan: TradePlan) -> "_EntryCancelResult":
@@ -1461,6 +1532,7 @@ class ExecutionSupervisor:
         return _EntryCancelResult(
             cancel_ok=cancel_ok,
             cancel_error=cancel_error,
+            order_quantity=plan.quantity,
             status=status,
             payload=payload,
             status_error=status_error,
@@ -4817,9 +4889,18 @@ def _entry_pricing_evidence(
     prior_comparison = (
         prior_pricing.get("initial_profile_comparison") if isinstance(prior_pricing, dict) else None
     )
+    initial_limit_price = (
+        prior_pricing.get("initial_limit_price") if isinstance(prior_pricing, dict) else None
+    )
     return {
         **pricing.evidence(),
         "entry_execution_profile": profile.name if profile is not None else "legacy",
+        "entry_reprice_max_chase_pct": resolve_entry_reprice_max_chase_pct(
+            deployment.execution.model_dump()
+        ),
+        "initial_limit_price": (
+            initial_limit_price if initial_limit_price is not None else plan.estimated_entry_price
+        ),
         "initial_profile_comparison": (
             prior_comparison
             if isinstance(prior_comparison, dict)
@@ -4830,6 +4911,36 @@ def _entry_pricing_evidence(
             )
         ),
     }
+
+
+def _entry_reprice_reference_limit_price(plan: TradePlan) -> float | None:
+    prior_pricing = plan.risk_details.get("entry_pricing")
+    value = prior_pricing.get("initial_limit_price") if isinstance(prior_pricing, dict) else None
+    if value is None:
+        value = plan.estimated_entry_price
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _entry_plan_from_cancel_fill(plan: TradePlan, cancel_result: _EntryCancelResult) -> TradePlan:
+    filled_price = _filled_entry_price(cancel_result.payload, fallback=plan.estimated_entry_price)
+    filled_quantity = cancel_result.confirmed_filled_quantity or plan.quantity
+    return replace(
+        plan,
+        quantity=filled_quantity,
+        estimated_entry_price=filled_price,
+        risk_details={
+            **dict(plan.risk_details),
+            "entry_reprice_cancel_race_filled": True,
+            "entry_reprice_original_quantity": plan.quantity,
+            "entry_reprice_filled_quantity": filled_quantity,
+            "entry_reprice_partial_fill": filled_quantity != plan.quantity,
+            "broker_average_fill_price": filled_price,
+        },
+    )
 
 
 def _risk_open_interest_percentile(plan: TradePlan) -> float | None:

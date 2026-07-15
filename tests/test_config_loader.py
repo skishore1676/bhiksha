@@ -379,6 +379,17 @@ def test_load_deployments_rejects_named_profile_checkpoint_at_profile_deadline(t
         load_deployments(root)
 
 
+def test_load_deployments_rejects_reprice_chase_cap_above_one(tmp_path: Path) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict("manual_qqq")
+    payload["execution"]["entry_reprice_max_chase_pct"] = 1.01
+    (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="less than or equal to 1"):
+        load_deployments(root)
+
+
 def _write_manifest(path: Path, deployment_id: str, *, symbol: str = "QQQ") -> None:
     payload = _manifest_dict(deployment_id, symbol=symbol)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

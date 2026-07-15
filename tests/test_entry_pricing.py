@@ -5,6 +5,7 @@ from bhiksha.execution.pricing import (
     ENTRY_EXECUTION_PROFILES,
     EntryPricingPolicy,
     build_entry_profile_comparison,
+    resolve_entry_reprice_max_chase_pct,
     resolve_initial_spread_fraction,
     scale_spread_fraction,
     select_entry_limit,
@@ -73,6 +74,9 @@ def test_named_entry_profiles_have_distinct_bounded_ladders() -> None:
     assert ENTRY_EXECUTION_PROFILES["patient"].reprice_checkpoints_seconds == (60, 180)
     assert ENTRY_EXECUTION_PROFILES["balanced"].reprice_spread_fractions == (0.60, 0.85)
     assert ENTRY_EXECUTION_PROFILES["urgent"].cancel_after_seconds == 60
+    assert ENTRY_EXECUTION_PROFILES["patient"].max_chase_pct == 0.10
+    assert ENTRY_EXECUTION_PROFILES["balanced"].max_chase_pct == 0.15
+    assert ENTRY_EXECUTION_PROFILES["urgent"].max_chase_pct == 0.25
 
 
 def test_entry_profile_comparison_prices_all_profiles_without_order_authority() -> None:
@@ -87,6 +91,7 @@ def test_entry_profile_comparison_prices_all_profiles_without_order_authority() 
     assert comparison["balanced"]["quote_limit_price"] == 2.74
     assert comparison["urgent"]["quote_limit_price"] == 2.75
     assert comparison["patient"]["effective_spread_fraction"] == 0.125
+    assert comparison["patient"]["max_chase_pct"] == 0.10
 
 
 def test_explicit_initial_fraction_overrides_named_profile_default() -> None:
@@ -100,3 +105,11 @@ def test_explicit_initial_fraction_overrides_named_profile_default() -> None:
     assert profile is not None
     assert profile.name == "patient"
     assert fraction == 0.40
+
+
+def test_explicit_reprice_chase_cap_overrides_named_profile_default() -> None:
+    assert resolve_entry_reprice_max_chase_pct(
+        {"entry_execution_profile": "patient", "entry_reprice_max_chase_pct": 0.05}
+    ) == 0.05
+    assert resolve_entry_reprice_max_chase_pct({"entry_execution_profile": "balanced"}) == 0.15
+    assert resolve_entry_reprice_max_chase_pct({}) is None

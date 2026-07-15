@@ -93,6 +93,7 @@ def test_compile_active_plan_from_csv_supports_strategy_and_manual_same_symbol(t
     assert strategy.execution.entry_reprice_checkpoints_seconds == [60, 180]
     assert strategy.execution.entry_reprice_cancel_after_seconds == 300
     assert strategy.execution.entry_reprice_spread_fractions == [0.50, 0.70]
+    assert strategy.execution.entry_reprice_max_chase_pct == 0.10
     assert strategy.execution.entry_window_start_et == "09:40"
     assert strategy.risk.max_trade_premium_usd == 200
     assert strategy.source.origin == "active_sheet_strategy"
@@ -1170,6 +1171,7 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
             {"section": "default", "key": "entry_reprice_checkpoints_seconds", "value": "[60, 180]"},
             {"section": "default", "key": "entry_reprice_cancel_after_seconds", "value": "300"},
             {"section": "default", "key": "entry_reprice_spread_fractions", "value": "[0.50, 0.70]"},
+            {"section": "default", "key": "entry_reprice_max_chase_pct", "value": "0.12"},
             {"section": "default", "key": "dte_fallback_policy", "value": "allow_nearest_after"},
             {"section": "default", "key": "max_open_positions_total", "value": "4"},
             {"section": "default", "key": "max_open_positions_per_symbol", "value": "2"},
@@ -1225,6 +1227,7 @@ def test_compile_active_plan_can_use_mala_evidence_and_operator_defaults(tmp_pat
     assert deployment.execution.entry_reprice_checkpoints_seconds == [60, 180]
     assert deployment.execution.entry_reprice_cancel_after_seconds == 300
     assert deployment.execution.entry_reprice_spread_fractions == [0.50, 0.70]
+    assert deployment.execution.entry_reprice_max_chase_pct == 0.12
     assert deployment.execution.dte_fallback_policy == "allow_nearest_after"
     assert deployment.execution.entry_window_start_et == "09:30"
     assert deployment.execution.entry_window_end_et == "16:00"

@@ -237,6 +237,7 @@ class ExecutionSpec(BaseModel):
     entry_reprice_checkpoints_seconds: list[int] | None = None
     entry_reprice_cancel_after_seconds: int | None = Field(default=None, ge=0)
     entry_reprice_spread_fractions: list[float] | None = None
+    entry_reprice_max_chase_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     entry_window_start_et: str | None = None
     entry_window_end_et: str | None = None
     shadow_only: bool = False

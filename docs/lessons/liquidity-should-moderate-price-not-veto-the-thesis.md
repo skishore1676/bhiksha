@@ -37,14 +37,23 @@ bid-only, never an implicit permission to chase.
 The Sheet controls an opt-in ladder through a named `entry_execution_profile`:
 `patient`, `balanced`, or `urgent`. Each profile bundles an initial spread
 fraction, OI-percentile scaling, reprice checkpoints and fractions, and a final
-cancel deadline. Fraction `0` means bid, `0.5` means mid, and `1` means ask.
-Explicit lane values override the bundle where supported. Existing lanes retain
-their legacy global pricing unless a profile is explicitly selected.
+cancel deadline. It also caps upward repricing from the original submitted
+limit at 10%, 15%, or 25%, respectively. Fraction `0` means bid, `0.5` means
+mid, and `1` means ask. Explicit lane values override the bundle where
+supported. Existing lanes retain their legacy global pricing unless a profile
+is explicitly selected.
 
 Each replacement still rechecks quote quality, cancel/status races, broker
 preflight, cash availability, and the lane's maximum trade premium. That last
 check matters because quantity was sized at the cheaper initial limit; without
 it, a later replacement could exceed the configured premium cap.
+
+Fresh quotes can move faster than the ladder. When a proposed replacement is
+above the profile's chase cap, keep the existing lower limit resting and check
+again at the next checkpoint. Do not cancel the safe order merely because the
+market moved away, and do not ratchet the cap from one replacement to the next;
+the reference remains the original submitted limit. The final profile deadline
+still cancels any unfilled order.
 
 The active-plan sync's lane-config snapshot must include these fields. A Sheet
 knob that changes trade economics but is absent from `LANE_CONFIG_CHANGED`

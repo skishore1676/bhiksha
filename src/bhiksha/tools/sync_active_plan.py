@@ -15,7 +15,10 @@ from typing import Iterator
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
-from bhiksha.execution.pricing import resolve_initial_spread_fraction
+from bhiksha.execution.pricing import (
+    resolve_entry_reprice_max_chase_pct,
+    resolve_initial_spread_fraction,
+)
 from bhiksha.strategy.capabilities import CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST_PATH
 from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
 
@@ -52,6 +55,7 @@ _LANE_CONFIG_FIELDS: tuple[tuple[str, str], ...] = (
     ("execution", "entry_reprice_checkpoints_seconds"),
     ("execution", "entry_reprice_cancel_after_seconds"),
     ("execution", "entry_reprice_spread_fractions"),
+    ("execution", "entry_reprice_max_chase_pct"),
 )
 
 
@@ -91,6 +95,7 @@ def lane_config_snapshot(plan: dict[str, object]) -> dict[str, dict[str, object]
                 execution.get("entry_reprice_spread_fractions"),
                 list(profile.reprice_spread_fractions) if profile is not None else None,
             )
+            lane["effective_entry_reprice_max_chase_pct"] = resolve_entry_reprice_max_chase_pct(execution)
         lanes[deployment_id] = lane
     return lanes
 
@@ -235,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
                     f" effective_entry_fraction={lane.get('effective_entry_pricing_spread_fraction')}"
                     f" reprice_enabled={lane.get('entry_reprice_enabled')}"
                     f" reprice_cancel_seconds={lane.get('entry_reprice_cancel_after_seconds')}"
+                    f" reprice_max_chase_pct={lane.get('entry_reprice_max_chase_pct')}"
+                    f" effective_reprice_max_chase_pct={lane.get('effective_entry_reprice_max_chase_pct')}"
                 )
             print(f"LANE_CONFIG_CHANGE_COUNT={len(result.lane_config_changes)}")
             for change in result.lane_config_changes:
