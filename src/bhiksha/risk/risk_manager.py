@@ -42,15 +42,15 @@ RAIL A (two-tier portfolio daily-drawdown cap, realized-only v1):
     (``bhiksha.app.runtime.prefetch_cash_budget_day``), which upserts the
     row before the bar loop starts specifically to keep this window short.
 
-RAIL B (per-deployment auto-demote, one-way):
+RAIL B (per-deployment auto-demote, operator-resettable):
   - over the rolling last N (demote_window, default 10) CLOSED LIVE trades
     of a deployment, once at least min_n (default 10) trades exist, if mean
     P&L per trade < demote_threshold_usd (default $0) -> demote: block
     further live entries for it this session (consult-point decision) AND
     persist a local override (``DemotionStore``) the active-plan compiler
     merges at next compile to force the row to shadow.
-  - one-way: DemotionStore.record_demotion is a no-op once a deployment is
-    already recorded, so this never flaps and never auto-re-promotes.
+  - never auto-re-promotes. A protected operator re-promotion records a cutoff
+    and Rail B requires a fresh post-cutoff window before it can demote again.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from bhiksha.domain.models import TradeRecord
+from bhiksha.domain.models import PartialFillRecord, TradeRecord
 from bhiksha.ops.alerts import AlertMode, send_lathi_alert
 from bhiksha.persistence.repository import CashBudgetRepository, EventRepository, TradeStateRepository
 from bhiksha.risk.demotion_store import DemotionStore
@@ -142,6 +142,74 @@ def _realized_pnl_usd(trade: TradeRecord) -> float | None:
     return round((trade.exit_price - trade.entry_price) * quantity * 100, 2)
 
 
+def _complete_realized_pnl_usd(
+    trade: TradeRecord,
+    partials: list[PartialFillRecord],
+) -> float | None:
+    """Realized P&L across the final residual and confirmed banked legs.
+
+    This intentionally mirrors ``weekly_scorecard._trade_pnl_and_basis``.
+    Missing or abandoned partial truth is skipped rather than estimated.
+    """
+    if trade.entry_price is None:
+        return None
+    partial_pnl = 0.0
+    banked_quantity = 0
+    for partial, quantity in _confirmed_partial_legs(trade, partials):
+        partial_pnl += (partial.fill_price - trade.entry_price) * quantity * 100
+        banked_quantity += quantity
+
+    final_pnl = _realized_pnl_usd(trade)
+    if final_pnl is None and banked_quantity == 0:
+        return None
+    return round((final_pnl or 0.0) + partial_pnl, 2)
+
+
+def _partial_realized_pnl_usd(
+    trade: TradeRecord,
+    partial: PartialFillRecord,
+    quantity: int,
+) -> float | None:
+    if trade.entry_price is None or partial.abandoned_reason or partial.fill_price is None:
+        return None
+    if quantity <= 0:
+        return None
+    return round((partial.fill_price - trade.entry_price) * quantity * 100, 2)
+
+
+def _confirmed_partial_legs(
+    trade: TradeRecord,
+    partials: list[PartialFillRecord],
+) -> list[tuple[PartialFillRecord, int]]:
+    """Return one bounded, conservative leg per broker order identity."""
+    if trade.entry_price is None:
+        return []
+    selected: dict[tuple[str, object], tuple[PartialFillRecord, int, float]] = {}
+    for index, partial in enumerate(partials):
+        if partial.abandoned_reason or partial.fill_price is None:
+            continue
+        closed_quantity = int(partial.closed_quantity or 0)
+        reported_quantity = (
+            closed_quantity if partial.fill_quantity is None else int(partial.fill_quantity)
+        )
+        quantity = min(closed_quantity, reported_quantity)
+        if quantity <= 0:
+            continue
+        identity: tuple[str, object]
+        if partial.order_id:
+            identity = ("order", partial.order_id)
+        else:
+            identity = ("row", partial.id if partial.id is not None else index)
+        pnl = (partial.fill_price - trade.entry_price) * quantity * 100
+        current = selected.get(identity)
+        # Duplicate broker-order rows are corruption. Count the order once and
+        # retain the lower P&L observation so positive duplication cannot hide
+        # a halt or demotion.
+        if current is None or pnl < current[2]:
+            selected[identity] = (partial, quantity, pnl)
+    return [(partial, quantity) for partial, quantity, _ in selected.values()]
+
+
 def _trade_date_et(timestamp: datetime) -> str:
     from zoneinfo import ZoneInfo
 
@@ -149,6 +217,10 @@ def _trade_date_et(timestamp: datetime) -> str:
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
     return timestamp.astimezone(et).date().isoformat()
+
+
+def _as_utc(timestamp: datetime) -> datetime:
+    return timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp.astimezone(UTC)
 
 
 @dataclass(slots=True, frozen=True)
@@ -368,17 +440,40 @@ class RiskManager:
 
     async def _realized_live_pnl_today(self, trade_date: str) -> float:
         trades = await self.trade_state_repository.get_recent_trades(limit=1000)
+        relevant_trades = [
+            trade
+            for trade in trades
+            if _is_live_trade(trade)
+            and not (
+                _is_closed_trade(trade)
+                and (
+                    trade.exit_filled_at is None
+                    or _trade_date_et(trade.exit_filled_at) != trade_date
+                )
+            )
+        ]
+        partials_by_trade = await self.trade_state_repository.get_partial_fills_for_trades(
+            [trade.trade_id for trade in relevant_trades]
+        )
         total = 0.0
-        for trade in trades:
-            if not _is_live_trade(trade) or not _is_closed_trade(trade):
-                continue
-            if trade.exit_filled_at is None:
-                continue
-            if _trade_date_et(trade.exit_filled_at) != trade_date:
-                continue
-            pnl = _realized_pnl_usd(trade)
-            if pnl is not None:
-                total += pnl
+        for trade in relevant_trades:
+            final_filled_today = (
+                _is_closed_trade(trade)
+                and trade.exit_filled_at is not None
+                and _trade_date_et(trade.exit_filled_at) == trade_date
+            )
+            if final_filled_today:
+                final_pnl = _realized_pnl_usd(trade)
+                if final_pnl is not None:
+                    total += final_pnl
+            for partial, quantity in _confirmed_partial_legs(
+                trade, partials_by_trade.get(trade.trade_id, [])
+            ):
+                if partial.filled_at is None or _trade_date_et(partial.filled_at) != trade_date:
+                    continue
+                partial_pnl = _partial_realized_pnl_usd(trade, partial, quantity)
+                if partial_pnl is not None:
+                    total += partial_pnl
         return round(total, 2)
 
     @property
@@ -661,13 +756,31 @@ class RiskManager:
             for trade in trades
             if trade.deployment_id == deployment_id and _is_live_trade(trade) and _is_closed_trade(trade)
         ]
+        cutoff = self.demotion_store.repromotion_cutoff(deployment_id)
+        if cutoff is not None:
+            deployment_live_closed = [
+                trade
+                for trade in deployment_live_closed
+                if trade.exit_filled_at is not None
+                and _as_utc(trade.exit_filled_at) > cutoff
+            ]
         # get_recent_trades is ordered by updated_at DESC; take the most
         # recent demote_window trades as "the rolling last N".
         window = deployment_live_closed[: self.settings.demote_window]
         if len(window) < self.settings.demote_min_n:
             return RailBStatus(demoted=False, reason="insufficient_trade_count", window_n=len(window))
 
-        pnls = [pnl for trade in window if (pnl := _realized_pnl_usd(trade)) is not None]
+        partials_by_trade = await self.trade_state_repository.get_partial_fills_for_trades(
+            [trade.trade_id for trade in window]
+        )
+        pnls = []
+        priced_trade_ids = []
+        for trade in window:
+            partials = partials_by_trade.get(trade.trade_id, [])
+            pnl = _complete_realized_pnl_usd(trade, partials)
+            if pnl is not None:
+                pnls.append(pnl)
+                priced_trade_ids.append(trade.trade_id)
         if len(pnls) < self.settings.demote_min_n:
             return RailBStatus(demoted=False, reason="insufficient_priced_trade_count", window_n=len(pnls))
 
@@ -681,7 +794,7 @@ class RiskManager:
             window_n=len(pnls),
             mean_pnl_usd=mean_pnl,
             threshold_usd=self.settings.demote_threshold_usd,
-            trade_ids=[trade.trade_id for trade in window],
+            trade_ids=priced_trade_ids,
             now=self._now_fn(),
         )
         self._session_demoted_ids.add(deployment_id)
@@ -704,8 +817,8 @@ class RiskManager:
                 f"${record.mean_pnl_usd:.2f}/trade (threshold ${record.threshold_usd:.2f}). "
                 "Live entries for this deployment are blocked for the rest of this session "
                 "and it will compile shadow-only starting next active-plan compile. "
-                f"To re-promote: an operator must delete the '{deployment_id}' entry from "
-                f"{self.demotion_store.path} (one-way -- there is no auto-re-promote)."
+                "There is no automatic re-promotion. A protected operator reset "
+                "is required and starts a fresh Rail B evidence window."
             ),
             level="warning",
         )

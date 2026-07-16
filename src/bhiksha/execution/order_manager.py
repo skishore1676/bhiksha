@@ -303,7 +303,7 @@ class OrderManager:
             normalized = (status or "").upper()
             if normalized == "FILLED":
                 return True, payload, None
-            if normalized in {"REJECTED", "CANCELED", "EXPIRED"}:
+            if normalized in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}:
                 return False, payload, normalized
             await __import__("asyncio").sleep(poll_seconds)
         return False, last_payload, "fill_timeout"

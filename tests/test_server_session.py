@@ -79,6 +79,7 @@ def test_server_session_start_status_stop_round_trip(tmp_path: Path, monkeypatch
     assert exit_code == 0
     metadata = json.loads(pid_path.read_text(encoding="utf-8"))
     assert metadata["pid"] == 43210
+    assert (pid_path.parent / "bhiksha.control.lock").exists()
     assert metadata["live"] is True
     assert Path(metadata["log_path"]).name.startswith("trade_session_")
     assert Path(metadata["log_path"]).name.endswith(".log")

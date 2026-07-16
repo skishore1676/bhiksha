@@ -28,6 +28,174 @@ def _runtime_deployment(runtime, *, symbol: str, fallback_id: str):
     return deployment
 
 
+def test_position_runner_keeps_recovered_live_position_real_after_demotion() -> None:
+    runtime = build_runtime()
+    base = _runtime_deployment(
+        runtime,
+        symbol="QQQ",
+        fallback_id="market_impulse_qqq_short_v1",
+    )
+    deployment = base.model_copy(
+        update={"execution": base.execution.model_copy(update={"shadow_only": True})}
+    )
+    position = TrackedPosition(
+        symbol="QQQ",
+        deployment_id=deployment.deployment_id,
+        trade_id="RECOVERED_LIVE",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.1,
+        source="live_open",
+    )
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.dry_run_values: list[bool] = []
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position
+            self.dry_run_values.append(dry_run)
+            return None
+
+    supervisor = StubSupervisor()
+    runner = runtime._make_manage_position_runner(
+        supervisor,
+        deployment,
+        position,
+        live=True,
+        output=lambda _message: None,
+    )
+
+    asyncio.run(runner())
+
+    assert supervisor.dry_run_values == [False]
+
+
+def test_position_runner_keeps_genuine_paper_positions_simulated() -> None:
+    runtime = build_runtime()
+    deployment = _runtime_deployment(
+        runtime,
+        symbol="QQQ",
+        fallback_id="market_impulse_qqq_short_v1",
+    )
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.dry_run_values: list[bool] = []
+
+        async def manage_open_position(self, deployment, position, *, dry_run: bool):
+            del deployment, position
+            self.dry_run_values.append(dry_run)
+            return None
+
+    for source in ("shadow", "dry_run"):
+        position = TrackedPosition(
+            symbol="QQQ",
+            deployment_id=deployment.deployment_id,
+            trade_id=source.upper(),
+            option_symbol="QQQ260330P00558000",
+            quantity=1,
+            entry_price=2.1,
+            source=source,
+        )
+        supervisor = StubSupervisor()
+        runner = runtime._make_manage_position_runner(
+            supervisor,
+            deployment,
+            position,
+            live=True,
+            output=lambda _message: None,
+        )
+
+        asyncio.run(runner())
+
+        assert supervisor.dry_run_values == [True]
+
+
+def test_exit_runner_keeps_recovered_live_position_real_after_demotion() -> None:
+    runtime = build_runtime()
+    base = _runtime_deployment(
+        runtime,
+        symbol="QQQ",
+        fallback_id="market_impulse_qqq_short_v1",
+    )
+    deployment = base.model_copy(
+        update={"execution": base.execution.model_copy(update={"shadow_only": True})}
+    )
+    position = TrackedPosition(
+        symbol="QQQ",
+        deployment_id=deployment.deployment_id,
+        trade_id="RECOVERED_LIVE_EXIT",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.1,
+        source="live_open",
+    )
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.dry_run_values: list[bool] = []
+
+        async def handle_exit(self, deployment, position, decision, *, dry_run: bool):
+            del deployment, position, decision
+            self.dry_run_values.append(dry_run)
+            return None
+
+    supervisor = StubSupervisor()
+    runner = runtime._make_exit_runner(
+        supervisor,
+        deployment,
+        position,
+        object(),
+        live=True,
+        output=lambda _message: None,
+    )
+
+    asyncio.run(runner())
+
+    assert supervisor.dry_run_values == [False]
+
+
+def test_exit_runner_keeps_genuine_paper_positions_simulated() -> None:
+    runtime = build_runtime()
+    deployment = _runtime_deployment(
+        runtime,
+        symbol="QQQ",
+        fallback_id="market_impulse_qqq_short_v1",
+    )
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.dry_run_values: list[bool] = []
+
+        async def handle_exit(self, deployment, position, decision, *, dry_run: bool):
+            del deployment, position, decision
+            self.dry_run_values.append(dry_run)
+            return None
+
+    for source in ("shadow", "dry_run"):
+        position = TrackedPosition(
+            symbol="QQQ",
+            deployment_id=deployment.deployment_id,
+            trade_id=f"{source.upper()}_EXIT",
+            option_symbol="QQQ260330P00558000",
+            quantity=1,
+            entry_price=2.1,
+            source=source,
+        )
+        supervisor = StubSupervisor()
+        runner = runtime._make_exit_runner(
+            supervisor,
+            deployment,
+            position,
+            object(),
+            live=True,
+            output=lambda _message: None,
+        )
+
+        asyncio.run(runner())
+
+        assert supervisor.dry_run_values == [True]
+
+
 def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments() -> None:
     runtime = build_runtime()
 

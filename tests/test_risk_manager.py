@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 
-from bhiksha.domain.models import CashBudgetDay, TradeRecord
+from bhiksha.domain.models import CashBudgetDay, PartialFillRecord, TradeRecord
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.risk.risk_manager import (
@@ -15,6 +16,7 @@ from bhiksha.risk.risk_manager import (
     RAIL_B_DEMOTED_REASON,
     BUDGET_UNAVAILABLE_REASON,
     OPEN_DRAWDOWN_WARNING_REASON,
+    _complete_realized_pnl_usd,
 )
 from bhiksha.risk.risk_settings import RiskSettings, resolve_risk_settings
 
@@ -117,6 +119,32 @@ def _closed_live_trade(trade_id: str, *, deployment_id: str, entry: float, exit_
         exit_price=exit_,
         exit_filled_quantity=quantity,
         exit_filled_at=exit_at,
+    )
+
+
+def _confirmed_partial(
+    trade_id: str,
+    *,
+    deployment_id: str,
+    entry_at: datetime,
+    fill_price: float,
+    quantity: int = 1,
+) -> PartialFillRecord:
+    return PartialFillRecord(
+        id=None,
+        trade_id=trade_id,
+        deployment_id=deployment_id,
+        symbol="QQQ",
+        option_symbol="QQQ260101C00500000",
+        closed_quantity=quantity,
+        order_id=f"PARTIAL-{trade_id}",
+        exit_rule="target_1_partial",
+        submitted_at=entry_at,
+        fill_price=fill_price,
+        fill_quantity=quantity,
+        filled_at=entry_at,
+        order_status="FILLED",
+        order_type="LIMIT",
     )
 
 
@@ -462,6 +490,190 @@ def test_rail_b_does_not_fire_with_positive_expectancy(tmp_path) -> None:
     decision = asyncio.run(manager.allow_entry("dep1"))
     assert decision.allowed is True
     assert manager.demotion_store.is_demoted("dep1") is False
+
+
+def test_rail_b_counts_confirmed_banked_partial_pnl(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0),
+    )
+    _seed_large_budget(manager)
+    for i in range(10):
+        trade = _closed_live_trade(
+            f"T{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW
+        )
+        asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+        asyncio.run(
+            manager.trade_state_repository.mark_closed(
+                f"T{i}", exit_price=4.0, exit_filled_quantity=1, exit_filled_at=NOW
+            )
+        )
+    # Nine -$100 trades plus T9's -$100 residual and +$1,100 banked leg
+    # produce a +$10 mean. The old residual-only calculation falsely demoted.
+    asyncio.run(
+        manager.trade_state_repository.record_partial_fill(
+            _confirmed_partial(
+                "T9", deployment_id="dep1", entry_at=NOW, fill_price=16.0
+            )
+        )
+    )
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+
+    assert decision.allowed is True
+    assert manager.demotion_store.is_demoted("dep1") is False
+
+
+def test_complete_pnl_counts_duplicate_partial_order_once() -> None:
+    trade = _closed_live_trade(
+        "DUPLICATE", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW
+    )
+    first = _confirmed_partial(
+        trade.trade_id, deployment_id="dep1", entry_at=NOW, fill_price=11.0
+    )
+    duplicate = replace(first, id=2)
+
+    assert _complete_realized_pnl_usd(trade, [first, duplicate]) == 500.0
+
+
+def test_complete_pnl_bounds_broker_fill_to_submitted_partial_quantity() -> None:
+    trade = _closed_live_trade(
+        "OVERSIZED", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW
+    )
+    partial = _confirmed_partial(
+        trade.trade_id, deployment_id="dep1", entry_at=NOW, fill_price=16.0
+    )
+    oversized = replace(partial, fill_quantity=99)
+
+    assert _complete_realized_pnl_usd(trade, [oversized]) == 1000.0
+
+
+def test_rail_a_counts_confirmed_banked_partial_pnl(tmp_path) -> None:
+    manager, _ = _manager(tmp_path, now=NOW)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(
+                trade_date="2026-04-20",
+                account_type="CASH",
+                broker_cash_only_buying_power=10_000.0,
+                usable_budget=10_000.0,
+                buffer_pct=0.0,
+            )
+        )
+    )
+    trade = _closed_live_trade(
+        "PARTIAL-WINNER", deployment_id="dep1", entry=5.0, exit_=2.0, exit_at=NOW
+    )
+    asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+    asyncio.run(
+        manager.trade_state_repository.mark_closed(
+            trade.trade_id, exit_price=2.0, exit_filled_quantity=1, exit_filled_at=NOW
+        )
+    )
+    asyncio.run(
+        manager.trade_state_repository.record_partial_fill(
+            _confirmed_partial(
+                trade.trade_id,
+                deployment_id="dep1",
+                entry_at=NOW,
+                fill_price=7.0,
+            )
+        )
+    )
+
+    status = asyncio.run(manager.book_actions()).rail_a
+
+    assert status.realized_live_pnl_usd == -100.0
+    assert status.halted is False
+
+
+def test_rail_a_books_partial_on_fill_day_not_runner_close_day(tmp_path) -> None:
+    manager, _ = _manager(tmp_path, now=NOW)
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(
+                trade_date="2026-04-20",
+                account_type="CASH",
+                broker_cash_only_buying_power=10_000.0,
+                usable_budget=10_000.0,
+                buffer_pct=0.0,
+            )
+        )
+    )
+    trade = TradeRecord(
+        trade_id="OPEN-PARTIAL",
+        deployment_id="dep1",
+        symbol="QQQ",
+        option_symbol="QQQ260101C00500000",
+        quantity=1,
+        entry_price=5.0,
+        entry_timestamp=NOW - timedelta(days=1),
+        status="target_active",
+        entry_order_id="LIVE123",
+    )
+    asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+    asyncio.run(
+        manager.trade_state_repository.record_partial_fill(
+            _confirmed_partial(
+                trade.trade_id,
+                deployment_id="dep1",
+                entry_at=NOW,
+                fill_price=7.0,
+            )
+        )
+    )
+
+    status = asyncio.run(manager.book_actions()).rail_a
+
+    assert status.realized_live_pnl_usd == 200.0
+
+
+def test_rail_b_repromotion_requires_fresh_post_cutoff_window(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0),
+    )
+    _seed_large_budget(manager)
+    store = manager.demotion_store
+    store.record_demotion(
+        deployment_id="dep1",
+        reason="rolling_window_negative_expectancy",
+        window_n=10,
+        mean_pnl_usd=-100.0,
+        threshold_usd=0.0,
+        trade_ids=[f"OLD{i}" for i in range(10)],
+        now=NOW,
+    )
+    for i in range(10):
+        trade = _closed_live_trade(
+            f"OLD{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW
+        )
+        asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+    store.repromote_many(
+        ["dep1"], reason="operator fresh trial", approved_by="suman", now=NOW
+    )
+
+    # A new process has no session demotion latch. The old ten trades are
+    # before the persisted cutoff and therefore cannot immediately re-demote.
+    fresh_manager, _ = _manager(
+        tmp_path,
+        now=NOW + timedelta(minutes=1),
+        settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0),
+    )
+    first = asyncio.run(fresh_manager.allow_entry("dep1"))
+    assert first.allowed is True
+
+    after_cutoff = NOW + timedelta(seconds=1)
+    for i in range(10):
+        trade = _closed_live_trade(
+            f"NEW{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=after_cutoff
+        )
+        asyncio.run(fresh_manager.trade_state_repository.upsert_trade(trade))
+    second = asyncio.run(fresh_manager.allow_entry("dep1"))
+    assert second.allowed is False
+    assert second.reason == RAIL_B_DEMOTED_REASON
 
 
 def test_rail_b_is_one_way_no_flap(tmp_path) -> None:

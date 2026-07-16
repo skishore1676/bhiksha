@@ -33,8 +33,19 @@ override.
 ## Risk rails (always on for live lanes)
 
 Two-tier daily drawdown on realized live P&L vs usable budget — tier-1 halts new entries, tier-2
-flattens the book — plus per-deployment auto-demote (rolling-10 negative expectancy → forced
-shadow via a local `DemotionStore`; re-promotion is a deliberate operator edit). Knobs resolve
+flattens the book — plus per-deployment auto-demote (rolling-10 negative expectancy -> forced
+shadow via a local `DemotionStore`; re-promotion is a protected operator action that starts a
+fresh evidence window). The runtime must be stopped and the command requires an explicit gate:
+
+```bash
+python -m bhiksha.tools.risk_demotion_admin repromote \
+  --deployment-id DEPLOYMENT_ID \
+  --reason "operator-approved fresh trial" \
+  --approved-by OPERATOR \
+  --confirm-live-state-change REPROMOTE
+```
+
+Knobs resolve
 `env > Operator_Defaults_v1 sheet > default` (see `bhiksha.risk.risk_settings.resolve_risk_settings`),
 validated at startup with warnings surfaced in the `risk_manager_startup` event. Every consult
 emits a `risk_manager_decision` event (throttled to state-changes + heartbeat so the stream stays

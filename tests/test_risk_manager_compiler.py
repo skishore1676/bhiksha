@@ -234,6 +234,28 @@ def test_compiler_demotion_override_is_noop_when_no_demotions(tmp_path: Path) ->
     assert warnings == []
 
 
+def test_compiler_restores_live_row_after_operator_repromotion(tmp_path: Path) -> None:
+    store = DemotionStore(tmp_path / "demoted_deployments.json")
+    store.record_demotion(
+        deployment_id="dep_live_1",
+        reason="rolling_window_negative_expectancy",
+        window_n=10,
+        mean_pnl_usd=-42.0,
+        threshold_usd=0.0,
+        trade_ids=[f"T{i}" for i in range(10)],
+    )
+    store.repromote_many(
+        ["dep_live_1"], reason="operator fresh trial", approved_by="suman"
+    )
+
+    updated, warnings = apply_risk_demotion_overrides(
+        [_live_deployment("dep_live_1")], demotion_store=store
+    )
+
+    assert updated[0].execution.shadow_only is False
+    assert warnings == []
+
+
 def test_compile_active_plan_from_rows_applies_demotion_override_end_to_end(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()

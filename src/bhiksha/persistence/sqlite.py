@@ -197,6 +197,15 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         await self._ensure_initialized()
         return await self.backend.run_read(self._get_partial_fills_sync, trade_id)
 
+    async def get_partial_fills_for_trades(
+        self, trade_ids: list[str]
+    ) -> dict[str, list[PartialFillRecord]]:
+        await self._ensure_initialized()
+        unique_ids = list(dict.fromkeys(str(trade_id) for trade_id in trade_ids if trade_id))
+        if not unique_ids:
+            return {}
+        return await self.backend.run_read(self._get_partial_fills_for_trades_sync, unique_ids)
+
     async def increment_partial_fill_enrich_attempts(self, record_id: int) -> None:
         await self._ensure_initialized()
         await self.backend.run_write(self._increment_partial_fill_enrich_attempts_sync, record_id)
@@ -627,6 +636,32 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 (trade_id,),
             ).fetchall()
         return [_partial_fill_record_from_row(row) for row in rows]
+
+    def _get_partial_fills_for_trades_sync(
+        self, trade_ids: list[str]
+    ) -> dict[str, list[PartialFillRecord]]:
+        grouped: dict[str, list[PartialFillRecord]] = {trade_id: [] for trade_id in trade_ids}
+        with closing(self.backend.connect()) as conn:
+            # Stay below conservative SQLite host-parameter limits while using
+            # one connection/read operation for the live risk consultation.
+            for offset in range(0, len(trade_ids), 500):
+                chunk = trade_ids[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT id, trade_id, deployment_id, symbol, option_symbol, closed_quantity, order_id, exit_rule,
+                           submitted_at, fill_price, fill_quantity, filled_at, order_status, order_type, broker_payload,
+                           origin, enrich_attempts, abandoned_reason
+                    FROM trade_partial_fills
+                    WHERE trade_id IN ({placeholders})
+                    ORDER BY id ASC
+                    """,
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    record = _partial_fill_record_from_row(row)
+                    grouped[record.trade_id].append(record)
+        return grouped
 
     def _increment_partial_fill_enrich_attempts_sync(self, record_id: int) -> None:
         with closing(self.backend.connect()) as conn:

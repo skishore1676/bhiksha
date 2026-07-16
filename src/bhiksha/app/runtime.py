@@ -61,7 +61,7 @@ from bhiksha.risk.cash_guard import CashGuard, trade_date_et
 from bhiksha.risk.plan_operator_defaults_source import PlanOperatorDefaultsSource
 from bhiksha.risk.risk_manager import RiskManager
 from bhiksha.risk.risk_settings import resolve_risk_settings
-from bhiksha.state.position_tracker import TrackedPosition
+from bhiksha.state.position_tracker import NON_LIVE_POSITION_SOURCES, TrackedPosition
 from bhiksha.state.reconciliation import reconcile_public_positions
 from bhiksha.strategy.registry import StrategyRegistry
 
@@ -1443,6 +1443,10 @@ class BhikshaRuntime:
             )
             supervisor.planner.position_tracker.replace_positions(tracker_positions)
             await supervisor.sync_lifecycle()
+            # sync_lifecycle can recover a terminal partial entry that was not
+            # yet visible in the portfolio snapshot. Include it in this same
+            # reconciliation pass so the reprotection sweep below arms a stop.
+            tracker_positions = supervisor.planner.position_tracker.active_positions()
             reconciliation_snapshot.positions = list(tracker_positions)
             reconciliation_snapshot.last_success_at = datetime.now(UTC)
             reconciliation_snapshot.last_synced_at = reconciliation_snapshot.last_success_at
@@ -1678,7 +1682,9 @@ class BhikshaRuntime:
                 deployment,
                 position,
                 decision,
-                dry_run=(not live) or deployment.execution.shadow_only or position.source == "shadow",
+                # A demotion blocks new live entries; it does not turn an
+                # existing broker position's exit into a paper transaction.
+                dry_run=(not live) or position.source in NON_LIVE_POSITION_SOURCES,
             )
             if exit_plan is not None:
                 output(
@@ -1706,7 +1712,9 @@ class BhikshaRuntime:
             managed = await supervisor.manage_open_position(
                 deployment,
                 position,
-                dry_run=(not live) or deployment.execution.shadow_only or position.source == "shadow",
+                # Existing broker positions remain real execution obligations
+                # even if Rail B has since demoted their deployment's entry lane.
+                dry_run=(not live) or position.source in NON_LIVE_POSITION_SOURCES,
             )
             if managed is not None and managed != position:
                 output(

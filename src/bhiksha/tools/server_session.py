@@ -13,6 +13,7 @@ import sys
 import time
 
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
+from bhiksha.tools.runtime_control_lock import runtime_control_lock
 from bhiksha.tools.sync_active_plan import sync_active_plan_once
 
 
@@ -186,48 +187,49 @@ def _sync_from_args(args: argparse.Namespace):
 
 def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
     pid_path = Path(args.pid_path).resolve()
-    existing = _runtime_status(pid_path)
-    if existing["running"]:
-        raise RuntimeError(f"Bhiksha is already running with pid={existing['pid']}")
+    with runtime_control_lock(pid_path):
+        existing = _runtime_status(pid_path)
+        if existing["running"]:
+            raise RuntimeError(f"Bhiksha is already running with pid={existing['pid']}")
 
-    runtime_log_dir = Path(args.runtime_log_dir).resolve()
-    runtime_log_dir.mkdir(parents=True, exist_ok=True)
-    log_date = datetime.now(UTC).date().isoformat()
-    log_path = runtime_log_dir / f"trade_session_{log_date}.log"
-    err_log_path = runtime_log_dir / f"trade_session_{log_date}.err.log"
-    repo_root = Path(args.repo_root).resolve()
-    active_plan = Path(args.active_plan).resolve()
-    command = [args.python_executable, "-u", "-m", "bhiksha.tools.trade_session", "--active-plan", str(active_plan)]
-    if args.live:
-        command.append("--live")
-    if args.max_bars is not None:
-        command.extend(["--max-bars", str(args.max_bars)])
+        runtime_log_dir = Path(args.runtime_log_dir).resolve()
+        runtime_log_dir.mkdir(parents=True, exist_ok=True)
+        log_date = datetime.now(UTC).date().isoformat()
+        log_path = runtime_log_dir / f"trade_session_{log_date}.log"
+        err_log_path = runtime_log_dir / f"trade_session_{log_date}.err.log"
+        repo_root = Path(args.repo_root).resolve()
+        active_plan = Path(args.active_plan).resolve()
+        command = [args.python_executable, "-u", "-m", "bhiksha.tools.trade_session", "--active-plan", str(active_plan)]
+        if args.live:
+            command.append("--live")
+        if args.max_bars is not None:
+            command.extend(["--max-bars", str(args.max_bars)])
 
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    with log_path.open("a", encoding="utf-8") as stdout_handle, err_log_path.open("a", encoding="utf-8") as stderr_handle:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            cwd=str(repo_root),
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            start_new_session=True,
-            env=env,
-        )
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        with log_path.open("a", encoding="utf-8") as stdout_handle, err_log_path.open("a", encoding="utf-8") as stderr_handle:
+            process = subprocess.Popen(  # noqa: S603
+                command,
+                cwd=str(repo_root),
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+                env=env,
+            )
 
-    metadata = {
-        "pid": process.pid,
-        "started_at": datetime.now(UTC).isoformat(),
-        "log_path": str(log_path),
-        "err_log_path": str(err_log_path),
-        "active_plan_path": str(active_plan),
-        "live": bool(args.live),
-        "max_bars": args.max_bars,
-        "command": command,
-        "repo_root": str(repo_root),
-    }
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        metadata = {
+            "pid": process.pid,
+            "started_at": datetime.now(UTC).isoformat(),
+            "log_path": str(log_path),
+            "err_log_path": str(err_log_path),
+            "active_plan_path": str(active_plan),
+            "live": bool(args.live),
+            "max_bars": args.max_bars,
+            "command": command,
+            "repo_root": str(repo_root),
+        }
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _verify_post_start_survival(
         process=process,
         pid_path=pid_path,

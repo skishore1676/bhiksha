@@ -43,7 +43,7 @@ from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
 from bhiksha.state.lifecycle import LifecycleTransition, TradeLifecycleStore
-from bhiksha.state.position_tracker import TrackedPosition
+from bhiksha.state.position_tracker import NON_LIVE_POSITION_SOURCES, TrackedPosition
 from bhiksha.time_utils import parse_time_text
 
 ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
@@ -53,7 +53,7 @@ ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
 # full-fill race. Anything else -- None/error/NEW/SUBMITTED/PARTIALLY_FILLED/
 # unknown -- means the order may still fill, so a reprice must not resubmit on
 # top of it without a clean cancel confirmation.
-_EXIT_ORDER_DEAD_STATUSES = frozenset({"CANCELED", "REJECTED", "EXPIRED"})
+_EXIT_ORDER_DEAD_STATUSES = frozenset({"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"})
 _ENTRY_ORDER_DEAD_STATUSES = _EXIT_ORDER_DEAD_STATUSES
 
 # Audit fix 3 (2026-07-08): give-up ceiling for the partial-fill enrichment
@@ -910,7 +910,7 @@ class ExecutionSupervisor:
                 await self._emit_lifecycle_transition(transition, reason="entry_reprice_no_fill_cancelled")
                 return plan
             normalized_error = (error or "").upper()
-            if normalized_error in {"REJECTED", "CANCELED", "EXPIRED"}:
+            if normalized_error in _ENTRY_ORDER_DEAD_STATUSES:
                 await self._release_cash_guard_reservation(plan.trade_id)
                 self.planner.position_tracker.close_position(
                     deployment.symbol,
@@ -1210,6 +1210,33 @@ class ExecutionSupervisor:
             timeout_seconds=max(int(timeout_seconds), 0),
             poll_seconds=self.app_config.order_fill_poll_seconds,
         )
+        active_plan = plan
+        if not filled and _terminal_entry_error(error):
+            terminal = _EntryCancelResult(
+                cancel_ok=False,
+                cancel_error=None,
+                order_quantity=plan.quantity,
+                status=error,
+                payload=payload,
+            )
+            if terminal.filled:
+                active_plan = _entry_plan_from_cancel_fill(plan, terminal)
+                filled = True
+                error = None
+                await self.event_repository.append(
+                    "entry_terminal_partial_fill_recovered",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "trade_id": plan.trade_id,
+                        "order_id": plan.order_id,
+                        "status": terminal.normalized_status,
+                        "filled_quantity": terminal.confirmed_filled_quantity,
+                        "original_quantity": plan.quantity,
+                        "payload": payload or {},
+                    },
+                )
+            elif terminal.fill_quantity_ambiguous:
+                error = f"entry_terminal_fill_ambiguous:{terminal.normalized_status}"
         await self.event_repository.append(
             "entry_fill_check",
             {
@@ -1222,7 +1249,7 @@ class ExecutionSupervisor:
                 "payload": payload or {},
             },
         )
-        return _EntryWaitResult(plan=plan, filled=filled, payload=payload, error=error)
+        return _EntryWaitResult(plan=active_plan, filled=filled, payload=payload, error=error)
 
     async def _reprice_live_entry(
         self,
@@ -1545,7 +1572,12 @@ class ExecutionSupervisor:
         *,
         dry_run: bool,
     ) -> TrackedPosition | None:
-        if position.source == "shadow" or deployment.execution.shadow_only:
+        # A deployment may be demoted to shadow while a broker position from
+        # its previously-live lane is still open or being reconciled. The
+        # position source is the execution truth: never simulate protection
+        # for a recovered real position merely because new entries are now
+        # shadow-only.
+        if position.source in NON_LIVE_POSITION_SOURCES:
             dry_run = True
         async with self._symbol_locks[position.symbol]:
             return await self._manage_open_position_locked(deployment, position, dry_run=dry_run)
@@ -3523,7 +3555,7 @@ class ExecutionSupervisor:
                 },
             )
             return None
-        if normalized in {"REJECTED", "CANCELED", "EXPIRED"} or position.exit_order_id is None:
+        if normalized in _EXIT_ORDER_DEAD_STATUSES or position.exit_order_id is None:
             resubmit_position = position
             if position.exit_order_id is not None and normalized in _EXIT_ORDER_DEAD_STATUSES:
                 # Item #21: the dead-status readback may hide a partial fill
@@ -4278,8 +4310,72 @@ class ExecutionSupervisor:
         if trade.entry_order_id is None:
             return
         status, payload, error = await self.planner.order_manager.get_order_status(trade.entry_order_id)
-        normalized = (status or error or "").upper()
-        if normalized not in {"REJECTED", "CANCELED", "EXPIRED"}:
+        terminal = _EntryCancelResult(
+            cancel_ok=False,
+            cancel_error=None,
+            order_quantity=trade.quantity,
+            status=status or error,
+            payload=payload,
+            status_error=error if status is not None else None,
+        )
+        normalized = terminal.normalized_status
+        if normalized not in _ENTRY_ORDER_DEAD_STATUSES:
+            return
+        if terminal.filled:
+            entry_price = _filled_entry_price(payload, fallback=trade.entry_price or 0.0)
+            if entry_price > 0:
+                filled_quantity = terminal.confirmed_filled_quantity or trade.quantity
+                self.planner.position_tracker.open_position(
+                    trade.symbol,
+                    trade.deployment_id,
+                    trade_id=trade.trade_id,
+                    option_symbol=trade.option_symbol,
+                    quantity=filled_quantity,
+                    entry_price=entry_price,
+                    underlying_entry_price=trade.underlying_entry_price,
+                    entry_timestamp=trade.entry_timestamp,
+                    source="live_open",
+                    order_id=trade.entry_order_id,
+                )
+                transition = self.lifecycle_store.mark_open(
+                    trade.symbol,
+                    trade.deployment_id,
+                    option_symbol=trade.option_symbol,
+                    order_id=trade.entry_order_id,
+                    protected=False,
+                )
+                await self._emit_lifecycle_transition(
+                    transition, reason="entry_reconcile_terminal_fill_recovered"
+                )
+                await self.event_repository.append(
+                    "entry_reconcile_terminal_fill_recovered",
+                    {
+                        "deployment_id": trade.deployment_id,
+                        "symbol": trade.symbol,
+                        "trade_id": trade.trade_id,
+                        "entry_order_id": trade.entry_order_id,
+                        "status": normalized,
+                        "filled_quantity": filled_quantity,
+                        "original_quantity": trade.quantity,
+                        "entry_price": entry_price,
+                        "payload": payload or {},
+                    },
+                )
+                return
+        if not terminal.safe_to_replace_or_close:
+            await self.event_repository.append(
+                "entry_reconcile_terminal_fill_unresolved",
+                {
+                    "deployment_id": trade.deployment_id,
+                    "symbol": trade.symbol,
+                    "trade_id": trade.trade_id,
+                    "entry_order_id": trade.entry_order_id,
+                    "status": normalized,
+                    "filled_quantity": terminal.reported_filled_quantity,
+                    "fill_quantity_ambiguous": terminal.fill_quantity_ambiguous,
+                    "payload": payload or {},
+                },
+            )
             return
         await self._release_cash_guard_reservation(trade.trade_id)
         await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
@@ -4957,7 +5053,7 @@ def _remaining_seconds(started_at: datetime, target_elapsed_seconds: int) -> int
 
 
 def _terminal_entry_error(error: str | None) -> bool:
-    return str(error or "").upper() in {"REJECTED", "CANCELED", "EXPIRED"}
+    return str(error or "").upper() in _ENTRY_ORDER_DEAD_STATUSES
 
 
 def _filled_entry_price(payload: dict | None, *, fallback: float) -> float:

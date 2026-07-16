@@ -720,7 +720,8 @@ def apply_risk_demotion_overrides(
         never be able to break a compile.
       - One-way: this function only reads the store; only
         ``RiskManager._evaluate_rail_b`` (in ``bhiksha.risk.risk_manager``)
-        ever writes to it. There is no re-promote path here.
+        ever writes to it. Protected re-promotion removes the active override
+        before compile and leaves a separate evidence-reset audit record.
     """
     store = demotion_store or DemotionStore()
     demotions = store.load()

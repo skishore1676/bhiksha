@@ -6,9 +6,11 @@ import argparse
 import asyncio
 from datetime import datetime, timezone
 import os
+from pathlib import Path
 
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.ops.logging import configure_logging
+from bhiksha.tools.runtime_control_lock import runtime_control_lock
 
 _OUTPUT_LEVELS = {
     "DEBUG": 10,
@@ -65,6 +67,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to an active plan JSON. When supplied, Bhiksha ignores config/deployments for this run.",
     )
     args = parser.parse_args(argv)
+    repo_root = Path(__file__).resolve().parents[3]
+    pid_path = Path(
+        os.getenv(
+            "BHIKSHA_RUNTIME_PID_PATH",
+            repo_root / "artifacts/playbook/runtime/bhiksha.pid",
+        )
+    )
+    # Atomic handoff with stopped-only admin work. Once this brief lock is
+    # released, the current process is visible to the admin's process scan.
+    with runtime_control_lock(pid_path):
+        pass
     asyncio.run(_run(args.max_bars, args.live, args.active_plan))
     return 0
 

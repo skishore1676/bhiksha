@@ -79,6 +79,12 @@ class TradeStateRepository(ABC):
         """Return every banked partial leg recorded for a trade (ITEM B, report reconstruction)."""
 
     @abstractmethod
+    async def get_partial_fills_for_trades(
+        self, trade_ids: list[str]
+    ) -> dict[str, list[PartialFillRecord]]:
+        """Return banked partial legs for several trades in one repository read."""
+
+    @abstractmethod
     async def increment_partial_fill_enrich_attempts(self, record_id: int) -> None:
         """Count one unresolved enrichment poll against a pending partial leg (audit fix 3)."""
 
@@ -147,6 +153,11 @@ class NullTradeStateRepository(TradeStateRepository):
     async def get_partial_fills(self, trade_id: str) -> list[PartialFillRecord]:
         del trade_id
         return []
+
+    async def get_partial_fills_for_trades(
+        self, trade_ids: list[str]
+    ) -> dict[str, list[PartialFillRecord]]:
+        return {trade_id: [] for trade_id in trade_ids}
 
     async def increment_partial_fill_enrich_attempts(self, record_id: int) -> None:
         del record_id

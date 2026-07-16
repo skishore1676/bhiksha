@@ -1908,6 +1908,68 @@ def test_execution_supervisor_releases_unfilled_reservation(tmp_path) -> None:
     assert supervisor.planner.position_tracker.total_open_positions == 0
 
 
+@pytest.mark.parametrize("terminal_status", ["CANCELED", "CANCELLED"])
+def test_execution_supervisor_protects_terminal_partial_entry_fill(
+    tmp_path, terminal_status
+) -> None:
+    class TerminalPartialOrderManager(StubOrderManager):
+        async def wait_for_fill(
+            self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2
+        ):
+            del order_id, timeout_seconds, poll_seconds
+            return (
+                False,
+                {
+                    "status": terminal_status,
+                    "filledQuantity": "1",
+                    "averageFillPrice": "2.10",
+                },
+                terminal_status,
+            )
+
+    planner = StubPlanner()
+    planner.order_manager = TerminalPartialOrderManager()
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_PARTIAL",
+        option_symbol="QQQ260330P00558000",
+        quantity=2,
+        source="live_pending",
+        order_id="ENTRY_PARTIAL",
+    )
+    plan = TradePlan(
+        trade_id="TRADE_PARTIAL",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=2,
+        estimated_entry_price=2.0,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_PARTIAL",
+    )
+
+    protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    assert protected.quantity == 1
+    assert protected.estimated_entry_price == 2.10
+    assert protected.stop_order_id == "STOP123"
+    assert planner.position_tracker.active_positions()[0].quantity == 1
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id")]
+    assert "entry_terminal_partial_fill_recovered" in event_types
+    assert "protective_stop_submission" in event_types
+
+
 def test_execution_supervisor_holds_fill_timeout_for_reconciliation(tmp_path) -> None:
     class TimeoutOrderManager(StubOrderManager):
         async def wait_for_fill(self, order_id: str, *, timeout_seconds: int = 20, poll_seconds: int = 2):
@@ -2022,11 +2084,14 @@ def test_execution_supervisor_sync_lifecycle_recovers_timed_out_entry(tmp_path) 
     assert "entry_reconcile_recovered" in event_types
 
 
-def test_execution_supervisor_sync_lifecycle_releases_terminal_reconcile_hold(tmp_path) -> None:
+@pytest.mark.parametrize("terminal_status", ["CANCELED", "CANCELLED"])
+def test_execution_supervisor_sync_lifecycle_releases_terminal_reconcile_hold(
+    tmp_path, terminal_status
+) -> None:
     class CanceledOrderManager(StubOrderManager):
         async def get_order_status(self, order_id: str):
             del order_id
-            return "CANCELED", {"status": "CANCELED"}, None
+            return terminal_status, {"status": terminal_status}, None
 
     class ReconcilePlanner(StubPlanner):
         def __init__(self):
@@ -2066,6 +2131,65 @@ def test_execution_supervisor_sync_lifecycle_releases_terminal_reconcile_hold(tm
     with sqlite3.connect(tmp_path / "events.db") as conn:
         event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
     assert "entry_reconcile_released" in event_types
+
+
+def test_execution_supervisor_recovers_and_protects_terminal_reconcile_fill(tmp_path) -> None:
+    class PartiallyFilledCanceledOrderManager(StubOrderManager):
+        async def get_order_status(self, order_id: str):
+            del order_id
+            return (
+                "CANCELLED",
+                {"status": "CANCELLED", "filledQuantity": "1", "averageFillPrice": "2.10"},
+                None,
+            )
+
+    class ReconcilePlanner(StubPlanner):
+        def __init__(self):
+            super().__init__()
+            self.order_manager = PartiallyFilledCanceledOrderManager()
+            self.cash_guard = RecordingCashGuard()
+
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=ReconcilePlanner(),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+
+    asyncio.run(
+        trade_repo.upsert_trade(
+            TradeRecord(
+                trade_id="TRADE_PARTIAL",
+                deployment_id="market_impulse_qqq_short_v1",
+                symbol="QQQ",
+                option_symbol="QQQ260330P00558000",
+                quantity=2,
+                entry_price=2.0,
+                status="pending_entry_reconcile",
+                entry_order_id="ENTRY_PARTIAL",
+            )
+        )
+    )
+    asyncio.run(supervisor.sync_lifecycle())
+
+    recovered = supervisor.planner.position_tracker.active_positions()[0]
+    assert recovered.quantity == 1
+    assert recovered.entry_price == 2.10
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={"execution": base.execution.model_copy(update={"shadow_only": True})}
+    )
+    protected = asyncio.run(supervisor.manage_open_position(deployment, recovered, dry_run=False))
+    assert protected is not None
+    assert protected.stop_order_id == "STOP123"
+    assert supervisor.planner.cash_guard.calls == []
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id")]
+    assert "entry_reconcile_terminal_fill_recovered" in event_types
+    assert "protective_stop_submission" in event_types
+    assert "entry_reconcile_released" not in event_types
 
 
 def test_execution_supervisor_recovers_open_paper_trade_after_restart(tmp_path) -> None:

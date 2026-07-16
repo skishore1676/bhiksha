@@ -32,7 +32,8 @@ def build_trading_governance_evidence(
     """Join persisted enforcement facts with scorecard review facts."""
     through_text = through.isoformat() if isinstance(through, date) else str(through)
     deployment_meta = _deployment_metadata(deployments)
-    records = DemotionStore(demotion_store_path).load()
+    store = DemotionStore(demotion_store_path)
+    records = store.load()
     active_demotions = []
     for deployment_id, record in sorted(records.items()):
         metadata = deployment_meta.get(deployment_id, {})
@@ -44,10 +45,29 @@ def build_trading_governance_evidence(
                 "mode": "live",
                 "enforcement_status": "demoted_to_shadow",
                 "matching_shadow_deployments": _matching_shadow_deployments(
-                    metadata, deployment_meta
+                    metadata, deployment_meta, exclude_deployment_id=deployment_id
                 ),
             }
         )
+
+    repromotion_resets = []
+    for deployment_id, history in sorted(store.load_repromotion_history().items()):
+        metadata = deployment_meta.get(deployment_id, {})
+        for index, record in enumerate(history):
+            is_current_cutoff = deployment_id not in records and index == len(history) - 1
+            repromotion_resets.append(
+                {
+                    **record.to_dict(),
+                    "symbol": metadata.get("symbol"),
+                    "strategy_key": metadata.get("strategy_key"),
+                    "is_current_cutoff": is_current_cutoff,
+                    "enforcement_status": (
+                        "live_fresh_evidence_window"
+                        if is_current_cutoff
+                        else "historical_repromotion_reset"
+                    ),
+                }
+            )
 
     promotion = scorecard.get("promotion_candidates") or {}
     named_promotion_lanes = {
@@ -82,6 +102,7 @@ def build_trading_governance_evidence(
             "promotions": "bhiksha.ops.weekly_scorecard",
         },
         "active_demotions": active_demotions,
+        "repromotion_resets": repromotion_resets,
         "promotion_review": {
             "criteria": promotion.get("criteria") or {},
             "candidates": promotion.get("candidates") or [],
@@ -115,6 +136,7 @@ def evidence_receipt(payload: dict[str, Any]) -> dict[str, Any]:
         "sha256": digest,
         "through": str(payload.get("through") or ""),
         "active_demotion_count": len(payload.get("active_demotions") or []),
+        "repromotion_reset_count": len(payload.get("repromotion_resets") or []),
         "promotion_candidate_count": len(
             ((payload.get("promotion_review") or {}).get("candidates") or [])
         ),
@@ -145,13 +167,16 @@ def _deployment_metadata(
 def _matching_shadow_deployments(
     live: dict[str, Any],
     deployments: dict[str, dict[str, Any]],
+    *,
+    exclude_deployment_id: str,
 ) -> list[str]:
     if not live:
         return []
     return sorted(
         deployment_id
         for deployment_id, candidate in deployments.items()
-        if candidate.get("shadow_only")
+        if deployment_id != exclude_deployment_id
+        and candidate.get("shadow_only")
         and candidate.get("symbol") == live.get("symbol")
         and candidate.get("strategy_key") == live.get("strategy_key")
     )
