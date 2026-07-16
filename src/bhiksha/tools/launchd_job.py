@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--weekly-review-mode",
-        default=os.getenv("BHIKSHA_WEEKLY_REVIEW_MODE", "on"),
+        default=os.getenv("BHIKSHA_WEEKLY_REVIEW_MODE", "off"),
         choices=["off", "on"],
     )
     parser.add_argument(
@@ -244,6 +244,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             "report_json": str(result.json_path),
             "report_markdown": str(result.markdown_path),
             "facts_export": str(result.facts_path),
+            "governance_evidence": str(result.governance_path),
             "telegram_sent": False,
         })
         return 0
@@ -277,6 +278,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
         "report_json": str(result.json_path),
         "report_markdown": str(result.markdown_path),
         "facts_export": str(result.facts_path),
+        "governance_evidence": str(result.governance_path),
         "workbook_update": workbook,
         "obsidian_review": review.to_dict() if review else None,
         "telegram_sent": False,

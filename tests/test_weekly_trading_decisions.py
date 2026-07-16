@@ -66,12 +66,16 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
         db_path, output_dir=tmp_path / "reports", week_end="2026-07-10",
     )
     export = json.loads(result.facts_path.read_text(encoding="utf-8"))
+    governance = json.loads(result.governance_path.read_text(encoding="utf-8"))
 
     assert export["schema"] == "bhiksha.trading_decision_facts.v1"
     assert export["receipt"]["status"] == "ok"
     assert export["receipt"]["fact_count"] == 1
     assert export["facts"][0]["lane"] == "shadow"
     assert export["facts"][0]["realized_pnl_usd"] == 50.0
+    assert governance["schema"] == "bhiksha.trading_governance_evidence.v1"
+    assert governance["receipt"]["status"] == "ok"
+    assert result.report["governance_evidence"] == str(result.governance_path)
 
     rerun = write_weekly_trading_decisions(
         db_path, output_dir=tmp_path / "reports", week_end="2026-07-10",
@@ -84,3 +88,9 @@ def test_weekly_publisher_binds_stable_review_id() -> None:
     source = Path("src/bhiksha/tools/launchd_job.py").read_text(encoding="utf-8")
 
     assert 'review_id=result.report["artifact_id"]' in source
+
+
+def test_weekly_job_defaults_to_evidence_only() -> None:
+    source = Path("src/bhiksha/tools/launchd_job.py").read_text(encoding="utf-8")
+
+    assert 'os.getenv("BHIKSHA_WEEKLY_REVIEW_MODE", "off")' in source

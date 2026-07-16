@@ -18,6 +18,7 @@ import sqlite3
 from typing import Any, TYPE_CHECKING
 
 from bhiksha.ops.shadow_ev_report import build_shadow_ev_report
+from bhiksha.ops.trading_governance_evidence import build_trading_governance_evidence
 from bhiksha.ops.weekly_scorecard import (
     _augment_trade,
     _data_quality_warnings,
@@ -37,6 +38,7 @@ class WeeklyTradingDecisionsWriteResult:
     json_path: Path
     markdown_path: Path
     facts_path: Path
+    governance_path: Path
 
 
 def write_weekly_trading_decisions(
@@ -63,9 +65,16 @@ def write_weekly_trading_decisions(
         deployments=deployments,
         report_dir=target,
     )
+    governance = build_trading_governance_evidence(
+        scorecard,
+        through=end,
+        deployments=deployments,
+    )
     stable_id = f"bhiksha-weekly-trading-decisions:{end.isoformat()}"
     facts_path = target / f"trading_decision_facts_{end.isoformat()}.json"
     _atomic_json(facts_path, facts)
+    governance_path = target / f"trading_governance_evidence_{end.isoformat()}.json"
+    _atomic_json(governance_path, governance)
     report = {
         "schema": "bhiksha.weekly_trading_decisions.v1",
         "artifact_id": stable_id,
@@ -76,6 +85,8 @@ def write_weekly_trading_decisions(
         "shadow_ev": shadow_ev,
         "facts_export": str(facts_path),
         "facts_export_receipt": facts["receipt"],
+        "governance_evidence": str(governance_path),
+        "governance_evidence_receipt": governance["receipt"],
         "workbook_update": {"status": "pending"},
     }
     stem = f"weekly_trading_decisions_{start.isoformat()}_{end.isoformat()}"
@@ -83,7 +94,9 @@ def write_weekly_trading_decisions(
     markdown_path = target / f"{stem}.md"
     _atomic_json(json_path, report)
     _atomic_text(markdown_path, render_weekly_trading_decisions_markdown(report))
-    return WeeklyTradingDecisionsWriteResult(report, json_path, markdown_path, facts_path)
+    return WeeklyTradingDecisionsWriteResult(
+        report, json_path, markdown_path, facts_path, governance_path
+    )
 
 
 def finalize_weekly_trading_decisions(
@@ -188,12 +201,14 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
         key=lambda lane: lane.get("total_pnl_usd") or 0.0,
     )[:3]
     workbook = report.get("workbook_update") or {}
+    governance = report.get("governance_evidence_receipt") or {}
     lines = [
         f"# Weekly Trading Decisions — Performance, Promotions & Fixes — {report.get('week_end')}",
         "",
         f"- artifact: `{report.get('artifact_id')}`",
         f"- workbook update: `{workbook.get('status', 'pending')}`",
         f"- facts: `{(report.get('facts_export_receipt') or {}).get('fact_count', 0)}` through `{report.get('week_end')}`",
+        f"- active Rail B demotions: `{governance.get('active_demotion_count', 0)}`",
         "",
         "## What happened",
         "",
