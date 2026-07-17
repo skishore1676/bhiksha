@@ -39,6 +39,7 @@ Bhiksha already owns the active launchd jobs:
 | --- | --- | --- |
 | `com.bhiksha.live-start` | Weekdays 08:20 CT | Restart live runtime from active plan. |
 | `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is running. |
+| `com.bhiksha.reconciliation-supervisor` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Observe entry reconciliation receipts and surface `waiting_you` only after autonomous recovery is exhausted. |
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop stale live runtime. |
 | `com.bhiksha.schwab-guard` | Trading days 07:10 and 15:20 CT | Verify premarket auth and renew after close when the token cannot survive the next full session. |
 | `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send intraday status, PnL, open positions, and runtime concerns. |
@@ -205,7 +206,7 @@ the evidence.
 
 ### 1. Add a launchd job registry
 
-Implemented. A machine-readable registry for the five Bhiksha jobs now exists
+Implemented. A machine-readable registry for the seven Bhiksha jobs now exists
 and is the shared source for installer generation and status output.
 
 Suggested file:
@@ -519,9 +520,9 @@ Operator result:
 
 Phase 1 is working when all of these are true on oldmac:
 
-1. `python -m bhiksha.tools.launchd_status --json` returns all six active
+1. `python -m bhiksha.tools.launchd_status --json` returns all seven active
    `com.bhiksha.*` jobs with no secrets and valid JSON.
-2. Control Tower renders the six Bhiksha jobs under the trading group.
+2. Control Tower renders the seven Bhiksha jobs under the trading group.
 3. `session-report-now` from Control Tower causes Bhiksha to send a Telegram
    session report using the Lathi Bus Telegram `status` template. The message is
    a compact operator card; the full markdown report remains the detailed audit

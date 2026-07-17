@@ -72,6 +72,7 @@ PY
     for label in \
       com.bhiksha.live-start \
       com.bhiksha.live-watchdog \
+      com.bhiksha.reconciliation-supervisor \
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
       com.bhiksha.session-report \
@@ -89,6 +90,7 @@ PY
     for label in \
       com.bhiksha.live-start \
       com.bhiksha.live-watchdog \
+      com.bhiksha.reconciliation-supervisor \
       com.bhiksha.live-stop \
       com.bhiksha.schwab-guard \
       com.bhiksha.session-report \

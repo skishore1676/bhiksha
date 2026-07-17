@@ -12,6 +12,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from bhiksha.ops.reconciliation_supervision import (
+    RECONCILIATION_HOLD_STATUS,
+    summarize_reconciliation_state,
+)
+
 if TYPE_CHECKING:
     from bhiksha.config.models import DeploymentManifest
 
@@ -54,6 +59,7 @@ def build_daily_report(
     *,
     trading_date: date | str | None = None,
     deployments: list["DeploymentManifest"] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build the date-scoped report.
 
@@ -79,6 +85,17 @@ def build_daily_report(
     provider_events = _provider_events(events)
     lifecycle_events = _lifecycle_events(events)
     trades = [_augment_trade(trade, partials_by_trade.get(str(trade.get("trade_id")), [])) for trade in trades]
+    entry_reconciliation = summarize_reconciliation_state(trades, events, now=now)
+    released_no_fill_ids = set(entry_reconciliation["released_no_fill_trade_ids"])
+    # Entry attempts in reconciliation are not broker positions, and a
+    # released zero-fill attempt is not a trade. Keep both in the dedicated
+    # reconciliation account instead of contaminating position/P&L reporting.
+    trades = [
+        trade
+        for trade in trades
+        if not _is_entry_reconciliation_hold(trade)
+        and str(trade.get("trade_id") or "") not in released_no_fill_ids
+    ]
     live_trades = [trade for trade in trades if trade["lane"] == "live"]
     shadow_trades = [trade for trade in trades if trade["lane"] == "shadow"]
     live_missing_exit_truth = _missing_exit_truth_count(live_trades)
@@ -132,6 +149,7 @@ def build_daily_report(
         },
         "open_position_summary": open_position_summary,
         "open_positions": open_positions,
+        "entry_reconciliation": entry_reconciliation,
         "trades": trades,
         "lifecycle": lifecycle_events,
         "data_quality_warnings": data_quality_warnings,
@@ -144,6 +162,7 @@ def build_daily_report(
             data_quality_warnings=data_quality_warnings,
             runtime_issue_counts=runtime_issue_counts,
             open_positions=open_positions,
+            entry_reconciliation=entry_reconciliation,
         ),
     }
 
@@ -152,6 +171,7 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
     summary = report.get("trade_summary") or {}
     status = report.get("status") or {}
     provider = ((report.get("provider_health") or {}).get("reconciliation") or {})
+    entry_reconciliation = report.get("entry_reconciliation") or {}
     lines = [
         f"# Bhiksha Trade Session - {report.get('trading_date')}",
         "",
@@ -166,6 +186,12 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"- reconciliation warnings: `{provider.get('warning_count', 0)}`",
         f"- reconciliation degraded: `{provider.get('degraded_count', 0)}`",
         f"- reconciliation blocking: `{provider.get('blocking_count', 0)}`",
+        (
+            "- entry reconciliation: "
+            f"`recovered {entry_reconciliation.get('recovered_count', 0)}, "
+            f"self-healing {entry_reconciliation.get('self_healing_count', 0)}, "
+            f"needs you {entry_reconciliation.get('needs_human_count', 0)}`"
+        ),
         f"- data-quality warnings: `{len(report.get('data_quality_warnings') or [])}`",
     ]
     profile_exits = report.get("profile_exit_summary") or {}
@@ -207,6 +233,24 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
                     target=_fmt_money(position.get("target_price")),
                     protection=position.get("protection_state") or "",
                 )
+            )
+
+    active_holds = entry_reconciliation.get("active_holds") or []
+    recoveries = entry_reconciliation.get("recoveries") or []
+    if active_holds or recoveries:
+        lines.extend(["", "## Entry Reconciliation"])
+        for hold in active_holds:
+            lines.append(
+                f"- `{hold.get('symbol')}` `{hold.get('deployment_id')}`: "
+                f"`{hold.get('state')}` for `{hold.get('age_seconds')}`s; "
+                f"order `{hold.get('entry_order_id')}`; affected deployment is blocked"
+            )
+        for recovery in recoveries:
+            duration = recovery.get("duration_seconds")
+            duration_text = f" in {duration}s" if duration is not None else ""
+            lines.append(
+                f"- `{recovery.get('symbol')}` `{recovery.get('deployment_id')}`: "
+                f"`{recovery.get('action')}`{duration_text}; no human action required"
             )
 
     trades = report.get("trades") or []
@@ -364,6 +408,7 @@ def render_daily_report_telegram_summary(
     trades = report.get("trades") or []
     open_summary = report.get("open_position_summary") or {}
     open_positions = report.get("open_positions") or []
+    entry_reconciliation = report.get("entry_reconciliation") or {}
     lines = [
         f"Bhiksha Session Report - {report.get('trading_date')}",
         "",
@@ -389,6 +434,12 @@ def render_daily_report_telegram_summary(
             f"warn {provider.get('warning_count', 0)}, "
             f"degraded {provider.get('degraded_count', 0)}, "
             f"blocking {provider.get('blocking_count', 0)}"
+        ),
+        (
+            "- Entry holds: "
+            f"self-healing {entry_reconciliation.get('self_healing_count', 0)}, "
+            f"recovered {entry_reconciliation.get('recovered_count', 0)}, "
+            f"needs you {entry_reconciliation.get('needs_human_count', 0)}"
         ),
     ]
     watch_items: list[str] = []
@@ -428,6 +479,15 @@ def render_daily_report_telegram_summary(
             f"{len(warnings)} warning(s); first={first.get('symbol')} "
             f"{_compact_warning_message(first.get('message'))}{suffix}"
         )
+    needs_human_holds = [
+        hold for hold in (entry_reconciliation.get("active_holds") or []) if hold.get("human_action_required")
+    ]
+    if needs_human_holds:
+        lane_text = ", ".join(
+            f"{hold.get('symbol')} ({_compact_deployment_id(hold.get('deployment_id'))})"
+            for hold in needs_human_holds[:3]
+        )
+        watch_items.append(f"NEEDS YOU - unresolved entry reconciliation: {lane_text}")
     runtime_issues = (((report.get("provider_health") or {}).get("runtime_issue_counts")) or {})
     if runtime_issues:
         issue_text = ", ".join(f"{key} x{value}" for key, value in list(runtime_issues.items())[:3])
@@ -532,6 +592,17 @@ def _empty_report(day: date) -> dict[str, Any]:
         },
         "open_position_summary": _open_position_summary([]),
         "open_positions": [],
+        "entry_reconciliation": {
+            "state": "no_data",
+            "attention_required": False,
+            "active_count": 0,
+            "self_healing_count": 0,
+            "needs_human_count": 0,
+            "recovered_count": 0,
+            "active_holds": [],
+            "recoveries": [],
+            "released_no_fill_trade_ids": [],
+        },
         "trades": [],
         "lifecycle": {},
         "data_quality_warnings": [],
@@ -722,6 +793,7 @@ def _load_day_trades(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
         "exit_mode",
         "exit_rule",
         "can_ladder",
+        "updated_at",
     ]
     selected = [column for column in desired if column in columns]
     day_text = day.isoformat()
@@ -1073,13 +1145,20 @@ def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def _is_open_trade(trade: dict[str, Any]) -> bool:
-    return str(trade.get("status") or "").lower() != "closed"
+    status = str(trade.get("status") or "").lower()
+    return status not in {"closed", RECONCILIATION_HOLD_STATUS}
+
+
+def _is_entry_reconciliation_hold(trade: dict[str, Any]) -> bool:
+    return str(trade.get("status") or "").lower() == RECONCILIATION_HOLD_STATUS
 
 
 def _protection_state(trade: dict[str, Any]) -> str:
     status = str(trade.get("status") or "").lower()
     if status == "closed":
         return "closed"
+    if status == RECONCILIATION_HOLD_STATUS:
+        return "reconciliation_hold"
     if trade.get("exit_order_id") or status.endswith("exit_pending") or "exit_pending" in status:
         return "exit_pending"
     if status == "target_active":
@@ -1105,6 +1184,7 @@ def _report_status(
     data_quality_warnings: list[dict[str, Any]],
     runtime_issue_counts: dict[str, int] | None = None,
     open_positions: list[dict[str, Any]] | None = None,
+    entry_reconciliation: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     if any(
         str(position.get("lane") or "").lower() == "live"
@@ -1114,6 +1194,8 @@ def _report_status(
         return {"level": "RED", "reason": "live_open_unprotected"}
     if (runtime_issue_counts or {}).get("dead_lane", 0) > 0:
         return {"level": "RED", "reason": "dead_live_lane"}
+    if (entry_reconciliation or {}).get("attention_required"):
+        return {"level": "RED", "reason": "stale_entry_reconciliation_hold"}
     if provider_events.get("blocking_count", 0) > 0:
         return {"level": "RED", "reason": "blocking_reconciliation_failure"}
     if provider_events.get("degraded_count", 0) > 0:

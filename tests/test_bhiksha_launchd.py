@@ -8,6 +8,7 @@ def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
 
     assert "com.bhiksha.live-start" in script
     assert "com.bhiksha.live-watchdog" in script
+    assert "com.bhiksha.reconciliation-supervisor" in script
     assert "com.bhiksha.live-stop" in script
     assert "com.bhiksha.schwab-guard" in script
     assert "com.bhiksha.session-report" in script
@@ -37,6 +38,16 @@ def test_bhiksha_launchd_installer_has_three_session_report_times() -> None:
     assert (9, 10) in times
     assert (11, 45) in times
     assert (14, 45) in times
+
+
+def test_reconciliation_supervisor_runs_independently_every_ten_minutes() -> None:
+    jobs = {job.runner_job: job for job in active_launchd_jobs()}
+    supervisor = jobs["reconciliation-supervisor"]
+
+    assert supervisor.label == "com.bhiksha.reconciliation-supervisor"
+    assert supervisor.schedule == jobs["live-watchdog"].schedule
+    assert supervisor.risk_class == "trading_safety_observer"
+    assert supervisor.allowed_manual_actions == ()
 
 
 def test_schwab_guard_has_premarket_and_after_close_checks() -> None:

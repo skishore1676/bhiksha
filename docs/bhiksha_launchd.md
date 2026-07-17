@@ -39,6 +39,7 @@ manual Control Tower actions do not need to be duplicated in shell.
 | --- | --- | --- |
 | `com.bhiksha.live-start` | Weekdays 08:20 CT | Restart Bhiksha live runtime from the active plan. Skips non-trading days. |
 | `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is still running. Skips non-trading days. |
+| `com.bhiksha.reconciliation-supervisor` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Verify entry holds self-heal, record receipts, and escalate only unresolved ambiguity older than five minutes. |
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop the live runtime. It does not skip non-trading days, so stale processes can still be cleaned up. |
 | `com.bhiksha.schwab-guard` | Trading days 07:10 and 15:20 CT | Verify premarket auth and, after close, renew whenever the token will not survive the next full trading session. Skips non-trading days. |
 | `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send an intraday session report with open positions, realized P&L, protection state, provider/runtime issues, and recent trades early enough for manual action. Skips non-trading days. |
@@ -60,6 +61,7 @@ All labels use one runner:
 ```bash
 scripts/launchd/run_bhiksha_job.sh live-start
 scripts/launchd/run_bhiksha_job.sh live-watchdog
+scripts/launchd/run_bhiksha_job.sh reconciliation-supervisor
 scripts/launchd/run_bhiksha_job.sh live-stop
 scripts/launchd/run_bhiksha_job.sh schwab-refresh
 scripts/launchd/run_bhiksha_job.sh session-report --report-label manual
@@ -104,7 +106,7 @@ python -m bhiksha.tools.launchd_status --json
 
 The status payload uses schema `bhiksha.launchd.status.v1` and includes:
 
-- all six active `com.bhiksha.*` jobs;
+- all seven active `com.bhiksha.*` jobs;
 - launchd loaded/exit state where available;
 - latest `BHIKSHA_LAUNCHD_JOB` payloads;
 - report and Schwab guard summaries;
@@ -144,7 +146,7 @@ blocked when authentication cannot remain trusted through the full session.
 ## Cutover Verification
 
 1. Install or reinstall Bhiksha-owned launchd jobs.
-2. Read back `launchctl list | grep bhiksha` and verify the six `com.bhiksha.*`
+2. Read back `launchctl list | grep bhiksha` and verify the seven `com.bhiksha.*`
    labels are loaded.
 3. Run `python -m bhiksha.tools.launchd_status --json` and verify the six
    jobs appear with schema `bhiksha.launchd.status.v1`.
@@ -177,6 +179,7 @@ The active labels are:
 ```text
 com.bhiksha.live-start
 com.bhiksha.live-watchdog
+com.bhiksha.reconciliation-supervisor
 com.bhiksha.live-stop
 com.bhiksha.schwab-guard
 com.bhiksha.session-report

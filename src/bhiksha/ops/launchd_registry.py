@@ -89,6 +89,15 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
         requires_confirmation_actions=("ensure-live-runtime",),
     ),
     LaunchdJobSpec(
+        label="com.bhiksha.reconciliation-supervisor",
+        runner_job="reconciliation-supervisor",
+        schedule=every_10_minutes(8, 30, 15, 0),
+        schedule_label="Weekdays every 10 minutes from 08:30 through 15:00 CT",
+        purpose="Verify entry reconciliation self-heals and escalate only stale, unresolved holds.",
+        skips_non_trading_days=True,
+        risk_class="trading_safety_observer",
+    ),
+    LaunchdJobSpec(
         label="com.bhiksha.live-stop",
         runner_job="live-stop",
         schedule=weekdays(15, 10),

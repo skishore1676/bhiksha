@@ -58,6 +58,61 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     assert snapshot["transport"]["status"] == "degraded"
 
 
+def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(monkeypatch, tmp_path) -> None:
+    payload = {
+        "schema": "bhiksha.launchd.latest_status.v1",
+        "generated_at": "2026-07-16T15:30:00+00:00",
+        "jobs": {
+            "reconciliation-supervisor": {
+                "recorded_at": "2026-07-16T15:30:00+00:00",
+                "label": "com.bhiksha.reconciliation-supervisor",
+                "payload": {
+                    "job": "reconciliation-supervisor",
+                    "status": "attention_required",
+                    "reconciliation_supervision": {
+                        "state": "needs_human",
+                        "observed_at": "2026-07-16T15:30:00+00:00",
+                        "attention_required": True,
+                        "needs_human_count": 1,
+                        "self_healing_count": 0,
+                        "active_holds": [
+                            {
+                                "symbol": "AMD",
+                                "deployment_id": "amd_short_live",
+                                "entry_order_id": "PUBLIC-AMD-ORDER",
+                                "state": "needs_human",
+                            }
+                        ],
+                    },
+                },
+            }
+        },
+    }
+    latest_status_path(tmp_path).parent.mkdir(parents=True)
+    latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": True}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 16, 15, 31, tzinfo=UTC),
+    )
+    job = next(item for item in snapshot["jobs"] if item["runner_job"] == "reconciliation-supervisor")
+
+    assert job["title"] == "Entry reconciliation supervision"
+    assert job["lifecycle"] == "waiting_you"
+    assert job["last_run_status"] == "needs_human"
+    assert job["findings"] == [
+        "Entry reconciliation could not finish safely; the affected deployment remains blocked."
+    ]
+    assert job["details"][0]["title"] == "AMD entry reconciliation"
+    assert job["summary"].startswith("Needs you: 1 entry reconciliation")
+
+
 def test_launchd_status_arms_failed_start_after_later_watchdog_recovery(monkeypatch, tmp_path) -> None:
     payload = {
         "schema": "bhiksha.launchd.latest_status.v1",

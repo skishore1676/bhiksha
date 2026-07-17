@@ -29,6 +29,7 @@ from bhiksha.ops.daily_report import (
     write_daily_report,
 )
 from bhiksha.ops.launchd_status_store import write_latest_status
+from bhiksha.ops.reconciliation_supervision import run_reconciliation_supervisor
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
 from bhiksha.ops.weekly_trading_decisions import (
     finalize_weekly_trading_decisions,
@@ -46,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=[
             "live-start",
             "live-watchdog",
+            "reconciliation-supervisor",
             "live-stop",
             "schwab-refresh",
             "session-report",
@@ -113,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
                 ["ensure-running", "--live", "--post-start-check-seconds", _post_start_check_seconds()],
                 repo_root=repo_root,
             )
+        if args.job == "reconciliation-supervisor":
+            return _reconciliation_supervisor_job(args, repo_root=repo_root)
         if args.job == "live-stop":
             return _stop_job(args, repo_root=repo_root)
         if args.job == "schwab-refresh":
@@ -223,6 +227,29 @@ def _session_report_job(args: argparse.Namespace) -> int:
         payload["obsidian_review"] = review.to_dict()
     _print_result(payload)
     return 0 if ok else 2
+
+
+def _reconciliation_supervisor_job(args: argparse.Namespace, *, repo_root: Path) -> int:
+    runtime = build_runtime(active_plan_path=args.active_plan)
+    receipt = run_reconciliation_supervisor(
+        runtime.app_config.sqlite_path,
+        receipt_dir=Path(runtime.app_config.playbook_artifacts_dir) / "reconciliation_supervision",
+        alert_mode=args.alert_mode,
+        alert_profile=args.alert_profile,
+    )
+    payload = {
+        "job": args.job,
+        "status": receipt["job_status"],
+        "reconciliation_supervision": receipt,
+        "alert": receipt.get("alert"),
+        "receipt": str(
+            Path(runtime.app_config.playbook_artifacts_dir)
+            / "reconciliation_supervision"
+            / "latest.json"
+        ),
+    }
+    _print_result(payload)
+    return 2 if receipt["attention_required"] else 0
 
 
 def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) -> int:

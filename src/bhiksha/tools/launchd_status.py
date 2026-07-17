@@ -92,10 +92,9 @@ def build_status_snapshot(
                 latest_record = {"recorded_at": _file_mtime_iso(spec.stdout_log(repo_root))}
         last = _last_job_view(latest_record, latest_payload)
         findings = _job_findings(last)
-        jobs.append(
-            {
+        job = {
                 "label": spec.label,
-                "title": "Schwab authentication" if spec.runner_job == "schwab-refresh" else spec.label,
+                "title": _job_title(spec.runner_job, spec.label),
                 "runner_job": spec.runner_job,
                 "kind": "external_launchd_job",
                 "serves_job": "C",
@@ -122,9 +121,20 @@ def build_status_snapshot(
                 "last_run_at": last.get("recorded_at") if isinstance(last, dict) else None,
                 "transport_status": _last_transport_status(last),
                 "findings": findings,
-                "lifecycle": "waiting_you" if findings and spec.runner_job == "schwab-refresh" else None,
+                "lifecycle": (
+                    "waiting_you"
+                    if findings and spec.runner_job in {"schwab-refresh", "reconciliation-supervisor"}
+                    else None
+                ),
             }
-        )
+        details = _job_details(last)
+        if details:
+            job["details"] = details
+        if spec.runner_job == "reconciliation-supervisor" and isinstance(last, dict):
+            supervision = _reconciliation_payload(last)
+            if supervision:
+                job["summary"] = _reconciliation_summary(supervision)
+        jobs.append(job)
 
     runtime_status = _runtime_status(repo_root=repo_root, deadline=deadline)
     _apply_live_start_recovery(jobs, runtime_status)
@@ -434,7 +444,55 @@ def _job_findings(last: dict[str, Any] | None) -> list[str]:
         return ["Schwab authentication expired; renewal is required."]
     if status == "refresh_token_near_expiry":
         return ["Schwab authentication will not survive the next trading session."]
+    if status == "needs_human":
+        return ["Entry reconciliation could not finish safely; the affected deployment remains blocked."]
     return [f"Domain health failed: {status}"]
+
+
+def _job_title(runner_job: str, label: str) -> str:
+    titles = {
+        "schwab-refresh": "Schwab authentication",
+        "reconciliation-supervisor": "Entry reconciliation supervision",
+    }
+    return titles.get(runner_job, label)
+
+
+def _reconciliation_payload(last: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(last, dict):
+        return {}
+    payload = last.get("payload") if isinstance(last.get("payload"), dict) else {}
+    supervision = payload.get("reconciliation_supervision")
+    return supervision if isinstance(supervision, dict) else {}
+
+
+def _reconciliation_summary(supervision: dict[str, Any]) -> str:
+    if supervision.get("attention_required"):
+        return (
+            f"Needs you: {supervision.get('needs_human_count', 0)} entry reconciliation "
+            "hold(s) remain unresolved; affected deployments are fail-closed."
+        )
+    if supervision.get("self_healing_count"):
+        return f"Self-healing: {supervision.get('self_healing_count')} transient entry hold(s)."
+    return "Healthy: no unresolved entry reconciliation holds."
+
+
+def _job_details(last: dict[str, Any] | None) -> list[dict[str, Any]]:
+    supervision = _reconciliation_payload(last)
+    if not supervision:
+        return []
+    details: list[dict[str, Any]] = []
+    for hold in supervision.get("active_holds") or []:
+        details.append(
+            {
+                "kind": "entry_reconciliation_hold",
+                "title": f"{hold.get('symbol')} entry reconciliation",
+                "surface": hold.get("deployment_id"),
+                "status": hold.get("state"),
+                "updated_at": supervision.get("observed_at"),
+                "review_ref": hold.get("entry_order_id"),
+            }
+        )
+    return details
 
 
 def _next_fire(schedule: tuple[dict[str, int], ...], *, now: datetime) -> str | None:
@@ -493,6 +551,17 @@ def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
             "reason": "schwab_token_guard",
             "attention_required": bool(result.get("attention_required", not result.get("ok"))),
             "failure_kind": result.get("failure_kind"),
+        }
+    if payload.get("job") == "reconciliation-supervisor":
+        supervision = payload.get("reconciliation_supervision") if isinstance(
+            payload.get("reconciliation_supervision"), dict
+        ) else {}
+        attention_required = bool(supervision.get("attention_required"))
+        return {
+            "ok": payload.get("status") == "ok" and not attention_required,
+            "status": "needs_human" if attention_required else supervision.get("state") or payload.get("status"),
+            "reason": "entry_reconciliation_supervision",
+            "attention_required": attention_required,
         }
     return {"ok": payload.get("status") == "ok", "status": payload.get("status"), "reason": payload.get("reason")}
 
