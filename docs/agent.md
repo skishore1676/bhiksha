@@ -11,6 +11,18 @@ Purpose: keep a simple running record of what we changed, what we decided, and w
 
 ## Session Log
 
+### 2026-07-17
+
+- Google Sheets control-plane reads now use four retries after the initial
+  request through the Google client's randomized exponential backoff. Beacon
+  sees only final exhaustion, not a transient 429/5xx or transport failure.
+- `live-watchdog` now requests `ensure-running --sync-before-start`. A stopped
+  runtime must compile a fresh active plan before recovery start; failed sync
+  leaves it stopped rather than launching the previous plan.
+- Intraday manual status writebacks explicitly drop to zero retries after
+  startup metadata discovery, keeping Google backoff outside the money path.
+- Full suite: 943 passed, including recovered-vs-exhausted Beacon boundaries.
+
 ### 2026-07-05
 
 - Bounded `bhiksha.tools.launchd_status` probes for external callers: each `launchctl print` / `server_session status` subprocess now catches `TimeoutExpired`/`OSError` and degrades only that field (`timeout`/`error`), and an overall 15s budget (env `BHIKSHA_STATUS_BUDGET_SECONDS`) short-circuits remaining probes to `not_checked`, so the status JSON always returns under lathi Control Tower's 20s kill; added root `RUNBOOK.md`. Verified: 34 launchd/alerts/report tests pass, 5 consecutive live runs 1.3-1.5s valid JSON.

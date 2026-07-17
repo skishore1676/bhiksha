@@ -220,6 +220,95 @@ def test_server_session_ensure_running_starts_when_missing(tmp_path: Path, monke
     assert metadata["pid"] == 54321
 
 
+def test_server_session_watchdog_syncs_before_recovery_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "runtime" / "bhiksha.pid"
+    active_plan_path = tmp_path / "active_plan.json"
+    events: list[str] = []
+
+    def _fake_sync(**kwargs):
+        events.append("sync")
+        active_plan_path.write_text("{}", encoding="utf-8")
+        return _sync_result(active_plan_path, tmp_path / "sync.log")
+
+    class _FakeProcess:
+        pid = 54322
+
+    def _fake_popen(command, **kwargs):
+        del command, kwargs
+        events.append("start")
+        return _FakeProcess()
+
+    def _fake_kill(pid: int, sig: int) -> None:
+        del pid, sig
+        raise ProcessLookupError
+
+    monkeypatch.setattr("bhiksha.tools.server_session.sync_active_plan_once", _fake_sync)
+    monkeypatch.setattr("bhiksha.tools.server_session.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("bhiksha.tools.server_session.os.kill", _fake_kill)
+
+    exit_code = server_session_main(
+        [
+            "ensure-running",
+            "--sync-before-start",
+            "--google-sheet-id",
+            "spreadsheet123",
+            "--credentials-path",
+            str(tmp_path / "credentials.json"),
+            "--pid-path",
+            str(pid_path),
+            "--runtime-log-dir",
+            str(tmp_path / "runtime_logs"),
+            "--active-plan",
+            str(active_plan_path),
+            "--repo-root",
+            str(tmp_path),
+            "--python-executable",
+            "/tmp/python",
+        ]
+    )
+
+    assert exit_code == 0
+    assert events == ["sync", "start"]
+
+
+def test_server_session_watchdog_does_not_start_stale_plan_when_sync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "runtime" / "bhiksha.pid"
+    monkeypatch.setattr(
+        "bhiksha.tools.server_session.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("runtime must not start after failed sync"),
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.server_session.sync_active_plan_once",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Google retries exhausted")),
+    )
+
+    with pytest.raises(RuntimeError, match="Google retries exhausted"):
+        server_session_main(
+            [
+                "ensure-running",
+                "--sync-before-start",
+                "--google-sheet-id",
+                "spreadsheet123",
+                "--credentials-path",
+                str(tmp_path / "credentials.json"),
+                "--pid-path",
+                str(pid_path),
+                "--active-plan",
+                str(tmp_path / "active_plan.json"),
+                "--repo-root",
+                str(tmp_path),
+                "--python-executable",
+                "/tmp/python",
+            ]
+        )
+
+    assert not pid_path.exists()
+
+
 def test_server_session_post_start_check_fails_when_runtime_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pid_path = tmp_path / "runtime" / "bhiksha.pid"
     runtime_log_dir = tmp_path / "runtime_logs"

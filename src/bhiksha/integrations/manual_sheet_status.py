@@ -45,6 +45,10 @@ class ManualSheetStatusWriter:
             sheet_name=str(manual_sheet_name),
             credentials_path=Path(credentials_path),
         )
+        # Metadata discovery happens during startup and may use the control-
+        # plane retry budget. Intraday status writebacks are best-effort and
+        # must not add exponential-backoff latency around entry/exit handling.
+        client.api_retries = 0
         row_index_by_deployment: dict[str, int] = {}
         for deployment in deployments:
             if not _is_sheet_backed_manual(deployment):

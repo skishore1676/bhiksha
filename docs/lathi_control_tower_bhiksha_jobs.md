@@ -38,7 +38,7 @@ Bhiksha already owns the active launchd jobs:
 | Label | Schedule | Purpose |
 | --- | --- | --- |
 | `com.bhiksha.live-start` | Weekdays 08:20 CT | Restart live runtime from active plan. |
-| `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is running. |
+| `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is running; refresh the Sheet-backed plan before recovering a stopped runtime. |
 | `com.bhiksha.reconciliation-supervisor` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Observe entry reconciliation receipts and surface `waiting_you` only after autonomous recovery is exhausted. |
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop stale live runtime. |
 | `com.bhiksha.schwab-guard` | Trading days 07:10 and 15:20 CT | Verify premarket auth and renew after close when the token cannot survive the next full session. |

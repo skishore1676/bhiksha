@@ -93,6 +93,12 @@ That command:
 2. stops any currently running Bhiksha server process
 3. starts Bhiksha again against the refreshed active plan
 
+The Sheet control-plane sync absorbs transient Google failures with four retries after the
+initial request using randomized exponential backoff. A failure reaches Beacon
+only after that budget is exhausted. Scheduled watchdog recovery also syncs a
+fresh plan before starting a stopped runtime; it does not fall back to a stale
+plan.
+
 Manual equivalents if needed:
 
 1. Update the Google Sheet.

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import httplib2
+import pytest
+from googleapiclient.errors import HttpError
+from googleapiclient.http import HttpRequest
 
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient, spreadsheet_id_from_url
 
@@ -13,7 +19,7 @@ def test_spreadsheet_id_from_url_extracts_id() -> None:
 
 
 def test_google_sheet_client_quotes_sheet_names_in_ranges(tmp_path: Path) -> None:
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {"retries": []}
 
     class _Values:
         def get(self, *, spreadsheetId: str, range: str):
@@ -21,7 +27,8 @@ def test_google_sheet_client_quotes_sheet_names_in_ranges(tmp_path: Path) -> Non
             captured["range"] = range
             return self
 
-        def execute(self):
+        def execute(self, *, num_retries: int = 0):
+            captured["retries"].append(num_retries)
             return {
                 "values": [
                     ["enabled", "strategy"],
@@ -35,7 +42,8 @@ def test_google_sheet_client_quotes_sheet_names_in_ranges(tmp_path: Path) -> Non
             captured["metadata_fields"] = fields
             return self
 
-        def execute(self):
+        def execute(self, *, num_retries: int = 0):
+            captured["retries"].append(num_retries)
             return {"sheets": [{"properties": {"title": "strategy catalog"}}]}
 
         def values(self):
@@ -57,6 +65,7 @@ def test_google_sheet_client_quotes_sheet_names_in_ranges(tmp_path: Path) -> Non
     assert captured["spreadsheetId"] == "spreadsheet123"
     assert captured["metadata_spreadsheetId"] == "spreadsheet123"
     assert captured["range"] == "'strategy catalog'!A1:ZZ2000"
+    assert captured["retries"] == [4, 4]
     assert rows[0]["row_index"] == 2
     assert rows[0]["strategy"] == "market_impulse_spy_short_v1"
 
@@ -67,7 +76,8 @@ def test_google_sheet_client_resolves_nearby_sheet_names(tmp_path: Path) -> None
             self.range = range
             return self
 
-        def execute(self):
+        def execute(self, *, num_retries: int = 0):
+            assert num_retries == 4
             return {"values": [["enabled"], ["TRUE"]]}
 
     class _Spreadsheets:
@@ -77,7 +87,8 @@ def test_google_sheet_client_resolves_nearby_sheet_names(tmp_path: Path) -> None
         def get(self, *, spreadsheetId: str, fields: str):
             return self
 
-        def execute(self):
+        def execute(self, *, num_retries: int = 0):
+            assert num_retries == 4
             return {"sheets": [{"properties": {"title": "active_strategy"}}]}
 
         def values(self):
@@ -116,7 +127,8 @@ def test_google_sheet_client_updates_row_cells_and_extends_headers(tmp_path: Pat
             captured.setdefault("batch_updates", []).append((spreadsheetId, body))
             return self
 
-        def execute(self):
+        def execute(self, *, num_retries: int = 0):
+            assert num_retries == 4
             gets = captured.get("gets", [])
             if len(gets) == 0:
                 return {"sheets": [{"properties": {"title": "manual_entry"}}]}
@@ -139,7 +151,8 @@ def test_google_sheet_client_updates_row_cells_and_extends_headers(tmp_path: Pat
             captured["metadata"] = (spreadsheetId, fields)
             return self
 
-        def execute(self):
+        def execute(self, *, num_retries: int = 0):
+            assert num_retries == 4
             return {"sheets": [{"properties": {"title": "manual_entry"}}]}
 
         def values(self):
@@ -175,3 +188,72 @@ def test_google_sheet_client_updates_row_cells_and_extends_headers(tmp_path: Pat
     assert "'manual_entry'!D2" in cell_ranges
     assert "'manual_entry'!E2" in cell_ranges
     assert "'manual_entry'!B2" in cell_ranges
+
+
+class _SequencedHttp:
+    def __init__(self, statuses: list[int]) -> None:
+        self.statuses = list(statuses)
+        self.calls = 0
+
+    def request(self, *args, **kwargs):
+        del args, kwargs
+        status = self.statuses[min(self.calls, len(self.statuses) - 1)]
+        self.calls += 1
+        response = httplib2.Response({"status": str(status)})
+        if status == 200:
+            return response, b'{"sheets":[{"properties":{"title":"strategy catalog"}}]}'
+        return response, b'{"error":{"message":"temporarily unavailable"}}'
+
+
+class _RequestService:
+    def __init__(self, request: HttpRequest) -> None:
+        self.request = request
+
+    def spreadsheets(self):
+        return self
+
+    def get(self, *, spreadsheetId: str, fields: str):
+        del spreadsheetId, fields
+        return self.request
+
+
+def _metadata_request(http: _SequencedHttp) -> HttpRequest:
+    request = HttpRequest(
+        http,
+        lambda response, content: json.loads(content.decode("utf-8")),
+        "https://sheets.googleapis.test/v4/spreadsheets/test",
+        method="GET",
+    )
+    request._sleep = lambda seconds: None
+    request._rand = lambda: 0.0
+    return request
+
+
+def test_google_sheet_client_recovers_from_transient_503(tmp_path: Path) -> None:
+    http = _SequencedHttp([503, 503, 200])
+
+    client = GoogleSheetTableClient(
+        spreadsheet_id="spreadsheet123",
+        sheet_name="strategy catalog",
+        credentials_path=tmp_path / "credentials.json",
+        service=_RequestService(_metadata_request(http)),
+    )
+
+    assert client.sheet_name == "strategy catalog"
+    assert http.calls == 3
+
+
+def test_google_sheet_client_raises_only_after_retry_exhaustion(tmp_path: Path) -> None:
+    http = _SequencedHttp([503])
+
+    with pytest.raises(HttpError) as exc_info:
+        GoogleSheetTableClient(
+            spreadsheet_id="spreadsheet123",
+            sheet_name="strategy catalog",
+            credentials_path=tmp_path / "credentials.json",
+            service=_RequestService(_metadata_request(http)),
+            api_retries=2,
+        )
+
+    assert exc_info.value.resp.status == 503
+    assert http.calls == 3

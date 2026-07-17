@@ -112,7 +112,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.job == "live-watchdog":
             return _server_session_job(
                 args,
-                ["ensure-running", "--live", "--post-start-check-seconds", _post_start_check_seconds()],
+                [
+                    "ensure-running",
+                    "--sync-before-start",
+                    "--live",
+                    "--post-start-check-seconds",
+                    _post_start_check_seconds(),
+                ],
                 repo_root=repo_root,
             )
         if args.job == "reconciliation-supervisor":

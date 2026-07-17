@@ -9,6 +9,7 @@ from typing import Any
 
 
 _SHEET_ID_RE = re.compile(r"/d/(?P<sheet_id>[a-zA-Z0-9-_]+)")
+_DEFAULT_API_RETRIES = 4
 
 
 def spreadsheet_id_from_url(url_or_id: str) -> str:
@@ -24,10 +25,12 @@ class GoogleSheetTableClient:
     sheet_name: str
     credentials_path: Path
     service: Any | None = None
+    api_retries: int = _DEFAULT_API_RETRIES
 
     def __post_init__(self) -> None:
         self.spreadsheet_id = spreadsheet_id_from_url(self.spreadsheet_id)
         self.credentials_path = Path(self.credentials_path).expanduser().resolve()
+        self.api_retries = max(0, int(self.api_retries))
         if self.service is None:
             self.service = self._build_service()
         self.sheet_name = self._resolve_sheet_name(self.sheet_name)
@@ -114,19 +117,18 @@ class GoogleSheetTableClient:
         return layout
 
     def _read_values(self, *, range_suffix: str) -> list[list[Any]]:
-        result = (
+        result = self._execute(
             self.service.spreadsheets()
             .values()
             .get(
                 spreadsheetId=self.spreadsheet_id,
                 range=self._quoted_range(range_suffix),
             )
-            .execute()
         )
         return result.get("values", [])
 
     def _update_ranges(self, data: list[dict[str, Any]]) -> None:
-        (
+        self._execute(
             self.service.spreadsheets()
             .values()
             .batchUpdate(
@@ -136,7 +138,6 @@ class GoogleSheetTableClient:
                     "data": data,
                 },
             )
-            .execute()
         )
 
     def _resolve_sheet_name(self, requested_name: str) -> str:
@@ -150,19 +151,27 @@ class GoogleSheetTableClient:
         return requested_name
 
     def _list_sheet_titles(self) -> list[str]:
-        result = (
+        result = self._execute(
             self.service.spreadsheets()
             .get(
                 spreadsheetId=self.spreadsheet_id,
                 fields="sheets.properties.title",
             )
-            .execute()
         )
         return [
             str(sheet["properties"]["title"])
             for sheet in result.get("sheets", [])
             if isinstance(sheet, dict) and isinstance(sheet.get("properties"), dict) and sheet["properties"].get("title")
         ]
+
+    def _execute(self, request: Any) -> dict[str, Any]:
+        """Execute through Google's retry-aware randomized exponential backoff.
+
+        ``num_retries`` covers rate limits, server-side 5xx responses, and
+        supported transport failures. The final exception is deliberately
+        allowed to escape so the launchd job alerts only after exhaustion.
+        """
+        return request.execute(num_retries=self.api_retries)
 
     def _quoted_range(self, suffix: str) -> str:
         escaped_sheet_name = self.sheet_name.replace("'", "''")

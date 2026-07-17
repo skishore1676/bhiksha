@@ -38,7 +38,7 @@ manual Control Tower actions do not need to be duplicated in shell.
 | Label | Schedule | Purpose |
 | --- | --- | --- |
 | `com.bhiksha.live-start` | Weekdays 08:20 CT | Restart Bhiksha live runtime from the active plan. Skips non-trading days. |
-| `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is still running. Skips non-trading days. |
+| `com.bhiksha.live-watchdog` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Ensure the live runtime is running; a stopped runtime refreshes the Sheet-backed plan before recovery start. Skips non-trading days. |
 | `com.bhiksha.reconciliation-supervisor` | Weekdays every 10 minutes from 08:30 through 15:00 CT | Verify entry holds self-heal, record receipts, and escalate only unresolved ambiguity older than five minutes. |
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop the live runtime. It does not skip non-trading days, so stale processes can still be cleaned up. |
 | `com.bhiksha.schwab-guard` | Trading days 07:10 and 15:20 CT | Verify premarket auth and, after close, renew whenever the token will not survive the next full trading session. Skips non-trading days. |
@@ -47,6 +47,17 @@ manual Control Tower actions do not need to be duplicated in shell.
 
 Launchd cannot natively express market holidays, so the runner performs the
 trading-day check before doing work.
+
+Google Sheets control-plane reads use the official client retry path with four
+retries after the initial request and randomized exponential backoff. Retryable
+rate limits, server errors, and supported transport failures stay inside the job;
+Beacon receives a launchd failure only after the retry budget is exhausted.
+If `live-start` still cannot compile a plan, the runtime remains stopped. The
+next watchdog attempt retries Sheet compilation before starting and never
+silently launches the previous active plan.
+
+Intraday manual-row status writebacks remain best-effort with no retry loop, so
+a Sheet outage cannot add backoff latency around entry or exit processing.
 
 The session report intentionally uses Lathi Bus's Telegram `status` template.
 Telegram gets a compact operator card: quick read, open positions, watch items,
