@@ -9,6 +9,7 @@ from datetime import datetime
 from bhiksha.domain.enums import ExitMode
 
 NON_LIVE_POSITION_SOURCES = {"shadow", "dry_run"}
+LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE = "live_entry_reconcile_hold"
 
 
 @dataclass(slots=True)

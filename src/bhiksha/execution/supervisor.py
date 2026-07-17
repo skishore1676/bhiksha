@@ -23,6 +23,10 @@ from bhiksha.domain.enums import ExitMode, SignalDirection
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
+from bhiksha.execution.brokers.public.order_status import (
+    PUBLIC_DEAD_ORDER_STATUSES,
+    PUBLIC_WORKING_ORDER_STATUSES,
+)
 from bhiksha.execution.pricing import (
     EntryPricingResult,
     build_entry_profile_comparison,
@@ -43,7 +47,11 @@ from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
 from bhiksha.state.lifecycle import LifecycleTransition, TradeLifecycleStore
-from bhiksha.state.position_tracker import NON_LIVE_POSITION_SOURCES, TrackedPosition
+from bhiksha.state.position_tracker import (
+    LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE,
+    NON_LIVE_POSITION_SOURCES,
+    TrackedPosition,
+)
 from bhiksha.time_utils import parse_time_text
 
 ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
@@ -53,7 +61,7 @@ ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
 # full-fill race. Anything else -- None/error/NEW/SUBMITTED/PARTIALLY_FILLED/
 # unknown -- means the order may still fill, so a reprice must not resubmit on
 # top of it without a clean cancel confirmation.
-_EXIT_ORDER_DEAD_STATUSES = frozenset({"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"})
+_EXIT_ORDER_DEAD_STATUSES = PUBLIC_DEAD_ORDER_STATUSES
 _ENTRY_ORDER_DEAD_STATUSES = _EXIT_ORDER_DEAD_STATUSES
 
 # Audit fix 3 (2026-07-08): give-up ceiling for the partial-fill enrichment
@@ -1602,6 +1610,30 @@ class ExecutionSupervisor:
         if updated.stop_order_id is None and updated.target_order_id is None:
             updated = await self._restore_missing_protection(deployment, updated, dry_run=dry_run)
 
+        if updated.source == LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE:
+            # The observed partial quantity needs catastrophe protection, but
+            # profile/native target transitions must wait until the residual
+            # entry order is terminal. Track restored protection in memory;
+            # the next portfolio reconciliation recovers it durably.
+            if updated != position:
+                self.planner.position_tracker.open_position(
+                    updated.symbol,
+                    updated.deployment_id,
+                    trade_id=updated.trade_id,
+                    option_symbol=updated.option_symbol,
+                    quantity=updated.quantity,
+                    entry_price=updated.entry_price,
+                    underlying_entry_price=updated.underlying_entry_price,
+                    entry_timestamp=updated.entry_timestamp,
+                    source=updated.source,
+                    order_id=updated.order_id,
+                    stop_order_id=updated.stop_order_id,
+                    stop_price=updated.stop_price,
+                    target_order_id=updated.target_order_id,
+                    target_price=updated.target_price,
+                )
+            return updated
+
         async def ensure_quote():
             nonlocal quote
             if quote is None:
@@ -2176,7 +2208,7 @@ class ExecutionSupervisor:
         canceled_stop_order_id = None
         canceled_target_order_id = None
         cancel_error = None
-        if decision.cancel_protection_orders:
+        if decision.cancel_protection_orders or position.stop_order_id or position.target_order_id:
             (
                 updated_position,
                 canceled_stop_order_id,
@@ -2188,6 +2220,24 @@ class ExecutionSupervisor:
                 dry_run=dry_run,
                 reason="strategy_exit",
             )
+
+        if not dry_run and cancel_error is not None:
+            plan = ExitPlan(
+                trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
+                deployment_id=deployment.deployment_id,
+                symbol=updated_position.symbol,
+                option_symbol=updated_position.option_symbol,
+                quantity=updated_position.quantity,
+                action=decision.action,
+                reasons=decision.reason,
+                dry_run=False,
+                canceled_stop_order_id=canceled_stop_order_id,
+                canceled_target_order_id=canceled_target_order_id,
+                error=f"exit_cancel_confirmation_pending:{cancel_error}",
+            )
+            await self.event_repository.append("exit_cancel_confirmation_blocked", asdict(plan))
+            await self.event_repository.append("exit_plan", asdict(plan))
+            return plan
 
         if dry_run:
             fill_details = await self._paper_exit_fill_details(updated_position, order_id="DRY_RUN_EXIT")
@@ -2298,7 +2348,11 @@ class ExecutionSupervisor:
         canceled_stop_order_id = None
         canceled_target_order_id = None
         cancel_error = None
-        if decision.cancel_protection_orders:
+        # A partial close always changes the quantity that protection must
+        # cover. Confirm the old stop/target is dead before submitting the
+        # partial; otherwise the old full-size sell and the partial close can
+        # race each other.
+        if decision.cancel_protection_orders or position.stop_order_id or position.target_order_id:
             (
                 updated_position,
                 canceled_stop_order_id,
@@ -2310,6 +2364,24 @@ class ExecutionSupervisor:
                 dry_run=dry_run,
                 reason="strategy_partial_scale",
             )
+
+        if not dry_run and cancel_error is not None:
+            plan = ExitPlan(
+                trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
+                deployment_id=deployment.deployment_id,
+                symbol=updated_position.symbol,
+                option_symbol=updated_position.option_symbol,
+                quantity=close_qty,
+                action=decision.action,
+                reasons=decision.reason,
+                dry_run=False,
+                canceled_stop_order_id=canceled_stop_order_id,
+                canceled_target_order_id=canceled_target_order_id,
+                error=f"partial_exit_cancel_confirmation_pending:{cancel_error}",
+            )
+            await self.event_repository.append("exit_cancel_confirmation_blocked", asdict(plan))
+            await self.event_repository.append("exit_plan", asdict(plan))
+            return plan
 
         # Size the close to the banked quantity only.
         partial_to_close = _replace_position(updated_position, quantity=close_qty)
@@ -2482,33 +2554,6 @@ class ExecutionSupervisor:
             exit_submitted_at=None,
         )
 
-        # NEW-2 (double stop): if the decision did NOT cancel protection but the
-        # position still carries a live stop, that stop covers the FULL original
-        # quantity and would coexist with the residual stop we are about to place
-        # -> two stops on one position. Cancel-then-replace: drop the stale
-        # full-size stop first so exactly one stop ends up covering the residual.
-        precanceled_residual_stop_id = None
-        if not decision.cancel_protection_orders and updated_position.stop_order_id:
-            precanceled_residual_stop_id = updated_position.stop_order_id
-            if not dry_run:
-                canceled, precancel_error = await self.planner.order_manager.cancel_order(
-                    updated_position.stop_order_id
-                )
-                await self.event_repository.append(
-                    "protection_cancel_attempt",
-                    {
-                        "deployment_id": deployment.deployment_id,
-                        "symbol": updated_position.symbol,
-                        "option_symbol": updated_position.option_symbol,
-                        "stop_order_id": updated_position.stop_order_id,
-                        "canceled": canceled,
-                        "error": precancel_error,
-                        "reason": "partial_scale_replace_full_size_stop",
-                    },
-                )
-                if precancel_error and error is None:
-                    error = precancel_error
-
         # NEW-1: ALWAYS re-arm a residual stop. Derive a price even when no prior
         # resting stop existed (from the profile stop in the decision diagnostics,
         # else the deployment exit spec). Never leave the residual stop_order_id
@@ -2655,7 +2700,7 @@ class ExecutionSupervisor:
                 "order_id": order_id,
                 "canceled_stop_order_id": canceled_stop_order_id,
                 "canceled_target_order_id": canceled_target_order_id,
-                "precanceled_residual_stop_order_id": precanceled_residual_stop_id,
+                "precanceled_residual_stop_order_id": canceled_stop_order_id,
                 "restored_stop_order_id": restored_stop_order_id,
                 "restored_stop_price": restored_stop_price if not residual_unprotected else None,
                 "residual_protected": not residual_unprotected,
@@ -3074,6 +3119,34 @@ class ExecutionSupervisor:
                 first_error = cancel_error
         return updated, canceled_stop_order_id, canceled_target_order_id, first_error
 
+    async def _defer_reconcile_hold_flatten(
+        self,
+        position: TrackedPosition,
+        *,
+        reason: str,
+        dry_run: bool,
+    ) -> None:
+        """Keep a partial entry hold protected until its buy order is terminal."""
+        canceled = False
+        cancel_error = "dry_run_cancel_not_requested" if dry_run else None
+        if not dry_run and position.order_id is not None:
+            canceled, cancel_error = await self.planner.order_manager.cancel_order(position.order_id)
+        payload = {
+            "category": "entry_reconcile_flatten_deferred",
+            "deployment_id": position.deployment_id,
+            "symbol": position.symbol,
+            "trade_id": position.trade_id,
+            "option_symbol": position.option_symbol,
+            "entry_order_id": position.order_id,
+            "position_quantity": position.quantity,
+            "cancel_confirmed_zero_fill": canceled,
+            "error": cancel_error or "entry_order_terminal_resolution_pending",
+            "stage": reason,
+        }
+        await self.event_repository.append("entry_reconcile_flatten_deferred", payload)
+        if not dry_run:
+            await self.event_repository.append("runtime_issue", payload)
+
     async def _finalize_pending_exit_fill(
         self,
         deployment: DeploymentManifest,
@@ -3198,17 +3271,19 @@ class ExecutionSupervisor:
            finding 1: NOT position.quantity, which reconciliation may have
            already shrunk past the fill) -- record the fill truth via
            ``_finalize_pending_exit_fill``; never resubmit.
-        2. BLOCKED (A.1, fail closed): the cancel was NOT cleanly confirmed AND
-           the readback did not cleanly prove the order dead (broker
+        2. BLOCKED (A.1, fail closed): the readback did not cleanly prove the
+           order dead (broker
            error/timeout/``None``/non-terminal status such as
-           ``PARTIALLY_FILLED``). The order may still fill; resubmitting now is
+           ``PARTIALLY_FILLED`` or ``PENDING_CANCEL``). Public's successful
+           DELETE response confirms only that the asynchronous cancel request
+           was accepted. The order may still fill; resubmitting now is
            the pre-audit blind-resubmit bug. Emit ``exit_reprice_blocked``
            (including the previously-discarded ``status_error``) and skip this
            cycle -- the pending-exit poller retries within
            ``order_fill_poll_seconds`` (the fail-safe mirror of the entry
            side's ``_cancel_entry_for_reprice_block``).
-        3. PARTIAL FILL (A.2, the consequential one): the order is dead (or the
-           cancel cleanly acked) with ``0 < filledQuantity <`` the order's own
+        3. PARTIAL FILL (A.2, the consequential one): the order is dead with
+           ``0 < filledQuantity <`` the order's own
            placed quantity -- the common real-broker outcome of a cancel
            racing a working order. Durably record the filled leg in
            ``trade_partial_fills`` (origin="exit_cancel_race"; this path is
@@ -3216,9 +3291,8 @@ class ExecutionSupervisor:
            banks) and return a position carrying only the RESIDUAL quantity
            (placed minus filled, audit finding 1) so the resubmit can never
            oversell.
-        4. RESUBMIT: the order is confirmed dead unfilled, or the cancel was
-           cleanly confirmed -- safe to place the replacement order at full
-           quantity (pre-existing behavior).
+        4. RESUBMIT: the order is confirmed dead unfilled -- safe to place the
+           replacement order at full quantity.
         """
         canceled, cancel_error, status, payload, status_error = await self._cancel_exit_order_and_check_fill(
             exit_order_id
@@ -3262,8 +3336,9 @@ class ExecutionSupervisor:
             )
             return _ExitCancelRaceOutcome(action="finalized", plan=plan)
 
-        # 2. A.1 fail closed: cancel unconfirmed and order not provably dead.
-        if not canceled and normalized_status not in _EXIT_ORDER_DEAD_STATUSES:
+        # 2. A.1 fail closed: DELETE acceptance is not cancellation proof.
+        # Only a terminal GET readback permits replacement.
+        if normalized_status not in _EXIT_ORDER_DEAD_STATUSES:
             await self.event_repository.append(
                 "exit_reprice_blocked",
                 {
@@ -3279,7 +3354,7 @@ class ExecutionSupervisor:
             )
             return _ExitCancelRaceOutcome(action="blocked", cancel_error=cancel_error)
 
-        # 3. A.2 partial fill on a dead-or-cancel-acked order. Residual is
+        # 3. A.2 partial fill on a dead order. Residual is
         # derived from the order's own placed quantity (audit finding 1).
         if filled_quantity is not None and 0 < filled_quantity < order_quantity:
             residual_quantity = order_quantity - filled_quantity
@@ -3327,7 +3402,7 @@ class ExecutionSupervisor:
                 cancel_error=cancel_error,
             )
 
-        # 4. Confirmed dead unfilled, or cleanly canceled: full-quantity resubmit.
+        # 4. Confirmed dead unfilled: full-quantity resubmit.
         return _ExitCancelRaceOutcome(action="resubmit", position=position, cancel_error=cancel_error)
 
     async def _resolve_dead_status_exit_for_resubmit(
@@ -3591,7 +3666,7 @@ class ExecutionSupervisor:
                 force_market=position.exit_mode == ExitMode.EMERGENCY,
             )
             return plan
-        if normalized in {"NEW", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}:
+        if normalized in PUBLIC_WORKING_ORDER_STATUSES:
             if position.exit_mode == ExitMode.STRATEGY:
                 try:
                     quote = await self.planner.order_manager.get_option_quote(position.option_symbol)
@@ -3605,6 +3680,19 @@ class ExecutionSupervisor:
                         dry_run=False,
                         reason="exit_reprice",
                     )
+                    if cancel_error is not None:
+                        await self.event_repository.append(
+                            "exit_reprice_blocked",
+                            {
+                                "deployment_id": deployment.deployment_id,
+                                "symbol": position.symbol,
+                                "option_symbol": position.option_symbol,
+                                "order_id": position.exit_order_id,
+                                "reason": "protection_cancel_confirmation_pending",
+                                "cancel_error": cancel_error,
+                            },
+                        )
+                        return None
                     if position.exit_order_id:
                         # E1 + audit A.1/A.2: cancel with fill-race, partial-fill,
                         # and fail-closed handling -- see
@@ -3701,6 +3789,9 @@ class ExecutionSupervisor:
             hard_flat_time = parse_time_text(deployment.exit.hard_flat_time_et or deployment.risk.hard_flat_time_et or "15:55")
             if now_et < hard_flat_time:
                 continue
+            if position.source == LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE:
+                await self._defer_reconcile_hold_flatten(position, reason="hard_flat", dry_run=dry_run)
+                continue
 
             order_id = "DRY_RUN_CLOSE"
             error = None
@@ -3737,6 +3828,19 @@ class ExecutionSupervisor:
                     dry_run=False,
                     reason="hard_flat",
                 )
+                if cancel_error is not None:
+                    await self.event_repository.append(
+                        "runtime_issue",
+                        {
+                            "category": "hard_flat_cancel_confirmation_pending",
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": position.symbol,
+                            "option_symbol": position.option_symbol,
+                            "error": cancel_error,
+                            "stage": "hard_flat",
+                        },
+                    )
+                    continue
                 updated_position, exit_plan = await self._submit_exit_request(
                     deployment,
                     updated_position,
@@ -3802,6 +3906,14 @@ class ExecutionSupervisor:
             if position.exit_mode is not None or position.exit_order_id is not None:
                 continue
             position_dry_run = dry_run or position.source == "shadow"
+
+            if position.source == LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE:
+                await self._defer_reconcile_hold_flatten(
+                    position,
+                    reason="halt_and_flatten",
+                    dry_run=dry_run,
+                )
+                continue
 
             order_id = "DRY_RUN_EMERGENCY_FLAT"
             error = None
@@ -3904,6 +4016,19 @@ class ExecutionSupervisor:
                     dry_run=False,
                     reason="halt_and_flatten",
                 )
+                if cancel_error is not None:
+                    await self.event_repository.append(
+                        "runtime_issue",
+                        {
+                            "category": "halt_flatten_cancel_confirmation_pending",
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": position.symbol,
+                            "option_symbol": position.option_symbol,
+                            "error": cancel_error,
+                            "stage": "halt_and_flatten",
+                        },
+                    )
+                    continue
                 updated_position, exit_plan = await self._submit_exit_request(
                     deployment,
                     updated_position,
@@ -3968,13 +4093,23 @@ class ExecutionSupervisor:
             for position in self.planner.position_tracker.active_positions()
             if position.trade_id is not None
         }
+        active_positions_by_trade_id = {
+            position.trade_id: position
+            for position in self.planner.position_tracker.active_positions()
+            if position.trade_id is not None
+        }
+        entry_reconcile_outcomes: dict[str, str] = {}
         for trade in open_trades:
             if trade.status == "pending_entry":
                 continue
             if trade.status == "pending_entry_reconcile":
-                if trade.trade_id in active_trade_ids:
-                    continue
-                await self._reconcile_pending_entry_release(trade)
+                outcome = await self._reconcile_pending_entry_release(
+                    trade,
+                    active_position=active_positions_by_trade_id.get(trade.trade_id),
+                )
+                entry_reconcile_outcomes[trade.trade_id] = outcome
+                if outcome == "recovered":
+                    active_trade_ids.add(trade.trade_id)
                 continue
             if trade.trade_id not in active_trade_ids:
                 if _is_paper_trade_record(trade):
@@ -4015,17 +4150,34 @@ class ExecutionSupervisor:
                         "entry_timestamp": position.entry_timestamp.isoformat() if position.entry_timestamp else None,
                     },
                 )
+            previous = open_trades_by_id.get(position.trade_id)
+            reconcile_outcome = entry_reconcile_outcomes.get(position.trade_id)
+            tracked_status = _tracked_trade_status(position)
+            hold_pending = (
+                previous is not None
+                and previous.status == "pending_entry_reconcile"
+                and reconcile_outcome == "pending"
+            )
+            if hold_pending:
+                # A portfolio position proves some quantity filled, but not that
+                # the rest of the asynchronous entry order is dead. Preserve the
+                # hold until GET /order reaches a terminal state.
+                tracked_status = "pending_entry_reconcile"
             await self._upsert_trade_record(
                 TradeRecord(
                     trade_id=position.trade_id,
                     deployment_id=position.deployment_id,
                     symbol=position.symbol,
                     option_symbol=position.option_symbol,
-                    quantity=position.quantity,
+                    # Preserve the submitted order quantity while the order is
+                    # nonterminal. The portfolio may expose only the currently
+                    # filled portion; shrinking this denominator would make a
+                    # later larger terminal fill appear corrupt.
+                    quantity=previous.quantity if hold_pending and previous is not None else position.quantity,
                     entry_price=position.entry_price,
                     underlying_entry_price=position.underlying_entry_price,
                     entry_timestamp=position.entry_timestamp,
-                    status=_tracked_trade_status(position),
+                    status=tracked_status,
                     entry_order_id=position.order_id,
                     stop_order_id=position.stop_order_id,
                     stop_price=position.stop_price,
@@ -4037,8 +4189,7 @@ class ExecutionSupervisor:
                     exit_mode=position.exit_mode,
                 )
             )
-            previous = open_trades_by_id.get(position.trade_id)
-            if previous is not None and previous.status == "pending_entry_reconcile":
+            if previous is not None and previous.status == "pending_entry_reconcile" and reconcile_outcome == "recovered":
                 await self.event_repository.append(
                     "entry_reconcile_recovered",
                     {
@@ -4306,21 +4457,24 @@ class ExecutionSupervisor:
         if trade_id:
             self._profile_exit_states.pop(f"trade:{trade_id}", None)
 
-    async def _reconcile_pending_entry_release(self, trade: TradeRecord) -> None:
+    async def _reconcile_pending_entry_release(
+        self,
+        trade: TradeRecord,
+        *,
+        active_position: TrackedPosition | None = None,
+    ) -> str:
         if trade.entry_order_id is None:
-            return
+            return "pending"
         status, payload, error = await self.planner.order_manager.get_order_status(trade.entry_order_id)
         terminal = _EntryCancelResult(
             cancel_ok=False,
             cancel_error=None,
             order_quantity=trade.quantity,
-            status=status or error,
+            status=status,
             payload=payload,
-            status_error=error if status is not None else None,
+            status_error=error,
         )
         normalized = terminal.normalized_status
-        if normalized not in _ENTRY_ORDER_DEAD_STATUSES:
-            return
         if terminal.filled:
             entry_price = _filled_entry_price(payload, fallback=trade.entry_price or 0.0)
             if entry_price > 0:
@@ -4336,6 +4490,10 @@ class ExecutionSupervisor:
                     entry_timestamp=trade.entry_timestamp,
                     source="live_open",
                     order_id=trade.entry_order_id,
+                    stop_order_id=active_position.stop_order_id if active_position is not None else None,
+                    stop_price=active_position.stop_price if active_position is not None else None,
+                    target_order_id=active_position.target_order_id if active_position is not None else None,
+                    target_price=active_position.target_price if active_position is not None else None,
                 )
                 transition = self.lifecycle_store.mark_open(
                     trade.symbol,
@@ -4361,7 +4519,9 @@ class ExecutionSupervisor:
                         "payload": payload or {},
                     },
                 )
-                return
+                return "recovered"
+        if normalized not in _ENTRY_ORDER_DEAD_STATUSES:
+            return "pending"
         if not terminal.safe_to_replace_or_close:
             await self.event_repository.append(
                 "entry_reconcile_terminal_fill_unresolved",
@@ -4376,7 +4536,25 @@ class ExecutionSupervisor:
                     "payload": payload or {},
                 },
             )
-            return
+            return "pending"
+        if active_position is not None:
+            # A dead zero-fill order and a live position are contradictory
+            # broker snapshots. Neither source is sufficient to close or
+            # promote the trade; leave the durable hold intact for the next
+            # reconciliation pass and eventual human escalation.
+            await self.event_repository.append(
+                "entry_reconcile_position_order_conflict",
+                {
+                    "deployment_id": trade.deployment_id,
+                    "symbol": trade.symbol,
+                    "trade_id": trade.trade_id,
+                    "entry_order_id": trade.entry_order_id,
+                    "status": normalized,
+                    "position_quantity": active_position.quantity,
+                    "payload": payload or {},
+                },
+            )
+            return "pending"
         await self._release_cash_guard_reservation(trade.trade_id)
         await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
         # NEW-4: releasing a reconcile-hold entry is terminal (the entry never
@@ -4402,6 +4580,7 @@ class ExecutionSupervisor:
                 "payload": payload or {},
             },
         )
+        return "released"
 
     def _recover_paper_trade(self, trade: TradeRecord) -> None:
         self.planner.position_tracker.open_position(
@@ -4436,6 +4615,59 @@ class ExecutionSupervisor:
         if stop_loss_pct is None or stop_loss_pct <= 0:
             return position
         existing_protection = None if dry_run else await self._find_active_close_order(position.option_symbol)
+        if existing_protection is not None and existing_protection.get("remaining_quantity") is None:
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": "protection_quantity_unknown",
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "trade_id": position.trade_id,
+                    "option_symbol": position.option_symbol,
+                    "position_quantity": position.quantity,
+                    "protection_order_id": existing_protection["order_id"],
+                    "error": "protection_remaining_quantity_unavailable",
+                    "stage": "protection_restore",
+                },
+            )
+        elif (
+            existing_protection is not None
+            and existing_protection.get("remaining_quantity") != position.quantity
+        ):
+            existing_order_id = str(existing_protection["order_id"])
+            canceled, cancel_error = await self.planner.order_manager.cancel_order(existing_order_id)
+            await self.event_repository.append(
+                "protection_quantity_mismatch",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": position.symbol,
+                    "trade_id": position.trade_id,
+                    "option_symbol": position.option_symbol,
+                    "position_quantity": position.quantity,
+                    "protection_order_id": existing_order_id,
+                    "protection_remaining_quantity": existing_protection.get("remaining_quantity"),
+                    "cancel_confirmed": canceled,
+                    "cancel_error": cancel_error,
+                },
+            )
+            if canceled:
+                existing_protection = None
+            else:
+                await self.event_repository.append(
+                    "runtime_issue",
+                    {
+                        "category": "protection_quantity_mismatch",
+                        "deployment_id": deployment.deployment_id,
+                        "symbol": position.symbol,
+                        "trade_id": position.trade_id,
+                        "option_symbol": position.option_symbol,
+                        "position_quantity": position.quantity,
+                        "protection_order_id": existing_order_id,
+                        "protection_remaining_quantity": existing_protection.get("remaining_quantity"),
+                        "error": cancel_error or "protection_cancel_confirmation_pending",
+                        "stage": "protection_restore",
+                    },
+                )
         if existing_protection is not None:
             updated = _replace_position(
                 position,
@@ -4559,7 +4791,7 @@ class ExecutionSupervisor:
                 continue
             if str(order.get("openCloseIndicator", "")).upper() != "CLOSE":
                 continue
-            if str(order.get("status", "")).upper() not in {"NEW", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}:
+            if str(order.get("status", "")).upper() not in PUBLIC_WORKING_ORDER_STATUSES:
                 continue
             order_type = str(order.get("type", "")).upper()
             if order_type == "STOP":
@@ -4571,7 +4803,12 @@ class ExecutionSupervisor:
             order_id = order.get("orderId")
             if not order_id:
                 continue
-            return {"order_id": str(order_id), "type": order_type, "price": price}
+            return {
+                "order_id": str(order_id),
+                "type": order_type,
+                "price": price,
+                "remaining_quantity": _remaining_order_quantity(order),
+            }
         return None
 
     async def _arm_position_protection(
@@ -5103,6 +5340,15 @@ def _maybe_int(value) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _remaining_order_quantity(payload: dict[str, Any]) -> int | None:
+    quantity = _maybe_int(payload.get("quantity"))
+    raw_filled = payload.get("filledQuantity")
+    filled = 0 if raw_filled is None else _maybe_int(raw_filled)
+    if quantity is None or filled is None or quantity < 0 or filled < 0 or filled > quantity:
+        return None
+    return quantity - filled
 
 
 def _maybe_datetime(value) -> datetime | None:

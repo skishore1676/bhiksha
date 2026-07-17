@@ -74,6 +74,24 @@ def test_inspection_keeps_transient_hold_self_healing_and_ages_stale_hold(tmp_pa
     assert stale["active_holds"][0]["blocked_scope"] == "deployment"
 
 
+def test_inspection_ages_hold_from_original_timeout_event_after_trade_refresh(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    started_at = NOW - timedelta(minutes=10)
+    _seed_hold(db_path, updated_at=started_at)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE trade_sessions SET updated_at = ? WHERE trade_id = 'hold-amd'",
+            ((NOW - timedelta(seconds=20)).isoformat(),),
+        )
+        conn.commit()
+
+    summary = inspect_reconciliation_state(db_path, now=NOW)
+
+    assert summary["state"] == "needs_human"
+    assert summary["active_holds"][0]["started_at"] == started_at.isoformat()
+    assert summary["active_holds"][0]["age_seconds"] == 600
+
+
 def test_supervisor_alerts_once_then_sends_one_recovery(tmp_path) -> None:
     db_path = tmp_path / "bhiksha.db"
     receipt_dir = tmp_path / "receipts"

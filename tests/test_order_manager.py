@@ -1,5 +1,7 @@
 import asyncio
 
+import httpx
+
 from bhiksha.execution.order_manager import OrderManager, normalize_option_symbol, round_price, snap_price
 
 
@@ -126,3 +128,73 @@ def test_order_manager_reuses_learned_underlying_increment() -> None:
     assert first.order_id == "OID2"
     assert second.order_id == "OID3"
     assert broker.placed_orders[2]["limitPrice"] == "4.25"
+
+
+def test_cancel_ack_requires_terminal_zero_fill_readback() -> None:
+    class StubBroker:
+        def __init__(self, payload: dict) -> None:
+            self.payload = payload
+            self.cancel_calls: list[str] = []
+
+        async def cancel_order(self, order_id: str) -> dict:
+            self.cancel_calls.append(order_id)
+            return {}  # Public 200: request accepted, not cancellation proof.
+
+        async def get_order(self, order_id: str) -> dict:
+            del order_id
+            return self.payload
+
+    cases = [
+        ({"status": "PENDING_CANCEL", "quantity": "2"}, False, "cancel_pending:PENDING_CANCEL"),
+        ({"status": "CANCELLED", "quantity": "2", "filledQuantity": None}, True, None),
+        (
+            {"status": "CANCELLED", "quantity": "2", "filledQuantity": "1"},
+            False,
+            "cancel_terminal_with_fill_or_ambiguous_quantity:CANCELLED",
+        ),
+        (
+            {"status": "CANCELLED", "quantity": "2", "filledQuantity": "N/A"},
+            False,
+            "cancel_terminal_with_fill_or_ambiguous_quantity:CANCELLED",
+        ),
+    ]
+
+    for payload, expected_ok, expected_error in cases:
+        broker = StubBroker(payload)
+        manager = OrderManager(broker=broker)
+
+        ok, error = asyncio.run(manager.cancel_order("ORDER123"))
+
+        assert ok is expected_ok
+        assert error == expected_error
+        assert broker.cancel_calls == ["ORDER123"]
+
+
+def test_cancel_can_confirm_terminal_order_after_request_error() -> None:
+    class StubBroker:
+        async def cancel_order(self, order_id: str) -> dict:
+            del order_id
+            raise ValueError("already closed")
+
+        async def get_order(self, order_id: str) -> dict:
+            del order_id
+            return {"status": "CANCELLED", "filledQuantity": None}
+
+    ok, error = asyncio.run(OrderManager(broker=StubBroker()).cancel_order("ORDER123"))
+
+    assert ok is True
+    assert error is None
+
+
+def test_get_order_status_classifies_documented_indexing_lag() -> None:
+    class StubBroker:
+        async def get_order(self, order_id: str) -> dict:
+            request = httpx.Request("GET", f"https://api.public.com/order/{order_id}")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+    status, payload, error = asyncio.run(OrderManager(broker=StubBroker()).get_order_status("ORDER123"))
+
+    assert status is None
+    assert payload is None
+    assert error == "order_not_indexed_yet"

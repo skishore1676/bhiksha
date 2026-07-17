@@ -20,7 +20,7 @@ from bhiksha.execution.supervisor import (
 )
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.state.lifecycle import TradeLifecycleStore
-from bhiksha.state.position_tracker import PositionTracker
+from bhiksha.state.position_tracker import LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE, PositionTracker
 from historical_config import historical_deployment
 
 
@@ -2035,9 +2035,19 @@ def test_execution_supervisor_holds_fill_timeout_for_reconciliation(tmp_path) ->
 
 
 def test_execution_supervisor_sync_lifecycle_recovers_timed_out_entry(tmp_path) -> None:
+    class FilledOrderManager(StubOrderManager):
+        async def get_order_status(self, order_id: str):
+            del order_id
+            return (
+                "FILLED",
+                {"status": "FILLED", "quantity": "1", "filledQuantity": "1", "averagePrice": "2.0"},
+                None,
+            )
+
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
     planner = StubPlanner()
+    planner.order_manager = FilledOrderManager()
     planner.cash_guard = RecordingCashGuard()
     supervisor = ExecutionSupervisor(
         planner=planner,
@@ -2082,6 +2092,348 @@ def test_execution_supervisor_sync_lifecycle_recovers_timed_out_entry(tmp_path) 
     with sqlite3.connect(tmp_path / "events.db") as conn:
         event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
     assert "entry_reconcile_recovered" in event_types
+
+
+def test_sync_lifecycle_keeps_active_partial_entry_on_hold_until_order_terminal(tmp_path) -> None:
+    class PartialEntryOrderManager(StubOrderManager):
+        def __init__(self) -> None:
+            self.status = "PARTIALLY_FILLED"
+            self.filled_quantity = "1"
+
+        async def get_order_status(self, order_id: str):
+            del order_id
+            return (
+                self.status,
+                {
+                    "status": self.status,
+                    "quantity": "2",
+                    "filledQuantity": self.filled_quantity,
+                    "averagePrice": "2.10",
+                },
+                None,
+            )
+
+    manager = PartialEntryOrderManager()
+    planner = StubPlanner()
+    planner.order_manager = manager
+    planner.cash_guard = RecordingCashGuard()
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    trade = TradeRecord(
+        trade_id="TRADE_PARTIAL_ACTIVE",
+        deployment_id="market_impulse_qqq_short_v1",
+        symbol="QQQ",
+        option_symbol="QQQ260330P00558000",
+        quantity=2,
+        entry_price=2.0,
+        entry_timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        status="pending_entry_reconcile",
+        entry_order_id="ENTRY_PARTIAL_ACTIVE",
+    )
+    asyncio.run(trade_repo.upsert_trade(trade))
+    planner.position_tracker.open_position(
+        "QQQ",
+        trade.deployment_id,
+        trade_id=trade.trade_id,
+        option_symbol=trade.option_symbol,
+        quantity=1,
+        entry_price=2.10,
+        entry_timestamp=trade.entry_timestamp,
+        source="live_open",
+        order_id=trade.entry_order_id,
+        stop_order_id="STOP_PARTIAL",
+        stop_price=1.05,
+    )
+
+    asyncio.run(supervisor.sync_lifecycle())
+
+    held = asyncio.run(trade_repo.get_open_trades())[0]
+    assert held.status == "pending_entry_reconcile"
+    assert held.quantity == 2
+    assert held.stop_order_id == "STOP_PARTIAL"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id")]
+    assert "entry_reconcile_recovered" not in event_types
+
+    # The residual lot can fill while cancellation is still settling. The
+    # durable hold kept the original order quantity (2), so this is valid.
+    manager.status = "FILLED"
+    manager.filled_quantity = "2"
+    asyncio.run(supervisor.sync_lifecycle())
+
+    recovered = asyncio.run(trade_repo.get_open_trades())[0]
+    assert recovered.status == "open_protected"
+    assert recovered.quantity == 2
+    assert recovered.stop_order_id == "STOP_PARTIAL"
+
+
+def test_reconcile_hold_position_arms_only_catastrophe_protection(tmp_path) -> None:
+    class HoldOrderManager(StubOrderManager):
+        def __init__(self) -> None:
+            self.quote_calls = 0
+
+        async def get_portfolio(self):
+            return {"orders": []}
+
+        async def get_option_quote(self, option_symbol: str):
+            del option_symbol
+            self.quote_calls += 1
+            raise AssertionError("reconciliation hold must not evaluate target/profile exits")
+
+    manager = HoldOrderManager()
+    planner = StubPlanner()
+    planner.order_manager = manager
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_HOLD_PROTECT",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.10,
+        source=LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE,
+        order_id="ENTRY_HOLD_PROTECT",
+    )
+    position = planner.position_tracker.active_positions()[0]
+
+    protected = asyncio.run(supervisor.manage_open_position(deployment, position, dry_run=False))
+
+    assert protected is not None
+    assert protected.stop_order_id == "STOP123"
+    assert manager.quote_calls == 0
+    assert planner.position_tracker.active_positions()[0].stop_order_id == "STOP123"
+
+
+def test_reconcile_hold_resizes_confirmed_stale_protection_quantity(tmp_path) -> None:
+    class MismatchedProtectionOrderManager(StubOrderManager):
+        def __init__(self) -> None:
+            self.cancel_calls: list[str] = []
+            self.stop_quantities: list[int] = []
+
+        async def get_portfolio(self):
+            return {
+                "orders": [
+                    {
+                        "orderId": "STOP_ONE_LOT",
+                        "instrument": {"symbol": "QQQ260330P00558000", "type": "OPTION"},
+                        "side": "SELL",
+                        "openCloseIndicator": "CLOSE",
+                        "type": "STOP",
+                        "status": "NEW",
+                        "quantity": "1",
+                        "filledQuantity": None,
+                        "stopPrice": "1.05",
+                    }
+                ]
+            }
+
+        async def cancel_order(self, order_id: str):
+            self.cancel_calls.append(order_id)
+            return True, None
+
+        async def place_stop_loss_order(self, option_symbol: str, stop_price: float, quantity: int):
+            del option_symbol, stop_price
+            self.stop_quantities.append(quantity)
+            return OrderResult(order_id="STOP_TWO_LOTS")
+
+    manager = MismatchedProtectionOrderManager()
+    planner = StubPlanner()
+    planner.order_manager = manager
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(planner=planner, event_repository=repo)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_RESIZE_PROTECT",
+        option_symbol="QQQ260330P00558000",
+        quantity=2,
+        entry_price=2.10,
+        source=LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE,
+        order_id="ENTRY_RESIZE_PROTECT",
+    )
+
+    protected = asyncio.run(
+        supervisor.manage_open_position(deployment, planner.position_tracker.active_positions()[0], dry_run=False)
+    )
+
+    assert protected is not None and protected.stop_order_id == "STOP_TWO_LOTS"
+    assert manager.cancel_calls == ["STOP_ONE_LOT"]
+    assert manager.stop_quantities == [2]
+
+
+def test_reconcile_hold_keeps_stale_protection_while_resize_cancel_pending(tmp_path) -> None:
+    class PendingResizeOrderManager(StubOrderManager):
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        async def get_portfolio(self):
+            return {
+                "orders": [
+                    {
+                        "orderId": "STOP_ONE_LOT",
+                        "instrument": {"symbol": "QQQ260330P00558000", "type": "OPTION"},
+                        "side": "SELL",
+                        "openCloseIndicator": "CLOSE",
+                        "type": "STOP",
+                        "status": "PENDING_CANCEL",
+                        "quantity": "1",
+                        "filledQuantity": None,
+                        "stopPrice": "1.05",
+                    }
+                ]
+            }
+
+        async def cancel_order(self, order_id: str):
+            del order_id
+            return False, "cancel_pending:PENDING_CANCEL"
+
+        async def place_stop_loss_order(self, option_symbol: str, stop_price: float, quantity: int):
+            del option_symbol, stop_price, quantity
+            self.stop_calls += 1
+            return OrderResult(order_id="UNSAFE_DUPLICATE_STOP")
+
+    manager = PendingResizeOrderManager()
+    planner = StubPlanner()
+    planner.order_manager = manager
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(planner=planner, event_repository=repo)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_PENDING_RESIZE",
+        option_symbol="QQQ260330P00558000",
+        quantity=2,
+        entry_price=2.10,
+        source=LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE,
+        order_id="ENTRY_PENDING_RESIZE",
+    )
+
+    protected = asyncio.run(
+        supervisor.manage_open_position(deployment, planner.position_tracker.active_positions()[0], dry_run=False)
+    )
+
+    assert protected is not None and protected.stop_order_id == "STOP_ONE_LOT"
+    assert manager.stop_calls == 0
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        issues = [
+            json.loads(row[0])
+            for row in conn.execute("SELECT payload FROM events WHERE event_type = 'runtime_issue'")
+        ]
+    assert any(issue["category"] == "protection_quantity_mismatch" for issue in issues)
+
+
+def test_hard_flat_defers_partial_entry_hold_until_entry_order_terminal(tmp_path) -> None:
+    class PendingEntryCancelOrderManager(StubOrderManager):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def cancel_order(self, order_id: str):
+            del order_id
+            return False, "cancel_pending:PENDING_CANCEL"
+
+        async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+            del option_symbol, quantity, exit_mode, limit_price
+            self.close_calls += 1
+            return OrderResult(order_id="UNSAFE_HARD_FLAT")
+
+    manager = PendingEntryCancelOrderManager()
+    planner = StubPlanner()
+    planner.order_manager = manager
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(planner=planner, event_repository=repo)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_HARD_FLAT_HOLD",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.10,
+        source=LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE,
+        order_id="ENTRY_HARD_FLAT_HOLD",
+        stop_order_id="STOP_HARD_FLAT_HOLD",
+        stop_price=1.05,
+    )
+
+    plans = asyncio.run(
+        supervisor.close_due_positions(
+            {deployment.deployment_id: deployment},
+            now=datetime(2026, 7, 16, 21, 0, tzinfo=UTC),
+            dry_run=False,
+        )
+    )
+
+    assert plans == []
+    assert manager.close_calls == 0
+    assert planner.position_tracker.active_positions()[0].stop_order_id == "STOP_HARD_FLAT_HOLD"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        issues = [
+            json.loads(row[0])
+            for row in conn.execute("SELECT payload FROM events WHERE event_type = 'runtime_issue'")
+        ]
+    assert any(issue["category"] == "entry_reconcile_flatten_deferred" for issue in issues)
+
+
+def test_sync_lifecycle_does_not_close_live_position_on_zero_fill_order_conflict(tmp_path) -> None:
+    class ConflictingOrderManager(StubOrderManager):
+        async def get_order_status(self, order_id: str):
+            del order_id
+            return "CANCELLED", {"status": "CANCELLED", "filledQuantity": None}, None
+
+    planner = StubPlanner()
+    planner.order_manager = ConflictingOrderManager()
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    trade = TradeRecord(
+        trade_id="TRADE_CONFLICT",
+        deployment_id="market_impulse_qqq_short_v1",
+        symbol="QQQ",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.0,
+        status="pending_entry_reconcile",
+        entry_order_id="ENTRY_CONFLICT",
+    )
+    asyncio.run(trade_repo.upsert_trade(trade))
+    planner.position_tracker.open_position(
+        "QQQ",
+        trade.deployment_id,
+        trade_id=trade.trade_id,
+        option_symbol=trade.option_symbol,
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+        order_id=trade.entry_order_id,
+    )
+
+    asyncio.run(supervisor.sync_lifecycle())
+
+    held = asyncio.run(trade_repo.get_open_trades())[0]
+    assert held.status == "pending_entry_reconcile"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id")]
+    assert "entry_reconcile_position_order_conflict" in event_types
+    assert "entry_reconcile_released" not in event_types
 
 
 @pytest.mark.parametrize("terminal_status", ["CANCELED", "CANCELLED"])
@@ -2480,6 +2832,66 @@ def test_execution_supervisor_handles_algorithmic_exit(tmp_path) -> None:
     tracked = supervisor.planner.position_tracker.active_positions()[0]
     assert tracked.exit_order_id == "CLOSE123"
     assert tracked.exit_mode == ExitMode.STRATEGY
+
+
+def test_algorithmic_exit_blocks_while_protection_cancel_is_unconfirmed(tmp_path) -> None:
+    class PendingProtectionCancelOrderManager(StubOrderManager):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def cancel_order(self, order_id: str):
+            del order_id
+            return False, "cancel_pending:PENDING_CANCEL"
+
+        async def place_close_order(self, option_symbol, quantity, *, exit_mode, limit_price=None):
+            del option_symbol, quantity, exit_mode, limit_price
+            self.close_calls += 1
+            return OrderResult(order_id="UNSAFE_CLOSE")
+
+    manager = PendingProtectionCancelOrderManager()
+    planner = StubPlanner()
+    planner.order_manager = manager
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        trade_id="TRADE_CANCEL_PENDING",
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP_PENDING_CANCEL",
+        stop_price=1.0,
+    )
+    position = planner.position_tracker.active_positions()[0]
+    decision = ExitDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 7, 16, 15, 0, tzinfo=UTC),
+        exit=True,
+        action="square_off",
+        reason=["profile_exit"],
+        cancel_protection_orders=True,
+    )
+
+    plan = asyncio.run(supervisor.handle_exit(deployment, position, decision, dry_run=False))
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.error == "exit_cancel_confirmation_pending:cancel_pending:PENDING_CANCEL"
+    assert manager.close_calls == 0
+    tracked = planner.position_tracker.active_positions()[0]
+    assert tracked.stop_order_id == "STOP_PENDING_CANCEL"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id")]
+    assert "exit_cancel_confirmation_blocked" in event_types
+    assert "exit_submission" not in event_types
 
 
 def test_execution_supervisor_closes_filled_pending_exit(tmp_path) -> None:
@@ -3615,6 +4027,49 @@ class ReconciledDeadStatusOrderManager(StubOrderManager):
         return True, None
 
 
+def test_exit_reprice_blocks_after_cancel_ack_while_order_is_pending_cancel(tmp_path) -> None:
+    class PendingCancelOrderManager(ReconciledDeadStatusOrderManager):
+        async def get_order_status(self, order_id):
+            del order_id
+            return (
+                "PENDING_CANCEL",
+                {
+                    "orderId": "DEAD_1",
+                    "status": "PENDING_CANCEL",
+                    "quantity": "1",
+                    "filledQuantity": None,
+                },
+                None,
+            )
+
+    manager = PendingCancelOrderManager(placed_quantity=1, filled_quantity=None)
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(manager),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, quantity=1)
+
+    plans = asyncio.run(supervisor.manage_pending_exits({deployment.deployment_id: deployment}))
+
+    assert plans == []
+    assert manager.close_orders == []
+    assert supervisor.planner.position_tracker.active_positions()[0].exit_order_id == "DEAD_1"
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        blocked = [
+            json.loads(row[0])
+            for row in conn.execute(
+                "SELECT payload FROM events WHERE event_type = 'exit_reprice_blocked'"
+            ).fetchall()
+        ]
+    assert len(blocked) == 1
+    assert blocked[0]["status"] == "PENDING_CANCEL"
+
+
 def _seed_exit_pending_dead_order(supervisor, trade_repo, deployment, *, quantity, trade_id="TRADE_RECON"):
     """Seed an exit_pending trade + tracked position whose resting exit order
     is DEAD_1 (mirrors the auditor's harness)."""
@@ -4504,6 +4959,56 @@ def test_execution_supervisor_virtual_target_activation_allows_ambiguous_cancel(
     assert managed.target_order_id == "TARGET123"
     assert ("cancel", "STOP123") in order_manager.calls
     assert ("place_target", 3.35) in order_manager.calls
+
+
+def test_public_virtual_target_waits_for_confirmed_stop_cancel(tmp_path) -> None:
+    class ConfirmRequiredOrderManager(RecordingOrderManager):
+        allows_exit_submission_before_cancel_confirmation = False
+
+    order_manager = ConfirmRequiredOrderManager(quote_bid=3.30, cancel_success=False)
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager),
+        event_repository=repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+    )
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "exit": base.exit.model_copy(
+                update={
+                    "use_profit_target": True,
+                    "profit_target_multiple": 1.5,
+                    "target_approach_offset_pct": 0.02,
+                }
+            )
+        }
+    )
+    supervisor.planner.position_tracker.open_position(
+        "QQQ",
+        deployment.deployment_id,
+        option_symbol="QQQ260401P00556000",
+        quantity=1,
+        entry_price=2.0,
+        source="live_open",
+        stop_order_id="STOP123",
+        stop_price=1.1,
+        target_price=3.35,
+    )
+
+    managed = asyncio.run(
+        supervisor.manage_open_position(
+            deployment,
+            supervisor.planner.position_tracker.active_positions()[0],
+            dry_run=False,
+        )
+    )
+
+    assert managed is not None
+    assert managed.stop_order_id == "STOP123"
+    assert managed.target_order_id is None
+    assert ("cancel", "STOP123") in order_manager.calls
+    assert ("place_target", 3.35) not in order_manager.calls
 
 
 def test_execution_supervisor_restores_stop_after_virtual_target_pullback(tmp_path) -> None:

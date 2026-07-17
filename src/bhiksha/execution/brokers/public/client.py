@@ -118,13 +118,16 @@ class PublicApiClient:
                 return {}
             return response.json()
         except httpx.HTTPStatusError:
-            logger.error(
-                "Public API {} {} failed with status {} body={}",
-                method,
-                endpoint,
-                response.status_code,
-                self._response_body_excerpt(response),
-            )
+            if method == "GET" and response.status_code == 404 and "/order/" in endpoint:
+                logger.debug("Public order not indexed yet endpoint={}", endpoint)
+            else:
+                logger.error(
+                    "Public API {} {} failed with status {} body={}",
+                    method,
+                    endpoint,
+                    response.status_code,
+                    self._response_body_excerpt(response),
+                )
             raise
 
     @staticmethod

@@ -37,3 +37,18 @@ def test_handle_response_logs_error_body_on_rejection() -> None:
 
     assert any("stop price below minimum tick" in line for line in captured)
     assert any("status 400" in line for line in captured)
+
+
+def test_order_get_404_is_expected_indexing_lag_not_error_log() -> None:
+    client = PublicApiClient.__new__(PublicApiClient)
+    request = httpx.Request("GET", "https://api.public.com/userapigateway/trading/ACCT/order/OID")
+    response = httpx.Response(status_code=404, request=request, text="")
+    captured: list[str] = []
+    sink_id = logger.add(lambda message: captured.append(str(message)), level="ERROR")
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(PublicApiClient._handle_response(client, "GET", "/trading/ACCT/order/OID", response))
+    finally:
+        logger.remove(sink_id)
+
+    assert captured == []

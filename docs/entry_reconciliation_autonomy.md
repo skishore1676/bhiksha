@@ -70,14 +70,34 @@ The alert is actionable and explicit: the listed deployment is blocked, no
 duplicate entry will be placed, and Public order state must be verified before
 manual release or retry. The same order fingerprint is not re-alerted.
 
-## Public.com Follow-Up
+## Public.com Order Contract Audit - 2026-07-16
 
-No new broker-state inference is introduced by this change. A second audit
-should map Public.com's website and API order states, cancellation transitions,
-partial-fill presentation, history latency, and portfolio/order consistency.
-Only then should Bhiksha consider shortening holds through additional broker
-corroboration. Any such change is a money-path change and requires the normal
-multi-round adversarial audit before deployment.
+The follow-up audit used Public's official Get order, Cancel order, Portfolio
+v2, History, Place order, and Replace order documentation, then compared those
+contracts with the real AMD/NVDA payloads retained on oldmac.
+
+The API is the automation source of truth; the website is an operator projection
+of the same asynchronous lifecycle. The resulting rules are:
+
+- DELETE 200 means cancellation requested, not canceled. GET order must confirm
+  terminal state before any replacement or protection handoff.
+- GET order 404 can be indexing lag while the order is already in the market.
+  It keeps the reconciliation hold active.
+- Portfolio v2 corroborates visible positions and open orders, but absence from
+  one snapshot never proves no fill.
+- A visible partial position does not release `pending_entry_reconcile` while
+  its entry order remains nonterminal. Bhiksha protects the observed quantity
+  and keeps polling the order. It uses the fail-closed
+  `live_entry_reconcile_hold` source, so target/profile exits and hard-flat
+  submission wait for terminal entry-order truth.
+- Pending cancel/replace orders remain attached during position reconciliation,
+  preventing duplicate stop or target submission.
+- If the observed position quantity grows after protection was armed, Bhiksha
+  compares it with the resting close order's remaining quantity. It resizes
+  protection only after the old order is confirmed dead; a pending cancel keeps
+  the old order attached and raises a runtime issue instead of duplicating it.
+- Public's asynchronous replace endpoint is not adopted yet. It becomes a good
+  option only after replacement-chain identity and replay are durable.
 
 ## Release Audit - 2026-07-16
 
@@ -108,3 +128,21 @@ Verification:
 - read-only replay against the 2026-07-16 oldmac database snapshot: GREEN,
   zero live trades, zero live open positions, two `released_no_fill`
   recoveries (AMD and NVDA), and no human attention required.
+
+## Public Order Contract Hardening - 2026-07-16
+
+Three adversarial passes followed the official-contract implementation:
+
+1. Preserved the original submitted order quantity while a partial portfolio
+   position remains on hold; otherwise a later residual fill could exceed the
+   rewritten denominator and remain unresolved forever.
+2. Added the fail-closed `live_entry_reconcile_hold` source and quantity-aware
+   protection repair, so targets/exits cannot race a residual entry and a stop
+   is resized only after confirmed cancellation.
+3. Audited emergency and target handoffs. Hard-flat defers while the entry is
+   nonterminal, and Public target activation no longer uses cancel-request
+   acceptance as permission to submit.
+
+Final verification: focused broker/reconciliation suite 147 passed; full suite
+935 passed; Python compile and `git diff --check` clean. Ruff remains unavailable
+in the installed environment.

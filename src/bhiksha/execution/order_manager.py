@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
@@ -15,8 +16,13 @@ from loguru import logger
 
 from bhiksha.domain.enums import ExitMode
 from bhiksha.execution.brokers.public.adapter import PublicBrokerAdapter
+from bhiksha.execution.brokers.public.order_status import (
+    PUBLIC_DEAD_ORDER_STATUSES,
+    public_order_confirmed_dead_unfilled,
+)
 
 DEFAULT_OPTION_TICK_INCREMENT = 0.05
+CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
 
 
 def round_price(value: float) -> float:
@@ -98,7 +104,7 @@ class OrderManager:
     """Minimal Public order manager for Day 1 single-leg options."""
 
     supports_concurrent_exit_orders = False
-    allows_exit_submission_before_cancel_confirmation = True
+    allows_exit_submission_before_cancel_confirmation = False
 
     def __init__(
         self,
@@ -276,15 +282,48 @@ class OrderManager:
         try:
             payload = await self.broker.get_order(order_id)
             return payload.get("status"), payload, None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None, None, "order_not_indexed_yet"
+            return None, None, str(exc)
         except Exception as exc:
             return None, None, str(exc)
 
     async def cancel_order(self, order_id: str) -> tuple[bool, str | None]:
+        """Request cancellation and confirm the order is terminal and unfilled.
+
+        Public's DELETE response acknowledges only an asynchronous cancellation
+        request. Callers use the boolean to decide whether a replacement or
+        closing order may be submitted, so it must represent final broker truth,
+        not HTTP request acceptance.
+        """
+        request_error: str | None = None
         try:
             await self.broker.cancel_order(order_id)
-            return True, None
         except Exception as exc:
-            return False, str(exc)
+            request_error = str(exc)
+
+        try:
+            status, payload, status_error = await asyncio.wait_for(
+                self.get_order_status(order_id),
+                timeout=CANCEL_STATUS_READBACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            status, payload, status_error = None, None, "cancel_status_readback_timeout"
+
+        if public_order_confirmed_dead_unfilled(status, payload):
+            return True, None
+
+        normalized = str(status or (payload or {}).get("status") or "").upper()
+        if normalized in PUBLIC_DEAD_ORDER_STATUSES:
+            reason = f"cancel_terminal_with_fill_or_ambiguous_quantity:{normalized}"
+        elif normalized:
+            reason = f"cancel_pending:{normalized}"
+        else:
+            reason = status_error or "cancel_status_unavailable"
+        if request_error:
+            reason = f"cancel_request_error:{request_error};{reason}"
+        return False, reason
 
     async def wait_for_fill(
         self,

@@ -8,8 +8,9 @@ from typing import Iterable
 
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.models import TradeRecord
+from bhiksha.execution.brokers.public.order_status import PUBLIC_WORKING_ORDER_STATUSES
 from bhiksha.execution.order_manager import normalize_option_symbol
-from bhiksha.state.position_tracker import TrackedPosition
+from bhiksha.state.position_tracker import LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE, TrackedPosition
 
 _OPTION_ROOT_RE = re.compile(r"^([A-Z]+)")
 _RECOVERY_MATCH_WINDOW = timedelta(hours=6)
@@ -65,7 +66,8 @@ def reconcile_public_positions(
             continue
         option_symbol = normalize_option_symbol(str(instrument.get("symbol", "")))
         symbol = _parse_option_root(option_symbol)
-        stop_order = stop_orders_by_symbol.get(option_symbol) or {}
+        observed_stop_order = stop_orders_by_symbol.get(option_symbol) or {}
+        stop_order = observed_stop_order
         limit_order = limit_orders_by_symbol.get(option_symbol) or {}
         broker_opened_at = _parse_opened_at(position)
         broker_entry_price = _parse_entry_price(position)
@@ -99,7 +101,11 @@ def reconcile_public_positions(
             # CLOSED trade record (record/broker divergence — not a position the
             # profile route should own).
             if _is_live_entry_order_id(matched_trade.entry_order_id) and matched_trade.status != "closed":
-                source = "live_open"
+                source = (
+                    LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE
+                    if matched_trade.status == "pending_entry_reconcile"
+                    else "live_open"
+                )
         else:
             symbol_deployments = deployments_by_symbol.get(symbol, [])
             if len(symbol_deployments) == 1:
@@ -119,6 +125,12 @@ def reconcile_public_positions(
         quantity = _parse_quantity(position)
         if quantity <= 0:
             continue
+        if stop_order and stop_order.get("remaining_quantity") != quantity:
+            # Leave mismatched/unknown protection unattached so the runtime's
+            # missing-protection pass can confirm-cancel and resize it. The
+            # broker order remains discoverable through Portfolio v2; no
+            # duplicate is submitted while cancellation is ambiguous.
+            stop_order = {}
         exit_order: dict[str, float | str] = {}
         target_order: dict[str, float | str] = {}
         if matched_trade is not None and matched_trade.status == "exit_pending":
@@ -137,8 +149,18 @@ def reconcile_public_positions(
                 entry_timestamp=entry_timestamp,
                 source=source,
                 order_id=matched_trade.entry_order_id if matched_trade is not None else None,
-                stop_order_id=stop_order.get("order_id") or (matched_trade.stop_order_id if matched_trade is not None else None),
-                stop_price=stop_order.get("price") or (matched_trade.stop_price if matched_trade is not None else None),
+                stop_order_id=stop_order.get("order_id")
+                or (
+                    matched_trade.stop_order_id
+                    if matched_trade is not None and not observed_stop_order
+                    else None
+                ),
+                stop_price=stop_order.get("price")
+                or (
+                    matched_trade.stop_price
+                    if matched_trade is not None and not observed_stop_order
+                    else None
+                ),
                 target_order_id=target_order.get("order_id") or (matched_trade.target_order_id if matched_trade is not None else None),
                 target_price=target_order.get("price") or (matched_trade.target_price if matched_trade is not None else None),
                 exit_order_id=exit_order.get("order_id") or (matched_trade.exit_order_id if matched_trade is not None else None),
@@ -269,7 +291,11 @@ def _index_open_exit_orders(orders: Iterable[dict]) -> tuple[dict[str, dict[str,
         if str(order.get("side", "")).upper() != "SELL":
             continue
         status = str(order.get("status", "")).upper()
-        if status not in {"NEW", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}:
+        # Portfolio v2 is explicitly an open-order snapshot. Keep Public's
+        # asynchronous cancel/replace states attached to the position until a
+        # terminal GET readback proves they are gone; dropping PENDING_CANCEL
+        # here can make the runtime submit duplicate protection.
+        if status not in PUBLIC_WORKING_ORDER_STATUSES:
             continue
         symbol = normalize_option_symbol(str(instrument.get("symbol", "")))
         order_id = order.get("orderId")
@@ -280,6 +306,7 @@ def _index_open_exit_orders(orders: Iterable[dict]) -> tuple[dict[str, dict[str,
             stop_indexed[symbol] = {
                 "order_id": str(order_id),
                 "price": _maybe_float(order.get("stopPrice")),
+                "remaining_quantity": _remaining_order_quantity(order),
             }
         elif order_type == "LIMIT":
             limit_indexed[symbol] = {
@@ -295,6 +322,15 @@ def _parse_entry_price(position: dict) -> float | None:
 
 def _parse_quantity(position: dict) -> int:
     return int(float(position.get("quantity", "0") or 0))
+
+
+def _remaining_order_quantity(order: dict) -> int | None:
+    quantity = _maybe_int(order.get("quantity"))
+    raw_filled = order.get("filledQuantity")
+    filled = 0 if raw_filled is None else _maybe_int(raw_filled)
+    if quantity is None or filled is None or quantity < 0 or filled < 0 or filled > quantity:
+        return None
+    return quantity - filled
 
 
 def _parse_opened_at(position: dict) -> datetime | None:
@@ -331,5 +367,14 @@ def _maybe_float(value) -> float | None:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
     except (TypeError, ValueError):
         return None

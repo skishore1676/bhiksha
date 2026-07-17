@@ -63,10 +63,38 @@ def inspect_reconciliation_state(
             """,
             (RECONCILIATION_HOLD_STATUS,),
         ).fetchall()
+        events: list[dict[str, Any]] = []
+        active_trade_ids = {str(row["trade_id"]) for row in rows}
+        if active_trade_ids and "events" in tables:
+            event_types = (RECONCILIATION_START_EVENT, *sorted(RECONCILIATION_RECOVERY_EVENTS))
+            placeholders = ",".join("?" for _ in event_types)
+            event_rows = conn.execute(
+                f"""
+                SELECT created_at, event_type, payload
+                FROM events
+                WHERE event_type IN ({placeholders})
+                ORDER BY created_at ASC, id ASC
+                """,
+                event_types,
+            ).fetchall()
+            for event_row in event_rows:
+                try:
+                    payload = json.loads(event_row["payload"])
+                except (TypeError, ValueError):
+                    continue
+                if str(payload.get("trade_id") or "") not in active_trade_ids:
+                    continue
+                events.append(
+                    {
+                        "created_at": event_row["created_at"],
+                        "event_type": event_row["event_type"],
+                        "payload": payload,
+                    }
+                )
 
     return summarize_reconciliation_state(
         [dict(row) for row in rows],
-        events=[],
+        events=events,
         now=observed_at,
         attention_after_seconds=attention_after_seconds,
     )

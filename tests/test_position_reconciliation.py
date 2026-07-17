@@ -64,6 +64,8 @@ def test_reconcile_public_positions_attaches_open_stop_order() -> None:
             "type": "STOP",
             "side": "SELL",
             "status": "NEW",
+            "quantity": "1",
+            "filledQuantity": None,
         }
     ]
 
@@ -71,6 +73,59 @@ def test_reconcile_public_positions_attaches_open_stop_order() -> None:
 
     assert len(tracked) == 1
     assert tracked[0].stop_order_id == "STOP123"
+
+
+def test_reconcile_keeps_async_cancel_and_replace_orders_attached() -> None:
+    deployments = _historical_enabled_deployments()
+    positions = [
+        {
+            "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+            "quantity": "1.0",
+        }
+    ]
+
+    for status in ("PENDING_CANCEL", "PENDING_REPLACE", "QUEUED_CANCELLED"):
+        orders = [
+            {
+                "orderId": f"STOP-{status}",
+                "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+                "type": "STOP",
+                "side": "SELL",
+                "status": status,
+                "quantity": "1",
+                "filledQuantity": None,
+            }
+        ]
+
+        tracked = reconcile_public_positions(positions, deployments, orders=orders)
+
+        assert tracked[0].stop_order_id == f"STOP-{status}"
+
+
+def test_reconcile_leaves_mismatched_stop_unattached_for_quantity_repair() -> None:
+    deployments = _historical_enabled_deployments()
+    positions = [
+        {
+            "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+            "quantity": "2.0",
+        }
+    ]
+    orders = [
+        {
+            "orderId": "STOP_ONE_LOT",
+            "instrument": {"symbol": "QQQ260401P00556000", "type": "OPTION"},
+            "type": "STOP",
+            "side": "SELL",
+            "status": "NEW",
+            "quantity": "1",
+            "filledQuantity": None,
+        }
+    ]
+
+    tracked = reconcile_public_positions(positions, deployments, orders=orders)
+
+    assert tracked[0].quantity == 2
+    assert tracked[0].stop_order_id is None
 
 
 def test_reconcile_public_positions_attaches_entry_and_target_metadata() -> None:
@@ -355,6 +410,19 @@ def test_reconcile_matched_open_live_trade_keeps_live_source() -> None:
         position_source=tracked[0].source,
         runtime_mode="live_approval_gated",
     )
+
+
+def test_reconcile_pending_entry_hold_uses_fail_closed_live_source() -> None:
+    from bhiksha.state.position_tracker import LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE
+
+    positions, deployments, known_trades = _matched_open_trade_fixture(
+        "a1b2c3d4-real-order",
+        status="pending_entry_reconcile",
+    )
+
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+
+    assert tracked[0].source == LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE
 
 
 def test_reconcile_matched_paper_entry_stays_broker_sync() -> None:
