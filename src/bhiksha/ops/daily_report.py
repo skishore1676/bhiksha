@@ -16,6 +16,10 @@ from bhiksha.ops.reconciliation_supervision import (
     RECONCILIATION_HOLD_STATUS,
     summarize_reconciliation_state,
 )
+from bhiksha.ops.provider_reconciliation_health import (
+    empty_provider_reconciliation,
+    summarize_provider_reconciliation,
+)
 
 if TYPE_CHECKING:
     from bhiksha.config.models import DeploymentManifest
@@ -183,9 +187,20 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"- live realized P&L: `{_summary_pnl_text(summary, 'live')}`",
         f"- shadow realized P&L: `{_summary_pnl_text(summary, 'shadow')}`",
         f"- total realized P&L: `{_summary_pnl_text(summary, 'total')}`",
-        f"- reconciliation warnings: `{provider.get('warning_count', 0)}`",
-        f"- reconciliation degraded: `{provider.get('degraded_count', 0)}`",
-        f"- reconciliation blocking: `{provider.get('blocking_count', 0)}`",
+        f"- provider reconciliation state: `{provider.get('state', 'healthy')}`",
+        (
+            "- active provider reconciliation: "
+            f"`warn {provider.get('active_warning_count', 0)}, "
+            f"degraded {provider.get('active_degraded_count', 0)}, "
+            f"blocking {provider.get('active_blocking_count', 0)}`"
+        ),
+        (
+            "- observed provider reconciliation: "
+            f"`warn {provider.get('warning_count', 0)}, "
+            f"degraded {provider.get('degraded_count', 0)}, "
+            f"blocking {provider.get('blocking_count', 0)}, "
+            f"recovered {provider.get('recovered_count', 0)}`"
+        ),
         (
             "- entry reconciliation: "
             f"`recovered {entry_reconciliation.get('recovered_count', 0)}, "
@@ -450,9 +465,12 @@ def render_daily_report_telegram_summary(
         ),
         (
             "- Reconciliation: "
-            f"warn {provider.get('warning_count', 0)}, "
-            f"degraded {provider.get('degraded_count', 0)}, "
-            f"blocking {provider.get('blocking_count', 0)}"
+            f"{provider.get('state', 'healthy')}; "
+            f"active warn {provider.get('active_warning_count', 0)}, "
+            f"degraded {provider.get('active_degraded_count', 0)}, "
+            f"blocking {provider.get('active_blocking_count', 0)}; "
+            f"observed warn {provider.get('warning_count', 0)}, "
+            f"recovered {provider.get('recovered_count', 0)}"
         ),
         (
             "- Entry holds: "
@@ -629,7 +647,7 @@ def _empty_report(day: date) -> dict[str, Any]:
         "entry_profile_comparison": [],
         "relaxed_evidence_lanes": [],
         "risk_rails": None,
-        "status": {"level": "NO_DATA", "reason": "db_missing"},
+        "status": {"level": "NO_DATA", "reason": "db_missing", "attention_required": True},
     }
 
 
@@ -999,35 +1017,11 @@ def _exit_attribution(trade: dict[str, Any]) -> str | None:
 
 
 def _provider_events(events: list[dict[str, Any]]) -> dict[str, Any]:
-    reconciliation_events = [
-        event for event in events if event["event_type"] in {"reconciliation_health", "runtime_issue"}
-        and (
-            event["event_type"] == "reconciliation_health"
-            or (event.get("payload") or {}).get("stage") == "reconciliation"
-        )
-    ]
-    severity_counts = Counter(str((event["payload"] or {}).get("severity") or "runtime_issue") for event in reconciliation_events)
-    return {
-        **_empty_reconciliation(),
-        "warning_count": severity_counts.get("warning", 0),
-        "degraded_count": severity_counts.get("degraded", 0),
-        "blocking_count": severity_counts.get("blocking", 0),
-        "runtime_issue_count": severity_counts.get("runtime_issue", 0),
-        "events": [
-            {
-                "created_at": event["created_at"],
-                "event_type": event["event_type"],
-                "severity": (event["payload"] or {}).get("severity"),
-                "reason": (event["payload"] or {}).get("reason"),
-                "error": (event["payload"] or {}).get("error"),
-            }
-            for event in reconciliation_events[-10:]
-        ],
-    }
+    return summarize_provider_reconciliation(events)
 
 
 def _empty_reconciliation() -> dict[str, Any]:
-    return {"warning_count": 0, "degraded_count": 0, "blocking_count": 0, "runtime_issue_count": 0, "events": []}
+    return empty_provider_reconciliation()
 
 
 def _lifecycle_events(events: list[dict[str, Any]]) -> dict[str, int]:
@@ -1219,26 +1213,30 @@ def _report_status(
     runtime_issue_counts: dict[str, int] | None = None,
     open_positions: list[dict[str, Any]] | None = None,
     entry_reconciliation: dict[str, Any] | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     if any(
         str(position.get("lane") or "").lower() == "live"
         and position.get("protection_state") == "unprotected"
         for position in (open_positions or [])
     ):
-        return {"level": "RED", "reason": "live_open_unprotected"}
+        return {"level": "RED", "reason": "live_open_unprotected", "attention_required": True}
     if (runtime_issue_counts or {}).get("dead_lane", 0) > 0:
-        return {"level": "RED", "reason": "dead_live_lane"}
+        return {"level": "RED", "reason": "dead_live_lane", "attention_required": True}
     if (entry_reconciliation or {}).get("attention_required"):
-        return {"level": "RED", "reason": "stale_entry_reconciliation_hold"}
-    if provider_events.get("blocking_count", 0) > 0:
-        return {"level": "RED", "reason": "blocking_reconciliation_failure"}
-    if provider_events.get("degraded_count", 0) > 0:
-        return {"level": "YELLOW", "reason": "degraded_reconciliation"}
+        return {"level": "RED", "reason": "stale_entry_reconciliation_hold", "attention_required": True}
+    if provider_events.get("attention_required"):
+        return {"level": "RED", "reason": "reconciliation_recovery_exhausted", "attention_required": True}
+    if provider_events.get("active_blocking_count", 0) > 0:
+        return {"level": "RED", "reason": "blocking_reconciliation_failure", "attention_required": True}
+    if provider_events.get("active_degraded_count", 0) > 0:
+        return {"level": "YELLOW", "reason": "degraded_reconciliation", "attention_required": False}
     if data_quality_warnings:
-        return {"level": "YELLOW", "reason": "data_quality_warning"}
-    if provider_events.get("warning_count", 0) > 0 or provider_events.get("runtime_issue_count", 0) > 0:
-        return {"level": "YELLOW", "reason": "provider_warning"}
-    return {"level": "GREEN", "reason": "ok"}
+        return {"level": "YELLOW", "reason": "data_quality_warning", "attention_required": False}
+    if provider_events.get("active_warning_count", 0) > 0 or provider_events.get(
+        "active_runtime_issue_count", 0
+    ) > 0:
+        return {"level": "YELLOW", "reason": "provider_warning", "attention_required": False}
+    return {"level": "GREEN", "reason": "ok", "attention_required": False}
 
 
 def _is_shadow_trade(trade: dict[str, Any]) -> bool:

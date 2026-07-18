@@ -105,9 +105,14 @@ class ReconciliationSnapshot:
     last_synced_at: datetime | None = None
     last_attempt_at: datetime | None = None
     last_success_at: datetime | None = None
+    first_failure_at: datetime | None = None
     last_error: str | None = None
     consecutive_failures: int = 0
+    attention_required: bool = False
     signature: str = ""
+
+
+PROVIDER_RECONCILIATION_ATTENTION_AFTER_SECONDS = 300
 
 
 @dataclass(slots=True)
@@ -1391,9 +1396,13 @@ class BhikshaRuntime:
             async with sync_lock:
                 reconciliation_snapshot.last_error = str(exc)
                 reconciliation_snapshot.consecutive_failures += 1
+                if reconciliation_snapshot.first_failure_at is None:
+                    reconciliation_snapshot.first_failure_at = now
                 consecutive_failures = reconciliation_snapshot.consecutive_failures
+                first_failure_at = reconciliation_snapshot.first_failure_at
                 last_success_at = reconciliation_snapshot.last_success_at
                 live_position_count = _live_reconciliation_position_count(reconciliation_snapshot.positions)
+                failure_age_seconds = max(0.0, (now - first_failure_at).total_seconds())
             severity = _reconciliation_failure_severity(
                 reason=reason,
                 consecutive_failures=consecutive_failures,
@@ -1402,6 +1411,12 @@ class BhikshaRuntime:
                 now=now,
                 max_staleness_seconds=self.app_config.reconciliation_max_staleness_seconds,
             )
+            attention_required = (
+                severity == "blocking"
+                or failure_age_seconds >= PROVIDER_RECONCILIATION_ATTENTION_AFTER_SECONDS
+            )
+            async with sync_lock:
+                reconciliation_snapshot.attention_required = attention_required
             payload = {
                 "category": classify_runtime_issue_category(error=str(exc), event_type="reconciliation"),
                 "symbol": "ALL",
@@ -1409,7 +1424,12 @@ class BhikshaRuntime:
                 "stage": "reconciliation",
                 "reason": reason,
                 "severity": severity,
+                "recovery_state": "needs_human" if attention_required else "self_healing",
+                "attention_required": attention_required,
                 "consecutive_failures": consecutive_failures,
+                "first_failure_at": first_failure_at.isoformat(),
+                "failure_age_seconds": round(failure_age_seconds, 3),
+                "attention_after_seconds": PROVIDER_RECONCILIATION_ATTENTION_AFTER_SECONDS,
                 "live_position_count": live_position_count,
                 "last_success_at": last_success_at.isoformat() if last_success_at is not None else None,
             }
@@ -1437,7 +1457,12 @@ class BhikshaRuntime:
             else:
                 output(f"RECONCILIATION_WARNING reason={reason} failures={consecutive_failures} error={exc}")
             return
+        recovered_at = datetime.now(UTC)
         async with sync_lock:
+            recovered_failure_count = reconciliation_snapshot.consecutive_failures
+            recovered_first_failure_at = reconciliation_snapshot.first_failure_at
+            recovered_last_error = reconciliation_snapshot.last_error
+            attention_was_required = reconciliation_snapshot.attention_required
             tracker_positions = _preserve_newer_pending_exit_state(
                 tracker_positions,
                 supervisor.planner.position_tracker.active_positions(),
@@ -1449,13 +1474,48 @@ class BhikshaRuntime:
             # reconciliation pass so the reprotection sweep below arms a stop.
             tracker_positions = supervisor.planner.position_tracker.active_positions()
             reconciliation_snapshot.positions = list(tracker_positions)
-            reconciliation_snapshot.last_success_at = datetime.now(UTC)
+            reconciliation_snapshot.last_success_at = recovered_at
             reconciliation_snapshot.last_synced_at = reconciliation_snapshot.last_success_at
+            reconciliation_snapshot.first_failure_at = None
             reconciliation_snapshot.last_error = None
             reconciliation_snapshot.consecutive_failures = 0
+            reconciliation_snapshot.attention_required = False
             reconciliation_snapshot.signature = ",".join(
                 f"{position.deployment_id}:{position.option_symbol}:{position.quantity}"
                 for position in tracker_positions
+            )
+        if recovered_failure_count > 0:
+            duration_seconds = (
+                max(0.0, (recovered_at - recovered_first_failure_at).total_seconds())
+                if recovered_first_failure_at is not None
+                else None
+            )
+            await _append_event_best_effort(
+                supervisor.event_repository,
+                "reconciliation_recovered",
+                {
+                    "stage": "reconciliation",
+                    "reason": reason,
+                    "severity": "recovered",
+                    "recovery_state": "recovered",
+                    "attention_required": False,
+                    "attention_was_required": attention_was_required,
+                    "attempt_count": recovered_failure_count,
+                    "first_failure_at": (
+                        recovered_first_failure_at.isoformat()
+                        if recovered_first_failure_at is not None
+                        else None
+                    ),
+                    "recovered_at": recovered_at.isoformat(),
+                    "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
+                    "last_error": recovered_last_error,
+                },
+                output=output,
+            )
+            output(
+                "RECONCILIATION_RECOVERED "
+                f"reason={reason} attempts={recovered_failure_count} "
+                f"duration_seconds={round(duration_seconds, 3) if duration_seconds is not None else 'unknown'}"
             )
         deployments_by_id = {deployment.deployment_id: deployment for deployment in self.enabled_deployments}
         for position in tracker_positions:

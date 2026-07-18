@@ -15,6 +15,7 @@ import sqlite3
 from typing import Any, Callable
 
 from bhiksha.ops.alerts import AlertMode, AlertResult, send_lathi_alert
+from bhiksha.ops.provider_reconciliation_health import inspect_provider_reconciliation
 
 
 ATTENTION_AFTER_SECONDS = 300
@@ -199,16 +200,34 @@ def run_reconciliation_supervisor(
     alert_sender: Callable[..., AlertResult] = send_lathi_alert,
 ) -> dict[str, Any]:
     observed_at = _as_utc(now or datetime.now(UTC))
-    summary = inspect_reconciliation_state(
+    entry_summary = inspect_reconciliation_state(
         db_path,
         now=observed_at,
         attention_after_seconds=attention_after_seconds,
     )
+    provider_summary = inspect_provider_reconciliation(db_path)
+    entry_attention_required = bool(entry_summary.get("attention_required"))
+    provider_attention_required = bool(provider_summary.get("attention_required"))
+    summary = {
+        **entry_summary,
+        "entry_attention_required": entry_attention_required,
+        "provider_reconciliation": provider_summary,
+        "attention_required": entry_attention_required or provider_attention_required,
+        "state": (
+            "needs_human"
+            if entry_attention_required or provider_attention_required
+            else entry_summary.get("state")
+            if entry_summary.get("state") != "healthy"
+            else provider_summary.get("state") or "healthy"
+        ),
+    }
     target_dir = Path(receipt_dir)
     latest_path = target_dir / "latest.json"
     previous = _read_json(latest_path)
     previous_alert_open = bool(previous.get("alert_open"))
     current_attention_keys = _attention_keys(summary.get("active_holds") or [])
+    if provider_attention_required:
+        current_attention_keys.add("provider_reconciliation:public_portfolio")
     previous_alerted_keys = {
         str(key) for key in (previous.get("alerted_attention_keys") or []) if str(key)
     }
@@ -226,7 +245,7 @@ def run_reconciliation_supervisor(
     if summary["attention_required"]:
         if new_attention_keys:
             alert = alert_sender(
-                title="Bhiksha entry reconciliation needs help",
+                title="Bhiksha reconciliation needs help",
                 body=_attention_body(summary),
                 level="error",
                 mode=alert_mode,
@@ -242,8 +261,11 @@ def run_reconciliation_supervisor(
         alert_open = previous_alert_open or bool(alerted_attention_keys)
     elif previous_alert_open:
         alert = alert_sender(
-            title="Bhiksha entry reconciliation recovered",
-            body="The previously escalated entry reconciliation hold is clear. Affected lanes are no longer blocked by that hold.",
+            title="Bhiksha reconciliation recovered",
+            body=(
+                "The previously escalated reconciliation condition is clear. "
+                "Affected lanes are no longer blocked by that condition."
+            ),
             level="info",
             mode=alert_mode,
             profile=alert_profile,
@@ -275,10 +297,26 @@ def run_reconciliation_supervisor(
 
 def _attention_body(summary: dict[str, Any]) -> str:
     lines = [
-        "Bhiksha exhausted its automatic entry-reconciliation window.",
-        "Affected deployments remain fail-closed; no duplicate entry will be submitted.",
+        "Bhiksha exhausted an automatic reconciliation window.",
+        "Affected live-entry scope remains fail-closed while broker truth is unresolved.",
         "",
     ]
+    provider = summary.get("provider_reconciliation") or {}
+    if provider.get("attention_required"):
+        failure = provider.get("last_failure") or {}
+        lines.extend(
+            [
+                "Provider portfolio reconciliation:",
+                (
+                    f"- failures={failure.get('consecutive_failures') or '?'} "
+                    f"age={failure.get('failure_age_seconds') or '?'}s "
+                    f"error={failure.get('error') or 'unknown'}"
+                ),
+                "",
+            ]
+        )
+    if summary.get("active_holds"):
+        lines.append("Entry-order holds:")
     for hold in (summary.get("active_holds") or []):
         if not hold.get("human_action_required"):
             continue
@@ -288,7 +326,13 @@ def _attention_body(summary: dict[str, Any]) -> str:
             f"- {hold.get('symbol')} / {hold.get('deployment_id')}: order {hold.get('entry_order_id')}, "
             f"hold age {age_text}; deployment blocked"
         )
-    lines.extend(["", "Required: verify the listed order state in Public before manually releasing or retrying the lane."])
+    lines.append("")
+    if provider.get("attention_required"):
+        lines.append("Required: verify Public portfolio access and account/session state before the next live entry.")
+    if any(hold.get("human_action_required") for hold in summary.get("active_holds") or []):
+        lines.append(
+            "Required: verify the listed order state in Public before manually releasing or retrying the lane."
+        )
     return "\n".join(lines)
 
 

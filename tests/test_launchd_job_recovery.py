@@ -7,6 +7,30 @@ from types import SimpleNamespace
 from bhiksha.tools import launchd_job
 
 
+def test_report_warning_without_attention_uses_normal_receipt_level() -> None:
+    assert launchd_job._alert_level_for_report(
+        {
+            "status": {
+                "level": "YELLOW",
+                "reason": "degraded_reconciliation",
+                "attention_required": False,
+            }
+        }
+    ) == "info"
+
+
+def test_report_attention_uses_error_level() -> None:
+    assert launchd_job._alert_level_for_report(
+        {
+            "status": {
+                "level": "RED",
+                "reason": "reconciliation_recovery_exhausted",
+                "attention_required": True,
+            }
+        }
+    ) == "error"
+
+
 def test_live_watchdog_requests_fresh_plan_before_recovery_start(
     tmp_path: Path, monkeypatch
 ) -> None:

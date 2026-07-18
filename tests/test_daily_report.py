@@ -101,7 +101,11 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
     assert report["provider_health"]["reconciliation"]["warning_count"] == 1
     assert report["lifecycle"]["target_approach_detected"] == 1
     assert report["data_quality_warnings"] == []
-    assert report["status"] == {"level": "YELLOW", "reason": "provider_warning"}
+    assert report["status"] == {
+        "level": "YELLOW",
+        "reason": "provider_warning",
+        "attention_required": False,
+    }
 
 
 def test_daily_report_summarizes_entry_profile_quote_comparisons(tmp_path) -> None:
@@ -191,7 +195,11 @@ def test_daily_report_marks_closed_live_trade_with_missing_exit_truth_unknown(tm
 
     assert report["trade_summary"]["live_realized_pnl_usd"] is None
     assert report["trade_summary"]["live_missing_exit_truth_count"] == 1
-    assert report["status"] == {"level": "YELLOW", "reason": "data_quality_warning"}
+    assert report["status"] == {
+        "level": "YELLOW",
+        "reason": "data_quality_warning",
+        "attention_required": False,
+    }
     assert report["data_quality_warnings"][0]["category"] == "live_exit_truth_missing"
     markdown = render_daily_report_markdown(report)
     telegram = render_daily_report_telegram_summary(report)
@@ -278,7 +286,11 @@ def test_daily_report_flags_only_implausible_underlying_to_strike_ratio(tmp_path
 
     assert [warning["trade_id"] for warning in report["data_quality_warnings"]] == ["bad-scale"]
     assert report["data_quality_warnings"][0]["message"].startswith("underlying entry price is far from option strike")
-    assert report["status"] == {"level": "YELLOW", "reason": "data_quality_warning"}
+    assert report["status"] == {
+        "level": "YELLOW",
+        "reason": "data_quality_warning",
+        "attention_required": False,
+    }
 
 
 def test_daily_report_writes_json_and_markdown(tmp_path) -> None:
@@ -495,14 +507,14 @@ def test_report_status_escalates_dead_lane_to_red() -> None:
         data_quality_warnings=[],
         runtime_issue_counts={"dead_lane": 1, "entry_selector_empty": 4},
     )
-    assert status == {"level": "RED", "reason": "dead_live_lane"}
+    assert status == {"level": "RED", "reason": "dead_live_lane", "attention_required": True}
 
     ok_status = _report_status(
         provider_events={"blocking_count": 0, "degraded_count": 0, "warning_count": 0},
         data_quality_warnings=[],
         runtime_issue_counts={},
     )
-    assert ok_status == {"level": "GREEN", "reason": "ok"}
+    assert ok_status == {"level": "GREEN", "reason": "ok", "attention_required": False}
 
 
 def test_report_status_escalates_live_unprotected_position_to_red() -> None:
@@ -515,7 +527,7 @@ def test_report_status_escalates_live_unprotected_position_to_red() -> None:
         open_positions=[{"lane": "live", "symbol": "IWM", "protection_state": "unprotected"}],
     )
 
-    assert status == {"level": "RED", "reason": "live_open_unprotected"}
+    assert status == {"level": "RED", "reason": "live_open_unprotected", "attention_required": True}
 
 
 # --------------------------------------------------------------------------- #

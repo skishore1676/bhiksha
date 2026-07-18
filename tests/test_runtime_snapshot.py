@@ -874,7 +874,55 @@ def test_runtime_reconciliation_single_periodic_failure_is_warning_only() -> Non
 
     assert [event_type for event_type, _ in supervisor.event_repository.events] == ["reconciliation_health"]
     assert supervisor.event_repository.events[0][1]["severity"] == "warning"
+    assert supervisor.event_repository.events[0][1]["recovery_state"] == "self_healing"
+    assert supervisor.event_repository.events[0][1]["attention_required"] is False
     assert output_lines[0].startswith("RECONCILIATION_WARNING ")
+
+    snapshot.first_failure_at = datetime.now(UTC) - timedelta(seconds=301)
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=StubBroker(),
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=output_lines.append,
+            reason="periodic",
+        )
+    )
+
+    assert supervisor.event_repository.events[1][0] == "reconciliation_health"
+    assert supervisor.event_repository.events[1][1]["recovery_state"] == "needs_human"
+    assert supervisor.event_repository.events[1][1]["attention_required"] is True
+    assert supervisor.event_repository.events[2][0] == "runtime_issue"
+
+    class SuccessBroker:
+        async def get_portfolio(self) -> dict:
+            return {"positions": [], "orders": []}
+
+    asyncio.run(
+        runtime._refresh_reconciliation(
+            broker=SuccessBroker(),
+            supervisor=supervisor,
+            sync_lock=asyncio.Lock(),
+            reconciliation_snapshot=snapshot,
+            output=output_lines.append,
+            reason="periodic",
+        )
+    )
+
+    assert [event_type for event_type, _ in supervisor.event_repository.events] == [
+        "reconciliation_health",
+        "reconciliation_health",
+        "runtime_issue",
+        "reconciliation_recovered",
+        "runtime_metric",
+    ]
+    assert supervisor.event_repository.events[3][1]["attempt_count"] == 2
+    assert supervisor.event_repository.events[3][1]["attention_was_required"] is True
+    assert supervisor.event_repository.events[3][1]["attention_required"] is False
+    assert snapshot.consecutive_failures == 0
+    assert snapshot.first_failure_at is None
+    assert any(line.startswith("RECONCILIATION_RECOVERED ") for line in output_lines)
 
 
 def test_runtime_reconciliation_failure_with_live_position_is_blocking_runtime_issue() -> None:

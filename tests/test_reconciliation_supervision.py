@@ -123,7 +123,10 @@ def test_supervisor_alerts_once_then_sends_one_recovery(tmp_path) -> None:
         alert_sender=fake_alert_sender,
     )
     with sqlite3.connect(db_path) as conn:
-        conn.execute("UPDATE trade_sessions SET status = 'closed', updated_at = ?", ((NOW + timedelta(minutes=2)).isoformat(),))
+        conn.execute(
+            "UPDATE trade_sessions SET status = 'closed', updated_at = ?",
+            ((NOW + timedelta(minutes=2)).isoformat(),),
+        )
         conn.commit()
     recovered = run_reconciliation_supervisor(
         db_path,
@@ -142,6 +145,68 @@ def test_supervisor_alerts_once_then_sends_one_recovery(tmp_path) -> None:
     assert "recovered" in sent[1]["title"]
     assert (receipt_dir / "latest.json").is_file()
     assert len((receipt_dir / "history.jsonl").read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_supervisor_pages_exhausted_provider_recovery_then_clears(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    receipt_dir = tmp_path / "receipts"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+
+    async def seed_failure() -> None:
+        await events.append(
+            "reconciliation_health",
+            {
+                "stage": "reconciliation",
+                "severity": "degraded",
+                "recovery_state": "needs_human",
+                "attention_required": True,
+                "consecutive_failures": 21,
+                "failure_age_seconds": 305,
+                "error": "portfolio unavailable",
+            },
+        )
+
+    asyncio.run(seed_failure())
+    sent: list[dict] = []
+
+    def fake_alert_sender(**kwargs):
+        sent.append(kwargs)
+        return AlertResult(
+            attempted=True,
+            ok=True,
+            mode=kwargs["mode"],
+            return_code=0,
+            network_call_performed=True,
+        )
+
+    first = run_reconciliation_supervisor(
+        db_path,
+        receipt_dir=receipt_dir,
+        alert_mode="live",
+        now=NOW,
+        alert_sender=fake_alert_sender,
+    )
+
+    async def seed_recovery() -> None:
+        await events.append("runtime_metric", {"metric": "portfolio_sync_ms", "value": 31.0})
+
+    asyncio.run(seed_recovery())
+    recovered = run_reconciliation_supervisor(
+        db_path,
+        receipt_dir=receipt_dir,
+        alert_mode="live",
+        now=NOW + timedelta(minutes=1),
+        alert_sender=fake_alert_sender,
+    )
+
+    assert first["provider_reconciliation"]["state"] == "needs_human"
+    assert first["alert_reason"] == "new_attention_state"
+    assert "portfolio reconciliation" in sent[0]["body"].lower()
+    assert recovered["provider_reconciliation"]["state"] == "recovered"
+    assert recovered["attention_required"] is False
+    assert recovered["alert_reason"] == "attention_cleared"
+    assert len(sent) == 2
 
 
 def test_partial_recovery_does_not_realert_surviving_hold(tmp_path) -> None:
@@ -231,7 +296,11 @@ def test_daily_report_does_not_call_entry_hold_an_open_position_or_trade(tmp_pat
     assert report["open_positions"] == []
     assert report["trades"] == []
     assert report["entry_reconciliation"]["needs_human_count"] == 1
-    assert report["status"] == {"level": "RED", "reason": "stale_entry_reconciliation_hold"}
+    assert report["status"] == {
+        "level": "RED",
+        "reason": "stale_entry_reconciliation_hold",
+        "attention_required": True,
+    }
     assert "Open positions\n- None" in telegram
     assert "NEEDS YOU - unresolved entry reconciliation: AMD" in telegram
     assert "unprotected" not in telegram.split("Open positions", 1)[1]
@@ -267,7 +336,7 @@ def test_daily_report_treats_released_zero_fill_as_recovery_not_trade(tmp_path) 
     assert report["trades"] == []
     assert report["entry_reconciliation"]["recovered_count"] == 1
     assert report["entry_reconciliation"]["recoveries"][0]["action"] == "released_no_fill"
-    assert report["status"] == {"level": "GREEN", "reason": "ok"}
+    assert report["status"] == {"level": "GREEN", "reason": "ok", "attention_required": False}
 
 
 def test_launchd_supervisor_exposes_alert_transport_at_top_level(monkeypatch, tmp_path) -> None:

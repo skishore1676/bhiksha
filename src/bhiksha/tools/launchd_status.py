@@ -16,6 +16,7 @@ from typing import Any
 
 from bhiksha.config.environment import load_dotenv
 from bhiksha.ops.launchd_registry import active_launchd_jobs, latest_status_path
+from bhiksha.ops.provider_reconciliation_health import inspect_provider_reconciliation
 
 # External callers (lathi Control Tower) kill this command at 20s
 # (LATHI_BHIKSHA_TIMEOUT_SECONDS). Keep the whole snapshot under that:
@@ -83,6 +84,7 @@ def build_status_snapshot(
     launchd = _launchd_state(deadline=deadline)
     jobs = []
     generated_at = now or datetime.now(UTC)
+    provider_reconciliation = inspect_provider_reconciliation(repo_root / "bhiksha.db")
     for spec in active_launchd_jobs():
         latest_record = latest_jobs.get(spec.runner_job) if isinstance(latest_jobs, dict) else None
         latest_payload = (latest_record or {}).get("payload") if isinstance(latest_record, dict) else None
@@ -91,6 +93,8 @@ def build_status_snapshot(
             if isinstance(latest_payload, dict) and not isinstance(latest_record, dict):
                 latest_record = {"recorded_at": _file_mtime_iso(spec.stdout_log(repo_root))}
         last = _last_job_view(latest_record, latest_payload)
+        if spec.runner_job == "session-report":
+            _apply_current_provider_health(last, provider_reconciliation)
         findings = _job_findings(last)
         job = {
                 "label": spec.label,
@@ -149,6 +153,7 @@ def build_status_snapshot(
         "runtime": runtime_status,
         "reports": {"latest": _latest_report_summary(repo_root)},
         "schwab_token_guard": {"latest": _latest_schwab_summary(repo_root)},
+        "provider_reconciliation": provider_reconciliation,
         "transport": _transport_rollup(jobs),
     }
 
@@ -391,6 +396,34 @@ def _last_job_view(latest_record: Any, latest_payload: dict[str, Any] | None) ->
     }
 
 
+def _apply_current_provider_health(
+    last: dict[str, Any] | None,
+    provider_reconciliation: dict[str, Any],
+) -> None:
+    """Clear a historical provider report only after durable success evidence."""
+
+    if not isinstance(last, dict) or provider_reconciliation.get("state") != "recovered":
+        return
+    domain = last.get("domain") if isinstance(last.get("domain"), dict) else {}
+    if domain.get("report_reason") not in {
+        "provider_warning",
+        "degraded_reconciliation",
+        "blocking_reconciliation_failure",
+        "reconciliation_recovery_exhausted",
+    }:
+        return
+    domain.update(
+        {
+            "ok": True,
+            "status": "recovered",
+            "attention_required": False,
+            "recovery_state": "recovered",
+            "recovered_at": (provider_reconciliation.get("last_recovery") or {}).get("created_at"),
+        }
+    )
+    last["domain"] = domain
+
+
 def _last_run_status(last: dict[str, Any] | None) -> str | None:
     if not isinstance(last, dict):
         return None
@@ -427,6 +460,8 @@ def _job_findings(last: dict[str, Any] | None) -> list[str]:
     if not isinstance(last, dict):
         return []
     domain = last.get("domain") if isinstance(last.get("domain"), dict) else {}
+    if domain.get("attention_required") is False:
+        return []
     if domain.get("ok") is not False:
         return []
     failure_kind = str(domain.get("failure_kind") or "")
@@ -452,7 +487,7 @@ def _job_findings(last: dict[str, Any] | None) -> list[str]:
 def _job_title(runner_job: str, label: str) -> str:
     titles = {
         "schwab-refresh": "Schwab authentication",
-        "reconciliation-supervisor": "Entry reconciliation supervision",
+        "reconciliation-supervisor": "Reconciliation supervision",
     }
     return titles.get(runner_job, label)
 
@@ -467,12 +502,23 @@ def _reconciliation_payload(last: dict[str, Any] | None) -> dict[str, Any]:
 
 def _reconciliation_summary(supervision: dict[str, Any]) -> str:
     if supervision.get("attention_required"):
+        provider = supervision.get("provider_reconciliation") or {}
+        if provider.get("attention_required"):
+            return (
+                "Needs you: Public portfolio reconciliation exhausted automatic recovery; "
+                "live entries remain fail-closed."
+            )
         return (
             f"Needs you: {supervision.get('needs_human_count', 0)} entry reconciliation "
             "hold(s) remain unresolved; affected deployments are fail-closed."
         )
     if supervision.get("self_healing_count"):
         return f"Self-healing: {supervision.get('self_healing_count')} transient entry hold(s)."
+    provider = supervision.get("provider_reconciliation") or {}
+    if provider.get("state") == "self_healing":
+        return "Self-healing: Public portfolio reconciliation is inside its automatic recovery window."
+    if provider.get("state") == "recovered":
+        return "Recovered: the latest Public portfolio reconciliation succeeded without operator action."
     return "Healthy: no unresolved entry reconciliation holds."
 
 
@@ -481,6 +527,19 @@ def _job_details(last: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not supervision:
         return []
     details: list[dict[str, Any]] = []
+    provider = supervision.get("provider_reconciliation") or {}
+    if provider.get("state") in {"self_healing", "needs_human", "recovered"}:
+        evidence = provider.get("last_failure") or provider.get("last_recovery") or {}
+        details.append(
+            {
+                "kind": "provider_reconciliation",
+                "title": "Public portfolio reconciliation",
+                "surface": "Bhiksha live runtime",
+                "status": provider.get("state"),
+                "updated_at": evidence.get("created_at") or provider.get("observed_at"),
+                "review_ref": evidence.get("error") or evidence.get("action"),
+            }
+        )
     for hold in supervision.get("active_holds") or []:
         details.append(
             {
@@ -535,11 +594,20 @@ def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
         report_status = payload.get("report_status")
         if isinstance(report_status, dict):
             status = str(report_status.get("level") or report_status.get("LEVEL") or "").upper()
-            ok = status == "GREEN"
+            attention_required = bool(report_status.get("attention_required", status == "RED"))
+            ok = payload.get("status") == "ok" and not attention_required
         else:
             status = str(report_status or "").upper()
+            attention_required = status == "RED"
             ok = payload.get("status") == "ok"
-        return {"ok": ok, "status": status or payload.get("status"), "reason": "session_report"}
+        return {
+            "ok": ok,
+            "status": "needs_human" if attention_required else status or payload.get("status"),
+            "reported_status": status or payload.get("status"),
+            "reason": "session_report",
+            "report_reason": report_status.get("reason") if isinstance(report_status, dict) else None,
+            "attention_required": attention_required,
+        }
     if payload.get("job") == "schwab-refresh":
         if payload.get("status") == "skipped":
             return {"ok": True, "status": "skipped", "reason": payload.get("reason") or "non_trading_day"}

@@ -58,6 +58,70 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     assert snapshot["transport"]["status"] == "degraded"
 
 
+def test_yellow_session_report_without_operator_gate_stays_out_of_attention(monkeypatch, tmp_path) -> None:
+    write_latest_status(
+        tmp_path,
+        {
+            "job": "session-report",
+            "status": "ok",
+            "report_status": {"level": "YELLOW", "reason": "provider_warning"},
+        },
+    )
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 18, 13, 0, tzinfo=UTC),
+    )
+    report = next(job for job in snapshot["jobs"] if job["runner_job"] == "session-report")
+
+    assert report["last"]["domain"]["attention_required"] is False
+    assert report["last"]["domain"]["ok"] is True
+    assert report["last_run_status"] == "YELLOW"
+    assert report["findings"] == []
+
+
+def test_recovered_provider_warning_clears_historical_report(monkeypatch, tmp_path) -> None:
+    write_latest_status(
+        tmp_path,
+        {
+            "job": "session-report",
+            "status": "ok",
+            "report_status": {"level": "YELLOW", "reason": "provider_warning"},
+        },
+    )
+    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status.inspect_provider_reconciliation",
+        lambda path: {
+            "state": "recovered",
+            "attention_required": False,
+            "last_recovery": {"created_at": "2026-07-17T14:11:26+00:00"},
+        },
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 7, 18, 13, 0, tzinfo=UTC),
+    )
+    report = next(job for job in snapshot["jobs"] if job["runner_job"] == "session-report")
+
+    assert report["last_run_status"] == "recovered"
+    assert report["last"]["domain"]["reported_status"] == "YELLOW"
+    assert report["last"]["domain"]["attention_required"] is False
+    assert report["findings"] == []
+
+
 def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(monkeypatch, tmp_path) -> None:
     payload = {
         "schema": "bhiksha.launchd.latest_status.v1",
@@ -103,7 +167,7 @@ def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(mo
     )
     job = next(item for item in snapshot["jobs"] if item["runner_job"] == "reconciliation-supervisor")
 
-    assert job["title"] == "Entry reconciliation supervision"
+    assert job["title"] == "Reconciliation supervision"
     assert job["lifecycle"] == "waiting_you"
     assert job["last_run_status"] == "needs_human"
     assert job["findings"] == [

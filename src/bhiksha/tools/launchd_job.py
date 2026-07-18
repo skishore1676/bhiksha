@@ -475,7 +475,10 @@ def _post_start_check_seconds() -> str:
 
 
 def _alert_level_for_report(report: dict) -> str:
-    level = str((report.get("status") or {}).get("level") or "GREEN").upper()
+    status = report.get("status") or {}
+    level = str(status.get("level") or "GREEN").upper()
+    if status.get("attention_required") is False:
+        return "info"
     if level == "RED":
         return "error"
     if level in {"YELLOW", "NO_DATA"}:
