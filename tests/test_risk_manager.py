@@ -1274,6 +1274,7 @@ def test_resolve_settings_rejects_negative_percentages(monkeypatch) -> None:
     """Audit finding #2: a negative pct flipped the threshold sign and would
     flatten a healthy, flat book. Negative values must fall back to defaults
     with a visible warning."""
+    monkeypatch.delenv("BHIKSHA_RISK_MAX_DAILY_DRAWDOWN_PCT", raising=False)
     monkeypatch.setenv("BHIKSHA_RISK_FLATTEN_DAILY_DRAWDOWN_PCT", "-3.0")
     settings = resolve_risk_settings()
     assert settings.flatten_daily_drawdown_pct == 3.0
