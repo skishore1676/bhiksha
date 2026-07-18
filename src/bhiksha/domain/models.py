@@ -252,3 +252,14 @@ class CashBudgetReservation:
     trade_date: str
     amount: float
     status: str
+
+
+@dataclass(slots=True, frozen=True)
+class EntryRiskReservation:
+    trade_id: str
+    deployment_id: str
+    symbol: str
+    cluster: str | None
+    planned_stop_loss_usd: float
+    expires_at: datetime
+    status: str = "reserved"

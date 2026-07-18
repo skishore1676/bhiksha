@@ -891,6 +891,8 @@ def test_daily_report_renders_risk_rails_section_from_startup_event_and_budget(t
                 "demote_window": 10,
                 "demote_min_n": 10,
                 "demote_threshold_usd": 0.0,
+                "prospective_loss_enabled": True,
+                "max_open_positions_per_cluster": 1,
                 "validation_warnings": [],
             },
         )
@@ -922,10 +924,14 @@ def test_daily_report_renders_risk_rails_section_from_startup_event_and_budget(t
     assert risk_rails["demote_window"] == 10
     assert risk_rails["demote_min_n"] == 10
     assert risk_rails["demote_threshold_usd"] == 0.0
+    assert risk_rails["prospective_loss_enabled"] is True
+    assert risk_rails["max_open_positions_per_cluster"] == 1
+    assert risk_rails["sized_entry_blocks"] == []
     assert risk_rails["validation_warnings"] == []
 
     markdown = render_daily_report_markdown(report)
     assert "## Risk Rails" in markdown
+    assert "prospective loss on, cluster cap 1" in markdown
     assert "rail-A(halt) on, rail-B(demote) on" in markdown
     assert "usable budget: `$8,000.00`" in markdown
     assert "tier-1 halt (new entries): `2.00% ($160.00)`" in markdown
@@ -967,11 +973,14 @@ def test_daily_report_risk_rails_section_surfaces_validation_warnings(tmp_path) 
     # No cash_budget_days row seeded for this day -> $ figures are unknown.
     assert risk_rails["usable_budget_usd"] is None
     assert risk_rails["max_daily_drawdown_usd"] is None
+    assert risk_rails["prospective_loss_enabled"] is None
+    assert risk_rails["max_open_positions_per_cluster"] is None
     assert len(risk_rails["validation_warnings"]) == 1
 
     markdown = render_daily_report_markdown(report)
     assert "usable budget: `unknown`" in markdown
     assert "tier-1 halt (new entries): `2.00% (n/a)`" in markdown
+    assert "prospective loss unknown, cluster cap unknown" in markdown
     assert "validation warnings: `1`" in markdown
     assert "flatten_daily_drawdown_pct=-1.0" in markdown
 

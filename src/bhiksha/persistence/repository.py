@@ -6,7 +6,13 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 
-from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, PartialFillRecord, TradeRecord
+from bhiksha.domain.models import (
+    CashBudgetDay,
+    CashBudgetReservation,
+    EntryRiskReservation,
+    PartialFillRecord,
+    TradeRecord,
+)
 from bhiksha.options.chain_snapshot import ChainSnapshotAttempt
 
 
@@ -92,6 +98,18 @@ class TradeStateRepository(ABC):
     async def mark_partial_fill_abandoned(self, record_id: int, *, reason: str) -> None:
         """Stop re-polling a partial leg that will never resolve, recording why (audit fix 3)."""
 
+    @abstractmethod
+    async def upsert_entry_risk_reservation(self, reservation: EntryRiskReservation) -> None:
+        """Create or replace a final-sized entry risk reservation."""
+
+    @abstractmethod
+    async def get_active_entry_risk_reservations(self) -> list[EntryRiskReservation]:
+        """Return reservations which still consume prospective risk headroom."""
+
+    @abstractmethod
+    async def mark_entry_risk_reservation_status(self, trade_id: str, status: str) -> None:
+        """Transition a final-sized entry risk reservation."""
+
 
 class NullTradeStateRepository(TradeStateRepository):
     async def upsert_trade(self, record: TradeRecord) -> None:
@@ -165,6 +183,17 @@ class NullTradeStateRepository(TradeStateRepository):
 
     async def mark_partial_fill_abandoned(self, record_id: int, *, reason: str) -> None:
         del record_id, reason
+        return None
+
+    async def upsert_entry_risk_reservation(self, reservation: EntryRiskReservation) -> None:
+        del reservation
+        return None
+
+    async def get_active_entry_risk_reservations(self) -> list[EntryRiskReservation]:
+        return []
+
+    async def mark_entry_risk_reservation_status(self, trade_id: str, status: str) -> None:
+        del trade_id, status
         return None
 
 

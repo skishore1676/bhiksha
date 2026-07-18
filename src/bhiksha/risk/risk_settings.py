@@ -52,6 +52,11 @@ class RiskSettings:
     demote_window: int
     demote_min_n: int
     demote_threshold_usd: float
+    # Final, sized-entry defenses. The prospective-loss rail shares Rail A's
+    # daily loss budget; the cluster cap prevents correlated deployments from
+    # independently filling that budget at the same time.
+    prospective_loss_enabled: bool = True
+    max_open_positions_per_cluster: int = 1
     # Operator audit P4 (2026-07-06): Rail A is realized-P&L-only -- it will
     # not notice an open live position bleeding intraday until the loss is
     # REALIZED (native protective stops still guard every trade, so this is
@@ -81,6 +86,8 @@ class RiskSettings:
             "demote_window": self.demote_window,
             "demote_min_n": self.demote_min_n,
             "demote_threshold_usd": self.demote_threshold_usd,
+            "prospective_loss_enabled": self.prospective_loss_enabled,
+            "max_open_positions_per_cluster": self.max_open_positions_per_cluster,
             "open_drawdown_warn_pct": self.open_drawdown_warn_pct,
             "validation_warnings": list(self.validation_warnings),
         }
@@ -91,6 +98,8 @@ _DEFAULT_FLATTEN_DAILY_DRAWDOWN_PCT = 3.0
 _DEFAULT_DEMOTE_WINDOW = 10
 _DEFAULT_DEMOTE_MIN_N = 10
 _DEFAULT_DEMOTE_THRESHOLD_USD = 0.0
+_DEFAULT_PROSPECTIVE_LOSS_ENABLED = True
+_DEFAULT_MAX_OPEN_POSITIONS_PER_CLUSTER = 1
 # No hardcoded numeric default: unset resolves to max_daily_drawdown_pct (see
 # resolve_risk_settings) -- the sentinel here is just "not configured".
 _DEFAULT_OPEN_DRAWDOWN_WARN_PCT = None
@@ -126,6 +135,18 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
     demote_threshold_usd = _resolve_float(
         "BHIKSHA_RISK_DEMOTE_THRESHOLD_USD", _DEFAULT_DEMOTE_THRESHOLD_USD, settings_source, warnings
     )
+    prospective_loss_enabled = _resolve_bool(
+        "BHIKSHA_RISK_PROSPECTIVE_LOSS_ENABLED",
+        _DEFAULT_PROSPECTIVE_LOSS_ENABLED,
+        settings_source,
+        warnings,
+    )
+    max_open_positions_per_cluster = _resolve_int(
+        "BHIKSHA_RISK_MAX_OPEN_POSITIONS_PER_CLUSTER",
+        _DEFAULT_MAX_OPEN_POSITIONS_PER_CLUSTER,
+        settings_source,
+        warnings,
+    )
     open_drawdown_warn_pct = _resolve_optional_float(
         "BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", _DEFAULT_OPEN_DRAWDOWN_WARN_PCT, settings_source, warnings
     )
@@ -157,6 +178,13 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
             f"demote_min_n={demote_min_n} > demote_window={demote_window}; clamping min_n to the window"
         )
         demote_min_n = demote_window
+    if max_open_positions_per_cluster < 0:
+        warnings.append(
+            "max_open_positions_per_cluster="
+            f"{max_open_positions_per_cluster} must be >= 0; using default "
+            f"{_DEFAULT_MAX_OPEN_POSITIONS_PER_CLUSTER}"
+        )
+        max_open_positions_per_cluster = _DEFAULT_MAX_OPEN_POSITIONS_PER_CLUSTER
     if open_drawdown_warn_pct is not None and open_drawdown_warn_pct <= 0:
         warnings.append(
             f"open_drawdown_warn_pct={open_drawdown_warn_pct} must be > 0; "
@@ -179,6 +207,8 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
         demote_window=demote_window,
         demote_min_n=demote_min_n,
         demote_threshold_usd=demote_threshold_usd,
+        prospective_loss_enabled=prospective_loss_enabled,
+        max_open_positions_per_cluster=max_open_positions_per_cluster,
         open_drawdown_warn_pct=open_drawdown_warn_pct,
         validation_warnings=tuple(warnings),
     )

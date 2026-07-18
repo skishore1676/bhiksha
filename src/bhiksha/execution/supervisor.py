@@ -35,6 +35,7 @@ from bhiksha.execution.pricing import (
     scale_spread_fraction,
     select_entry_limit,
 )
+from bhiksha.risk.planned_loss import resolve_planned_stop_loss_pct
 from bhiksha.execution.profile_exit import (
     ProfileExitFields,
     ProfileExitState,
@@ -899,7 +900,7 @@ class ExecutionSupervisor:
         error = wait_result.error
         if not filled:
             if wait_result.cancelled_without_fill:
-                await self._release_cash_guard_reservation(plan.trade_id)
+                await self._release_entry_reservations(plan.trade_id)
                 self.planner.position_tracker.close_position(
                     deployment.symbol,
                     deployment.deployment_id,
@@ -919,7 +920,7 @@ class ExecutionSupervisor:
                 return plan
             normalized_error = (error or "").upper()
             if normalized_error in _ENTRY_ORDER_DEAD_STATUSES:
-                await self._release_cash_guard_reservation(plan.trade_id)
+                await self._release_entry_reservations(plan.trade_id)
                 self.planner.position_tracker.close_position(
                     deployment.symbol,
                     deployment.deployment_id,
@@ -1064,6 +1065,7 @@ class ExecutionSupervisor:
                 can_ladder=plan.quantity >= 2,
             )
         )
+        await self._commit_entry_risk_reservation(plan.trade_id)
         if protection_error is not None:
             await self.event_repository.append(
                 "runtime_issue",
@@ -1395,6 +1397,39 @@ class ExecutionSupervisor:
             return _EntryRepriceResult(plan=plan, error=f"entry_reprice_cancel_unconfirmed:{cancel_state}")
 
         cash_guard_details: dict[str, object] = {}
+        sized_risk_details: dict[str, object] = {}
+        risk_manager = getattr(self.planner, "risk_manager", None)
+        if risk_manager is not None:
+            stop_loss_pct, stop_loss_source = resolve_planned_stop_loss_pct(deployment)
+            sized_risk = await risk_manager.reserve_sized_entry(
+                trade_id=plan.trade_id,
+                deployment_id=plan.deployment_id,
+                symbol=plan.symbol,
+                entry_price=final_limit_price,
+                quantity=plan.quantity,
+                stop_loss_pct=stop_loss_pct,
+            )
+            sized_risk_details = {
+                "sized_entry_risk": dict(sized_risk.details),
+                "planned_stop_loss_pct": stop_loss_pct,
+                "planned_stop_loss_source": stop_loss_source,
+            }
+            if not sized_risk.allowed:
+                await self.event_repository.append(
+                    "entry_reprice_sized_risk_blocked",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "trade_id": plan.trade_id,
+                        "attempt": attempt,
+                        "reason": sized_risk.reason,
+                        **sized_risk_details,
+                    },
+                )
+                return _EntryRepriceResult(
+                    plan=plan,
+                    error=sized_risk.reason or "entry_reprice_sized_risk_blocked",
+                    cancelled_without_fill=True,
+                )
         if getattr(self.planner, "cash_guard", None) is not None:
             await self.planner.cash_guard.release_entry(plan.trade_id)
             cash_result = await self.planner.cash_guard.reserve_entry(
@@ -1422,15 +1457,28 @@ class ExecutionSupervisor:
                 )
 
         replacement_order_id = str(uuid.uuid4())
-        result = await self.planner.order_manager.place_entry_order(
-            plan.option_symbol,
-            final_limit_price,
-            plan.quantity,
-            order_id=replacement_order_id,
-        )
+        try:
+            result = await self.planner.order_manager.place_entry_order(
+                plan.option_symbol,
+                final_limit_price,
+                plan.quantity,
+                order_id=replacement_order_id,
+            )
+        except Exception as exc:
+            if getattr(self.planner, "cash_guard", None) is not None:
+                await self.planner.cash_guard.release_entry(plan.trade_id)
+            if risk_manager is not None:
+                await risk_manager.release_sized_entry(plan.trade_id)
+            return _EntryRepriceResult(
+                plan=plan,
+                error=f"entry_reprice_order_submit_failed:{exc}",
+                cancelled_without_fill=True,
+            )
         if result.order_id is None:
             if getattr(self.planner, "cash_guard", None) is not None:
                 await self.planner.cash_guard.release_entry(plan.trade_id)
+            if risk_manager is not None:
+                await risk_manager.release_sized_entry(plan.trade_id)
             return _EntryRepriceResult(
                 plan=plan,
                 error=result.error or "entry_reprice_order_submit_failed",
@@ -1446,6 +1494,7 @@ class ExecutionSupervisor:
             "buying_power_requirement": preflight.buying_power_requirement,
             "estimated_cost": preflight.estimated_cost,
             **cash_guard_details,
+            **sized_risk_details,
         }
         repriced_plan = replace(
             plan,
@@ -4519,6 +4568,7 @@ class ExecutionSupervisor:
                         "payload": payload or {},
                     },
                 )
+                await self._commit_entry_risk_reservation(trade.trade_id)
                 return "recovered"
         if normalized not in _ENTRY_ORDER_DEAD_STATUSES:
             return "pending"
@@ -4555,7 +4605,7 @@ class ExecutionSupervisor:
                 },
             )
             return "pending"
-        await self._release_cash_guard_reservation(trade.trade_id)
+        await self._release_entry_reservations(trade.trade_id)
         await self.trade_state_repository.mark_closed(trade.trade_id, exit_order_id=trade.exit_order_id)
         # NEW-4: releasing a reconcile-hold entry is terminal (the entry never
         # filled / was rejected-cancelled-expired). Clear any profile-exit ladder
@@ -4988,6 +5038,17 @@ class ExecutionSupervisor:
         if cash_guard is None:
             return
         await cash_guard.release_entry(trade_id)
+
+    async def _release_entry_reservations(self, trade_id: str) -> None:
+        await self._release_cash_guard_reservation(trade_id)
+        risk_manager = getattr(self.planner, "risk_manager", None)
+        if risk_manager is not None:
+            await risk_manager.release_sized_entry(trade_id)
+
+    async def _commit_entry_risk_reservation(self, trade_id: str) -> None:
+        risk_manager = getattr(self.planner, "risk_manager", None)
+        if risk_manager is not None:
+            await risk_manager.commit_sized_entry(trade_id)
 
     async def _paper_exit_fill_details(self, position: TrackedPosition, *, order_id: str) -> dict[str, Any]:
         exit_price = None
@@ -5542,25 +5603,7 @@ def _paper_trade_source(trade: TradeRecord) -> str:
 
 
 def _resolved_recovery_stop_loss_pct(deployment: DeploymentManifest) -> tuple[float | None, str]:
-    if deployment.exit.stop_loss_pct is not None and deployment.exit.stop_loss_pct > 0:
-        return deployment.exit.stop_loss_pct, "deployment_native"
-    if deployment.risk.stop_loss_pct is not None and deployment.risk.stop_loss_pct > 0:
-        return deployment.risk.stop_loss_pct, "global_fallback"
-    # HIGH-2: a profile-exit deployment must never no-op the re-arm path into a
-    # naked ride. When neither the deployment nor the global stop pct is set, let
-    # the profile supply its OWN recovery floor from its premium-stop dials
-    # (initial stop, else the wider disaster stop). Config validation
-    # (``_validate_profile_recovery_stop``) also rejects a profile deployment that
-    # leaves all of these unset, so this is belt-and-suspenders for the runtime.
-    exit_spec = deployment.exit
-    if getattr(exit_spec, "profile_exit_id", None):
-        initial = getattr(exit_spec, "initial_stop_pct", None)
-        if initial is not None and initial > 0:
-            return float(initial), "profile_initial_stop"
-        disaster = getattr(exit_spec, "premium_disaster_stop_pct", None)
-        if disaster is not None and disaster > 0:
-            return float(disaster), "profile_disaster_stop"
-    return None, "unavailable"
+    return resolve_planned_stop_loss_pct(deployment)
 
 
 class _DryRunOrderResult:

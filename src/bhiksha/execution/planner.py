@@ -24,6 +24,8 @@ from bhiksha.options.vehicle_resolver import VehicleResolver
 from bhiksha.persistence.repository import ChainSnapshotRepository, NullChainSnapshotRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.risk.governor import RiskGovernor
+from bhiksha.risk.planned_loss import resolve_planned_stop_loss_pct
+from bhiksha.risk.risk_manager import RiskManager
 from bhiksha.state.position_tracker import PositionTracker
 from bhiksha.time_utils import parse_time_text
 
@@ -42,6 +44,7 @@ class ExecutionPlanner:
         order_manager: OrderManager | None = None,
         position_tracker: PositionTracker | None = None,
         cash_guard: CashGuard | None = None,
+        risk_manager: RiskManager | None = None,
         chain_snapshot_repository: ChainSnapshotRepository | None = None,
     ) -> None:
         self.chain_service = chain_service or PublicOptionChainService()
@@ -49,6 +52,7 @@ class ExecutionPlanner:
         self.order_manager = order_manager or OrderManager()
         self.position_tracker = position_tracker or PositionTracker()
         self.cash_guard = cash_guard
+        self.risk_manager = risk_manager
         self.chain_snapshot_repository = chain_snapshot_repository or NullChainSnapshotRepository()
 
     async def close(self) -> None:
@@ -390,6 +394,45 @@ class ExecutionPlanner:
             preflight.estimated_cost or 0.0,
             final_limit_price * quantity * 100,
         )
+        sized_risk_details: dict[str, object] = {}
+        if self.risk_manager is not None:
+            stop_loss_pct, stop_loss_source = resolve_planned_stop_loss_pct(deployment)
+            sized_risk = await self.risk_manager.reserve_sized_entry(
+                trade_id=trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                entry_price=final_limit_price,
+                quantity=quantity,
+                stop_loss_pct=stop_loss_pct,
+            )
+            sized_risk_details = {
+                "sized_entry_risk": dict(sized_risk.details),
+                "planned_stop_loss_pct": stop_loss_pct,
+                "planned_stop_loss_source": stop_loss_source,
+            }
+            if not sized_risk.allowed:
+                return TradePlan(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol=selection.option_symbol,
+                    quantity=quantity,
+                    estimated_entry_price=final_limit_price,
+                    risk_reasons=[sized_risk.reason or "sized_entry_risk_blocked"],
+                    dry_run=False,
+                    order_id=None,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
+                    risk_details={
+                        "required_cash": required_cash,
+                        "buying_power_requirement": preflight.buying_power_requirement,
+                        "estimated_cost": preflight.estimated_cost,
+                        "entry_pricing": pricing_evidence,
+                        **selection_details,
+                        **sized_risk_details,
+                    },
+                )
         cash_guard_details: dict[str, object] = {}
         if self.cash_guard is not None:
             cash_guard_result = await self.cash_guard.reserve_entry(
@@ -399,6 +442,8 @@ class ExecutionPlanner:
             )
             cash_guard_details = dict(cash_guard_result.details)
             if cash_guard_result.blocked:
+                if self.risk_manager is not None:
+                    await self.risk_manager.release_sized_entry(trade_id)
                 return TradePlan(
                     trade_id=trade_id,
                     deployment_id=deployment.deployment_id,
@@ -418,17 +463,27 @@ class ExecutionPlanner:
                         "estimated_cost": preflight.estimated_cost,
                         "entry_pricing": pricing_evidence,
                         **selection_details,
+                        **sized_risk_details,
                         **cash_guard_details,
                     },
                 )
-        result: OrderResult = await self.order_manager.place_entry_order(
-            selection.option_symbol,
-            final_limit_price,
-            quantity,
-            order_id=trade_id,
-        )
+        try:
+            result: OrderResult = await self.order_manager.place_entry_order(
+                selection.option_symbol,
+                final_limit_price,
+                quantity,
+                order_id=trade_id,
+            )
+        except Exception:
+            if self.cash_guard is not None:
+                await self.cash_guard.release_entry(trade_id)
+            if self.risk_manager is not None:
+                await self.risk_manager.release_sized_entry(trade_id)
+            raise
         if self.cash_guard is not None and (result.order_id is None or result.error):
             await self.cash_guard.release_entry(trade_id)
+        if self.risk_manager is not None and (result.order_id is None or result.error):
+            await self.risk_manager.release_sized_entry(trade_id)
         if result.order_id:
             self.position_tracker.open_position(
                 deployment.symbol,
@@ -460,6 +515,7 @@ class ExecutionPlanner:
                 "estimated_cost": preflight.estimated_cost,
                 "entry_pricing": pricing_evidence,
                 **selection_details,
+                **sized_risk_details,
                 **cash_guard_details,
             },
         )

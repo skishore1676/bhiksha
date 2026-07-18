@@ -16,6 +16,9 @@ from bhiksha.risk.risk_manager import (
     RAIL_B_DEMOTED_REASON,
     BUDGET_UNAVAILABLE_REASON,
     OPEN_DRAWDOWN_WARNING_REASON,
+    CORRELATION_CLUSTER_CAP_REASON,
+    PROSPECTIVE_LOSS_HEADROOM_REASON,
+    OPEN_POSITION_RISK_UNAVAILABLE_REASON,
     _complete_realized_pnl_usd,
 )
 from bhiksha.risk.risk_settings import RiskSettings, resolve_risk_settings
@@ -298,6 +301,25 @@ def test_rail_a_ignores_shadow_trades_in_pnl(tmp_path) -> None:
     assert result.rail_a.halted is False
 
 
+def test_rail_a_ignores_dry_run_trades_in_pnl(tmp_path) -> None:
+    manager, _ = _manager(tmp_path, now=NOW)
+    _put_budget(manager, 10000.0)
+    paper_trade = _closed_live_trade(
+        "PAPER",
+        deployment_id="dep1",
+        entry=8.0,
+        exit_=1.0,
+        exit_at=NOW,
+    )
+    paper_trade = replace(paper_trade, entry_order_id="DRY_RUN")
+    asyncio.run(manager.trade_state_repository.upsert_trade(paper_trade))
+
+    result = asyncio.run(manager.book_actions())
+
+    assert result.rail_a.realized_live_pnl_usd == 0.0
+    assert result.rail_a.halted is False
+
+
 def test_rail_a_disabled_via_settings_is_inactive(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(rail_a_enabled=False))
     asyncio.run(
@@ -381,7 +403,374 @@ def test_allow_entry_rail_a_disabled_still_allows_with_no_budget_row(tmp_path) -
     decision = asyncio.run(manager.allow_entry("dep1"))
 
     assert decision.allowed is True
+
+
+# --------------------------------------------------------------------------
+# Final sized-entry risk: prospective Rail A headroom + correlation clusters
+# --------------------------------------------------------------------------
+
+
+def _put_budget(manager: RiskManager, usable_budget: float) -> None:
+    asyncio.run(
+        manager.cash_budget_repository.upsert_day(
+            CashBudgetDay(
+                trade_date="2026-04-20",
+                account_type="CASH",
+                broker_cash_only_buying_power=usable_budget,
+                usable_budget=usable_budget,
+                buffer_pct=0.0,
+            )
+        )
+    )
+
+
+def test_sized_entry_reproduces_smh_amd_headroom_block(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(
+            max_daily_drawdown_pct=7.5,
+            flatten_daily_drawdown_pct=10.0,
+            max_open_positions_per_cluster=0,
+        ),
+    )
+    _put_budget(manager, 11342.81)
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            TradeRecord(
+                trade_id="SMH-LIVE",
+                deployment_id="smh-dep",
+                symbol="SMH",
+                option_symbol="SMH260101P00300000",
+                quantity=2,
+                entry_price=7.70,
+                stop_price=5.005,
+                status="open_protected",
+                entry_order_id="LIVE-SMH",
+            )
+        )
+    )
+
+    decision = asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="AMD-PROPOSED",
+            deployment_id="amd-dep",
+            symbol="AMD",
+            entry_price=10.45,
+            quantity=1,
+            stop_loss_pct=0.35,
+        )
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == PROSPECTIVE_LOSS_HEADROOM_REASON
+    assert decision.details["open_planned_stop_loss_usd"] == 539.0
+    assert decision.details["proposed_planned_stop_loss_usd"] == 365.75
+    assert decision.details["prospective_total_loss_usd"] == 904.75
+    assert decision.details["daily_loss_budget_usd"] == 850.71
+
+
+def test_sized_entry_cluster_blocks_amd_while_smh_is_open(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(max_daily_drawdown_pct=20.0, flatten_daily_drawdown_pct=25.0),
+    )
+    _put_budget(manager, 10000.0)
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            TradeRecord(
+                trade_id="SMH-LIVE",
+                deployment_id="smh-dep",
+                symbol="SMH",
+                quantity=1,
+                entry_price=5.0,
+                stop_price=3.0,
+                status="open_protected",
+                entry_order_id="LIVE-SMH",
+            )
+        )
+    )
+
+    decision = asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="AMD-PROPOSED",
+            deployment_id="amd-dep",
+            symbol="AMD",
+            entry_price=5.0,
+            quantity=1,
+            stop_loss_pct=0.35,
+        )
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == CORRELATION_CLUSTER_CAP_REASON
+    assert decision.details["correlation_cluster"] == "semiconductors"
+    assert decision.details["cluster_open_or_reserved_count"] == 1
+
+
+def test_sized_entry_reservations_are_atomic_for_concurrent_signals(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(
+            max_daily_drawdown_pct=10.0,
+            flatten_daily_drawdown_pct=15.0,
+            max_open_positions_per_cluster=0,
+        ),
+    )
+    _put_budget(manager, 10000.0)
+
+    async def run_both():
+        return await asyncio.gather(
+            manager.reserve_sized_entry(
+                trade_id="ONE",
+                deployment_id="one",
+                symbol="AAPL",
+                entry_price=10.0,
+                quantity=1,
+                stop_loss_pct=0.60,
+            ),
+            manager.reserve_sized_entry(
+                trade_id="TWO",
+                deployment_id="two",
+                symbol="MSFT",
+                entry_price=10.0,
+                quantity=1,
+                stop_loss_pct=0.60,
+            ),
+        )
+
+    decisions = asyncio.run(run_both())
+
+    assert sum(decision.allowed for decision in decisions) == 1
+    blocked = next(decision for decision in decisions if not decision.allowed)
+    assert blocked.reason == PROSPECTIVE_LOSS_HEADROOM_REASON
+    assert blocked.details["pending_reserved_stop_loss_usd"] == 600.0
+
+
+def test_sized_entry_reservation_survives_risk_manager_restart(tmp_path) -> None:
+    settings = _settings(
+        max_daily_drawdown_pct=10.0,
+        flatten_daily_drawdown_pct=15.0,
+        max_open_positions_per_cluster=0,
+    )
+    first_manager, _ = _manager(tmp_path, now=NOW, settings=settings)
+    _put_budget(first_manager, 10000.0)
+    first = asyncio.run(
+        first_manager.reserve_sized_entry(
+            trade_id="BEFORE-RESTART",
+            deployment_id="one",
+            symbol="AAPL",
+            entry_price=10.0,
+            quantity=1,
+            stop_loss_pct=0.60,
+        )
+    )
+
+    restarted_manager, _ = _manager(tmp_path, now=NOW + timedelta(minutes=1), settings=settings)
+    second = asyncio.run(
+        restarted_manager.reserve_sized_entry(
+            trade_id="AFTER-RESTART",
+            deployment_id="two",
+            symbol="MSFT",
+            entry_price=10.0,
+            quantity=1,
+            stop_loss_pct=0.60,
+        )
+    )
+
+    assert first.allowed is True
+    assert second.allowed is False
+    assert second.reason == PROSPECTIVE_LOSS_HEADROOM_REASON
+    assert second.details["pending_reserved_stop_loss_usd"] == 600.0
+
+
+def test_orphaned_sized_entry_reservation_expires_after_thirty_minutes(tmp_path) -> None:
+    settings = _settings(
+        max_daily_drawdown_pct=10.0,
+        flatten_daily_drawdown_pct=15.0,
+        max_open_positions_per_cluster=0,
+    )
+    manager, db_path = _manager(tmp_path, now=NOW, settings=settings)
+    _put_budget(manager, 10000.0)
+    asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="ORPHAN",
+            deployment_id="one",
+            symbol="AAPL",
+            entry_price=10.0,
+            quantity=1,
+            stop_loss_pct=0.60,
+        )
+    )
+
+    restarted_manager, _ = _manager(
+        tmp_path,
+        now=NOW + timedelta(minutes=31),
+        settings=settings,
+    )
+    decision = asyncio.run(
+        restarted_manager.reserve_sized_entry(
+            trade_id="AFTER-EXPIRY",
+            deployment_id="two",
+            symbol="MSFT",
+            entry_price=10.0,
+            quantity=1,
+            stop_loss_pct=0.60,
+        )
+    )
+
+    assert decision.allowed is True
+    with sqlite3.connect(db_path) as conn:
+        status = conn.execute(
+            "SELECT status FROM entry_risk_reservations WHERE trade_id = 'ORPHAN'"
+        ).fetchone()[0]
+    assert status == "expired"
+
+
+def test_sized_entry_reprice_replaces_its_own_reservation(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(max_daily_drawdown_pct=20.0, flatten_daily_drawdown_pct=25.0),
+    )
+    _put_budget(manager, 10000.0)
+
+    first = asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="SMH-ONE",
+            deployment_id="smh-dep",
+            symbol="SMH",
+            entry_price=5.0,
+            quantity=1,
+            stop_loss_pct=0.35,
+        )
+    )
+    repriced = asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="SMH-ONE",
+            deployment_id="smh-dep",
+            symbol="SMH",
+            entry_price=5.5,
+            quantity=1,
+            stop_loss_pct=0.35,
+        )
+    )
+
+    assert first.allowed is True
+    assert repriced.allowed is True
+    assert repriced.details["cluster_open_or_reserved_count"] == 0
+    assert repriced.details["proposed_planned_stop_loss_usd"] == 192.5
+
+
+def test_sized_entry_unprotected_open_trade_counts_full_premium(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(
+            max_daily_drawdown_pct=10.0,
+            flatten_daily_drawdown_pct=15.0,
+            max_open_positions_per_cluster=0,
+        ),
+    )
+    _put_budget(manager, 10000.0)
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            TradeRecord(
+                trade_id="PENDING",
+                deployment_id="pending-dep",
+                symbol="AAPL",
+                quantity=1,
+                entry_price=8.0,
+                stop_price=None,
+                status="pending_entry_reconcile",
+                entry_order_id="LIVE-PENDING",
+            )
+        )
+    )
+
+    decision = asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="NEXT",
+            deployment_id="next-dep",
+            symbol="MSFT",
+            entry_price=2.0,
+            quantity=1,
+            stop_loss_pct=0.50,
+        )
+    )
+
+    assert decision.allowed is True
+    assert decision.details["open_planned_stop_loss_usd"] == 800.0
+    assert decision.details["unprotected_full_premium_trade_ids"] == ["PENDING"]
     assert decision.reason == "approved"
+
+
+def test_sized_entry_blocks_when_open_trade_risk_cannot_be_quantified(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(
+            max_daily_drawdown_pct=10.0,
+            flatten_daily_drawdown_pct=15.0,
+            max_open_positions_per_cluster=0,
+        ),
+    )
+    _put_budget(manager, 10000.0)
+    asyncio.run(
+        manager.trade_state_repository.upsert_trade(
+            TradeRecord(
+                trade_id="BROKEN-OPEN",
+                deployment_id="broken-dep",
+                symbol="AAPL",
+                quantity=1,
+                entry_price=None,
+                status="open_unprotected",
+                entry_order_id="LIVE-BROKEN",
+            )
+        )
+    )
+
+    decision = asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="NEXT",
+            deployment_id="next-dep",
+            symbol="MSFT",
+            entry_price=2.0,
+            quantity=1,
+            stop_loss_pct=0.50,
+        )
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == OPEN_POSITION_RISK_UNAVAILABLE_REASON
+    assert decision.details["unquantifiable_open_trade_ids"] == ["BROKEN-OPEN"]
+
+
+def test_disabling_prospective_loss_does_not_require_a_stop_or_budget(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(
+            prospective_loss_enabled=False,
+            max_open_positions_per_cluster=0,
+        ),
+    )
+
+    decision = asyncio.run(
+        manager.reserve_sized_entry(
+            trade_id="NO-STOP",
+            deployment_id="no-stop-dep",
+            symbol="AAPL",
+            entry_price=2.0,
+            quantity=1,
+            stop_loss_pct=None,
+        )
+    )
+
+    assert decision.allowed is True
+    assert decision.details["proposed_planned_stop_loss_usd"] == 0.0
 
 
 def test_allow_entry_not_blocked_by_pnl_query_failure(tmp_path, monkeypatch) -> None:
@@ -798,6 +1187,8 @@ def test_resolve_risk_settings_env_overrides_default(monkeypatch) -> None:
     monkeypatch.setenv("BHIKSHA_RISK_DEMOTE_THRESHOLD_USD", "-5")
     monkeypatch.setenv("BHIKSHA_RISK_RAIL_A_ENABLED", "false")
     monkeypatch.setenv("BHIKSHA_RISK_RAIL_B_ENABLED", "0")
+    monkeypatch.setenv("BHIKSHA_RISK_PROSPECTIVE_LOSS_ENABLED", "false")
+    monkeypatch.setenv("BHIKSHA_RISK_MAX_OPEN_POSITIONS_PER_CLUSTER", "2")
 
     settings = resolve_risk_settings()
 
@@ -808,6 +1199,8 @@ def test_resolve_risk_settings_env_overrides_default(monkeypatch) -> None:
     assert settings.demote_threshold_usd == -5.0
     assert settings.rail_a_enabled is False
     assert settings.rail_b_enabled is False
+    assert settings.prospective_loss_enabled is False
+    assert settings.max_open_positions_per_cluster == 2
 
 
 def test_resolve_risk_settings_defaults_when_no_env(monkeypatch) -> None:
@@ -819,6 +1212,8 @@ def test_resolve_risk_settings_defaults_when_no_env(monkeypatch) -> None:
         "BHIKSHA_RISK_DEMOTE_THRESHOLD_USD",
         "BHIKSHA_RISK_RAIL_A_ENABLED",
         "BHIKSHA_RISK_RAIL_B_ENABLED",
+        "BHIKSHA_RISK_PROSPECTIVE_LOSS_ENABLED",
+        "BHIKSHA_RISK_MAX_OPEN_POSITIONS_PER_CLUSTER",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -831,6 +1226,8 @@ def test_resolve_risk_settings_defaults_when_no_env(monkeypatch) -> None:
     assert settings.demote_threshold_usd == 0.0
     assert settings.rail_a_enabled is True
     assert settings.rail_b_enabled is True
+    assert settings.prospective_loss_enabled is True
+    assert settings.max_open_positions_per_cluster == 1
 
 
 # --------------------------------------------------------------------------

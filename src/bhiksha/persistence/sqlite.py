@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from bhiksha.domain.enums import ExitMode
-from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, PartialFillRecord, TradeRecord
+from bhiksha.domain.models import (
+    CashBudgetDay,
+    CashBudgetReservation,
+    EntryRiskReservation,
+    PartialFillRecord,
+    TradeRecord,
+)
 from bhiksha.options.chain_snapshot import ChainSnapshotAttempt, ContractSnapshotRow
 from bhiksha.persistence.repository import (
     CashBudgetRepository,
@@ -214,6 +220,22 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         await self._ensure_initialized()
         await self.backend.run_write(self._mark_partial_fill_abandoned_sync, record_id, reason)
 
+    async def upsert_entry_risk_reservation(self, reservation: EntryRiskReservation) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(self._upsert_entry_risk_reservation_sync, reservation)
+
+    async def get_active_entry_risk_reservations(self) -> list[EntryRiskReservation]:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_active_entry_risk_reservations_sync)
+
+    async def mark_entry_risk_reservation_status(self, trade_id: str, status: str) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(
+            self._mark_entry_risk_reservation_status_sync,
+            trade_id,
+            status,
+        )
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -347,6 +369,103 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 conn.execute("ALTER TABLE trade_partial_fills ADD COLUMN abandoned_reason TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_partial_fills_trade_id ON trade_partial_fills(trade_id)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS entry_risk_reservations (
+                    trade_id TEXT PRIMARY KEY,
+                    deployment_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    cluster TEXT,
+                    planned_stop_loss_usd REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_entry_risk_reservations_status
+                ON entry_risk_reservations(status)
+                """
+            )
+            conn.commit()
+
+    def _upsert_entry_risk_reservation_sync(
+        self,
+        reservation: EntryRiskReservation,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO entry_risk_reservations (
+                    trade_id, deployment_id, symbol, cluster,
+                    planned_stop_loss_usd, status, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_id) DO UPDATE SET
+                    deployment_id=excluded.deployment_id,
+                    symbol=excluded.symbol,
+                    cluster=excluded.cluster,
+                    planned_stop_loss_usd=excluded.planned_stop_loss_usd,
+                    status=excluded.status,
+                    expires_at=excluded.expires_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    reservation.trade_id,
+                    reservation.deployment_id,
+                    reservation.symbol,
+                    reservation.cluster,
+                    reservation.planned_stop_loss_usd,
+                    reservation.status,
+                    reservation.expires_at.isoformat(),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def _get_active_entry_risk_reservations_sync(self) -> list[EntryRiskReservation]:
+        with closing(self.backend.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_id, deployment_id, symbol, cluster,
+                       planned_stop_loss_usd, status, expires_at
+                FROM entry_risk_reservations
+                WHERE status = 'reserved'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_sessions
+                      WHERE trade_sessions.trade_id = entry_risk_reservations.trade_id
+                        AND lower(trade_sessions.status) = 'closed'
+                  )
+                ORDER BY created_at, trade_id
+                """
+            ).fetchall()
+        return [
+            EntryRiskReservation(
+                trade_id=row[0],
+                deployment_id=row[1],
+                symbol=row[2],
+                cluster=row[3],
+                planned_stop_loss_usd=float(row[4]),
+                status=row[5],
+                expires_at=datetime.fromisoformat(row[6]),
+            )
+            for row in rows
+        ]
+
+    def _mark_entry_risk_reservation_status_sync(self, trade_id: str, status: str) -> None:
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE entry_risk_reservations
+                SET status = ?, updated_at = ?
+                WHERE trade_id = ?
+                """,
+                (status, datetime.now(UTC).isoformat(), trade_id),
             )
             conn.commit()
 

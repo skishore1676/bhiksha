@@ -367,6 +367,25 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
             f"min_n {risk_rails.get('demote_min_n')}, "
             f"threshold {_fmt_money_or_na(risk_rails.get('demote_threshold_usd'))}`"
         )
+        prospective_enabled = risk_rails.get("prospective_loss_enabled")
+        prospective_text = (
+            "unknown"
+            if prospective_enabled is None
+            else ("on" if prospective_enabled else "off")
+        )
+        cluster_cap = risk_rails.get("max_open_positions_per_cluster")
+        lines.append(
+            "- sized-entry defenses: "
+            f"`prospective loss {prospective_text}, "
+            f"cluster cap {cluster_cap if cluster_cap is not None else 'unknown'}`"
+        )
+        sized_entry_blocks = risk_rails.get("sized_entry_blocks") or []
+        if sized_entry_blocks:
+            lines.append(f"- sized entries blocked: `{len(sized_entry_blocks)}`")
+            for blocked in sized_entry_blocks:
+                lines.append(
+                    f"  - `{blocked.get('deployment_id')}`: `{blocked.get('reason')}`"
+                )
         # Operator audit P4 (2026-07-06): open-book mark-to-market WARNING
         # (never a halt/flatten -- see RiskManager.OpenDrawdownStatus).
         lines.append(
@@ -733,6 +752,12 @@ def _risk_rails_summary(conn: sqlite3.Connection, day: date, events: list[dict[s
     open_drawdown_warnings = [
         event["payload"] or {} for event in events if event["event_type"] == OPEN_DRAWDOWN_WARNING_EVENT_TYPE
     ]
+    sized_entry_blocks = [
+        event["payload"] or {}
+        for event in events
+        if event["event_type"] == "risk_manager_sized_entry_decision"
+        and (event["payload"] or {}).get("decision") == "blocked"
+    ]
 
     return {
         "rail_a_enabled": bool(settings_payload.get("rail_a_enabled", True)),
@@ -745,6 +770,15 @@ def _risk_rails_summary(conn: sqlite3.Connection, day: date, events: list[dict[s
         "demote_window": _maybe_int(settings_payload.get("demote_window")),
         "demote_min_n": _maybe_int(settings_payload.get("demote_min_n")),
         "demote_threshold_usd": _maybe_float(settings_payload.get("demote_threshold_usd")),
+        "prospective_loss_enabled": (
+            bool(settings_payload["prospective_loss_enabled"])
+            if "prospective_loss_enabled" in settings_payload
+            else None
+        ),
+        "max_open_positions_per_cluster": _maybe_int(
+            settings_payload.get("max_open_positions_per_cluster")
+        ),
+        "sized_entry_blocks": sized_entry_blocks,
         "open_drawdown_warn_pct": open_dd_warn_pct,
         "open_drawdown_warn_usd": _pct_to_usd(open_dd_warn_pct),
         "open_drawdown_warnings": open_drawdown_warnings,

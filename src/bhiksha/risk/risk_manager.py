@@ -18,6 +18,10 @@ precedent):
     been breached. The caller (``BhikshaRuntime``) is responsible for
     actually invoking the EXISTING ``supervisor.halt_and_flatten_positions``
     machinery when told to -- this module does not place or cancel orders.
+  * ``reserve_sized_entry(...)`` -- the final live-only consult after option
+    quote, quantity, and preflight are known. It durably reserves planned-stop
+    loss headroom and enforces the confirmed correlation-cluster cap before a
+    broker submission can occur.
 
 RAIL A (two-tier portfolio daily-drawdown cap, realized-only v1):
   - tier 1 (halt): today's realized LIVE P&L <= -(max_daily_drawdown_pct/100)
@@ -55,14 +59,17 @@ RAIL B (per-deployment auto-demote, operator-resettable):
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from bhiksha.domain.models import PartialFillRecord, TradeRecord
+from bhiksha.domain.models import EntryRiskReservation, PartialFillRecord, TradeRecord
 from bhiksha.ops.alerts import AlertMode, send_lathi_alert
 from bhiksha.persistence.repository import CashBudgetRepository, EventRepository, TradeStateRepository
+from bhiksha.risk.clusters import correlation_cluster
 from bhiksha.risk.demotion_store import DemotionStore
+from bhiksha.risk.planned_loss import planned_stop_loss_usd
 from bhiksha.risk.risk_settings import RiskSettings
 
 SHADOW_ENTRY_ORDER_ID = "SHADOW_ENTRY"
@@ -72,6 +79,13 @@ TIER2_FLATTEN_REASON = "risk_rail_a_tier2_flatten"
 RAIL_B_DEMOTED_REASON = "risk_rail_b_demoted"
 BUDGET_UNAVAILABLE_REASON = "risk_rail_a_budget_unavailable"
 OPEN_DRAWDOWN_WARNING_REASON = "risk_open_drawdown_warning"
+PROSPECTIVE_LOSS_HEADROOM_REASON = "risk_prospective_loss_headroom_exceeded"
+CORRELATION_CLUSTER_CAP_REASON = "risk_correlation_cluster_at_cap"
+SIZED_ENTRY_BOOK_UNAVAILABLE_REASON = "risk_sized_entry_book_unavailable"
+PROPOSED_STOP_UNAVAILABLE_REASON = "risk_proposed_stop_unavailable"
+OPEN_POSITION_RISK_UNAVAILABLE_REASON = "risk_open_position_risk_unavailable"
+SIZED_ENTRY_RESERVATION_FAILED_REASON = "risk_sized_entry_reservation_failed"
+SIZED_ENTRY_RESERVATION_TTL = timedelta(minutes=30)
 
 # Type of the optional per-position mark-price callback (operator audit P4,
 # 2026-07-06 -- see _compute_open_drawdown_status). Keyed by option_symbol,
@@ -102,7 +116,8 @@ _OK_HEARTBEAT_SECONDS = 600
 
 
 def _is_live_trade(trade: TradeRecord) -> bool:
-    return trade.entry_order_id != SHADOW_ENTRY_ORDER_ID
+    order_id = trade.entry_order_id or ""
+    return order_id != SHADOW_ENTRY_ORDER_ID and not order_id.startswith("DRY_RUN")
 
 
 def _is_closed_trade(trade: TradeRecord) -> bool:
@@ -356,6 +371,12 @@ class RiskManager:
         # readable without losing the halt/flatten/change signal.
         self._last_emitted_decision: str | None = None
         self._last_ok_heartbeat_at: datetime | None = None
+        # A broker submission happens after the final quote/preflight. Keep
+        # the risk check and reservation atomic so concurrent signal runners
+        # cannot both observe the same headroom. The reservation remains until
+        # the supervisor has persisted the filled/open trade, or releases it
+        # after a confirmed no-fill path.
+        self._sized_entry_lock = asyncio.Lock()
 
     async def startup_log(self) -> None:
         """Emit the one startup event proving resolved knobs (env > sheet > default)."""
@@ -922,6 +943,266 @@ class RiskManager:
         decision = EntryDecision(allowed=True, reason="approved")
         await self._emit_entry_decision(deployment_id, decision)
         return decision
+
+    async def reserve_sized_entry(
+        self,
+        *,
+        trade_id: str,
+        deployment_id: str,
+        symbol: str,
+        entry_price: float,
+        quantity: int,
+        stop_loss_pct: float | None,
+    ) -> EntryDecision:
+        """Atomically approve and reserve final, priced live-entry risk.
+
+        Rail A's realized-only halt remains the backstop. This consult prevents
+        the book from accepting open planned-stop risk which, together with
+        losses already realized today, would exceed that same halt budget.
+        """
+        async with self._sized_entry_lock:
+            proposed_loss = planned_stop_loss_usd(
+                entry_price=entry_price,
+                quantity=quantity,
+                stop_loss_pct=stop_loss_pct,
+            )
+            if proposed_loss is None and self.settings.prospective_loss_enabled:
+                decision = EntryDecision(
+                    allowed=False,
+                    reason=PROPOSED_STOP_UNAVAILABLE_REASON,
+                    rail="A-prospective",
+                    details={
+                        "entry_price": entry_price,
+                        "quantity": quantity,
+                        "stop_loss_pct": stop_loss_pct,
+                    },
+                )
+                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                return decision
+            proposed_loss = proposed_loss or 0.0
+
+            cluster = correlation_cluster(symbol)
+            try:
+                open_trades = await self.trade_state_repository.get_open_trades()
+                active_reservations = (
+                    await self.trade_state_repository.get_active_entry_risk_reservations()
+                )
+            except Exception as exc:
+                decision = EntryDecision(
+                    allowed=False,
+                    reason=SIZED_ENTRY_BOOK_UNAVAILABLE_REASON,
+                    rail="entry-risk",
+                    details={"error": str(exc)},
+                )
+                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                return decision
+
+            now = self._now_fn()
+            other_reservations: dict[str, EntryRiskReservation] = {}
+            for reservation in active_reservations:
+                if reservation.expires_at <= now:
+                    await self.trade_state_repository.mark_entry_risk_reservation_status(
+                        reservation.trade_id,
+                        "expired",
+                    )
+                    continue
+                if reservation.trade_id != trade_id:
+                    other_reservations[reservation.trade_id] = reservation
+            reserved_ids = set(other_reservations)
+            live_open_trades = [
+                trade
+                for trade in open_trades
+                if _is_open_live_trade(trade)
+                and trade.trade_id != trade_id
+                and trade.trade_id not in reserved_ids
+            ]
+
+            cluster_count = sum(
+                1
+                for trade in live_open_trades
+                if correlation_cluster(trade.symbol) == cluster
+            ) + sum(
+                1
+                for reservation in other_reservations.values()
+                if reservation.cluster == cluster
+            )
+            cluster_limit = self.settings.max_open_positions_per_cluster
+            cluster_details: dict[str, object] = {
+                "correlation_cluster": cluster,
+                "cluster_open_or_reserved_count": cluster_count,
+                "max_open_positions_per_cluster": cluster_limit,
+                "cluster_mapped": cluster is not None,
+            }
+            if cluster is not None and cluster_limit > 0 and cluster_count >= cluster_limit:
+                decision = EntryDecision(
+                    allowed=False,
+                    reason=CORRELATION_CLUSTER_CAP_REASON,
+                    rail="correlation-cluster",
+                    details=cluster_details,
+                )
+                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                return decision
+
+            loss_details: dict[str, object] = {
+                "prospective_loss_enabled": self.settings.prospective_loss_enabled,
+                "proposed_planned_stop_loss_usd": proposed_loss,
+                **cluster_details,
+            }
+            if self.settings.prospective_loss_enabled:
+                rail_a = await self._compute_rail_a_status()
+                if self.settings.rail_a_enabled and not rail_a.active:
+                    decision = EntryDecision(
+                        allowed=False,
+                        reason=BUDGET_UNAVAILABLE_REASON,
+                        rail="A-prospective",
+                        details={
+                            **loss_details,
+                            "rail_a_inactive_reason": rail_a.reason,
+                            "trade_date": rail_a.trade_date,
+                        },
+                    )
+                    await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                    return decision
+                if rail_a.active and (rail_a.halted or rail_a.flatten):
+                    self._session_halted = True
+                if self._session_halted:
+                    decision = EntryDecision(
+                        allowed=False,
+                        reason=TIER1_HALT_REASON,
+                        rail="A",
+                        details=loss_details,
+                    )
+                    await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                    return decision
+                if rail_a.active:
+                    open_planned_loss = 0.0
+                    unprotected_trade_ids: list[str] = []
+                    unquantifiable_trade_ids: list[str] = []
+                    for trade in live_open_trades:
+                        planned_loss = planned_stop_loss_usd(
+                            entry_price=trade.entry_price,
+                            quantity=trade.quantity,
+                            stop_price=trade.stop_price,
+                        )
+                        if planned_loss is None:
+                            if trade.entry_price is not None and trade.entry_price > 0 and trade.quantity > 0:
+                                planned_loss = round(trade.entry_price * trade.quantity * 100, 2)
+                                unprotected_trade_ids.append(trade.trade_id)
+                            else:
+                                unquantifiable_trade_ids.append(trade.trade_id)
+                        open_planned_loss += planned_loss or 0.0
+                    reserved_planned_loss = round(
+                        sum(
+                            reservation.planned_stop_loss_usd
+                            for reservation in other_reservations.values()
+                        ),
+                        2,
+                    )
+                    realized_loss = max(-(rail_a.realized_live_pnl_usd or 0.0), 0.0)
+                    loss_budget = abs(rail_a.halt_threshold_usd or 0.0)
+                    prospective_total = round(
+                        realized_loss + open_planned_loss + reserved_planned_loss + proposed_loss,
+                        2,
+                    )
+                    loss_details.update(
+                        {
+                            "realized_loss_usd": round(realized_loss, 2),
+                            "open_planned_stop_loss_usd": round(open_planned_loss, 2),
+                            "pending_reserved_stop_loss_usd": reserved_planned_loss,
+                            "prospective_total_loss_usd": prospective_total,
+                            "daily_loss_budget_usd": round(loss_budget, 2),
+                            "remaining_loss_headroom_usd": round(
+                                loss_budget
+                                - realized_loss
+                                - open_planned_loss
+                                - reserved_planned_loss,
+                                2,
+                            ),
+                            "unprotected_full_premium_trade_ids": unprotected_trade_ids,
+                            "unquantifiable_open_trade_ids": unquantifiable_trade_ids,
+                            "trade_date": rail_a.trade_date,
+                        }
+                    )
+                    if unquantifiable_trade_ids:
+                        decision = EntryDecision(
+                            allowed=False,
+                            reason=OPEN_POSITION_RISK_UNAVAILABLE_REASON,
+                            rail="A-prospective",
+                            details=loss_details,
+                        )
+                        await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                        return decision
+                    if prospective_total > loss_budget:
+                        decision = EntryDecision(
+                            allowed=False,
+                            reason=PROSPECTIVE_LOSS_HEADROOM_REASON,
+                            rail="A-prospective",
+                            details=loss_details,
+                        )
+                        await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                        return decision
+
+            try:
+                await self.trade_state_repository.upsert_entry_risk_reservation(
+                    EntryRiskReservation(
+                        trade_id=trade_id,
+                        deployment_id=deployment_id,
+                        symbol=symbol,
+                        cluster=cluster,
+                        planned_stop_loss_usd=proposed_loss,
+                        expires_at=now + SIZED_ENTRY_RESERVATION_TTL,
+                    )
+                )
+            except Exception as exc:
+                decision = EntryDecision(
+                    allowed=False,
+                    reason=SIZED_ENTRY_RESERVATION_FAILED_REASON,
+                    rail="entry-risk",
+                    details={**loss_details, "error": str(exc)},
+                )
+                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                return decision
+            decision = EntryDecision(
+                allowed=True,
+                reason="approved",
+                rail="sized-entry",
+                details=loss_details,
+            )
+            await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+            return decision
+
+    async def release_sized_entry(self, trade_id: str) -> None:
+        async with self._sized_entry_lock:
+            await self.trade_state_repository.mark_entry_risk_reservation_status(
+                trade_id,
+                "released",
+            )
+
+    async def commit_sized_entry(self, trade_id: str) -> None:
+        """Release the transient reservation after durable open-trade truth exists."""
+        async with self._sized_entry_lock:
+            await self.trade_state_repository.mark_entry_risk_reservation_status(
+                trade_id,
+                "committed",
+            )
+
+    async def _emit_sized_entry_decision(
+        self,
+        deployment_id: str,
+        trade_id: str,
+        decision: EntryDecision,
+    ) -> None:
+        await self.event_repository.append(
+            "risk_manager_sized_entry_decision",
+            {
+                "deployment_id": deployment_id,
+                "trade_id": trade_id,
+                "decision": "allowed" if decision.allowed else "blocked",
+                "reason": decision.reason,
+                "rail": decision.rail,
+                "details": decision.details,
+            },
+        )
 
     async def _emit_entry_decision(self, deployment_id: str, decision: EntryDecision) -> None:
         await self.event_repository.append(

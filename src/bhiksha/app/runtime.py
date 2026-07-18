@@ -291,6 +291,7 @@ class BhikshaRuntime:
         await self.risk_manager.startup_log()
         planner = ExecutionPlanner(
             order_manager=order_manager,
+            risk_manager=self.risk_manager,
             cash_guard=CashGuard(
                 order_manager=order_manager,
                 repository=cash_budget_repository,

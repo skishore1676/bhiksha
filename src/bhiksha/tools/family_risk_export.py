@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from bhiksha.risk.clusters import correlation_cluster
+
 
 SCHEMA = "family-risk-shadow/v1"
 _OCC = re.compile(r"^[A-Z.]+\d{6}([CP])\d{8}$")
@@ -35,19 +37,6 @@ _CONTRACT_MULTIPLIER = 100
 _MULTIPLIER_PROVENANCE = "app_standard_option_contract"
 _MULTIPLIER_PROVENANCE_DETAIL = "occ_standard_equity_option:100_shares_per_contract_app_convention"
 
-# App-owned static underlying -> correlation cluster map.  Deterministic and
-# documented, not inferred: an underlying absent from this map exports a null
-# cluster (never a guess).  Kept intentionally small; extend only with clusters
-# Suman has confirmed in the family-risk brief.
-_CLUSTER_BY_UNDERLYING = {
-    "SPY": "broad_market", "QQQ": "broad_market", "IWM": "broad_market",
-    "DIA": "broad_market", "VOO": "broad_market", "VTI": "broad_market",
-    "NVDA": "semiconductors", "AMD": "semiconductors", "SMH": "semiconductors",
-    "MU": "semiconductors", "INTC": "semiconductors", "TSM": "semiconductors",
-    "AVGO": "semiconductors", "SOXL": "semiconductors", "SOXX": "semiconductors",
-    "VIX": "volatility", "VXX": "volatility", "UVXY": "volatility",
-    "SVXY": "volatility", "VIXY": "volatility",
-}
 _CLUSTER_PROVENANCE = "app_static_underlying_cluster_map"
 
 
@@ -148,7 +137,7 @@ def _map_row(row: dict[str, Any], *, broker_observed_at: str | None) -> dict[str
         raise ValueError(f"open trade {row.get('trade_id')} lacks a broker entry-order reference")
     direction = "call" if match.group(1) == "C" else "put"
     symbol = str(row["symbol"]).upper()
-    cluster = _CLUSTER_BY_UNDERLYING.get(symbol)
+    cluster = correlation_cluster(symbol)
     entry_price = row.get("entry_price")
     stop_price = row.get("stop_price")
     capital, worst_case, planned_stop, risk_notes = _long_option_risk(

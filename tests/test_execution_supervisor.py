@@ -19,6 +19,7 @@ from bhiksha.execution.supervisor import (
     _entry_reprice_spread_fraction,
 )
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
+from bhiksha.risk.risk_manager import EntryDecision
 from bhiksha.state.lifecycle import TradeLifecycleStore
 from bhiksha.state.position_tracker import LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE, PositionTracker
 from historical_config import historical_deployment
@@ -225,6 +226,19 @@ class RepricingOrderManager(StubOrderManager):
         return OrderResult(order_id=order_id or "REPRICE123")
 
 
+class RaisingRepricingOrderManager(RepricingOrderManager):
+    async def place_entry_order(
+        self,
+        option_symbol: str,
+        limit_price: float,
+        quantity: int,
+        *,
+        order_id: str | None = None,
+    ):
+        del option_symbol, limit_price, quantity, order_id
+        raise RuntimeError("submit transport failed")
+
+
 class StatusMapOrderManager(RecordingOrderManager):
     def __init__(self, statuses: dict[str, tuple[str | None, dict | None, str | None]]):
         super().__init__()
@@ -240,9 +254,33 @@ class ExplodingStatusOrderManager(RecordingOrderManager):
 
 
 class RecordingPlanner(StubPlanner):
-    def __init__(self, order_manager: RecordingOrderManager):
+    def __init__(self, order_manager: RecordingOrderManager, *, risk_manager=None):
         self.order_manager = order_manager
         self.position_tracker = PositionTracker()
+        self.risk_manager = risk_manager
+
+
+class RecordingSizedRiskManager:
+    def __init__(self, *, allowed: bool = True, reason: str = "approved") -> None:
+        self.allowed = allowed
+        self.reason = reason
+        self.reserve_calls: list[dict] = []
+        self.release_calls: list[str] = []
+        self.commit_calls: list[str] = []
+
+    async def reserve_sized_entry(self, **kwargs):
+        self.reserve_calls.append(kwargs)
+        return EntryDecision(
+            allowed=self.allowed,
+            reason=self.reason,
+            details={"proposed_planned_stop_loss_usd": 101.5},
+        )
+
+    async def release_sized_entry(self, trade_id: str) -> None:
+        self.release_calls.append(trade_id)
+
+    async def commit_sized_entry(self, trade_id: str) -> None:
+        self.commit_calls.append(trade_id)
 
 
 class RecordingManualStatusWriter:
@@ -639,6 +677,111 @@ def test_reprice_chase_cap_does_not_block_a_lower_replacement(tmp_path) -> None:
     assert result.plan.estimated_entry_price == 2.90
     assert order_manager.cancel_calls == ["ENTRY_HIGH"]
     assert order_manager.entry_calls[0][1] == 2.90
+
+
+def test_reprice_rechecks_sized_risk_after_confirmed_cancel(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=2.90, quote_ask=3.00)
+    risk_manager = RecordingSizedRiskManager(
+        allowed=False,
+        reason="risk_prospective_loss_headroom_exceeded",
+    )
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager, risk_manager=risk_manager),
+        event_repository=repo,
+        app_config=AppConfig(entry_reprice_enabled=False),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_RISK_REPRICE",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.80,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_RISK",
+    )
+
+    result = asyncio.run(supervisor._reprice_live_entry(plan, deployment, attempt=1))
+
+    assert result.cancelled_without_fill is True
+    assert result.error == "risk_prospective_loss_headroom_exceeded"
+    assert order_manager.cancel_calls == ["ENTRY_RISK"]
+    assert order_manager.entry_calls == []
+    assert risk_manager.reserve_calls[0]["entry_price"] == 3.0
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events")]
+    assert "entry_reprice_sized_risk_blocked" in event_types
+
+
+def test_reprice_submit_exception_releases_sized_risk(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RaisingRepricingOrderManager(
+        fill_after_orders=99,
+        quote_bid=2.90,
+        quote_ask=3.00,
+    )
+    risk_manager = RecordingSizedRiskManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager, risk_manager=risk_manager),
+        event_repository=repo,
+        app_config=AppConfig(entry_reprice_enabled=False),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_RISK_EXCEPTION",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.80,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_EXCEPTION",
+    )
+
+    result = asyncio.run(supervisor._reprice_live_entry(plan, deployment, attempt=1))
+
+    assert result.cancelled_without_fill is True
+    assert result.error == "entry_reprice_order_submit_failed:submit transport failed"
+    assert risk_manager.release_calls == ["TRADE_RISK_EXCEPTION"]
+
+
+def test_filled_entry_commits_sized_risk_after_open_trade_is_persisted(tmp_path) -> None:
+    db_path = str(tmp_path / "events.db")
+    event_repo = SQLiteEventRepository(db_path)
+    trade_repo = SQLiteTradeStateRepository(db_path)
+    order_manager = RepricingOrderManager(fill_after_orders=1, replacement_fill_price=2.88)
+    risk_manager = RecordingSizedRiskManager()
+    supervisor = ExecutionSupervisor(
+        planner=RecordingPlanner(order_manager, risk_manager=risk_manager),
+        event_repository=event_repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(entry_reprice_enabled=False),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_RISK_COMMIT",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.85,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_COMMIT",
+    )
+
+    asyncio.run(supervisor._protect_live_entry(plan, deployment))
+
+    open_trades = asyncio.run(trade_repo.get_open_trades())
+    assert open_trades[0].status == "open_protected"
+    assert risk_manager.commit_calls == ["TRADE_RISK_COMMIT"]
 
 
 def test_order_resting_above_chase_cap_is_cancelled_at_profile_deadline(tmp_path) -> None:

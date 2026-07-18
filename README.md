@@ -33,9 +33,10 @@ override.
 ## Risk rails (always on for live lanes)
 
 Two-tier daily drawdown on realized live P&L vs usable budget — tier-1 halts new entries, tier-2
-flattens the book — plus per-deployment auto-demote (rolling-10 negative expectancy -> forced
-shadow via a local `DemotionStore`; re-promotion is a protected operator action that starts a
-fresh evidence window). The runtime must be stopped and the command requires an explicit gate:
+flattens the book — plus a final sized-entry headroom check, a correlation-cluster position cap,
+and per-deployment auto-demote (rolling-10 negative expectancy -> forced shadow via a local
+`DemotionStore`; re-promotion is a protected operator action that starts a fresh evidence
+window). The runtime must be stopped and the command requires an explicit gate:
 
 ```bash
 python -m bhiksha.tools.risk_demotion_admin repromote \
@@ -68,6 +69,8 @@ Env vars always win. To make a knob operator-editable without a deploy, add a ro
 | `demote_threshold_usd`          | `BHIKSHA_RISK_DEMOTE_THRESHOLD_USD`           | `0.0`   |
 | `rail_a_enabled`                | `BHIKSHA_RISK_RAIL_A_ENABLED`                 | `true`  |
 | `rail_b_enabled`                | `BHIKSHA_RISK_RAIL_B_ENABLED`                 | `true`  |
+| `prospective_loss_enabled`      | `BHIKSHA_RISK_PROSPECTIVE_LOSS_ENABLED`       | `true`  |
+| `max_open_positions_per_cluster` | `BHIKSHA_RISK_MAX_OPEN_POSITIONS_PER_CLUSTER` | `1`     |
 
 These keys are exactly the env var name with the `BHIKSHA_RISK_` prefix stripped and
 lowercased — see `bhiksha.risk.plan_operator_defaults_source` for the concrete `SettingsSource`
@@ -76,6 +79,8 @@ carried on the compiled `active_plan.json` as `operator_defaults`, not re-read l
 edit takes effect on the next plan sync/session start — same cadence as any other
 `Operator_Defaults_v1` row. Sheet values pass through the same validation/clamping as env values;
 an invalid value falls back to the default and is reported in `validation_warnings`.
+Set `max_open_positions_per_cluster=0` to disable only the cluster cap. See
+`docs/prospective_entry_risk.md` for the loss formula, confirmed cluster map, and event evidence.
 
 ## Where to look
 

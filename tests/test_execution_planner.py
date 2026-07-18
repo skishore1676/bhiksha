@@ -11,6 +11,7 @@ from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.repository import ChainSnapshotRepository
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
 from bhiksha.risk.cash_guard import CashGuard
+from bhiksha.risk.risk_manager import EntryDecision
 from bhiksha.state.position_tracker import PositionTracker
 from historical_config import historical_deployment
 
@@ -159,6 +160,43 @@ class MarginOrderManager(LowCashOrderManager):
         return {"brokerageAccountType": "MARGIN"}
 
 
+class RejectingOrderManager(StubOrderManager):
+    async def place_entry_order(
+        self,
+        option_symbol: str,
+        limit_price: float,
+        quantity: int,
+        order_id: str | None = None,
+    ):
+        del option_symbol, limit_price, quantity, order_id
+        self.place_entry_order_calls += 1
+
+        class Result:
+            order_id = None
+            error = "broker rejected"
+
+        return Result()
+
+
+class StubRiskManager:
+    def __init__(self, *, allowed: bool = True, reason: str = "approved") -> None:
+        self.allowed = allowed
+        self.reason = reason
+        self.reserve_calls: list[dict] = []
+        self.release_calls: list[str] = []
+
+    async def reserve_sized_entry(self, **kwargs):
+        self.reserve_calls.append(kwargs)
+        return EntryDecision(
+            allowed=self.allowed,
+            reason=self.reason,
+            details={"proposed_planned_stop_loss_usd": 130.5},
+        )
+
+    async def release_sized_entry(self, trade_id: str) -> None:
+        self.release_calls.append(trade_id)
+
+
 def _cash_guard(order_manager, tmp_path) -> CashGuard:
     backend = SQLiteBackend(str(tmp_path / "bhiksha.db"))
     return CashGuard(
@@ -194,6 +232,85 @@ def test_execution_planner_creates_dry_run_trade_plan():
     assert plan.risk_details["entry_pricing"]["bid"] == 2.70
     assert plan.risk_details["entry_pricing"]["ask"] == 2.90
     assert plan.risk_details["entry_pricing"]["mid"] == 2.80
+
+
+def test_live_planner_blocks_before_order_when_sized_risk_rejects() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    order_manager = StubOrderManager()
+    risk_manager = StubRiskManager(
+        allowed=False,
+        reason="risk_prospective_loss_headroom_exceeded",
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=0,
+            delta=-0.31,
+        ),
+        order_manager=order_manager,
+        position_tracker=PositionTracker(),
+        risk_manager=risk_manager,
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=False))
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.risk_reasons == ["risk_prospective_loss_headroom_exceeded"]
+    assert order_manager.place_entry_order_calls == 0
+    assert risk_manager.reserve_calls[0]["entry_price"] == 2.9
+    assert risk_manager.reserve_calls[0]["quantity"] == 1
+
+
+def test_live_planner_releases_sized_risk_when_cash_guard_blocks(tmp_path) -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    order_manager = LowCashOrderManager()
+    risk_manager = StubRiskManager()
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=0,
+            delta=-0.31,
+        ),
+        order_manager=order_manager,
+        position_tracker=PositionTracker(),
+        cash_guard=_cash_guard(order_manager, tmp_path),
+        risk_manager=risk_manager,
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=False))
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.risk_reasons == ["insufficient_internal_settled_cash_budget"]
+    assert risk_manager.release_calls == [plan.trade_id]
+    assert order_manager.place_entry_order_calls == 0
+
+
+def test_live_planner_releases_sized_risk_when_broker_rejects() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    order_manager = RejectingOrderManager()
+    risk_manager = StubRiskManager()
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=0,
+            delta=-0.31,
+        ),
+        order_manager=order_manager,
+        position_tracker=PositionTracker(),
+        risk_manager=risk_manager,
+    )
+
+    plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=False))
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.risk_reasons[-1] == "broker rejected"
+    assert risk_manager.release_calls == [plan.trade_id]
 
 
 def test_execution_planner_scales_initial_spread_fraction_by_chain_oi_percentile():
