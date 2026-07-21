@@ -59,6 +59,20 @@ GIVEBACK_TIERS: dict[str, tuple[float, float]] = {
 _DEFAULT_EOD_TIME = dt_time(15, 55)
 
 
+def _float_or_default(value: Any, default: float) -> float:
+    """Coerce ``value`` to float, using ``default`` ONLY when it is ``None``.
+
+    A plain ``... or default`` collapses a legitimate ``0`` (or ``0.0``) to the
+    default because zero is falsy. ``target_1_quantity`` carries real meaning at
+    ``0`` (bank nothing at T1, let the whole position ride to T2 — the kernel
+    validates it as ``ge=0``), so an explicit ``0`` must NOT be silently rewritten
+    to the ``1.0`` default (which would instead exit the *entire* position at T1).
+    """
+    if value is None:
+        return default
+    return float(value)
+
+
 class ProfileLadderRule(str, Enum):
     """Which rung of the priority ladder fired (or HOLD)."""
 
@@ -205,7 +219,7 @@ class ProfileExitFields:
             profile_id=str(get("policy_id", "")) or "unknown_profile",
             target_1_r=get("target_1_r"),
             target_2_r=get("target_2_r"),
-            target_1_quantity=float(get("target_1_quantity", 1.0) or 1.0),
+            target_1_quantity=_float_or_default(get("target_1_quantity"), 1.0),
             initial_stop_pct=get("initial_stop_pct"),
             premium_disaster_stop_pct=get("premium_disaster_stop_pct"),
             option_stop_fallback_pct=float(get("option_stop_fallback_pct", 0.45) or 0.45),
@@ -233,7 +247,7 @@ class ProfileExitFields:
             profile_id=str(get("profile_exit_id") or get("profile") or "unknown_profile"),
             target_1_r=get("target_1_r"),
             target_2_r=get("target_2_r"),
-            target_1_quantity=float(get("target_1_quantity", 1.0) or 1.0),
+            target_1_quantity=_float_or_default(get("target_1_quantity"), 1.0),
             initial_stop_pct=get("initial_stop_pct"),
             premium_disaster_stop_pct=get("premium_disaster_stop_pct"),
             option_stop_fallback_pct=float(get("stop_loss_pct", 0.45) or 0.45),
@@ -278,7 +292,7 @@ class ProfileExitFields:
             profile_id=profile_id,
             target_1_r=num("target_1_r"),
             target_2_r=num("target_2_r"),
-            target_1_quantity=num("target_1_quantity") or 1.0,
+            target_1_quantity=_float_or_default(num("target_1_quantity"), 1.0),
             initial_stop_pct=num("initial_stop_pct"),
             premium_disaster_stop_pct=num("premium_disaster_stop_pct"),
             option_stop_fallback_pct=num("option_stop_fallback_pct") or fallback_stop_pct,
