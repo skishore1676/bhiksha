@@ -577,6 +577,87 @@ def test_from_exit_spec_reads_v2_dials() -> None:
     assert fields.max_hold_seconds == 10800
 
 
+def test_explicit_zero_target_1_quantity_is_preserved_by_adapters() -> None:
+    # target_1_quantity == 0 is a VALID operator profile (kernel ge=0): bank
+    # nothing at T1, let the whole position ride to T2. A ``... or 1.0`` fallback
+    # would silently rewrite the falsy 0 to the 1.0 default, which means "exit the
+    # entire position at T1" — the exact opposite intent. All three adapters must
+    # keep an explicit 0.
+    spec = ExitSpec(
+        profile_exit_id="RIDE_TO_T2",
+        target_1_r=1.0,
+        target_2_r=3.0,
+        target_1_quantity=0.0,
+        initial_stop_pct=0.40,
+        stop_loss_pct=0.40,
+    )
+    assert ProfileExitFields.from_exit_spec(spec).target_1_quantity == 0.0
+
+    mgmt = ManagementPolicySpec(
+        policy_id="RIDE_TO_T2",
+        stop_family="premium_pct",
+        stop_anchor="option_premium",
+        exit_family="r_multiple",
+        target_model="staged",
+        target_r=3.0,
+        target_1_r=1.0,
+        target_2_r=3.0,
+        target_1_quantity=0.0,
+        initial_stop_pct=0.40,
+    )
+    assert ProfileExitFields.from_management_spec(mgmt).target_1_quantity == 0.0
+    assert ProfileExitFields.from_management_spec(mgmt.model_dump()).target_1_quantity == 0.0
+    # The dict adapter also accepts serialized values, so preserve a valid
+    # string zero rather than treating it as a missing quantity.
+    mgmt_dict = mgmt.model_dump()
+    mgmt_dict["target_1_quantity"] = "0"
+    assert ProfileExitFields.from_management_spec(mgmt_dict).target_1_quantity == 0.0
+    # Invalid values must retain the prior fail-loud behavior instead of being
+    # silently converted into a full T1 exit (the 1.0 default).
+    mgmt_dict["target_1_quantity"] = "invalid"
+    with pytest.raises(ValueError):
+        ProfileExitFields.from_management_spec(mgmt_dict)
+
+    params = {
+        "target_1_r": 1.0,
+        "target_2_r": 3.0,
+        "target_1_quantity": 0.0,
+        "initial_stop_pct": 0.40,
+    }
+    assert ProfileExitFields.from_exit_params("RIDE_TO_T2", params).target_1_quantity == 0.0
+
+    # A MISSING quantity still defaults to the full-position 1.0 (back-compat).
+    assert ProfileExitFields.from_exit_params("X", {}).target_1_quantity == 1.0
+
+
+def test_zero_target_1_quantity_holds_through_t1_instead_of_exiting() -> None:
+    # End-to-end ladder proof: with target_1_quantity == 0 a touch of the T1 level
+    # must NOT fire any exit (the position rides to T2). Before the fix the
+    # coerced-to-1.0 quantity produced a FULL square_off of the whole position at
+    # T1 — an inverted decision.
+    fields = ProfileExitFields.from_exit_spec(
+        ExitSpec(
+            profile_exit_id="RIDE_TO_T2",
+            target_1_r=1.0,
+            target_2_r=3.0,
+            target_1_quantity=0.0,
+            initial_stop_pct=0.40,
+            stop_loss_pct=0.40,
+        )
+    )
+    # entry 1.00, risk = 0.40, T1 price = 1.00 + 1.0 * 0.40 = 1.40.
+    decision, state = _eval(fields, 1.40, quantity=10)
+    assert decision.exit is False
+    assert decision.rule is ProfileLadderRule.HOLD
+    assert state.target_1_banked is False
+
+    # A genuine T2 touch (1.00 + 3.0 * 0.40 = 2.20) still exits the full position.
+    decision2, _ = _eval(fields, 2.20, quantity=10)
+    assert decision2.exit is True
+    assert decision2.rule is ProfileLadderRule.TARGET_2_RUNNER
+    assert decision2.exit_quantity == 10
+
+
 # --------------------------------------------------------------------------- #
 # Decision -> existing FSM-action / ExitDecision mapping
 # --------------------------------------------------------------------------- #
