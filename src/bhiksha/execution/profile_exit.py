@@ -70,10 +70,7 @@ def _float_or_default(value: Any, default: float) -> float:
     """
     if value is None:
         return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+    return float(value)
 
 
 class ProfileLadderRule(str, Enum):

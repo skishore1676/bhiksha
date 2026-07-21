@@ -607,6 +607,16 @@ def test_explicit_zero_target_1_quantity_is_preserved_by_adapters() -> None:
     )
     assert ProfileExitFields.from_management_spec(mgmt).target_1_quantity == 0.0
     assert ProfileExitFields.from_management_spec(mgmt.model_dump()).target_1_quantity == 0.0
+    # The dict adapter also accepts serialized values, so preserve a valid
+    # string zero rather than treating it as a missing quantity.
+    mgmt_dict = mgmt.model_dump()
+    mgmt_dict["target_1_quantity"] = "0"
+    assert ProfileExitFields.from_management_spec(mgmt_dict).target_1_quantity == 0.0
+    # Invalid values must retain the prior fail-loud behavior instead of being
+    # silently converted into a full T1 exit (the 1.0 default).
+    mgmt_dict["target_1_quantity"] = "invalid"
+    with pytest.raises(ValueError):
+        ProfileExitFields.from_management_spec(mgmt_dict)
 
     params = {
         "target_1_r": 1.0,
