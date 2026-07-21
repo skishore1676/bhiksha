@@ -65,20 +65,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--active-plan", default="artifacts/playbook/active_plan.json")
     parser.add_argument("--report-label", default="scheduled")
     parser.add_argument("--alert-mode", default=os.getenv("BHIKSHA_LAUNCHD_ALERT_MODE", "live"), choices=["off", "spool", "live"])
-    parser.add_argument("--alert-profile", default=os.getenv("BHIKSHA_LATHI_PROFILE", "jarvis-northstar"))
+    parser.add_argument("--alert-profile", default=os.getenv("BHIKSHA_LATHI_PROFILE", "bhiksha-northstar"))
     parser.add_argument(
         "--obsidian-review-mode",
         default=os.getenv("BHIKSHA_SESSION_REPORT_OBSIDIAN_MODE", "off"),
         choices=["off", "on"],
         help=(
-            "Also project the session report onto the Obsidian coding-agent "
-            "review surface via Lathi Bus (approve/archive). Graceful no-op when "
+            "Also project the session report onto the passive Bhiksha shelf "
+            "via Lathi Bus. Graceful no-op when "
             "the bus is unreachable; never fails the report job."
         ),
     )
     parser.add_argument(
         "--obsidian-review-profile",
-        default=os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "coding-agent-northstar"),
+        default=os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "bhiksha-northstar"),
     )
     parser.add_argument(
         "--weekly-review-mode",
@@ -301,6 +301,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             workspace_root=Path.cwd(),
             artifact_id=result.report["artifact_id"],
             owner_consumer="bhiksha",
+            resume_mode="automatic",
             review_id=result.report["artifact_id"],
         )
     ok = args.weekly_review_mode == "off" or bool(review and review.ok)
@@ -389,6 +390,7 @@ def _publish_session_report_review(
             workspace_root=Path.cwd(),
             artifact_id=_relative_artifact_id(result.markdown_path),
             owner_consumer="bhiksha",
+            passive=True,
         )
     except Exception as exc:  # noqa: BLE001 - projection must never fail the job.
         logger.warning("Obsidian session-report review projection crashed: {}", exc)

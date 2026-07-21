@@ -209,7 +209,7 @@ def _make_report(tmp_path: Path) -> Path:
     return source
 
 
-def test_publish_lathi_review_routes_to_coding_agent_surface(monkeypatch, tmp_path) -> None:
+def test_publish_lathi_review_routes_to_bhiksha_surface(monkeypatch, tmp_path) -> None:
     source = _make_report(tmp_path)
     calls: list[list[str]] = []
 
@@ -241,12 +241,13 @@ def test_publish_lathi_review_routes_to_coding_agent_surface(monkeypatch, tmp_pa
     assert result.review_id == "Bhiksha close session report - 2026-07-09"
     assert result.note_path == "07 Agents/Coding/Inbox/Bhiksha close session report.md"
     assert result.surface == "obsidian"
-    assert result.profile == "coding-agent-northstar"
+    assert result.profile == "bhiksha-northstar"
 
     args = calls[0]
     # Route: publish subcommand onto the shared coding-agent profile/folder.
     assert args[:2] == ["lathi-bus", "publish"]
-    assert args[args.index("--profile") + 1] == "coding-agent-northstar"
+    assert args[args.index("--profile") + 1] == "bhiksha-northstar"
+    assert args[args.index("--resume-mode") + 1] == "automatic"
     # Artifact: the actual on-disk markdown report is the published source.
     assert args[args.index("--source") + 1] == str(source)
     assert args[args.index("--title") + 1] == "Bhiksha close session report - 2026-07-09"

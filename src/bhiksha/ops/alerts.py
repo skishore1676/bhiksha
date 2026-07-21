@@ -88,7 +88,7 @@ def send_lathi_alert(
     if mode == "off":
         return AlertResult(mode="off")
 
-    profile = profile or os.getenv("BHIKSHA_LATHI_PROFILE", "jarvis-northstar")
+    profile = profile or os.getenv("BHIKSHA_LATHI_PROFILE", "bhiksha-northstar")
     if command is None:
         command, cwd = _default_lathi_invocation(cwd)
     cwd_path = Path(cwd).expanduser() if cwd else None
@@ -167,17 +167,19 @@ def publish_lathi_review(
     artifact_id: str | None = None,
     owner_consumer: str = "bhiksha",
     resume_command: str | None = None,
+    resume_mode: str = "automatic",
+    passive: bool = False,
     review_id: str | None = None,
     command: list[str] | None = None,
     cwd: str | Path | None = None,
     timeout_seconds: float | None = None,
 ) -> ReviewPublishResult:
-    """Project a reviewable artifact onto the Obsidian coding-agent surface.
+    """Project a Bhiksha artifact onto its registered Obsidian shelf.
 
     Follows the ``lathi-review-bus`` contract: the default profile
-    ``coding-agent-northstar`` routes to folder ``07 Agents/Coding`` and the
-    published card carries an approve/archive decision affordance (the CLI's
-    ``publish`` default). Bhiksha owns the decision to publish and the artifact
+    ``bhiksha-northstar`` routes to ``06 Lathi/C.1 · Bhiksha Runtime``. Passive
+    session reports use ``publish-reading`` and create no review task; explicitly
+    actionable weekly reviews use the normal publish lifecycle. Bhiksha owns the artifact
     body; Lathi Bus owns the vault surface.
 
     Transport-graceful, mirroring ``send_lathi_alert``: a missing/unreachable
@@ -188,7 +190,7 @@ def publish_lathi_review(
     if mode == "off":
         return ReviewPublishResult(mode="off")
 
-    profile = profile or os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "coding-agent-northstar")
+    profile = profile or os.getenv("BHIKSHA_OBSIDIAN_REVIEW_PROFILE", "bhiksha-northstar")
     # The bus CLI runs with cwd switched to the lathi-bus checkout (see
     # _default_lathi_invocation), so a caller-relative source path would be
     # resolved against the wrong directory there — absolutize it here.
@@ -208,24 +210,25 @@ def publish_lathi_review(
 
     args = [
         *command,
-        "publish",
+        "publish-reading" if passive else "publish",
         "--profile",
         profile,
         "--source",
         str(source_path),
         "--title",
         title,
-        "--owner-consumer",
-        owner_consumer,
+        "--owner-consumer", owner_consumer,
     ]
     if workspace_root:
         args.extend(["--workspace-root", str(Path(workspace_root).expanduser())])
     if artifact_id:
         args.extend(["--artifact-id", str(artifact_id)])
-    if resume_command:
+    if resume_command and not passive:
         args.extend(["--resume-command", resume_command])
     if review_id:
-        args.extend(["--review-id", review_id])
+        args.extend(["--publication-id" if passive else "--review-id", review_id])
+    if not passive:
+        args.extend(["--resume-mode", resume_mode])
 
     try:
         env = os.environ.copy()

@@ -19,7 +19,7 @@ from bhiksha.tools import launchd_job
 def _args(**overrides) -> argparse.Namespace:
     base = {
         "obsidian_review_mode": "on",
-        "obsidian_review_profile": "coding-agent-northstar",
+        "obsidian_review_profile": "bhiksha-northstar",
     }
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -36,7 +36,7 @@ def _result(tmp_path: Path) -> DailyReportWriteResult:
     )
 
 
-def test_session_report_review_publishes_markdown_to_coding_agent(monkeypatch, tmp_path) -> None:
+def test_session_report_projects_markdown_to_passive_bhiksha_shelf(monkeypatch, tmp_path) -> None:
     captured: dict = {}
 
     def fake_publish(**kwargs):
@@ -47,7 +47,7 @@ def test_session_report_review_publishes_markdown_to_coding_agent(monkeypatch, t
             mode="on",
             profile=kwargs["profile"],
             review_id="Bhiksha close session report - 2026-07-09",
-            note_path="07 Agents/Coding/Inbox/Bhiksha close session report.md",
+            note_path="06 Lathi/C.1 · Bhiksha Runtime/Inbox/Bhiksha close session report.md",
             surface="obsidian",
         )
 
@@ -60,9 +60,10 @@ def test_session_report_review_publishes_markdown_to_coding_agent(monkeypatch, t
     assert review.ok is True
     # Artifact: the on-disk markdown report is what gets projected.
     assert captured["source"] == result.markdown_path
-    # Route/profile: the shared coding-agent surface.
-    assert captured["profile"] == "coding-agent-northstar"
+    # Route/profile: the passive Bhiksha runtime shelf.
+    assert captured["profile"] == "bhiksha-northstar"
     assert captured["owner_consumer"] == "bhiksha"
+    assert captured["passive"] is True
     # Title carries the trading date so the operator can tell reports apart.
     assert captured["title"] == "Bhiksha close session report - 2026-07-09"
 
