@@ -72,3 +72,16 @@ Deploy only at the normal post-flat session boundary after:
 4. oldmac is confirmed flat and its checkout/dirtiness are preserved; and
 5. post-deploy readback proves commit/tree, launchd health, startup policy
    identity, and fresh state/manifest output.
+
+## 2026-07-24 deployment proof
+
+Increment 1 passed two independent adversarial reviews and the complete Air
+suite. The oldmac deployment then exposed and closed one observational
+Exit Edge SQLite schema-startup race; the bounded readback fix passed the full
+`1001`-test suite on both Air and oldmac. The production database remained flat
+through deployment, and all Bhiksha launchd jobs remained loaded but stopped
+after the session boundary.
+
+The Dynamic Risk Envelope remains broker-inert and default-off. Deployment did
+not edit the Google Sheet, enable the live profile route, start the trading
+runtime, or submit/cancel/replace any broker order.

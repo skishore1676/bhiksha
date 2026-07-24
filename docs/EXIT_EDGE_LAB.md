@@ -65,9 +65,9 @@ Missing bid, stale/crossed/out-of-order/duplicate quotes, sequence gaps, policy
 identity, recorder failures, or a tape ending before all arms fill make the
 case insufficient.
 
-`ProspectiveQuoteTapeRepository` is a separate experiment store using a 1ms
-SQLite busy timeout. Its `try_*` methods swallow storage/serialization failures
-and return `False` so the
+`ProspectiveQuoteTapeRepository` is a separate experiment store. Quote/state
+writes and every `try_*` path retain a 1ms SQLite busy timeout and return
+`False` on storage/serialization failure so the
 experiment is censored without changing live decision/dispatch timing. It has
 no broker imports and never restores or mutates the real profile FSM/order
 state. Production integration must still enqueue writes off the money-path
@@ -75,6 +75,13 @@ thread. Cohort registration and quote appends are idempotent; conflicting reuse
 of an identity or sequence fails closed for the experiment. Orphan quotes and
 source/feed transitions are rejected. Censor reasons persist and the repository
 can reconstruct a replay case after restart.
+
+The observational `registration_summary` status/report query alone allows a
+bounded 250ms SQLite busy interval so it can read through the recorder's brief
+schema-initialization lock on slower hosts. A pre-schema read reports an empty
+denominator; persistent locks, corruption, and unrelated schema errors still
+surface. This readback value has no planner, risk, execution, reconciliation,
+order, or broker path.
 
 The sidecar persists candidate state in
 `exit_edge_shadow_envelope_state`. Identity, state revision, and locked floor
