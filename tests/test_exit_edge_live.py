@@ -190,6 +190,19 @@ def test_registration_queue_full_is_durable_denominator_not_silent_loss(tmp_path
     recorder.close()
 
 
+def test_registration_summary_is_empty_before_writer_initializes_schema(
+    tmp_path: Path,
+) -> None:
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+
+    assert repository.registration_summary() == {
+        "confirmed_fill_attempts": 0,
+        "eligible_attempts": 0,
+        "registered_cohorts": 0,
+        "missing_or_ineligible_registrations": 0,
+    }
+
+
 def test_restart_gap_censors_unfinished_persisted_cohort(tmp_path: Path) -> None:
     builder = _recorder(tmp_path)
     _, payload = builder._registration_payloads(

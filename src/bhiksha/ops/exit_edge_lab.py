@@ -366,13 +366,23 @@ class ProspectiveQuoteTapeRepository:
             return False
 
     def registration_summary(self) -> dict[str, int]:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*), SUM(eligible), "
-                "SUM(CASE WHEN outcome='registered' THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN outcome!='registered' THEN 1 ELSE 0 END) "
-                "FROM exit_edge_registration_attempts"
-            ).fetchone()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*), SUM(eligible), "
+                    "SUM(CASE WHEN outcome='registered' THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN outcome!='registered' THEN 1 ELSE 0 END) "
+                    "FROM exit_edge_registration_attempts"
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            # A status reader can create/open the SQLite file in the narrow
+            # interval before the recorder worker finishes CREATE TABLE.  An
+            # absent registration table means the durable denominator is still
+            # empty, not that status readback should fail.  Preserve every other
+            # SQLite error (locks, corruption, permissions) as a real failure.
+            if "no such table: exit_edge_registration_attempts" not in str(exc):
+                raise
+            row = (0, 0, 0, 0)
         return {
             "confirmed_fill_attempts": int(row[0] or 0),
             "eligible_attempts": int(row[1] or 0),
