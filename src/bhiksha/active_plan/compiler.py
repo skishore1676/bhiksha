@@ -1459,11 +1459,26 @@ _EXIT_PROFILE_SPEC_FIELD_MAP: dict[str, str] = {
     "no_progress_seconds": "no_progress_seconds",
     "max_hold_seconds": "max_hold_seconds",
     "high_water_giveback_policy": "high_water_giveback_policy",
+    "giveback_arm_r": "giveback_arm_r",
+    "giveback_retrace_fraction": "giveback_retrace_fraction",
+    "risk_envelope_enabled": "risk_envelope_enabled",
+    "risk_envelope_activation_r": "risk_envelope_activation_r",
+    "risk_envelope_initial_floor_r": "risk_envelope_initial_floor_r",
+    "risk_envelope_curvature": "risk_envelope_curvature",
+    "risk_envelope_floor_at_t1_r": "risk_envelope_floor_at_t1_r",
+    "risk_envelope_ratchet_step_r": "risk_envelope_ratchet_step_r",
     "breakeven_after_t1": "breakeven_after_t1",
     "eod_flat": "eod_flat",
     "no_progress_favorable_floor_r": "no_progress_favorable_floor_r",
     "option_stop_fallback_pct": "stop_loss_pct",
     "hard_flat_time_et": "hard_flat_time_et",
+}
+
+_BHIKSHA_LEGACY_GIVEBACK_VALUES: dict[str, tuple[float, float] | None] = {
+    "OFF": None,
+    "STRICT": (1.0, 0.33),
+    "MODERATE": (1.25, 0.50),
+    "LOOSE": (1.5, 0.66),
 }
 
 
@@ -1488,12 +1503,41 @@ def _exit_spec_fields_from_management_policy_spec(spec_payload: dict[str, Any]) 
     from mala_bhiksha_kernel import ManagementPolicySpec  # noqa: PLC0415
 
     spec = ManagementPolicySpec.model_validate(spec_payload)
+    original_policy_id = spec.policy_id
+    resolution = "source_explicit"
+    if spec.policy_schema_version != "exit-policy.v1":
+        resolved_payload = spec.model_dump(mode="json")
+        resolved_payload["policy_schema_version"] = "exit-policy.v1"
+        resolved_payload["policy_id"] = f"{original_policy_id}.bhiksha.compat.v1"
+        legacy_values = _BHIKSHA_LEGACY_GIVEBACK_VALUES[
+            spec.high_water_giveback_policy
+        ]
+        if legacy_values is not None:
+            resolved_payload["giveback_arm_r"] = legacy_values[0]
+            resolved_payload["giveback_retrace_fraction"] = legacy_values[1]
+        spec = ManagementPolicySpec.model_validate(resolved_payload)
+        resolution = "bhiksha_legacy_compatibility_map"
     mapped: dict[str, Any] = {}
     for spec_field, exit_field in _EXIT_PROFILE_SPEC_FIELD_MAP.items():
         value = getattr(spec, spec_field, None)
         if value is None:
             continue
         mapped[exit_field] = value
+    # ``profile_exit_id`` stays the operator-facing source label. The new
+    # versioned policy id/hash carry execution authority.
+    mapped["profile_exit_id"] = original_policy_id
+    mapped["exit_policy_schema_version"] = spec.policy_schema_version
+    mapped["exit_policy_id"] = spec.policy_id
+    mapped["exit_policy_hash"] = spec.policy_hash
+    mapped["exit_policy_snapshot"] = spec.model_dump(mode="json")
+    mapped["exit_policy_provenance"] = {
+        "resolution": resolution,
+        "source_policy_id": original_policy_id,
+        "source_schema_version": spec_payload.get(
+            "policy_schema_version", "management-policy.v2"
+        ),
+        "friendly_label_non_authoritative": True,
+    }
     return mapped
 
 
@@ -1544,6 +1588,33 @@ def _apply_exit_profile_spec(
         if key in protected_keys:
             continue
         updated[key] = value
+    # Identity must cover the fully resolved policy AFTER operator precedence,
+    # not merely the published profile before row-level overrides. Otherwise two
+    # trades with different effective economics could retain the same hash.
+    from bhiksha.shared_kernel import ensure_kernel_on_path
+
+    ensure_kernel_on_path()
+    from mala_bhiksha_kernel import ManagementPolicySpec  # noqa: PLC0415
+
+    resolved_payload = dict(mapped["exit_policy_snapshot"])
+    for spec_field, exit_field in _EXIT_PROFILE_SPEC_FIELD_MAP.items():
+        if (
+            spec_field != "policy_id"
+            and spec_field in resolved_payload
+            and exit_field in updated
+        ):
+            resolved_payload[spec_field] = updated[exit_field]
+    resolved_spec = ManagementPolicySpec.model_validate(resolved_payload)
+    updated["exit_policy_schema_version"] = resolved_spec.policy_schema_version
+    updated["exit_policy_id"] = resolved_spec.policy_id
+    updated["exit_policy_hash"] = resolved_spec.policy_hash
+    updated["exit_policy_snapshot"] = resolved_spec.model_dump(mode="json")
+    provenance = dict(mapped["exit_policy_provenance"])
+    provenance["effective_override_keys"] = sorted(
+        key for key in protected_keys if key in _EXIT_PROFILE_SPEC_FIELD_MAP.values()
+    )
+    provenance["resolution_stage"] = "after_active_plan_precedence"
+    updated["exit_policy_provenance"] = provenance
     return updated
 
 

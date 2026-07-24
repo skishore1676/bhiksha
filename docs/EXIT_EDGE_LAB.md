@@ -7,9 +7,10 @@ The lab has two deliberately separate modes.
    generally right-censored at the authoritative exit, and legacy/profile
    buckets in the weekly scorecard contain different trades and are confounded
    by entry, contract, time, and lane selection.
-2. Prospective mode replays the current profile and legacy mechanics from one
-   immutable actual entry and one append-only executable quote tape. It admits a
-   pair only after both virtual arms have terminal modeled fills.
+2. Prospective mode replays the current profile, legacy mechanics, and the
+   Exit Engine V2 Control/Variant A/Variant B arms from one immutable actual
+   entry and one append-only executable quote tape. It admits a case only after
+   every compared arm has a terminal modeled fill.
 
 This is observational counterfactual evidence, not causal proof. Per tradelab
 ADR-011 it cannot discover or validate other exit profiles.
@@ -24,11 +25,28 @@ experiment spec. Each quote record must carry provider `quote_at`, local
 `received_at`, monotonic `sequence`, provider/cache `source` and `feed`, bid,
 ask, last, spread, and derived freshness.
 
+The frozen experiment also carries the exact canonical Control policy and the
+two named shadow candidate policies. Each arm has a canonical policy id and
+hash. Control retains the trade's immutable live-policy identity and has no
+pre-T1 envelope. Variant A uses activation `0.25R`, curvature `1.5`, and a
+`0.0R` floor at T1; Variant B differs only in curvature `2.0`. The candidates
+are built from the exact Control canonical payload, so unrelated stop, target,
+giveback, time-stop, and EOD semantics do not drift.
+
+Every candidate receives every captured quote row. Its shadow state is keyed by
+`(trade_id, experiment_id, candidate_id)` and carries that candidate's policy
+hash, monotonic locked floor, last observation, and revision. Variant A and
+Variant B never share a mutable floor. The report emits quote/provider
+timestamps, age, spread, executable bid, current and peak R, candidate and
+locked floors, hypothetical stop premium, would-ratchet/would-breach flags, and
+the Control decision from the same row. Missing identity/timestamp and
+expected-versus-recorded row counts are explicit.
+
 Prospective fixtures must carry that explicit precomputed hash. The loader never
 auto-signs an unhashed fixture, because doing so after a settings edit would make
 mutable analysis settings look frozen.
 
-The tape must continue after the first actual or virtual exit until both virtual
+The tape must continue after the first actual or virtual exit until all virtual
 arms terminate or the cohort is explicitly censored. The recorder consumes an
 existing quote cache/feed or an isolated low-priority quota; it must never add
 broker calls that compete with protection or exit traffic.
@@ -43,8 +61,9 @@ Fill model:
 - midpoint, last, ask fallback, and last-mark imputation are forbidden;
 - modeled fills and real broker fills remain separate facts.
 
-Missing bid, stale/crossed/out-of-order/duplicate quotes, sequence gaps, recorder
-failures, or a tape ending before both arms fill make the case insufficient.
+Missing bid, stale/crossed/out-of-order/duplicate quotes, sequence gaps, policy
+identity, recorder failures, or a tape ending before all arms fill make the
+case insufficient.
 
 `ProspectiveQuoteTapeRepository` is a separate experiment store using a 1ms
 SQLite busy timeout. Its `try_*` methods swallow storage/serialization failures
@@ -56,6 +75,11 @@ thread. Cohort registration and quote appends are idempotent; conflicting reuse
 of an identity or sequence fails closed for the experiment. Orphan quotes and
 source/feed transitions are rejected. Censor reasons persist and the repository
 can reconstruct a replay case after restart.
+
+The sidecar persists candidate state in
+`exit_edge_shadow_envelope_state`. Identity, state revision, and locked floor
+are fail-closed against regression. This is evidence state only: it is not the
+live profile FSM, committed stop state, or an order instruction.
 
 ## Commands
 
@@ -103,14 +127,15 @@ daemon worker outside the symbol lock and money path.
 Eligibility is strict. A cohort is created only when the broker fill payload
 has `status=FILLED` and contains `averageFillPrice`/`averagePrice`, positive
 `filledQuantity`, and `filledAt` or Public's FILLED-order completion field
-`closedAt`, and the deployment carries a named profile. Plan price,
-requested quantity, submission time, `openedAt`, and `lastTradeTime` are never
-substituted. Every confirmed-fill attempt—including ineligible or queue-dropped
-attempts—is queued for `exit_edge_registration_attempts`, so missing cohorts
-remain visible in the denominator. Persistence failures are retained for
-in-session retry and surfaced in the health artifact; a permanent storage
-outage still requires reconciliation against Bhiksha's authoritative
-`entry_fill_check` history before inference.
+`closedAt`, and the deployment carries a named profile plus a valid canonical
+`exit-policy.v1` snapshot/id/hash. Plan price, requested quantity, submission
+time, `openedAt`, and `lastTradeTime` are never substituted. Every
+confirmed-fill attempt—including ineligible or queue-dropped attempts—is
+queued for `exit_edge_registration_attempts`, so missing cohorts remain visible
+in the denominator. Persistence failures are retained for in-session retry and
+surfaced in the health artifact; a permanent storage outage still requires
+reconciliation against Bhiksha's authoritative `entry_fill_check` history
+before inference.
 
 Quote timestamps are accepted only when Public identifies the field as
 `quoteTimestamp`. Generic response timestamps and trade timestamps do not prove

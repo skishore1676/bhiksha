@@ -382,6 +382,23 @@ class ExitSpec(BaseModel):
     # L1: configurable favorable-excursion floor (in R) for the no-progress time
     # stop; the profile evaluator defaults to 0.25 when unset.
     no_progress_favorable_floor_r: float = 0.25
+    # Exit Engine V2 authoritative identity. These fields are additive and
+    # populated by active-plan compilation after all precedence resolution.
+    # ``profile_exit_id`` remains the friendly operator label; execution and
+    # recovery identity comes from the explicit policy payload/hash below.
+    exit_policy_schema_version: str | None = None
+    exit_policy_id: str | None = None
+    exit_policy_hash: str | None = None
+    exit_policy_snapshot: dict[str, Any] = Field(default_factory=dict)
+    exit_policy_provenance: dict[str, Any] = Field(default_factory=dict)
+    giveback_arm_r: float | None = None
+    giveback_retrace_fraction: float | None = None
+    risk_envelope_enabled: bool = False
+    risk_envelope_activation_r: float | None = None
+    risk_envelope_initial_floor_r: float | None = None
+    risk_envelope_curvature: float | None = None
+    risk_envelope_floor_at_t1_r: float | None = None
+    risk_envelope_ratchet_step_r: float | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -415,6 +432,38 @@ class ExitSpec(BaseModel):
                 "ExitSpec premium_disaster_stop_pct "
                 f"({disaster}) must not be tighter than initial_stop_pct ({initial}); "
                 "the disaster stop is a catastrophe backstop and must be wider (>=)"
+            )
+        explicit_giveback = (self.giveback_arm_r, self.giveback_retrace_fraction)
+        if (explicit_giveback[0] is None) != (explicit_giveback[1] is None):
+            raise ValueError(
+                "giveback_arm_r and giveback_retrace_fraction must be set together"
+            )
+        if self.exit_policy_hash and not self.exit_policy_snapshot:
+            raise ValueError("exit_policy_hash requires a full exit_policy_snapshot")
+        if self.risk_envelope_enabled:
+            envelope_values = (
+                self.risk_envelope_activation_r,
+                self.risk_envelope_initial_floor_r,
+                self.risk_envelope_curvature,
+                self.risk_envelope_floor_at_t1_r,
+                self.risk_envelope_ratchet_step_r,
+            )
+            if any(value is None for value in envelope_values):
+                raise ValueError(
+                    "enabled risk envelope requires all explicit envelope fields"
+                )
+        elif any(
+            value is not None
+            for value in (
+                self.risk_envelope_activation_r,
+                self.risk_envelope_initial_floor_r,
+                self.risk_envelope_curvature,
+                self.risk_envelope_floor_at_t1_r,
+                self.risk_envelope_ratchet_step_r,
+            )
+        ):
+            raise ValueError(
+                "disabled risk envelope cannot carry envelope parameter values"
             )
         return self
 

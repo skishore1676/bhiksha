@@ -12,6 +12,7 @@ from bhiksha.execution.supervisor import _confirmed_entry_fill_facts
 from bhiksha.ops import exit_edge_live
 from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
+from bhiksha.execution.exit_policy import canonical_policy_hash
 
 
 ENTRY = datetime(2026, 7, 10, 14, 0, tzinfo=UTC)
@@ -19,6 +20,38 @@ OPTION = "QQQ260710P00713000"
 
 
 def _deployment():
+    control_policy = {
+        "policy_id": "exit.premium_envelope.trend_continuation.control.v1",
+        "stop_family": "premium_pct",
+        "stop_anchor": "filled_option_premium",
+        "exit_family": "profile_ladder",
+        "target_model": "staged_r",
+        "target_r": 2.0,
+        "hard_flat_time_et": "15:55",
+        "option_stop_fallback_pct": 0.45,
+        "target_order_mode": "virtual_or_broker",
+        "source_config_id": None,
+        "parameters": {},
+        "policy_schema_version": "exit-policy.v1",
+        "target_1_r": 1.0,
+        "target_2_r": 2.0,
+        "target_1_quantity": 0.6,
+        "initial_stop_pct": 0.35,
+        "premium_disaster_stop_pct": 0.45,
+        "no_progress_seconds": None,
+        "max_hold_seconds": None,
+        "high_water_giveback_policy": "OFF",
+        "giveback_arm_r": None,
+        "giveback_retrace_fraction": None,
+        "risk_envelope_enabled": False,
+        "risk_envelope_activation_r": None,
+        "risk_envelope_initial_floor_r": None,
+        "risk_envelope_curvature": None,
+        "risk_envelope_floor_at_t1_r": None,
+        "risk_envelope_ratchet_step_r": None,
+        "breakeven_after_t1": True,
+        "eod_flat": True,
+    }
     return SimpleNamespace(
         deployment_id="qqq-live",
         symbol="QQQ",
@@ -29,7 +62,7 @@ def _deployment():
             target_2_r=2.0,
             target_1_quantity=0.6,
             initial_stop_pct=0.35,
-            premium_disaster_stop_pct=0.35,
+            premium_disaster_stop_pct=0.45,
             stop_loss_pct=0.35,
             profit_target_multiple=1.0,
             option_profit_target_pct=None,
@@ -41,6 +74,10 @@ def _deployment():
             eod_flat=True,
             hard_flat_time_et="15:55",
             no_progress_favorable_floor_r=0.25,
+            exit_policy_schema_version="exit-policy.v1",
+            exit_policy_id=control_policy["policy_id"],
+            exit_policy_hash=canonical_policy_hash(control_policy),
+            exit_policy_snapshot=control_policy,
         ),
     )
 
@@ -93,10 +130,15 @@ def test_live_recorder_pairs_from_reused_quotes_and_stops_observing(tmp_path: Pa
     assert snapshot["broker_calls_added"] == 0
     recorder.close()
 
-    case = ProspectiveQuoteTapeRepository(tmp_path / "edge.db").load_case("exit-edge:T1")
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    case = repository.load_case("exit-edge:T1")
     assert len(case.quotes) == 5
     assert case.persisted_censor_reason is None
     assert case.legacy_config["comparator_version"] == "bhiksha-native-premium-stop-full-target-eod-v1"
+    states = repository.load_shadow_envelope_states("T1")
+    assert {state.candidate_id for state in states} == {
+        "variant_a", "variant_b"
+    }
 
 
 def test_full_queue_and_slow_storage_never_block_quote_observer(tmp_path: Path) -> None:

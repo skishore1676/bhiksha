@@ -89,5 +89,6 @@ Set `max_open_positions_per_cluster=0` to disable only the cluster cap. See
 - Runtime truth: `bhiksha.db` (`events`, `trade_sessions`); compiled plan:
   `artifacts/playbook/active_plan.json` (incl. `gate_override_key_warnings`, suppression reasons).
 - Deploy/runbook: `docs/deploy_runbook.md`. Launchd contract: `docs/bhiksha_launchd.md`.
+- Exit Engine V2 Increment 1 runtime boundary: `docs/EXIT_ENGINE_V2_INCREMENT_1.md`.
 - Hard-won operating lessons: `docs/lessons/`.
 - Cross-repo follow-on workplan: `mala_v2/docs/LIVE_LOOP_WORKPLAN.md`.

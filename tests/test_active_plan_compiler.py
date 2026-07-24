@@ -16,6 +16,7 @@ from bhiksha.active_plan.compiler import (
     sync_google_strategy_catalog,
 )
 from bhiksha.config.loader import load_active_plan
+from bhiksha.execution.exit_policy import canonical_policy_hash
 from bhiksha.tools.compile_active_plan import main as compile_active_plan_main
 
 
@@ -456,6 +457,15 @@ def test_compile_active_plan_carries_exit_profile_spec_onto_manual_exit(tmp_path
     assert exit_spec.max_hold_seconds == 5400
     # giveback enum carried verbatim (validated by the kernel spec).
     assert exit_spec.high_water_giveback_policy == "MODERATE"
+    assert exit_spec.giveback_arm_r == 1.25
+    assert exit_spec.giveback_retrace_fraction == 0.50
+    assert exit_spec.exit_policy_schema_version == "exit-policy.v1"
+    assert exit_spec.exit_policy_id == "opening_drive_scalp_v1.bhiksha.compat.v1"
+    assert len(exit_spec.exit_policy_hash or "") == 64
+    assert exit_spec.exit_policy_provenance["resolution"] == (
+        "bhiksha_legacy_compatibility_map"
+    )
+    assert exit_spec.exit_policy_snapshot["giveback_arm_r"] == 1.25
     assert exit_spec.breakeven_after_t1 is False
     assert exit_spec.eod_flat is False
     # option_stop_fallback_pct -> exit.stop_loss_pct (the resolvable recovery stop)
@@ -540,6 +550,13 @@ def test_exit_profile_fallback_does_not_widen_existing_catalog_stop(tmp_path: Pa
     deployment = compiled.plan.deployments[0]
     assert deployment.risk.stop_loss_pct == 0.35
     assert deployment.exit.stop_loss_pct == 0.35
+    assert deployment.exit.exit_policy_snapshot["option_stop_fallback_pct"] == 0.35
+    assert deployment.exit.exit_policy_hash == canonical_policy_hash(
+        deployment.exit.exit_policy_snapshot
+    )
+    assert deployment.exit.exit_policy_provenance["effective_override_keys"] == [
+        "stop_loss_pct"
+    ]
     assert deployment.exit.initial_stop_pct == 0.30
     assert deployment.exit.profile_exit_id == "opening_drive_scalp_v1"
 

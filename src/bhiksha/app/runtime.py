@@ -49,6 +49,10 @@ from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.ops.daily_report import write_daily_report
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
+from bhiksha.ops.session_manifest import (
+    effective_exit_policy_records,
+    write_session_manifest,
+)
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.sqlite import (
     SQLiteBackend,
@@ -57,6 +61,7 @@ from bhiksha.persistence.sqlite import (
     SQLiteEventRepository,
     SQLiteTradeStateRepository,
 )
+from bhiksha.persistence.exit_state import SQLiteExitStateRepository
 from bhiksha.risk.cash_guard import CashGuard, trade_date_et
 from bhiksha.risk.plan_operator_defaults_source import PlanOperatorDefaultsSource
 from bhiksha.risk.risk_manager import RiskManager
@@ -244,12 +249,22 @@ class BhikshaRuntime:
             if deployment.strategy.key in MANUAL_INTRABAR_STRATEGY_KEYS:
                 manual_intrabar_deployments_by_symbol[deployment.symbol].append(deployment)
             deployments_by_id[deployment.deployment_id] = deployment
+        startup_snapshot = self.startup_snapshot(live=live, max_bars=max_bars)
+        startup_config_id = startup_snapshot.get("config_fingerprint")
+        active_plan_id = (
+            (self.deployment_selection or {}).get("active_plan_id")
+            or (self.active_plan or {}).get("active_plan_id")
+        )
 
         store = RollingBarStore(max_bars_per_symbol=self.app_config.rolling_bar_capacity)
         evaluator = ReplaySignalEvaluator(FeatureService(), self.strategy_registry)
         sqlite_backend = SQLiteBackend(self.app_config.sqlite_path)
         event_repository = SQLiteEventRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         trade_state_repository = SQLiteTradeStateRepository(self.app_config.sqlite_path, backend=sqlite_backend)
+        exit_state_repository = SQLiteExitStateRepository(
+            self.app_config.sqlite_path,
+            backend=sqlite_backend,
+        )
         cash_budget_repository = SQLiteCashBudgetRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         chain_snapshot_repository = SQLiteChainSnapshotRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         await _sweep_chain_snapshot_retention_best_effort(chain_snapshot_repository, output=output)
@@ -317,6 +332,9 @@ class BhikshaRuntime:
             manual_status_writer=manual_status_writer,
             reconcile_trigger=reconcile_trigger,
             exit_edge_recorder=exit_edge_recorder,
+            exit_state_repository=exit_state_repository,
+            active_plan_id=active_plan_id,
+            startup_config_id=startup_config_id,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker
@@ -414,7 +432,18 @@ class BhikshaRuntime:
         }
 
         try:
-            startup_snapshot = self.startup_snapshot(live=live, max_bars=max_bars)
+            try:
+                receipt = write_session_manifest(
+                    startup_snapshot,
+                    output_dir=Path(self.app_config.playbook_artifacts_dir)
+                    / "session_manifests",
+                )
+                output(
+                    "SESSION_MANIFEST "
+                    f"json={receipt.json_path} markdown={receipt.markdown_path}"
+                )
+            except Exception as exc:
+                output(f"RUNTIME_ISSUE ALL stage=session_manifest_receipt error={exc}")
             output("STARTUP_CONFIG " + json.dumps(startup_snapshot, sort_keys=True))
             await event_repository.append("startup_config", startup_snapshot)
             await self._refresh_reconciliation(
@@ -651,6 +680,9 @@ class BhikshaRuntime:
             "app": self.app_config.model_dump(),
             "providers": self.provider_config.model_dump(),
             "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
+            "effective_exit_policies": effective_exit_policy_records(
+                self.enabled_deployments
+            ),
             "warmup": {
                 "policy": "feature_contract_v1",
                 "legacy_base_trading_days": self.app_config.warmup_trading_days,

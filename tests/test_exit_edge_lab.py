@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
@@ -13,19 +14,57 @@ from bhiksha.ops.exit_edge_lab import (
     QuoteTapeMark,
     analyze_cases,
     analyze_prospective_repository,
+    build_risk_envelope_experiment,
     build_historical_coverage_report,
     experiment_spec_hash,
     load_fixture_cases,
 )
+from bhiksha.execution.exit_policy import canonical_policy_hash
 
 ENTRY = datetime(2026, 7, 9, 14, 0, tzinfo=UTC)
+
+
+def _control_policy() -> dict:
+    return {
+        "policy_id": "exit.premium_envelope.trend_continuation.control.v1",
+        "stop_family": "premium_pct",
+        "stop_anchor": "filled_option_premium",
+        "exit_family": "profile_ladder",
+        "target_model": "staged_r",
+        "target_r": 2.0,
+        "hard_flat_time_et": "15:55",
+        "option_stop_fallback_pct": 0.45,
+        "target_order_mode": "virtual_or_broker",
+        "source_config_id": None,
+        "parameters": {},
+        "policy_schema_version": "exit-policy.v1",
+        "target_1_r": 1.0,
+        "target_2_r": 2.0,
+        "target_1_quantity": 0.6,
+        "initial_stop_pct": 0.35,
+        "premium_disaster_stop_pct": 0.45,
+        "no_progress_seconds": None,
+        "max_hold_seconds": None,
+        "high_water_giveback_policy": "MODERATE",
+        "giveback_arm_r": 1.25,
+        "giveback_retrace_fraction": 0.5,
+        "risk_envelope_enabled": False,
+        "risk_envelope_activation_r": None,
+        "risk_envelope_initial_floor_r": None,
+        "risk_envelope_curvature": None,
+        "risk_envelope_floor_at_t1_r": None,
+        "risk_envelope_ratchet_step_r": None,
+        "breakeven_after_t1": True,
+        "eod_flat": True,
+    }
 
 
 def _raw_case() -> dict:
     profile = {
         "profile_exit_id": "profile__trend_continuation", "initial_stop_pct": 0.35,
-        "premium_disaster_stop_pct": 0.35, "target_1_r": 1.0, "target_2_r": 2.0,
-        "target_1_quantity": 0.6, "high_water_giveback_policy": "OFF",
+        "premium_disaster_stop_pct": 0.45, "target_1_r": 1.0, "target_2_r": 2.0,
+        "target_1_quantity": 0.6, "high_water_giveback_policy": "MODERATE",
+        "giveback_arm_r": 1.25, "giveback_retrace_fraction": 0.5,
         "eod_flat": True, "hard_flat_time_et": "15:55",
     }
     legacy = {"stop_loss_pct": 0.35, "profit_target_pct": 0.35, "hard_flat_time_et": "15:55"}
@@ -34,6 +73,11 @@ def _raw_case() -> dict:
         "evaluator_version": "profile-evaluator-v1", "fill_model_version": "next-fresh-natural-bid-v2",
         "quote_source": "public_cache", "quote_feed": "existing_position_quote_cache_v1",
     }
+    control = _control_policy()
+    experiment["risk_envelope"] = build_risk_envelope_experiment(
+        control,
+        control_policy_hash=canonical_policy_hash(control),
+    )
     bids = [2.10, 2.70, 2.75, 3.40, 3.35]
     return {
         "cohort_id": "C1", "trade_id": "T1", "cluster_id": "2026-07-09:QQQ",
@@ -68,6 +112,102 @@ def test_next_tick_bid_fill_pairs_partial_and_runner(tmp_path: Path) -> None:
     assert row["profile_outcome"]["realized_pnl_usd"] == 990.0
     assert row["paired_delta_pnl_usd"] == 240.0
     assert row["profile_outcome"]["legs"][1]["fill_sequence"] == 5
+    assert set(row["risk_envelope_outcomes"]) == {
+        "control", "variant_a", "variant_b"
+    }
+    assert len(row["risk_envelope_observations"]) == len(_raw_case()["quotes"]) * 3
+    assert row["missingness"]["identity_or_timestamp_rows"] == 0
+
+
+def test_control_a_b_have_distinct_identity_and_isolated_monotonic_state(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_case()
+    # Rise to 0.8R, retrace through both distinct locked floors, then provide
+    # the next fresh bid used by the existing modeled fill convention.
+    raw["quotes"] = []
+    for sequence, bid in enumerate([2.10, 2.56, 2.40, 2.20], start=1):
+        at = ENTRY + timedelta(seconds=sequence * 15)
+        raw["quotes"].append(
+            {
+                "sequence": sequence,
+                "source": "public_cache",
+                "feed": "existing_position_quote_cache_v1",
+                "quote_at": at.isoformat(),
+                "received_at": (at + timedelta(milliseconds=100)).isoformat(),
+                "bid": bid,
+                "ask": bid + 0.05,
+                "last": bid + 0.02,
+            }
+        )
+    row = analyze_cases(_load(tmp_path, raw))["cases"][0]
+    states = {
+        state["candidate_id"]: state
+        for state in row["shadow_envelope_states"]
+    }
+    assert set(states) == {"variant_a", "variant_b"}
+    assert states["variant_a"]["candidate_policy_hash"] != states["variant_b"][
+        "candidate_policy_hash"
+    ]
+    assert states["variant_a"]["candidate_policy_hash"] == (
+        "b10f6888610abc25484199bb3b20692df90d8599ba26d09edf8ae83b9970412e"
+    )
+    assert states["variant_b"]["candidate_policy_hash"] == (
+        "3485c6e78458621b4e596f13c92a5f8f75b5bf873a05a9f9c445c2eefb387f54"
+    )
+    assert states["variant_a"]["locked_floor_r"] > states["variant_b"][
+        "locked_floor_r"
+    ]
+    observations = row["risk_envelope_observations"]
+    for candidate_id in ("variant_a", "variant_b"):
+        floors = [
+            item["locked_floor_r"]
+            for item in observations
+            if item["candidate_id"] == candidate_id
+            and item["candidate_floor_r"] is not None
+        ]
+        assert floors == sorted(floors)
+        assert all(
+            item["control_decision"]
+            for item in observations
+            if item["candidate_id"] == candidate_id
+        )
+
+
+def test_shadow_candidate_state_repository_rejects_identity_and_floor_regression(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_case()
+    case = _load(tmp_path, raw)[0]
+    row = analyze_cases([case])["cases"][0]
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "lab.db")
+    repo.initialize()
+    from bhiksha.ops.exit_edge_lab import ShadowEnvelopeState
+
+    states = tuple(
+        ShadowEnvelopeState(**state)
+        for state in row["shadow_envelope_states"]
+    )
+    repo.persist_shadow_envelope_states(states)
+    loaded = repo.load_shadow_envelope_states("T1")
+    assert {state.candidate_id for state in loaded} == {
+        "variant_a", "variant_b"
+    }
+    regressed = replace(
+        states[0],
+        locked_floor_r=float(states[0].locked_floor_r) - 0.1,
+    )
+    with pytest.raises(ValueError, match="floor regressed"):
+        repo.persist_shadow_envelope_states((regressed,))
+    cleared = replace(states[0], locked_floor_r=None)
+    with pytest.raises(ValueError, match="cannot be cleared"):
+        repo.persist_shadow_envelope_states((cleared,))
+    equal_revision_drift = replace(
+        states[0],
+        last_observation_id="different-observation",
+    )
+    with pytest.raises(ValueError, match="equal revision is not idempotent"):
+        repo.persist_shadow_envelope_states((equal_revision_drift,))
 
 
 def test_wide_quote_still_uses_executable_bid_not_midpoint(tmp_path: Path) -> None:
@@ -113,7 +253,9 @@ def test_tape_end_before_second_arm_fill_is_right_censored(tmp_path: Path) -> No
     raw=_raw_case(); raw["quotes"]=raw["quotes"][:4]
     row=analyze_cases(_load(tmp_path,raw))["cases"][0]
     assert row["status"] == "insufficient_data"
-    assert row["insufficient_reason"] == "right_censored:profile"
+    assert row["insufficient_reason"] == (
+        "right_censored:control,variant_a,variant_b"
+    )
 
 
 def test_pre_entry_quote_and_feed_transition_are_censored(tmp_path: Path) -> None:
@@ -136,6 +278,14 @@ def test_unhashed_fixture_cannot_auto_sign_itself(tmp_path: Path) -> None:
     raw=_raw_case(); raw.pop("experiment_spec_hash")
     with pytest.raises(ValueError, match="explicit experiment_spec_hash"):
         _load(tmp_path,raw)
+
+
+def test_pre_increment_fixture_exposes_missing_envelope_identity() -> None:
+    fixture = Path(__file__).parent / "fixtures/exit_edge_lab/paired_quote_tape.json"
+    row = analyze_cases(load_fixture_cases(fixture))["cases"][0]
+    assert row["insufficient_reason"] == (
+        "missing_risk_envelope_experiment_identity"
+    )
 
 
 def test_unsupported_or_heterogeneous_experiment_versions_cannot_aggregate(tmp_path: Path) -> None:

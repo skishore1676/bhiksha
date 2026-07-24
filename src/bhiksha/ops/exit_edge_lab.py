@@ -28,6 +28,10 @@ from bhiksha.execution.profile_exit import (
     ProfileMarketView,
     evaluate_profile_exit,
 )
+from bhiksha.execution.exit_policy import (
+    canonical_policy_hash,
+    evaluate_risk_envelope,
+)
 
 ET = ZoneInfo("America/New_York")
 SCOPE_BOUNDARY = (
@@ -43,6 +47,8 @@ FILL_MODEL = (
 )
 EVALUATOR_VERSION = "profile-evaluator-v1"
 FILL_MODEL_VERSION = "next-fresh-natural-bid-v2"
+RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION = "exit-edge-risk-envelope.v1"
+RISK_ENVELOPE_EXPERIMENT_ID = "trend-continuation-control-a-b.v1"
 SQLITE_NONBLOCKING_TIMEOUT_SECONDS = 0.001
 
 
@@ -86,6 +92,19 @@ class PolicyOutcome:
     realized_pnl_usd: float
     time_in_trade_seconds: float
     legs: tuple[dict[str, Any], ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ShadowEnvelopeState:
+    trade_id: str
+    experiment_id: str
+    candidate_id: str
+    candidate_policy_id: str
+    candidate_policy_hash: str
+    locked_floor_r: float | None
+    last_evaluated_at: str | None
+    last_observation_id: str | None
+    state_revision: int
 
 
 class ProspectiveQuoteTapeRepository:
@@ -149,6 +168,19 @@ class ProspectiveQuoteTapeRepository:
                   observed_at TEXT NOT NULL, eligible INTEGER NOT NULL,
                   cohort_id TEXT, outcome TEXT NOT NULL, reason TEXT,
                   persisted_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS exit_edge_shadow_envelope_state (
+                  trade_id TEXT NOT NULL,
+                  experiment_id TEXT NOT NULL,
+                  candidate_id TEXT NOT NULL,
+                  candidate_policy_id TEXT NOT NULL,
+                  candidate_policy_hash TEXT NOT NULL,
+                  locked_floor_r REAL,
+                  last_evaluated_at TEXT,
+                  last_observation_id TEXT,
+                  state_revision INTEGER NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (trade_id, experiment_id, candidate_id)
                 );
                 """
             )
@@ -348,6 +380,97 @@ class ProspectiveQuoteTapeRepository:
             "missing_or_ineligible_registrations": int(row[3] or 0),
         }
 
+    def persist_shadow_envelope_states(
+        self, states: tuple[ShadowEnvelopeState, ...]
+    ) -> None:
+        """Persist replay state without allowing identity/floor regression."""
+        if self.read_only:
+            raise ValueError("read-only prospective repository cannot persist shadow state")
+        with self._connect() as conn:
+            for state in states:
+                existing = conn.execute(
+                    """
+                    SELECT candidate_policy_id, candidate_policy_hash,
+                           locked_floor_r, last_evaluated_at,
+                           last_observation_id, state_revision
+                    FROM exit_edge_shadow_envelope_state
+                    WHERE trade_id=? AND experiment_id=? AND candidate_id=?
+                    """,
+                    (state.trade_id, state.experiment_id, state.candidate_id),
+                ).fetchone()
+                if existing is not None:
+                    if tuple(existing[:2]) != (
+                        state.candidate_policy_id,
+                        state.candidate_policy_hash,
+                    ):
+                        raise ValueError("shadow candidate policy identity changed")
+                    prior_floor = existing[2]
+                    if prior_floor is not None and state.locked_floor_r is None:
+                        raise ValueError("shadow candidate floor cannot be cleared")
+                    if (
+                        prior_floor is not None
+                        and state.locked_floor_r is not None
+                        and state.locked_floor_r < float(prior_floor)
+                    ):
+                        raise ValueError("shadow candidate floor regressed")
+                    prior_revision = int(existing[5])
+                    if state.state_revision < prior_revision:
+                        raise ValueError("shadow candidate state revision regressed")
+                    if state.state_revision == prior_revision and (
+                        state.locked_floor_r,
+                        state.last_evaluated_at,
+                        state.last_observation_id,
+                    ) != tuple(existing[2:5]):
+                        raise ValueError(
+                            "shadow candidate equal revision is not idempotent"
+                        )
+                conn.execute(
+                    """
+                    INSERT INTO exit_edge_shadow_envelope_state (
+                      trade_id, experiment_id, candidate_id,
+                      candidate_policy_id, candidate_policy_hash,
+                      locked_floor_r, last_evaluated_at, last_observation_id,
+                      state_revision, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_id, experiment_id, candidate_id) DO UPDATE SET
+                      locked_floor_r=excluded.locked_floor_r,
+                      last_evaluated_at=excluded.last_evaluated_at,
+                      last_observation_id=excluded.last_observation_id,
+                      state_revision=excluded.state_revision,
+                      updated_at=excluded.updated_at
+                    """,
+                    (
+                        state.trade_id,
+                        state.experiment_id,
+                        state.candidate_id,
+                        state.candidate_policy_id,
+                        state.candidate_policy_hash,
+                        state.locked_floor_r,
+                        state.last_evaluated_at,
+                        state.last_observation_id,
+                        state.state_revision,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+
+    def load_shadow_envelope_states(
+        self, trade_id: str
+    ) -> tuple[ShadowEnvelopeState, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_id, experiment_id, candidate_id,
+                       candidate_policy_id, candidate_policy_hash,
+                       locked_floor_r, last_evaluated_at, last_observation_id,
+                       state_revision
+                FROM exit_edge_shadow_envelope_state
+                WHERE trade_id=?
+                ORDER BY experiment_id, candidate_id
+                """,
+                (trade_id,),
+            ).fetchall()
+        return tuple(ShadowEnvelopeState(*row) for row in rows)
+
 
 def experiment_spec_hash(
     profile: dict[str, Any], legacy: dict[str, Any], experiment: dict[str, Any],
@@ -359,6 +482,75 @@ def experiment_spec_hash(
 def policy_config_hash(profile: dict[str, Any], legacy: dict[str, Any]) -> str:
     """Compatibility helper for callers that only need a policy fingerprint."""
     return hashlib.sha256(_canonical_json({"profile": profile, "legacy": legacy}).encode()).hexdigest()
+
+
+def build_risk_envelope_experiment(
+    control_policy: dict[str, Any],
+    *,
+    control_policy_hash: str,
+) -> dict[str, Any]:
+    """Freeze Control/A/B identities from one exact canonical control policy."""
+    control = dict(control_policy)
+    if canonical_policy_hash(control) != control_policy_hash:
+        raise ValueError("control policy hash does not match canonical policy")
+    if str(control.get("policy_schema_version")) != "exit-policy.v1":
+        raise ValueError("risk-envelope experiment requires exit-policy.v1 control")
+    if bool(control.get("risk_envelope_enabled")):
+        raise ValueError("Increment 1 control must have no enabled risk envelope")
+    if control.get("target_1_r") is None:
+        raise ValueError("risk-envelope experiment requires explicit target_1_r")
+
+    arms: list[dict[str, Any]] = [
+        {
+            "candidate_id": "control",
+            "candidate_policy_id": str(control["policy_id"]),
+            "candidate_policy_hash": control_policy_hash,
+            "canonical_policy": control,
+        }
+    ]
+    for candidate_id, policy_id, curvature in (
+        (
+            "variant_a",
+            "exit.premium_envelope.trend_continuation.shadow.a.v1",
+            1.5,
+        ),
+        (
+            "variant_b",
+            "exit.premium_envelope.trend_continuation.shadow.b.v1",
+            2.0,
+        ),
+    ):
+        candidate = {
+            **control,
+            "policy_id": policy_id,
+            "risk_envelope_enabled": True,
+            "risk_envelope_activation_r": 0.25,
+            "risk_envelope_initial_floor_r": -1.0,
+            "risk_envelope_curvature": curvature,
+            "risk_envelope_floor_at_t1_r": 0.0,
+            "risk_envelope_ratchet_step_r": 0.1,
+        }
+        evaluate_risk_envelope(
+            peak_r=0.25,
+            activation_r=0.25,
+            target_1_r=float(candidate["target_1_r"]),
+            initial_floor_r=-1.0,
+            floor_at_t1_r=0.0,
+            curvature=curvature,
+        )
+        arms.append(
+            {
+                "candidate_id": candidate_id,
+                "candidate_policy_id": policy_id,
+                "candidate_policy_hash": canonical_policy_hash(candidate),
+                "canonical_policy": candidate,
+            }
+        )
+    return {
+        "schema_version": RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION,
+        "experiment_id": RISK_ENVELOPE_EXPERIMENT_ID,
+        "arms": arms,
+    }
 
 
 def load_fixture_cases(path: str | Path) -> list[ExitEdgeCase]:
@@ -376,11 +568,43 @@ def analyze_cases(cases: list[ExitEdgeCase]) -> dict[str, Any]:
     ]
     paired = [row for row in rows if row["status"] == "paired"]
     specs = sorted({row["experiment_spec_hash"] for row in rows})
+    summary = _summary(paired, len(rows), heterogeneous_specs=len(specs) > 1)
+    summary["risk_envelope_missingness"] = {
+        "candidate_observation_rows": sum(
+            int(row.get("missingness", {}).get("candidate_observation_rows", 0))
+            for row in rows
+        ),
+        "expected_candidate_observation_rows": sum(
+            int(
+                row.get("missingness", {}).get(
+                    "expected_candidate_observation_rows", 0
+                )
+            )
+            for row in rows
+        ),
+        "identity_or_timestamp_rows": sum(
+            int(row.get("missingness", {}).get("identity_or_timestamp_rows", 0))
+            for row in rows
+        ),
+        "cases_missing_envelope_identity": sum(
+            row.get("insufficient_reason")
+            == "missing_risk_envelope_experiment_identity"
+            for row in rows
+        ),
+        "arm_outcomes_without_post_exit_quote": sum(
+            len(
+                row.get("missingness", {}).get(
+                    "arms_without_post_exit_quote", []
+                )
+            )
+            for row in rows
+        ),
+    }
     return {
-        "schema_version": 3, "report_type": "prospective_paired_replay",
+        "schema_version": 4, "report_type": "prospective_paired_replay",
         "generated_at": datetime.now(UTC).isoformat(), "scope_boundary": SCOPE_BOUNDARY,
         "fill_model": FILL_MODEL, "experiment_spec_hashes": specs,
-        "summary": _summary(paired, len(rows), heterogeneous_specs=len(specs) > 1), "cases": rows,
+        "summary": summary, "cases": rows,
     }
 
 
@@ -537,7 +761,22 @@ def render_markdown(report: dict[str, Any]) -> str:
              f"- Median cluster-uplift 95% lower bound: "
              f"{s['confidence']['median_cluster_uplift_one_sided_95_lower_usd']}",
              f"- Confidence: {s['confidence']['indicator']} — {s['confidence']['reason']}",
-             f"- Frozen experiment hashes: {', '.join(report['experiment_spec_hashes'])}", ""]
+             f"- Frozen experiment hashes: {', '.join(report['experiment_spec_hashes'])}",
+             f"- Control/A/B observation rows: "
+             f"{s['risk_envelope_missingness']['candidate_observation_rows']} / "
+             f"{s['risk_envelope_missingness']['expected_candidate_observation_rows']}",
+             f"- Missing identity/timestamp rows: "
+             f"{s['risk_envelope_missingness']['identity_or_timestamp_rows']}",
+             f"- Arm outcomes without a post-exit quote: "
+             f"{s['risk_envelope_missingness']['arm_outcomes_without_post_exit_quote']}",
+             ""]
+    for candidate_id, metrics in s["risk_envelope_candidate_vs_control"].items():
+        lines.append(
+            f"- {candidate_id} vs Control mean P&L: "
+            f"{metrics['mean_delta_pnl_usd']} "
+            f"(envelope exits: {metrics['envelope_exit_count']})"
+        )
+    lines.append("")
     if "registration_denominator" in s:
         denominator = s["registration_denominator"]
         lines.extend([
@@ -568,24 +807,105 @@ def _analyze_case(case: ExitEdgeCase) -> dict[str, Any]:
         return {**base, "status": "insufficient_data", "insufficient_reason": problem}
     profile = _replay(case, "profile", fill_latency_ms, max_freshness_ms)
     legacy = _replay(case, "legacy", fill_latency_ms, max_freshness_ms)
+    envelope_spec = case.experiment["risk_envelope"]
+    arms = {
+        str(arm["candidate_id"]): arm
+        for arm in envelope_spec["arms"]
+    }
+    control_observations = _control_observations(case, arms["control"])
+    candidate_results = {
+        candidate_id: _replay_envelope_candidate(
+            case,
+            arm,
+            control_observations=control_observations,
+            latency_ms=fill_latency_ms,
+            max_freshness_ms=max_freshness_ms,
+        )
+        for candidate_id, arm in arms.items()
+        if candidate_id != "control"
+    }
+    envelope_outcomes = {
+        "control": profile,
+        **{
+            candidate_id: result[0]
+            for candidate_id, result in candidate_results.items()
+        },
+    }
+    envelope_observations = list(control_observations.values())
+    envelope_states: list[ShadowEnvelopeState] = []
+    for result in candidate_results.values():
+        envelope_observations.extend(result[1])
+        envelope_states.append(result[2])
     terminal_at = max(
-        _parse_datetime(outcome.exit_timestamp) for outcome in (profile, legacy) if outcome is not None
-    ) if profile is not None or legacy is not None else None
+        _parse_datetime(outcome.exit_timestamp)
+        for outcome in (legacy, *envelope_outcomes.values())
+        if outcome is not None
+    ) if legacy is not None or any(envelope_outcomes.values()) else None
     bids = [q.bid for q in case.quotes if q.bid is not None and q.bid > 0
             and q.quote_at >= case.entry_timestamp
             and (terminal_at is None or q.received_at <= terminal_at)]
+    identity_missing = sum(
+        1
+        for observation in envelope_observations
+        if not observation.get("trade_id")
+        or not observation.get("candidate_policy_id")
+        or not observation.get("candidate_policy_hash")
+        or not observation.get("quote_at")
+        or not observation.get("received_at")
+    )
+    post_exit_rows = {
+        name: (
+            sum(
+                quote.received_at > _parse_datetime(outcome.exit_timestamp)
+                for quote in case.quotes
+            )
+            if outcome is not None
+            else 0
+        )
+        for name, outcome in {
+            "legacy": legacy,
+            **envelope_outcomes,
+        }.items()
+    }
     row = {**base,
            "holding_window_end": terminal_at.isoformat() if terminal_at is not None else None,
            "mfe_pct": round((max(bids)-case.entry_premium)/case.entry_premium*100, 2) if bids else None,
-           "mae_pct": round((min(bids)-case.entry_premium)/case.entry_premium*100, 2) if bids else None}
-    if profile is None or legacy is None:
-        missing = [name for name, value in (("profile", profile), ("legacy", legacy)) if value is None]
+           "mae_pct": round((min(bids)-case.entry_premium)/case.entry_premium*100, 2) if bids else None,
+           "risk_envelope_experiment_id": envelope_spec["experiment_id"],
+           "risk_envelope_observations": envelope_observations,
+           "shadow_envelope_states": [asdict(state) for state in envelope_states],
+           "missingness": {
+               "identity_or_timestamp_rows": identity_missing,
+               "candidate_observation_rows": len(envelope_observations),
+               "expected_candidate_observation_rows": len(case.quotes) * 3,
+               "post_exit_quote_rows_by_arm": post_exit_rows,
+               "arms_without_post_exit_quote": sorted(
+                   name for name, count in post_exit_rows.items() if count == 0
+               ),
+           }}
+    all_outcomes = {"legacy": legacy, **envelope_outcomes}
+    if any(value is None for value in all_outcomes.values()):
+        missing = [name for name, value in all_outcomes.items() if value is None]
         return {**row, "status": "insufficient_data",
                 "insufficient_reason": "right_censored:" + ",".join(missing),
                 "profile_outcome": asdict(profile) if profile else None,
-                "legacy_outcome": asdict(legacy) if legacy else None}
+                "legacy_outcome": asdict(legacy) if legacy else None,
+                "risk_envelope_outcomes": {
+                    name: asdict(value) if value else None
+                    for name, value in envelope_outcomes.items()
+                }}
+    control_pnl = float(profile.realized_pnl_usd)
     return {**row, "status": "paired", "insufficient_reason": None,
             "profile_outcome": asdict(profile), "legacy_outcome": asdict(legacy),
+            "risk_envelope_outcomes": {
+                name: asdict(value)
+                for name, value in envelope_outcomes.items()
+            },
+            "candidate_delta_pnl_usd": {
+                name: round(float(value.realized_pnl_usd) - control_pnl, 2)
+                for name, value in envelope_outcomes.items()
+                if name != "control"
+            },
             "paired_delta_pnl_usd": round(profile.realized_pnl_usd-legacy.realized_pnl_usd, 2),
             "paired_delta_time_in_trade_seconds": round(profile.time_in_trade_seconds-legacy.time_in_trade_seconds, 3)}
 
@@ -636,8 +956,347 @@ def _replay(case: ExitEdgeCase, policy: str, latency_ms: int, max_freshness_ms: 
     return None
 
 
+def _control_observations(
+    case: ExitEdgeCase, control_arm: dict[str, Any]
+) -> dict[int, dict[str, Any]]:
+    """Replay the live/control ladder once and retain its same-row decisions."""
+    state = ProfileExitState.new(case.entry_premium, seed_quantity=case.quantity)
+    risk = case.profile.stop_pct * case.entry_premium
+    peak_r = 0.0
+    terminal = False
+    observations: dict[int, dict[str, Any]] = {}
+    for quote in case.quotes:
+        current_r = (float(quote.bid) - case.entry_premium) / risk
+        peak_r = max(peak_r, current_r)
+        decision_rule = "terminal"
+        decision_action = "terminal"
+        if not terminal:
+            decision = evaluate_profile_exit(
+                fields=case.profile,
+                entry_premium=case.entry_premium,
+                quantity=case.quantity,
+                market=ProfileMarketView(
+                    current_premium=float(quote.bid),
+                    bar_time_et=quote.quote_at.astimezone(ET).time().replace(tzinfo=None),
+                    bid=quote.bid,
+                    ask=quote.ask,
+                    last=quote.last,
+                ),
+                entry_time=case.entry_timestamp,
+                now=quote.quote_at,
+                state=state,
+                require_bar_time_for_eod=True,
+            )
+            decision_rule = decision.rule.value
+            decision_action = decision.fsm_action.value
+            terminal = bool(
+                decision.exit
+                and decision.fsm_action
+                in (
+                    ProfileFsmAction.SQUARE_OFF,
+                    ProfileFsmAction.HARD_FLAT,
+                )
+            )
+        observations[quote.sequence] = _envelope_observation(
+            case=case,
+            quote=quote,
+            experiment_id=case.experiment["risk_envelope"]["experiment_id"],
+            arm=control_arm,
+            current_r=current_r,
+            raw_peak_r=peak_r,
+            confirmed_peak_r=peak_r,
+            candidate_floor_r=None,
+            locked_floor_r=None,
+            hypothetical_stop_premium=None,
+            would_ratchet=False,
+            would_breach=False,
+            control_rule=decision_rule,
+            control_action=decision_action,
+            candidate_active=not terminal,
+        )
+    return observations
+
+
+def _replay_envelope_candidate(
+    case: ExitEdgeCase,
+    arm: dict[str, Any],
+    *,
+    control_observations: dict[int, dict[str, Any]],
+    latency_ms: int,
+    max_freshness_ms: int,
+) -> tuple[PolicyOutcome | None, list[dict[str, Any]], ShadowEnvelopeState]:
+    """Replay one candidate with state isolated by trade/experiment/candidate."""
+    policy = arm["canonical_policy"]
+    candidate_id = str(arm["candidate_id"])
+    experiment_id = str(case.experiment["risk_envelope"]["experiment_id"])
+    profile_state = ProfileExitState.new(
+        case.entry_premium, seed_quantity=case.quantity
+    )
+    risk = case.profile.stop_pct * case.entry_premium
+    remaining = case.quantity
+    pnl = 0.0
+    legs: list[dict[str, Any]] = []
+    pending: tuple[QuoteTapeMark, str, int, bool] | None = None
+    outcome: PolicyOutcome | None = None
+    raw_peak_r = 0.0
+    confirmed_peak_r = 0.0
+    locked_floor_r = float(policy["risk_envelope_initial_floor_r"])
+    revision = 1
+    last_evaluated_at: str | None = None
+    last_observation_id: str | None = None
+    observations: list[dict[str, Any]] = []
+
+    for quote in case.quotes:
+        current_r = (float(quote.bid) - case.entry_premium) / risk
+        if outcome is not None:
+            control = control_observations[quote.sequence]
+            observations.append(
+                _envelope_observation(
+                    case=case,
+                    quote=quote,
+                    experiment_id=experiment_id,
+                    arm=arm,
+                    current_r=current_r,
+                    raw_peak_r=raw_peak_r,
+                    confirmed_peak_r=confirmed_peak_r,
+                    candidate_floor_r=None,
+                    locked_floor_r=locked_floor_r,
+                    hypothetical_stop_premium=None,
+                    would_ratchet=False,
+                    would_breach=False,
+                    control_rule=str(control["control_decision"]["rule"]),
+                    control_action=str(control["control_decision"]["action"]),
+                    candidate_active=False,
+                )
+            )
+            continue
+
+        if pending is not None:
+            trigger, rule, quantity, partial = pending
+            age_ms = (quote.received_at - quote.quote_at).total_seconds() * 1000
+            elapsed_ms = (
+                quote.received_at - trigger.received_at
+            ).total_seconds() * 1000
+            if (
+                quote.sequence > trigger.sequence
+                and elapsed_ms >= latency_ms
+                and _executable(quote, age_ms, max_freshness_ms)
+            ):
+                fill = float(quote.bid)
+                filled_quantity = min(quantity, remaining)
+                pnl += (
+                    (fill - case.entry_premium)
+                    * filled_quantity
+                    * 100
+                )
+                remaining -= filled_quantity
+                legs.append(
+                    {
+                        "trigger_sequence": trigger.sequence,
+                        "fill_sequence": quote.sequence,
+                        "fill_at": quote.received_at.isoformat(),
+                        "rule": rule,
+                        "quantity": filled_quantity,
+                        "fill_bid": fill,
+                    }
+                )
+                pending = None
+                if remaining <= 0 or not partial:
+                    outcome = PolicyOutcome(
+                        candidate_id,
+                        quote.received_at.isoformat(),
+                        rule,
+                        round(pnl, 2),
+                        round(
+                            (
+                                quote.received_at - case.entry_timestamp
+                            ).total_seconds(),
+                            3,
+                        ),
+                        tuple(legs),
+                    )
+            control = control_observations[quote.sequence]
+            observations.append(
+                _envelope_observation(
+                    case=case,
+                    quote=quote,
+                    experiment_id=experiment_id,
+                    arm=arm,
+                    current_r=current_r,
+                    raw_peak_r=raw_peak_r,
+                    confirmed_peak_r=confirmed_peak_r,
+                    candidate_floor_r=None,
+                    locked_floor_r=locked_floor_r,
+                    hypothetical_stop_premium=case.entry_premium
+                    + locked_floor_r * risk,
+                    would_ratchet=False,
+                    would_breach=False,
+                    control_rule=str(control["control_decision"]["rule"]),
+                    control_action=str(control["control_decision"]["action"]),
+                    candidate_active=outcome is None,
+                )
+            )
+            continue
+
+        raw_peak_r = max(raw_peak_r, current_r)
+        confirmed_peak_r = max(confirmed_peak_r, raw_peak_r)
+        candidate_floor_r = evaluate_risk_envelope(
+            peak_r=confirmed_peak_r,
+            activation_r=float(policy["risk_envelope_activation_r"]),
+            target_1_r=float(policy["target_1_r"]),
+            initial_floor_r=float(policy["risk_envelope_initial_floor_r"]),
+            floor_at_t1_r=float(policy["risk_envelope_floor_at_t1_r"]),
+            curvature=float(policy["risk_envelope_curvature"]),
+        )
+        previous_floor = locked_floor_r
+        locked_floor_r = max(locked_floor_r, candidate_floor_r)
+        would_ratchet = locked_floor_r > previous_floor
+        # The row also advances last_evaluated/last_observation, so every new
+        # evaluated observation receives a new revision even when the floor
+        # itself remains unchanged. Equal revisions are reserved for exact
+        # idempotent replay.
+        revision += 1
+        pre_t1 = confirmed_peak_r < float(policy["target_1_r"])
+        would_breach = bool(pre_t1 and current_r <= locked_floor_r)
+        control = control_observations[quote.sequence]
+        observation_id = f"{case.trade_id}:{quote.sequence}:{candidate_id}"
+        last_evaluated_at = quote.received_at.isoformat()
+        last_observation_id = observation_id
+        observations.append(
+            _envelope_observation(
+                case=case,
+                quote=quote,
+                experiment_id=experiment_id,
+                arm=arm,
+                current_r=current_r,
+                raw_peak_r=raw_peak_r,
+                confirmed_peak_r=confirmed_peak_r,
+                candidate_floor_r=candidate_floor_r,
+                locked_floor_r=locked_floor_r,
+                hypothetical_stop_premium=case.entry_premium
+                + locked_floor_r * risk,
+                would_ratchet=would_ratchet,
+                would_breach=would_breach,
+                control_rule=str(control["control_decision"]["rule"]),
+                control_action=str(control["control_decision"]["action"]),
+                candidate_active=True,
+            )
+        )
+
+        decision = evaluate_profile_exit(
+            fields=case.profile,
+            entry_premium=case.entry_premium,
+            quantity=case.quantity,
+            market=ProfileMarketView(
+                current_premium=float(quote.bid),
+                bar_time_et=quote.quote_at.astimezone(ET).time().replace(tzinfo=None),
+                bid=quote.bid,
+                ask=quote.ask,
+                last=quote.last,
+            ),
+            entry_time=case.entry_timestamp,
+            now=quote.quote_at,
+            state=profile_state,
+            require_bar_time_for_eod=True,
+        )
+        if would_breach:
+            pending = (
+                quote,
+                f"risk_envelope_{candidate_id}",
+                remaining,
+                False,
+            )
+        elif decision.exit:
+            partial = decision.fsm_action is ProfileFsmAction.PARTIAL_SCALE
+            pending = (
+                quote,
+                decision.rule.value,
+                decision.exit_quantity or remaining,
+                partial,
+            )
+
+    return (
+        outcome,
+        observations,
+        ShadowEnvelopeState(
+            trade_id=case.trade_id,
+            experiment_id=experiment_id,
+            candidate_id=candidate_id,
+            candidate_policy_id=str(arm["candidate_policy_id"]),
+            candidate_policy_hash=str(arm["candidate_policy_hash"]),
+            locked_floor_r=locked_floor_r,
+            last_evaluated_at=last_evaluated_at,
+            last_observation_id=last_observation_id,
+            state_revision=revision,
+        ),
+    )
+
+
+def _envelope_observation(
+    *,
+    case: ExitEdgeCase,
+    quote: QuoteTapeMark,
+    experiment_id: str,
+    arm: dict[str, Any],
+    current_r: float,
+    raw_peak_r: float,
+    confirmed_peak_r: float,
+    candidate_floor_r: float | None,
+    locked_floor_r: float | None,
+    hypothetical_stop_premium: float | None,
+    would_ratchet: bool,
+    would_breach: bool,
+    control_rule: str,
+    control_action: str,
+    candidate_active: bool,
+) -> dict[str, Any]:
+    age_ms = (quote.received_at - quote.quote_at).total_seconds() * 1000
+    spread = (
+        float(quote.ask) - float(quote.bid)
+        if quote.ask is not None and quote.bid is not None
+        else None
+    )
+    candidate_id = str(arm["candidate_id"])
+    return {
+        "observation_id": f"{case.trade_id}:{quote.sequence}:{candidate_id}",
+        "trade_id": case.trade_id,
+        "deployment_id": case.deployment_id,
+        "experiment_id": experiment_id,
+        "candidate_id": candidate_id,
+        "candidate_policy_id": str(arm["candidate_policy_id"]),
+        "candidate_policy_hash": str(arm["candidate_policy_hash"]),
+        "sequence": quote.sequence,
+        "quote_source": quote.source,
+        "quote_feed": quote.feed,
+        "quote_at": quote.quote_at.isoformat(),
+        "received_at": quote.received_at.isoformat(),
+        "quote_age_ms": age_ms,
+        "bid": quote.bid,
+        "ask": quote.ask,
+        "spread": spread,
+        "executable_exit_reference_premium": quote.bid,
+        "current_r": current_r,
+        "raw_peak_r": raw_peak_r,
+        "confirmed_peak_r": confirmed_peak_r,
+        "candidate_floor_r": candidate_floor_r,
+        "locked_floor_r": locked_floor_r,
+        "hypothetical_stop_premium": hypothetical_stop_premium,
+        "would_ratchet": would_ratchet,
+        "would_breach": would_breach,
+        "candidate_active": candidate_active,
+        "control_decision": {
+            "rule": control_rule,
+            "action": control_action,
+        },
+    }
+
+
 def _tape_problem(case: ExitEdgeCase, max_freshness_ms: int, max_sequence_gap: int) -> str | None:
     if case.entry_premium <= 0 or case.quantity <= 0: return "invalid_entry"
+    if not case.trade_id or not case.deployment_id:
+        return "missing_trade_or_deployment_identity"
+    if "risk_envelope" not in case.experiment:
+        return "missing_risk_envelope_experiment_identity"
     if experiment_spec_hash(case.profile_config, case.legacy_config, case.experiment) != case.experiment_spec_hash:
         return "experiment_spec_hash_mismatch"
     if (
@@ -701,12 +1360,36 @@ def _summary(
     else:
         indicator = "inconclusive"
         reason = "The conservative cluster-uplift bound is nonpositive or aggregate uplift is nonpositive."
+    candidate_deltas = {
+        candidate_id: [
+            float(row["candidate_delta_pnl_usd"][candidate_id])
+            for row in paired
+            if candidate_id in row.get("candidate_delta_pnl_usd", {})
+        ]
+        for candidate_id in ("variant_a", "variant_b")
+    }
     return {
         "case_count": case_count, "paired_count": n, "insufficient_count": case_count-n,
         "cluster_count": len(cluster_uplifts), "cluster_labels_present": all(row.get("cluster_id") for row in paired),
         "homogeneous_experiment_spec": not heterogeneous_specs,
         "total_paired_delta_pnl_usd": round(total, 2) if total is not None else None,
         "mean_paired_delta_pnl_usd": round(mean, 2) if mean is not None else None,
+        "risk_envelope_candidate_vs_control": {
+            candidate_id: {
+                "paired_count": len(values),
+                "total_delta_pnl_usd": round(sum(values), 2) if values else None,
+                "mean_delta_pnl_usd": round(fmean(values), 2) if values else None,
+                "envelope_exit_count": sum(
+                    str(
+                        row.get("risk_envelope_outcomes", {})
+                        .get(candidate_id, {})
+                        .get("exit_rule", "")
+                    ).startswith("risk_envelope_")
+                    for row in paired
+                ),
+            }
+            for candidate_id, values in candidate_deltas.items()
+        },
         "confidence": {
             "indicator": indicator, "reason": reason,
             "inference_unit": "cluster_mean_paired_pnl_usd",
@@ -771,6 +1454,11 @@ def _normalized_experiment(value: dict[str, Any]) -> dict[str, Any]:
         "quote_source": str(value["quote_source"]),
         "quote_feed": str(value["quote_feed"]),
     }
+    risk_envelope = value.get("risk_envelope")
+    if risk_envelope is not None:
+        normalized["risk_envelope"] = _normalized_risk_envelope_experiment(
+            risk_envelope
+        )
     if not normalized["quote_source"] or not normalized["quote_feed"]:
         raise ValueError("quote source/feed lineage is required")
     if normalized["fill_latency_ms"] < 0 or normalized["max_freshness_ms"] < 0:
@@ -778,6 +1466,55 @@ def _normalized_experiment(value: dict[str, Any]) -> dict[str, Any]:
     if normalized["max_sequence_gap"] < 1:
         raise ValueError("max_sequence_gap must be positive")
     return normalized
+
+
+def _normalized_risk_envelope_experiment(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("risk_envelope experiment must be an object")
+    if value.get("schema_version") != RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION:
+        raise ValueError("unsupported risk-envelope experiment schema")
+    experiment_id = str(value.get("experiment_id") or "")
+    if not experiment_id:
+        raise ValueError("risk-envelope experiment_id is required")
+    raw_arms = value.get("arms")
+    if not isinstance(raw_arms, list):
+        raise ValueError("risk-envelope arms must be a list")
+    arms: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_arms:
+        if not isinstance(raw, dict):
+            raise ValueError("risk-envelope arm must be an object")
+        candidate_id = str(raw.get("candidate_id") or "")
+        policy_id = str(raw.get("candidate_policy_id") or "")
+        policy_hash = str(raw.get("candidate_policy_hash") or "")
+        policy = raw.get("canonical_policy")
+        if (
+            not candidate_id
+            or candidate_id in seen
+            or not policy_id
+            or not isinstance(policy, dict)
+        ):
+            raise ValueError("invalid or duplicate risk-envelope candidate identity")
+        if str(policy.get("policy_id") or "") != policy_id:
+            raise ValueError("candidate policy id does not match canonical policy")
+        if canonical_policy_hash(policy) != policy_hash:
+            raise ValueError("candidate policy hash does not match canonical policy")
+        seen.add(candidate_id)
+        arms.append(
+            {
+                "candidate_id": candidate_id,
+                "candidate_policy_id": policy_id,
+                "candidate_policy_hash": policy_hash,
+                "canonical_policy": dict(policy),
+            }
+        )
+    if seen != {"control", "variant_a", "variant_b"}:
+        raise ValueError("risk-envelope experiment requires Control, Variant A, Variant B")
+    return {
+        "schema_version": RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION,
+        "experiment_id": experiment_id,
+        "arms": arms,
+    }
 
 
 def _canonical_json(value: Any)->str:return json.dumps(value,sort_keys=True,separators=(",",":"))
@@ -789,6 +1526,7 @@ def _parse_datetime(value:Any)->datetime:
 def _optional_datetime(value:Any)->datetime|None:return None if value in (None,"") else _parse_datetime(value)
 
 
-__all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","analyze_cases","analyze_prospective_repository",
-         "build_historical_coverage_report","experiment_spec_hash","load_fixture_cases","policy_config_hash",
-         "render_markdown","write_exit_edge_report"]
+__all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","ShadowEnvelopeState","analyze_cases",
+         "analyze_prospective_repository","build_historical_coverage_report",
+         "build_risk_envelope_experiment","experiment_spec_hash","load_fixture_cases",
+         "policy_config_hash","render_markdown","write_exit_edge_report"]

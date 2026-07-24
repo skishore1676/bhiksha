@@ -83,6 +83,7 @@ async def evaluate_and_record_profile_exit(
     event_sink: EventSink,
     fields: ProfileExitFields,
     deployment_id: str,
+    trade_id: str | None = None,
     symbol: str,
     option_symbol: str | None,
     entry_premium: float,
@@ -94,6 +95,13 @@ async def evaluate_and_record_profile_exit(
     deployment_shadow_only: bool,
     position_source: str | None,
     runtime_mode: str | None = None,
+    policy_schema_version: str | None = None,
+    policy_id: str | None = None,
+    policy_hash: str | None = None,
+    state_version: int | None = None,
+    quote_source: str = "existing_order_manager_quote",
+    quote_timestamp: str | None = None,
+    quote_timestamp_field: str | None = None,
     now: datetime | None = None,
     require_bar_time_for_eod: bool = False,
 ) -> ProfileExitShadowOutcome:
@@ -132,10 +140,15 @@ async def evaluate_and_record_profile_exit(
         "profile_exit_shadow",
         {
             "deployment_id": deployment_id,
+            "trade_id": trade_id,
             "symbol": symbol,
             "option_symbol": option_symbol,
             "timestamp": now.isoformat(),
             "profile_id": decision.profile_id,
+            "policy_schema_version": policy_schema_version,
+            "policy_id": policy_id,
+            "policy_hash": policy_hash,
+            "state_version": state_version,
             "rule": decision.rule.value,
             "fsm_action": decision.fsm_action.value,
             "reason": decision.reason,
@@ -146,6 +159,15 @@ async def evaluate_and_record_profile_exit(
             "entry_premium": entry_premium,
             "quantity": quantity,
             "current_premium": market.current_premium,
+            "quote_source": quote_source,
+            "quote_timestamp": quote_timestamp,
+            "quote_timestamp_field": quote_timestamp_field,
+            "evaluation_timestamp": now.isoformat(),
+            "spread": (
+                market.ask - market.bid
+                if market.ask is not None and market.bid is not None
+                else None
+            ),
             "mode": "live_dispatch" if dispatched else "shadow_record",
             "dispatch_allowed": dispatch_allowed,
             # Gate-input diagnostics: when dispatch_allowed is False on an armed

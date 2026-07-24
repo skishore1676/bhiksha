@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import UTC
+import hashlib
 import math
 import os
 import uuid
@@ -20,6 +21,11 @@ from bhiksha.config.models import AppConfig
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.events import ExitEvaluatedEvent, SignalEvaluatedEvent, TradeLifecycleTransitionEvent
 from bhiksha.domain.enums import ExitMode, SignalDirection
+from bhiksha.domain.exit_state import (
+    ExitActionIntent,
+    ExitRuntimeState,
+    TradeExitPolicySnapshot,
+)
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
@@ -44,9 +50,14 @@ from bhiksha.execution.profile_exit import (
     profile_exit_dispatch_allowed,
 )
 from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit, ProfileExitDispatchError
+from bhiksha.execution.exit_policy import canonical_policy_hash
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
+from bhiksha.persistence.exit_state import (
+    ExitStateRepository,
+    NullExitStateRepository,
+)
 from bhiksha.state.lifecycle import LifecycleTransition, TradeLifecycleStore
 from bhiksha.state.position_tracker import (
     LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE,
@@ -179,6 +190,9 @@ class ExecutionSupervisor:
         manual_status_writer: ManualSheetStatusWriter | None = None,
         reconcile_trigger: asyncio.Event | None = None,
         exit_edge_recorder: Any | None = None,
+        exit_state_repository: ExitStateRepository | None = None,
+        active_plan_id: str | None = None,
+        startup_config_id: str | None = None,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
@@ -189,6 +203,11 @@ class ExecutionSupervisor:
         self.manual_status_writer = manual_status_writer
         self.reconcile_trigger = reconcile_trigger
         self.exit_edge_recorder = exit_edge_recorder
+        self.exit_state_repository = (
+            exit_state_repository or NullExitStateRepository()
+        )
+        self.active_plan_id = active_plan_id
+        self.startup_config_id = startup_config_id
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._disabled_entry_deployments: set[str] = set()
@@ -198,6 +217,10 @@ class ExecutionSupervisor:
         # clears it on close. Without this the ladder would reset every tick and
         # re-bank partials / re-arm giveback / re-emit breakeven.
         self._profile_exit_states: dict[str, ProfileExitState] = {}
+        self._durable_exit_states: dict[str, ExitRuntimeState] = {}
+        self._frozen_exit_policies: dict[str, TradeExitPolicySnapshot] = {}
+        self._profile_exit_degraded_trades: set[str] = set()
+        self._profile_exit_recovery_events: set[str] = set()
 
     async def close(self) -> None:
         if self.exit_edge_recorder is not None:
@@ -263,6 +286,377 @@ class ExecutionSupervisor:
     def clear_profile_exit_state(self, position: TrackedPosition) -> None:
         """Drop a position's persisted ladder state (call on close/flatten)."""
         self._profile_exit_states.pop(self._profile_state_key(position), None)
+
+    async def _freeze_exit_policy_for_confirmed_trade(
+        self,
+        deployment: DeploymentManifest,
+        *,
+        trade_id: str,
+        option_symbol: str | None,
+        entry_premium: float,
+        quantity: int,
+        committed_stop_price: float | None,
+    ) -> None:
+        """Atomically freeze policy and initial state after confirmed fill.
+
+        Broker protection is armed before this helper is called. A persistence
+        failure therefore degrades profile authority but never removes the
+        independently resting protective stop.
+        """
+
+        if not self._deployment_carries_exit_profile(deployment):
+            return
+        exit_spec = deployment.exit
+        policy = dict(exit_spec.exit_policy_snapshot)
+        policy_hash = exit_spec.exit_policy_hash
+        policy_id = exit_spec.exit_policy_id
+        policy_schema_version = exit_spec.exit_policy_schema_version
+        if (
+            not policy
+            or not policy_hash
+            or not policy_id
+            or not policy_schema_version
+            or canonical_policy_hash(policy) != policy_hash
+        ):
+            await self._mark_exit_state_degraded(
+                trade_id,
+                deployment=deployment,
+                option_symbol=option_symbol,
+                reason="missing_or_invalid_authoritative_policy_at_entry",
+            )
+            return
+        fields = ProfileExitFields.from_exit_spec(exit_spec)
+        initial_risk = fields.stop_pct * entry_premium
+        snapshot = TradeExitPolicySnapshot(
+            trade_id=trade_id,
+            deployment_id=deployment.deployment_id,
+            option_symbol=option_symbol,
+            active_plan_id=self.active_plan_id,
+            startup_config_id=self.startup_config_id,
+            policy_schema_version=policy_schema_version,
+            policy_id=policy_id,
+            policy_hash=policy_hash,
+            canonical_policy=policy,
+            provenance=dict(exit_spec.exit_policy_provenance),
+            frozen_at=datetime.now(UTC),
+        )
+        state = ExitRuntimeState(
+            trade_id=trade_id,
+            deployment_id=deployment.deployment_id,
+            option_symbol=option_symbol,
+            policy_hash=policy_hash,
+            seed_entry_premium=entry_premium,
+            seed_quantity=quantity,
+            initial_risk_per_contract=initial_risk,
+            raw_peak_premium=entry_premium,
+            confirmed_peak_r=0.0,
+            committed_stop_price=committed_stop_price,
+            last_evaluated_at=None,
+            state_version=1,
+        )
+        try:
+            await self.exit_state_repository.freeze_policy_and_initialize_state(
+                snapshot,
+                state,
+            )
+        except Exception as exc:
+            await self._mark_exit_state_degraded(
+                trade_id,
+                deployment=deployment,
+                option_symbol=option_symbol,
+                reason=f"policy_state_freeze_failed:{exc}",
+            )
+            return
+        self._frozen_exit_policies[trade_id] = snapshot
+        self._durable_exit_states[trade_id] = state
+        await self.event_repository.append(
+            "trade_exit_policy_frozen",
+            {
+                "trade_id": trade_id,
+                "deployment_id": deployment.deployment_id,
+                "option_symbol": option_symbol,
+                "active_plan_id": self.active_plan_id,
+                "startup_config_id": self.startup_config_id,
+                "policy_schema_version": policy_schema_version,
+                "policy_id": policy_id,
+                "policy_hash": policy_hash,
+                "state_version": state.state_version,
+            },
+        )
+
+    async def _hydrate_frozen_profile_state(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+    ) -> tuple[ProfileExitFields, ProfileExitState]:
+        """Load frozen policy/runtime facts before evaluating a live position."""
+
+        trade_id = position.trade_id
+        current_fields = ProfileExitFields.from_exit_spec(deployment.exit)
+        if trade_id is None or isinstance(
+            self.exit_state_repository, NullExitStateRepository
+        ):
+            return (
+                current_fields,
+                self.get_or_create_profile_exit_state(
+                    position,
+                    entry_premium=position.entry_price or 0.0,
+                ),
+            )
+        cached = self._frozen_exit_policies.get(trade_id)
+        durable = self._durable_exit_states.get(trade_id)
+        if cached is None:
+            cached = await self.exit_state_repository.get_policy_snapshot(trade_id)
+        if durable is None:
+            durable = await self.exit_state_repository.get_runtime_state(trade_id)
+        open_intents = await self.exit_state_repository.get_open_action_intents(
+            trade_id
+        )
+        if open_intents:
+            await self._reconcile_open_profile_intents(
+                deployment,
+                position,
+                open_intents,
+            )
+            open_intents = await self.exit_state_repository.get_open_action_intents(
+                trade_id
+            )
+            durable = await self.exit_state_repository.get_runtime_state(trade_id)
+        reason = None
+        if cached is None or durable is None:
+            reason = "missing_frozen_policy_or_runtime_state"
+        elif cached.policy_hash != durable.policy_hash:
+            reason = "policy_hash_mismatch"
+        elif canonical_policy_hash(cached.canonical_policy) != cached.policy_hash:
+            reason = "frozen_policy_hash_verification_failed"
+        elif (
+            durable.seed_entry_premium != position.entry_price
+            or durable.deployment_id != position.deployment_id
+            or durable.option_symbol != position.option_symbol
+        ):
+            reason = "runtime_state_identity_mismatch"
+        elif open_intents:
+            reason = "unresolved_exit_action_intent"
+        if reason is not None:
+            await self._mark_exit_state_degraded(
+                trade_id,
+                deployment=deployment,
+                option_symbol=position.option_symbol,
+                reason=reason,
+                open_intents=open_intents,
+            )
+            return (
+                current_fields,
+                self.get_or_create_profile_exit_state(
+                    position,
+                    entry_premium=position.entry_price or 0.0,
+                ),
+            )
+
+        self._frozen_exit_policies[trade_id] = cached
+        self._durable_exit_states[trade_id] = durable
+        key = self._profile_state_key(position)
+        state = self._profile_exit_states.get(key)
+        if state is None:
+            state = ProfileExitState(
+                peak_premium=durable.raw_peak_premium,
+                target_1_banked=durable.target_1_banked,
+                stop_at_breakeven=durable.breakeven_emitted,
+                banked_quantity=durable.banked_quantity,
+                breakeven_emitted=durable.breakeven_emitted,
+                seed_entry_premium=durable.seed_entry_premium,
+                seed_quantity=durable.seed_quantity,
+            )
+            self._profile_exit_states[key] = state
+            await self.event_repository.append(
+                "exit_state_recovered",
+                {
+                    "trade_id": trade_id,
+                    "deployment_id": deployment.deployment_id,
+                    "option_symbol": position.option_symbol,
+                    "policy_hash": cached.policy_hash,
+                    "state_version": durable.state_version,
+                    "peak_premium": durable.raw_peak_premium,
+                    "target_1_banked": durable.target_1_banked,
+                    "banked_quantity": durable.banked_quantity,
+                    "breakeven_emitted": durable.breakeven_emitted,
+                },
+            )
+        return ProfileExitFields.from_management_spec(
+            cached.canonical_policy
+        ), state
+
+    async def _reconcile_open_profile_intents(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        intents: list[ExitActionIntent],
+    ) -> None:
+        """Resolve broker-provable action outcomes before enabling profile exits."""
+
+        for intent in intents:
+            if intent.broker_order_id is None:
+                continue
+            try:
+                status, payload, error = await asyncio.wait_for(
+                    self.planner.order_manager.get_order_status(intent.broker_order_id),
+                    timeout=ENTRY_CANCEL_STATUS_READBACK_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                continue
+            if error or payload is None:
+                continue
+            normalized = str(status or payload.get("status") or "").upper()
+            if intent.action_kind == "stop_to_breakeven":
+                if normalized in PUBLIC_WORKING_ORDER_STATUSES:
+                    durable = await self.exit_state_repository.get_runtime_state(
+                        intent.trade_id
+                    )
+                    if durable is None or intent.requested_stop_price is None:
+                        continue
+                    advanced = replace(
+                        durable,
+                        committed_stop_price=intent.requested_stop_price,
+                        breakeven_emitted=True,
+                        runner_state="post_t1",
+                        recovery_status="active",
+                        degraded_reason=None,
+                        state_version=durable.state_version + 1,
+                    )
+                    await self.exit_state_repository.transition_runtime_state(
+                        advanced,
+                        expected_version=durable.state_version,
+                    )
+                    await self.exit_state_repository.resolve_action_intent(
+                        intent.idempotency_key,
+                        status="confirmed",
+                        broker_payload=payload,
+                    )
+                    self._durable_exit_states[intent.trade_id] = advanced
+                elif normalized in _EXIT_ORDER_DEAD_STATUSES:
+                    await self.exit_state_repository.resolve_action_intent(
+                        intent.idempotency_key,
+                        status="failed",
+                        broker_payload=payload,
+                    )
+                continue
+            if intent.action_kind != "partial_scale":
+                continue
+            details = _exit_fill_details(payload, status=status)
+            has_fill = (
+                details["exit_price"] is not None
+                and bool(details["exit_filled_quantity"])
+            )
+            if _is_filled_exit_order(
+                payload,
+                status=status,
+                option_symbol=position.option_symbol,
+            ) or (normalized in _EXIT_ORDER_DEAD_STATUSES and has_fill):
+                record_id = await self.trade_state_repository.record_partial_fill(
+                    PartialFillRecord(
+                        id=None,
+                        trade_id=intent.trade_id,
+                        deployment_id=deployment.deployment_id,
+                        symbol=position.symbol,
+                        option_symbol=position.option_symbol,
+                        closed_quantity=intent.requested_quantity or 0,
+                        order_id=intent.broker_order_id,
+                        exit_rule="target_1_partial",
+                        submitted_at=intent.created_at or datetime.now(UTC),
+                    )
+                )
+                await self.trade_state_repository.enrich_partial_fill(
+                    record_id,
+                    fill_price=details["exit_price"],
+                    fill_quantity=details["exit_filled_quantity"],
+                    filled_at=details["exit_filled_at"],
+                    order_status=details["exit_order_status"],
+                    order_type=details["exit_order_type"],
+                    broker_payload=details["exit_broker_payload"],
+                )
+                await self._confirm_partial_action_intent(
+                    intent.trade_id,
+                    order_id=intent.broker_order_id,
+                    confirmed_quantity=int(details["exit_filled_quantity"] or 0),
+                    broker_payload=payload,
+                )
+            elif normalized in _EXIT_ORDER_DEAD_STATUSES:
+                await self.exit_state_repository.resolve_action_intent(
+                    intent.idempotency_key,
+                    status="failed",
+                    broker_payload=payload,
+                )
+
+    async def _mark_exit_state_degraded(
+        self,
+        trade_id: str,
+        *,
+        deployment: DeploymentManifest,
+        option_symbol: str | None,
+        reason: str,
+        open_intents: list[ExitActionIntent] | None = None,
+    ) -> None:
+        self._profile_exit_degraded_trades.add(trade_id)
+        if trade_id in self._profile_exit_recovery_events:
+            return
+        self._profile_exit_recovery_events.add(trade_id)
+        await self.event_repository.append(
+            "exit_state_recovery",
+            {
+                "trade_id": trade_id,
+                "deployment_id": deployment.deployment_id,
+                "option_symbol": option_symbol,
+                "status": "STATE_DEGRADED",
+                "reason": reason,
+                "profile_dispatch_allowed": False,
+                "protection_policy": "retain_or_restore_existing_broker_protection",
+                "historical_peak_invented": False,
+                "open_action_intents": [
+                    {
+                        "idempotency_key": item.idempotency_key,
+                        "action_kind": item.action_kind,
+                        "action_slot": item.action_slot,
+                        "status": item.status,
+                        "broker_order_id": item.broker_order_id,
+                    }
+                    for item in (open_intents or [])
+                ],
+            },
+        )
+
+    async def _persist_live_peak_state(
+        self,
+        position: TrackedPosition,
+        *,
+        state: ProfileExitState,
+        now: datetime,
+    ) -> None:
+        trade_id = position.trade_id
+        if (
+            trade_id is None
+            or trade_id in self._profile_exit_degraded_trades
+            or isinstance(self.exit_state_repository, NullExitStateRepository)
+        ):
+            return
+        durable = self._durable_exit_states.get(trade_id)
+        if durable is None or state.peak_premium <= durable.raw_peak_premium:
+            return
+        peak_r = (
+            state.peak_premium - durable.seed_entry_premium
+        ) / durable.initial_risk_per_contract
+        advanced = replace(
+            durable,
+            raw_peak_premium=state.peak_premium,
+            confirmed_peak_r=max(durable.confirmed_peak_r, peak_r),
+            peak_timestamp=now,
+            last_evaluated_at=now,
+            state_version=durable.state_version + 1,
+        )
+        await self.exit_state_repository.transition_runtime_state(
+            advanced,
+            expected_version=durable.state_version,
+        )
+        self._durable_exit_states[trade_id] = advanced
 
     def _tracked_position_like(self, position: TrackedPosition) -> TrackedPosition | None:
         """Return the CURRENT tracked position matching ``position``'s identity.
@@ -400,6 +794,11 @@ class ExecutionSupervisor:
         """
         if not self._deployment_carries_exit_profile(deployment):
             return False
+        if (
+            position.trade_id is not None
+            and position.trade_id in self._profile_exit_degraded_trades
+        ):
+            return False
         drives_live = self._profile_exit_drives_live(deployment)
         return profile_exit_dispatch_allowed(
             live=drives_live,
@@ -468,7 +867,10 @@ class ExecutionSupervisor:
             return position
 
         now = now or datetime.now(UTC)
-        fields = ProfileExitFields.from_exit_spec(deployment.exit)
+        fields, state = await self._hydrate_frozen_profile_state(
+            deployment,
+            position,
+        )
         market = ProfileMarketView(
             current_premium=quote.exit_reference_price,
             # Wall-clock ET time-of-day for the EOD rung (best-effort; the
@@ -478,12 +880,14 @@ class ExecutionSupervisor:
             ask=getattr(quote, "ask", None),
             last=getattr(quote, "last", None),
         )
-        state = self.get_or_create_profile_exit_state(position, entry_premium=position.entry_price)
-
         # FLIP SEAM (the operator's one-line live enablement is the flag inside
         # ``_profile_exit_drives_live``; everything downstream of ``live`` is
         # already wired). This wave: ``drives_live`` is False, so ``live=False``.
-        drives_live = self._profile_exit_drives_live(deployment)
+        requested_live = self._profile_exit_drives_live(deployment)
+        drives_live = bool(
+            requested_live
+            and position.trade_id not in self._profile_exit_degraded_trades
+        )
 
         # MEDIUM-1(flip): protect a mid-position flag flip. With the flag OFF the
         # recorder still advances ``state`` every tick (peak ratchets; a T1 touch
@@ -507,6 +911,7 @@ class ExecutionSupervisor:
             event_sink=self.event_repository,
             fields=fields,
             deployment_id=deployment.deployment_id,
+            trade_id=position.trade_id,
             symbol=position.symbol,
             option_symbol=position.option_symbol,
             entry_premium=position.entry_price,
@@ -533,11 +938,41 @@ class ExecutionSupervisor:
             # Bhiksha. Going live therefore requires BOTH the operator flag flip
             # AND a deployment whose real mode is ``live_approval_gated``.
             runtime_mode=self._resolved_runtime_mode(deployment),
+            policy_schema_version=fields.policy_schema_version,
+            policy_id=fields.policy_id,
+            policy_hash=fields.policy_hash,
+            state_version=(
+                self._durable_exit_states[position.trade_id].state_version
+                if position.trade_id in self._durable_exit_states
+                else None
+            ),
+            quote_timestamp=getattr(quote, "quote_timestamp", None),
+            quote_timestamp_field=getattr(
+                quote,
+                "quote_timestamp_field",
+                None,
+            ),
             now=now,
             # The supervisor's EOD authority is close_due_positions; do not hard-fail
             # the shadow record when a bar clock is unavailable.
             require_bar_time_for_eod=False,
         )
+        if drives_live:
+            await self._persist_live_peak_state(
+                position,
+                state=state,
+                now=now,
+            )
+        if outcome.exit_decision is not None:
+            outcome.exit_decision.features["policy_schema_version"] = (
+                fields.policy_schema_version
+            )
+            outcome.exit_decision.features["policy_id"] = fields.policy_id
+            outcome.exit_decision.features["policy_hash"] = fields.policy_hash
+            if position.trade_id in self._durable_exit_states:
+                outcome.exit_decision.features["state_version"] = (
+                    self._durable_exit_states[position.trade_id].state_version
+                )
 
         # ARMED DISPATCH ROUTE. ``outcome.dispatched`` is True ONLY when the
         # fail-closed gate is OPEN for this position AND the profile decision would
@@ -1064,6 +1499,14 @@ class ExecutionSupervisor:
                 # order-management logic; the daily report is the consumer.
                 can_ladder=plan.quantity >= 2,
             )
+        )
+        await self._freeze_exit_policy_for_confirmed_trade(
+            deployment,
+            trade_id=plan.trade_id,
+            option_symbol=plan.option_symbol,
+            entry_premium=plan.estimated_entry_price,
+            quantity=plan.quantity,
+            committed_stop_price=stop_price,
         )
         await self._commit_entry_risk_reservation(plan.trade_id)
         if protection_error is not None:
@@ -2388,6 +2831,51 @@ class ExecutionSupervisor:
             )
 
         updated_position = position
+        action_intent_key: str | None = None
+        if (
+            not dry_run
+            and exit_rule == "target_1_partial"
+            and not isinstance(self.exit_state_repository, NullExitStateRepository)
+        ):
+            trade_id = updated_position.trade_id
+            policy_hash = decision.features.get("policy_hash")
+            if trade_id is None or not policy_hash:
+                raise ProfileExitDispatchError(
+                    "profile target-1 partial lacks durable trade/policy identity"
+                )
+            open_intents = await self.exit_state_repository.get_open_action_intents(
+                trade_id
+            )
+            if open_intents:
+                await self._mark_exit_state_degraded(
+                    trade_id,
+                    deployment=deployment,
+                    option_symbol=updated_position.option_symbol,
+                    reason="duplicate_partial_blocked_by_open_action_intent",
+                    open_intents=open_intents,
+                )
+                raise ProfileExitDispatchError(
+                    f"trade {trade_id} has unresolved exit action intent"
+                )
+            durable = self._durable_exit_states.get(trade_id)
+            if durable is None:
+                raise ProfileExitDispatchError(
+                    f"trade {trade_id} lacks durable exit runtime state"
+                )
+            action_intent_key = hashlib.sha256(
+                f"{trade_id}|{policy_hash}|target_1|{uuid.uuid4()}".encode("utf-8")
+            ).hexdigest()
+            await self.exit_state_repository.prepare_action_intent(
+                ExitActionIntent(
+                    idempotency_key=action_intent_key,
+                    trade_id=trade_id,
+                    policy_hash=policy_hash,
+                    action_kind="partial_scale",
+                    action_slot=f"target_1:{action_intent_key}",
+                    expected_state_version=durable.state_version,
+                    requested_quantity=close_qty,
+                )
+            )
         # MEDIUM-1: capture the prior resting stop price BEFORE cancelling
         # protection. ``_cancel_exit_protection`` now clears ``stop_price`` when it
         # clears ``stop_order_id``, so the residual stop derivation must read the
@@ -2415,6 +2903,13 @@ class ExecutionSupervisor:
             )
 
         if not dry_run and cancel_error is not None:
+            if action_intent_key is not None:
+                await self.exit_state_repository.resolve_action_intent(
+                    action_intent_key,
+                    status="failed",
+                    broker_payload={"error": cancel_error, "stage": "cancel_protection"},
+                )
+                self._rollback_unconfirmed_target_1(position)
             plan = ExitPlan(
                 trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
                 deployment_id=deployment.deployment_id,
@@ -2449,7 +2944,19 @@ class ExecutionSupervisor:
             )
             order_id = result.order_id
             error = result.error or error
+            if order_id is not None and action_intent_key is not None:
+                await self.exit_state_repository.bind_action_order(
+                    action_intent_key,
+                    broker_order_id=order_id,
+                )
             if order_id is None:
+                if action_intent_key is not None:
+                    await self.exit_state_repository.resolve_action_intent(
+                        action_intent_key,
+                        status="failed",
+                        broker_payload={"error": error},
+                    )
+                    self._rollback_unconfirmed_target_1(position)
                 await self.event_repository.append(
                     "exit_submission_failure",
                     {
@@ -2742,8 +3249,12 @@ class ExecutionSupervisor:
             "partial_scale_submission",
             {
                 "deployment_id": deployment.deployment_id,
+                "trade_id": residual.trade_id,
                 "symbol": updated_position.symbol,
                 "option_symbol": updated_position.option_symbol,
+                "policy_hash": decision.features.get("policy_hash"),
+                "state_version": decision.features.get("state_version"),
+                "idempotency_key": action_intent_key,
                 "closed_quantity": close_qty,
                 "residual_quantity": residual_qty,
                 "order_id": order_id,
@@ -2775,6 +3286,18 @@ class ExecutionSupervisor:
         await self.event_repository.append("exit_plan", asdict(plan))
         return plan
 
+    def _rollback_unconfirmed_target_1(self, position: TrackedPosition) -> None:
+        """Undo evaluator-only T1 mutation when no partial broker effect occurred."""
+
+        state = self._profile_exit_states.get(self._profile_state_key(position))
+        if state is None:
+            return
+        state.target_1_banked = False
+        state.target_1_premium = None
+        state.banked_quantity = 0
+        state.stop_at_breakeven = False
+        state.breakeven_emitted = False
+
     async def _apply_replacement_stop(
         self,
         deployment: DeploymentManifest,
@@ -2798,11 +3321,71 @@ class ExecutionSupervisor:
         if position.stop_price is not None and round(position.stop_price, 2) == round(new_stop_price, 2):
             return position  # already there; nothing to do
 
+        action_intent_key: str | None = None
+        durable: ExitRuntimeState | None = None
+        is_profile_breakeven = (
+            decision.features.get("profile_fsm_action") == "stop_to_breakeven"
+        )
+        if (
+            not dry_run
+            and is_profile_breakeven
+            and not isinstance(self.exit_state_repository, NullExitStateRepository)
+        ):
+            trade_id = position.trade_id
+            policy_hash = decision.features.get("policy_hash")
+            if trade_id is None or not policy_hash:
+                raise ProfileExitDispatchError(
+                    "profile breakeven lacks durable trade/policy identity"
+                )
+            open_intents = await self.exit_state_repository.get_open_action_intents(
+                trade_id
+            )
+            if open_intents:
+                await self._mark_exit_state_degraded(
+                    trade_id,
+                    deployment=deployment,
+                    option_symbol=position.option_symbol,
+                    reason="duplicate_breakeven_blocked_by_open_action_intent",
+                    open_intents=open_intents,
+                )
+                raise ProfileExitDispatchError(
+                    f"trade {trade_id} has unresolved exit action intent"
+                )
+            durable = self._durable_exit_states.get(trade_id)
+            if durable is None:
+                raise ProfileExitDispatchError(
+                    f"trade {trade_id} lacks durable exit runtime state"
+                )
+            action_intent_key = hashlib.sha256(
+                f"{trade_id}|{policy_hash}|breakeven|{uuid.uuid4()}".encode("utf-8")
+            ).hexdigest()
+            await self.exit_state_repository.prepare_action_intent(
+                ExitActionIntent(
+                    idempotency_key=action_intent_key,
+                    trade_id=trade_id,
+                    policy_hash=policy_hash,
+                    action_kind="stop_to_breakeven",
+                    action_slot=f"breakeven:{action_intent_key}",
+                    expected_state_version=durable.state_version,
+                    requested_stop_price=new_stop_price,
+                )
+            )
+
         canceled_stop_order_id = position.stop_order_id
         cancel_error = None
         if position.stop_order_id and not dry_run:
             canceled, cancel_error = await self.planner.order_manager.cancel_order(position.stop_order_id)
             if not canceled and not self._allows_exit_submission_before_cancel_confirmation():
+                if action_intent_key is not None:
+                    await self.exit_state_repository.resolve_action_intent(
+                        action_intent_key,
+                        status="failed",
+                        broker_payload={
+                            "error": cancel_error,
+                            "stage": "cancel_existing_stop",
+                        },
+                    )
+                    self._rollback_unconfirmed_breakeven(position)
                 await self.event_repository.append(
                     "protection_cancel_attempt",
                     {
@@ -2841,6 +3424,11 @@ class ExecutionSupervisor:
                 )
                 new_stop_order_id = retry.order_id
                 new_stop_error = retry.error or new_stop_error
+            if new_stop_order_id is not None and action_intent_key is not None:
+                await self.exit_state_repository.bind_action_order(
+                    action_intent_key,
+                    broker_order_id=new_stop_order_id,
+                )
 
         # NEW-6: do NOT persist ``stop_price`` when the placement failed
         # (``stop_order_id is None``). Keeping a stale ``stop_price`` would fool
@@ -2849,6 +3437,49 @@ class ExecutionSupervisor:
         # (stop_order_id is None and target_order_id is None) re-arms it next tick.
         persisted_stop_price = new_stop_price if new_stop_order_id is not None else None
         replacement_unprotected = new_stop_order_id is None and not dry_run
+        if action_intent_key is not None:
+            if replacement_unprotected:
+                await self.exit_state_repository.resolve_action_intent(
+                    action_intent_key,
+                    status="failed",
+                    broker_payload={
+                        "error": new_stop_error,
+                        "stage": "place_replacement_stop",
+                    },
+                )
+                self._rollback_unconfirmed_breakeven(position)
+            elif durable is not None and position.trade_id is not None:
+                advanced = replace(
+                    durable,
+                    committed_stop_price=new_stop_price,
+                    breakeven_emitted=True,
+                    runner_state="post_t1",
+                    recovery_status="active",
+                    degraded_reason=None,
+                    state_version=durable.state_version + 1,
+                )
+                await self.exit_state_repository.transition_runtime_state(
+                    advanced,
+                    expected_version=durable.state_version,
+                )
+                await self.exit_state_repository.resolve_action_intent(
+                    action_intent_key,
+                    status="confirmed",
+                    broker_payload={"broker_order_id": new_stop_order_id},
+                )
+                self._durable_exit_states[position.trade_id] = advanced
+                await self.event_repository.append(
+                    "exit_action_committed",
+                    {
+                        "trade_id": position.trade_id,
+                        "policy_hash": advanced.policy_hash,
+                        "action_kind": "stop_to_breakeven",
+                        "idempotency_key": action_intent_key,
+                        "broker_order_id": new_stop_order_id,
+                        "committed_stop_price": new_stop_price,
+                        "state_version": advanced.state_version,
+                    },
+                )
         updated = _replace_position(
             position, stop_order_id=new_stop_order_id, stop_price=persisted_stop_price
         )
@@ -2909,6 +3540,11 @@ class ExecutionSupervisor:
             )
             await self._emit_lifecycle_transition(transition, reason="profile_replacement_stop")
         return updated
+
+    def _rollback_unconfirmed_breakeven(self, position: TrackedPosition) -> None:
+        state = self._profile_exit_states.get(self._profile_state_key(position))
+        if state is not None:
+            state.breakeven_emitted = False
 
     async def _submit_exit_request(
         self,
@@ -4385,14 +5021,113 @@ class ExecutionSupervisor:
                         "payload": payload,
                     },
                 )
+                await self._confirm_partial_action_intent(
+                    record.trade_id,
+                    order_id=record.order_id,
+                    confirmed_quantity=int(
+                        details["exit_filled_quantity"]
+                        or record.closed_quantity
+                    ),
+                    broker_payload=payload,
+                )
                 continue
             if normalized in _EXIT_ORDER_DEAD_STATUSES:
                 # Order died without any fill: it can never be enriched.
                 await self._abandon_partial_fill(record, reason=f"terminal_status:{normalized}")
+                await self._fail_partial_action_intent(
+                    record.trade_id,
+                    order_id=record.order_id,
+                    broker_payload=payload,
+                )
                 continue
             await self._register_partial_fill_poll_failure(
                 record, error=f"non_terminal_status:{normalized or 'unknown'}"
             )
+
+    async def _confirm_partial_action_intent(
+        self,
+        trade_id: str,
+        *,
+        order_id: str | None,
+        confirmed_quantity: int,
+        broker_payload: dict[str, Any],
+    ) -> None:
+        if isinstance(self.exit_state_repository, NullExitStateRepository):
+            return
+        intents = await self.exit_state_repository.get_open_action_intents(trade_id)
+        intent = next(
+            (
+                item
+                for item in intents
+                if item.action_kind == "partial_scale"
+                and item.broker_order_id == order_id
+            ),
+            None,
+        )
+        if intent is None:
+            return
+        durable = await self.exit_state_repository.get_runtime_state(trade_id)
+        if durable is None:
+            return
+        advanced = replace(
+            durable,
+            target_1_banked=True,
+            banked_quantity=max(durable.banked_quantity, confirmed_quantity),
+            runner_state="post_t1",
+            recovery_status="active",
+            degraded_reason=None,
+            state_version=durable.state_version + 1,
+        )
+        await self.exit_state_repository.transition_runtime_state(
+            advanced,
+            expected_version=durable.state_version,
+        )
+        await self.exit_state_repository.resolve_action_intent(
+            intent.idempotency_key,
+            status="confirmed",
+            broker_payload=broker_payload,
+        )
+        self._durable_exit_states[trade_id] = advanced
+        self._profile_exit_degraded_trades.discard(trade_id)
+        await self.event_repository.append(
+            "exit_action_committed",
+            {
+                "trade_id": trade_id,
+                "policy_hash": advanced.policy_hash,
+                "action_kind": "partial_scale",
+                "idempotency_key": intent.idempotency_key,
+                "broker_order_id": order_id,
+                "confirmed_quantity": confirmed_quantity,
+                "state_version": advanced.state_version,
+            },
+        )
+
+    async def _fail_partial_action_intent(
+        self,
+        trade_id: str,
+        *,
+        order_id: str | None,
+        broker_payload: dict[str, Any],
+    ) -> None:
+        if isinstance(self.exit_state_repository, NullExitStateRepository):
+            return
+        intents = await self.exit_state_repository.get_open_action_intents(trade_id)
+        intent = next(
+            (
+                item
+                for item in intents
+                if item.action_kind == "partial_scale"
+                and item.broker_order_id == order_id
+            ),
+            None,
+        )
+        if intent is None:
+            return
+        await self.exit_state_repository.resolve_action_intent(
+            intent.idempotency_key,
+            status="failed",
+            broker_payload=broker_payload,
+        )
 
     async def _register_partial_fill_poll_failure(self, record: PartialFillRecord, *, error: str) -> None:
         """Count one unresolved enrichment poll; abandon at the ceiling (audit fix 3)."""

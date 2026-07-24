@@ -657,6 +657,17 @@ class SQLiteTradeStateRepository(TradeStateRepository):
 
     def _record_partial_fill_sync(self, record: PartialFillRecord) -> int:
         with closing(self.backend.connect()) as conn:
+            if record.order_id is not None:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM trade_partial_fills
+                    WHERE trade_id = ? AND order_id = ?
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (record.trade_id, record.order_id),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing[0])
             now = datetime.now(UTC).isoformat()
             cursor = conn.execute(
                 """

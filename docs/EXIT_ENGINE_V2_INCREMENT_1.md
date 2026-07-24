@@ -1,0 +1,62 @@
+# Exit Engine V2 Increment 1 — Bhiksha Implementation
+
+The cross-repository product contract is owned by TradeLab:
+`docs/EXIT_ENGINE_V2_INCREMENT_1.md` in the sibling `tradelab` repository. This
+document records only Bhiksha's implementation and operating boundary.
+
+## Shipped boundary
+
+- `active_plan` plus `startup_config` remain the only session configuration
+  authority.
+- Active-plan compilation resolves legacy profile labels to explicit
+  `exit-policy.v1` numbers, then hashes the fully resolved policy after
+  row-level precedence.
+- Each confirmed trade freezes one immutable policy snapshot and initializes
+  versioned runtime state in the existing runtime SQLite database.
+- Profile-exit events carry stable trade, policy, state, and quote lineage.
+- Partial-scale and breakeven broker effects use durable action intents.
+  Confirmed broker readback advances banked/breakeven state; unresolved effects
+  block duplicates.
+- Missing, contradictory, or ambiguous restart state emits `STATE_DEGRADED`,
+  keeps the profile dispatcher closed, and retains the existing protection
+  path. Recovery never invents a historical peak.
+- The generated session manifest is a review receipt, not a second source of
+  configuration.
+- Exit Edge Lab owns Control/Variant A/Variant B counterfactual evidence in its
+  separate sidecar store.
+
+## Safety boundary
+
+Increment 1 adds no live Dynamic Risk Envelope switch and no envelope path to an
+order manager, broker client, cancel, replace, or dispatch function. Existing
+target, stop, partial, giveback, sizing, and native-exit economics remain the
+live control. The profile route's pre-existing live gate is unchanged.
+
+Existing open trades that predate an immutable policy snapshot do not silently
+adopt the current session policy. They enter visible degraded recovery and
+continue only through facts and protection paths the runtime can prove.
+
+## Runtime evidence
+
+At startup, Bhiksha emits the effective exit policy records in `startup_config`
+and writes:
+
+```text
+<playbook_artifacts_dir>/session_manifests/session_manifest_<trading-date>_<config-fingerprint>.json
+<playbook_artifacts_dir>/session_manifests/session_manifest_<trading-date>_<config-fingerprint>.md
+```
+
+For each material transition, audit the SQLite policy snapshot, runtime state,
+action intent, trade/fill record, identified event, and broker readback
+together. A local state assertion is not broker proof.
+
+## Release gate
+
+Deploy only at the normal post-flat session boundary after:
+
+1. kernel, Bhiksha, PAT, and TradeLab suites are green;
+2. current-behavior golden fixtures are unchanged;
+3. at least two fresh adversarial money-path audit rounds pass;
+4. oldmac is confirmed flat and its checkout/dirtiness are preserved; and
+5. post-deploy readback proves commit/tree, launchd health, startup policy
+   identity, and fresh state/manifest output.

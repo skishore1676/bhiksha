@@ -140,6 +140,11 @@ class ProfileExitFields:
     # L1: the favorable-excursion floor (in R) below which the no-progress time
     # stop is allowed to fire. Previously a hardcoded 0.25 literal; now a dial.
     no_progress_favorable_floor_r: float = 0.25
+    policy_schema_version: str | None = None
+    policy_id: str | None = None
+    policy_hash: str | None = None
+    explicit_giveback_arm_r: float | None = None
+    explicit_giveback_retrace_fraction: float | None = None
 
     def __post_init__(self) -> None:
         # M2: reject an inverted stop config at construction time. The disaster
@@ -182,11 +187,15 @@ class ProfileExitFields:
 
     @property
     def giveback_arm_r(self) -> float | None:
+        if self.explicit_giveback_arm_r is not None:
+            return float(self.explicit_giveback_arm_r)
         arm, _ = GIVEBACK_TIERS.get(self.high_water_giveback_policy.upper(), (0.0, 0.0))
         return arm if arm > 0 else None
 
     @property
     def giveback_retrace_frac(self) -> float:
+        if self.explicit_giveback_retrace_fraction is not None:
+            return float(self.explicit_giveback_retrace_fraction)
         _, frac = GIVEBACK_TIERS.get(self.high_water_giveback_policy.upper(), (0.0, 0.5))
         return frac if frac > 0 else 0.5
 
@@ -215,6 +224,12 @@ class ProfileExitFields:
         kernel import stays optional here.
         """
         get = spec.get if isinstance(spec, dict) else (lambda k, d=None: getattr(spec, k, d))
+        policy_hash = get("policy_hash") if isinstance(spec, dict) else None
+        if (
+            not isinstance(spec, dict)
+            and getattr(spec, "policy_resolution_status", None) == "resolved"
+        ):
+            policy_hash = spec.policy_hash
         return cls(
             profile_id=str(get("policy_id", "")) or "unknown_profile",
             target_1_r=get("target_1_r"),
@@ -231,6 +246,11 @@ class ProfileExitFields:
             eod_flat=bool(get("eod_flat", True)),
             hard_flat_time_et=str(get("hard_flat_time_et", "15:55") or "15:55"),
             no_progress_favorable_floor_r=float(get("no_progress_favorable_floor_r", 0.25) or 0.25),
+            policy_schema_version=get("policy_schema_version"),
+            policy_id=get("policy_id"),
+            policy_hash=policy_hash,
+            explicit_giveback_arm_r=get("giveback_arm_r"),
+            explicit_giveback_retrace_fraction=get("giveback_retrace_fraction"),
         )
 
     @classmethod
@@ -259,6 +279,11 @@ class ProfileExitFields:
             eod_flat=bool(get("eod_flat", True)),
             hard_flat_time_et=str(get("hard_flat_time_et", "15:55") or "15:55"),
             no_progress_favorable_floor_r=float(get("no_progress_favorable_floor_r", 0.25) or 0.25),
+            policy_schema_version=get("exit_policy_schema_version"),
+            policy_id=get("exit_policy_id"),
+            policy_hash=get("exit_policy_hash"),
+            explicit_giveback_arm_r=get("giveback_arm_r"),
+            explicit_giveback_retrace_fraction=get("giveback_retrace_fraction"),
         )
 
     @classmethod
@@ -304,6 +329,11 @@ class ProfileExitFields:
             eod_flat=bool(params.get("eod_flat", True)),
             hard_flat_time_et=str(params.get("hard_flat_time_et", "15:55") or "15:55"),
             no_progress_favorable_floor_r=num("no_progress_favorable_floor_r") or 0.25,
+            policy_schema_version=str(params.get("policy_schema_version") or "") or None,
+            policy_id=str(params.get("policy_id") or "") or None,
+            policy_hash=str(params.get("policy_hash") or "") or None,
+            explicit_giveback_arm_r=num("giveback_arm_r"),
+            explicit_giveback_retrace_fraction=num("giveback_retrace_fraction"),
         )
 
 

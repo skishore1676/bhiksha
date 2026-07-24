@@ -294,6 +294,69 @@ def test_no_progress_does_not_fire_when_thesis_made_progress() -> None:
     assert decision.rule is ProfileLadderRule.HOLD
 
 
+def test_july_20_qqq_path_holds_at_point_eight_r_then_exits_at_original_stop() -> None:
+    """Golden fixture for the pre-envelope behavior that motivated Exit Engine V2.
+
+    The verified trade entered at 2.69, peaked at 3.44 (+0.7966R on a 35%
+    premium risk budget), never reached T1 or the current MODERATE 1.25R
+    giveback arm, and ultimately exited at the original 1.75 stop. Increment 1
+    may record envelope counterfactuals for this path but must not change these
+    live ladder decisions.
+    """
+
+    entry = 2.69
+    fields = ProfileExitFields(
+        profile_id="TREND_CONTINUATION",
+        target_1_r=1.0,
+        target_2_r=2.0,
+        target_1_quantity=0.60,
+        initial_stop_pct=0.35,
+        no_progress_seconds=900,
+        high_water_giveback_policy="MODERATE",
+        eod_flat=False,
+    )
+    state = ProfileExitState.new(entry, seed_quantity=5)
+
+    peak = evaluate_profile_exit(
+        fields=fields,
+        entry_premium=entry,
+        quantity=5,
+        market=_market(3.44),
+        entry_time=ENTRY_TIME,
+        now=ENTRY_TIME.replace(minute=1),
+        state=state,
+    )
+    assert peak.rule is ProfileLadderRule.HOLD
+    assert state.peak_premium == pytest.approx(3.44)
+
+    worked_then_retraced = evaluate_profile_exit(
+        fields=fields,
+        entry_premium=entry,
+        quantity=5,
+        market=_market(2.34),
+        entry_time=ENTRY_TIME,
+        now=ENTRY_TIME.replace(minute=20),
+        state=state,
+    )
+    assert worked_then_retraced.rule is ProfileLadderRule.HOLD
+
+    broker_stop_fill_tick = evaluate_profile_exit(
+        fields=fields,
+        entry_premium=entry,
+        quantity=5,
+        market=_market(1.75),
+        entry_time=ENTRY_TIME,
+        now=ENTRY_TIME.replace(minute=21),
+        state=state,
+    )
+    # The profile evaluator's exact floor is 2.69 * (1 - 0.35) = 1.7485, so
+    # the rounded $1.75 broker stop can fill while the profile path still says
+    # HOLD. This distinction is intentional: the broker protection, not a
+    # profile dispatch, closed the verified trade.
+    assert broker_stop_fill_tick.rule is ProfileLadderRule.HOLD
+    assert broker_stop_fill_tick.features["current_r"] == pytest.approx(-0.9984)
+
+
 # --------------------------------------------------------------------------- #
 # Ladder rung 6: EOD flat (highest precedence when enabled)
 # --------------------------------------------------------------------------- #

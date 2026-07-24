@@ -24,7 +24,9 @@ from bhiksha.ops.exit_edge_lab import (
     FILL_MODEL_VERSION,
     ProspectiveQuoteTapeRepository,
     QuoteTapeMark,
+    ShadowEnvelopeState,
     analyze_cases,
+    build_risk_envelope_experiment,
     experiment_spec_hash,
 )
 
@@ -258,6 +260,12 @@ class ExitEdgeLiveRecorder:
             try:
                 case = repository.load_case(cohort_id)
                 row = analyze_cases([case])["cases"][0]
+                states = tuple(
+                    ShadowEnvelopeState(**state)
+                    for state in row.get("shadow_envelope_states", [])
+                )
+                if states:
+                    repository.persist_shadow_envelope_states(states)
                 if row["status"] == "paired":
                     self._increment_health("paired_cohorts")
                     continue
@@ -333,6 +341,12 @@ class ExitEdgeLiveRecorder:
                     continue
                 case = repository.load_case(cohort_id)
                 row = analyze_cases([case])["cases"][0]
+                states = tuple(
+                    ShadowEnvelopeState(**state)
+                    for state in row.get("shadow_envelope_states", [])
+                )
+                if states:
+                    repository.persist_shadow_envelope_states(states)
                 if row["status"] == "paired":
                     self._deactivate(case.option_symbol, cohort_id)
                     self._increment_health("paired_cohorts")
@@ -484,6 +498,17 @@ class ExitEdgeLiveRecorder:
             reasons.append("missing_broker_filled_quantity")
         if not profile_id:
             reasons.append("deployment_has_no_frozen_profile")
+        control_policy = getattr(deployment.exit, "exit_policy_snapshot", None)
+        control_policy_hash = getattr(deployment.exit, "exit_policy_hash", None)
+        control_policy_id = getattr(deployment.exit, "exit_policy_id", None)
+        if not isinstance(control_policy, dict) or not control_policy:
+            reasons.append("missing_canonical_exit_policy_snapshot")
+        if not control_policy_hash or not control_policy_id:
+            reasons.append("missing_canonical_exit_policy_identity")
+        elif isinstance(control_policy, dict) and str(
+            control_policy.get("policy_id") or ""
+        ) != str(control_policy_id):
+            reasons.append("canonical_exit_policy_id_mismatch")
         cohort_id = f"exit-edge:{trade_id}"
         attempt = {
             "trade_id": str(trade_id), "deployment_id": str(deployment.deployment_id),
@@ -500,6 +525,35 @@ class ExitEdgeLiveRecorder:
         profile = asdict(fields)
         profile["profile_exit_id"] = profile.pop("profile_id")
         profile["stop_loss_pct"] = profile.pop("option_stop_fallback_pct")
+        profile_to_policy_fields = {
+            "target_1_r": "target_1_r",
+            "target_2_r": "target_2_r",
+            "target_1_quantity": "target_1_quantity",
+            "initial_stop_pct": "initial_stop_pct",
+            "premium_disaster_stop_pct": "premium_disaster_stop_pct",
+            "no_progress_seconds": "no_progress_seconds",
+            "max_hold_seconds": "max_hold_seconds",
+            "high_water_giveback_policy": "high_water_giveback_policy",
+            "explicit_giveback_arm_r": "giveback_arm_r",
+            "explicit_giveback_retrace_fraction": "giveback_retrace_fraction",
+            "breakeven_after_t1": "breakeven_after_t1",
+            "eod_flat": "eod_flat",
+            "hard_flat_time_et": "hard_flat_time_et",
+        }
+        mismatches = [
+            profile_key
+            for profile_key, policy_key in profile_to_policy_fields.items()
+            if profile.get(profile_key) != control_policy.get(policy_key)
+        ]
+        if mismatches:
+            attempt["eligible"] = False
+            attempt["cohort_id"] = None
+            attempt["outcome"] = "ineligible"
+            attempt["reason"] = (
+                "profile_and_canonical_policy_mismatch:"
+                + ",".join(sorted(mismatches))
+            )
+            return attempt, None
         target_pct = None
         if bool(deployment.exit.use_profit_target):
             if deployment.exit.option_profit_target_pct is not None:
@@ -523,6 +577,17 @@ class ExitEdgeLiveRecorder:
             "quote_source": QUOTE_SOURCE,
             "quote_feed": QUOTE_FEED,
         }
+        try:
+            experiment["risk_envelope"] = build_risk_envelope_experiment(
+                dict(control_policy),
+                control_policy_hash=str(control_policy_hash),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            attempt["eligible"] = False
+            attempt["cohort_id"] = None
+            attempt["outcome"] = "ineligible"
+            attempt["reason"] = f"invalid_canonical_exit_policy:{exc}"
+            return attempt, None
         return attempt, {
             "cohort_id": cohort_id,
             "trade_id": str(trade_id),
