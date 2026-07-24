@@ -54,8 +54,14 @@ class _StatusOrderManager(StubOrderManager):
 
 
 class _WorkingPartialOrderManager(_StatusOrderManager):
-    def __init__(self, payload: dict, *, cancel_success: bool = False) -> None:
-        super().__init__("NEW", payload)
+    def __init__(
+        self,
+        payload: dict,
+        *,
+        status: str = "NEW",
+        cancel_success: bool = False,
+    ) -> None:
+        super().__init__(status, payload)
         self.stop_placements = 0
         self.close_placements = 0
         self.cancel_success = cancel_success
@@ -146,7 +152,7 @@ def _seed(exit_repo: SQLiteExitStateRepository, *, target_1_banked: bool = False
     return state
 
 
-def _supervisor(tmp_path, manager, exit_repo):
+def _supervisor(tmp_path, manager, exit_repo, *, quantity: int = 1):
     state_path = str(tmp_path / "trade.db")
     planner = RecordingPlanner(manager)
     planner.position_tracker.open_position(
@@ -154,7 +160,7 @@ def _supervisor(tmp_path, manager, exit_repo):
         "market_impulse_qqq_short_v1",
         trade_id="T1",
         option_symbol=OPTION,
-        quantity=1,
+        quantity=quantity,
         entry_price=3.0,
         entry_timestamp=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
         source="live_open",
@@ -632,3 +638,72 @@ def test_hard_flat_blocks_overlapping_full_close_while_partial_is_working(
     assert issue["policy_schema_version"] == "exit-policy.v1"
     assert issue["policy_id"] == "exit.test.control.v1"
     assert issue["idempotency_key"] is None
+
+
+def test_hard_flat_keeps_blocking_after_fill_proof_until_quantity_refresh(
+    tmp_path,
+) -> None:
+    exit_repo = SQLiteExitStateRepository(str(tmp_path / "exit.db"))
+    _seed(exit_repo)
+    intent = ExitActionIntent(
+        idempotency_key="partial-filled-before-hard-flat",
+        trade_id="T1",
+        policy_hash=POLICY_HASH,
+        action_kind="partial_scale",
+        action_slot="target_1:filled-before-hard-flat",
+        expected_state_version=1,
+        requested_quantity=1,
+    )
+    asyncio.run(exit_repo.prepare_action_intent(intent))
+    asyncio.run(
+        exit_repo.bind_action_order(
+            intent.idempotency_key,
+            broker_order_id="CLOSE_FILLED",
+        )
+    )
+    manager = _WorkingPartialOrderManager(
+        {
+            "status": "FILLED",
+            "orderId": "CLOSE_FILLED",
+            "orderSide": "SELL",
+            "openCloseIndicator": "CLOSE",
+            "instrument": {"symbol": OPTION},
+            "quantity": "1",
+            "filledQuantity": "1",
+            "averagePrice": "4.00",
+        },
+        status="FILLED",
+        cancel_success=False,
+    )
+    supervisor, position = _supervisor(
+        tmp_path,
+        manager,
+        exit_repo,
+        quantity=2,
+    )
+    supervisor._profile_exit_degraded_trades.add("T1")
+    deployments = {position.deployment_id: _deployment()}
+    hard_flat_at = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+
+    first = asyncio.run(
+        supervisor.close_due_positions(
+            deployments,
+            now=hard_flat_at,
+            dry_run=False,
+        )
+    )
+    second = asyncio.run(
+        supervisor.close_due_positions(
+            deployments,
+            now=hard_flat_at,
+            dry_run=False,
+        )
+    )
+
+    durable = asyncio.run(exit_repo.get_runtime_state("T1"))
+    assert first == []
+    assert second == []
+    assert manager.close_placements == 0
+    assert durable.banked_quantity == 1
+    assert asyncio.run(exit_repo.get_open_action_intents("T1")) == []
+    assert supervisor.planner.position_tracker.active_positions()[0].quantity == 2

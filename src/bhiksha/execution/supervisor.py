@@ -5281,9 +5281,6 @@ class ExecutionSupervisor:
         partial_intents = [
             intent for intent in open_intents if intent.action_kind == "partial_scale"
         ]
-        if not partial_intents:
-            return position
-
         for intent in partial_intents:
             broker_order_id = intent.broker_order_id or intent.idempotency_key
             canceled, cancel_error = await self.planner.order_manager.cancel_order(
@@ -5323,9 +5320,10 @@ class ExecutionSupervisor:
                     [intent],
                 )
 
-        open_intents = await self.exit_state_repository.get_open_action_intents(
-            trade_id
-        )
+        if partial_intents:
+            open_intents = (
+                await self.exit_state_repository.get_open_action_intents(trade_id)
+            )
         durable = await self.exit_state_repository.get_runtime_state(trade_id)
         if durable is not None:
             self._durable_exit_states[trade_id] = durable
