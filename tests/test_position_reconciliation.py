@@ -164,6 +164,47 @@ def test_reconcile_public_positions_attaches_entry_and_target_metadata() -> None
     assert tracked[0].target_price == 3.35
 
 
+def test_reconcile_does_not_treat_stale_trade_record_as_working_protection() -> None:
+    deployments = _historical_enabled_deployments()
+    positions = [
+        {
+            "instrument": {
+                "symbol": "QQQ260401P00556000",
+                "type": "OPTION",
+            },
+            "quantity": "1.0",
+        }
+    ]
+    known_trades = [
+        TradeRecord(
+            trade_id="TRADE123",
+            deployment_id="market_impulse_qqq_short_v1",
+            symbol="QQQ",
+            option_symbol="QQQ260401P00556000",
+            quantity=1,
+            status="open_protected",
+            entry_order_id="ENTRY123",
+            stop_order_id="STALE_STOP",
+            stop_price=1.25,
+            target_order_id="STALE_TARGET",
+            target_price=3.50,
+        )
+    ]
+
+    tracked = reconcile_public_positions(
+        positions,
+        deployments,
+        orders=[],
+        known_trades=known_trades,
+    )
+
+    assert tracked[0].trade_id == "TRADE123"
+    assert tracked[0].stop_order_id is None
+    assert tracked[0].stop_price is None
+    assert tracked[0].target_order_id is None
+    assert tracked[0].target_price is None
+
+
 def test_reconcile_public_positions_prefers_known_trade_identity_over_symbol_match() -> None:
     deployments = load_historical_deployments()
     qqq = historical_deployment("market_impulse_qqq_short_v1")

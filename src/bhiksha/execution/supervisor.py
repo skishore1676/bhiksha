@@ -408,6 +408,13 @@ class ExecutionSupervisor:
             cached = await self.exit_state_repository.get_policy_snapshot(trade_id)
         if durable is None:
             durable = await self.exit_state_repository.get_runtime_state(trade_id)
+        # Cache recovered identity before action-intent reconciliation so every
+        # recovery/cancel/commit event carries the frozen policy coordinates.
+        # Validation below still decides whether execution may resume.
+        if cached is not None:
+            self._frozen_exit_policies[trade_id] = cached
+        if durable is not None:
+            self._durable_exit_states[trade_id] = durable
         open_intents = await self.exit_state_repository.get_open_action_intents(
             trade_id
         )
@@ -556,6 +563,8 @@ class ExecutionSupervisor:
                         or broker_stop_price is None
                         or round(broker_stop_price, 2)
                         != round(intent.requested_stop_price, 2)
+                        or _remaining_order_quantity(payload)
+                        != position.quantity
                     ):
                         continue
                     durable = await self.exit_state_repository.get_runtime_state(
@@ -654,6 +663,7 @@ class ExecutionSupervisor:
     ) -> None:
         self._profile_exit_degraded_trades.add(trade_id)
         persistence_error: str | None = None
+        durable = self._durable_exit_states.get(trade_id)
         if not isinstance(self.exit_state_repository, NullExitStateRepository):
             try:
                 durable = await self.exit_state_repository.get_runtime_state(trade_id)
@@ -671,18 +681,31 @@ class ExecutionSupervisor:
                         degraded,
                         expected_version=durable.state_version,
                     )
+                    durable = degraded
                     self._durable_exit_states[trade_id] = degraded
             except Exception as exc:
                 persistence_error = str(exc)
         if trade_id in self._profile_exit_recovery_events:
             return
         self._profile_exit_recovery_events.add(trade_id)
+        snapshot = self._frozen_exit_policies.get(trade_id)
         await self.event_repository.append(
             "exit_state_recovery",
             {
                 "trade_id": trade_id,
                 "deployment_id": deployment.deployment_id,
                 "option_symbol": option_symbol,
+                "policy_schema_version": (
+                    snapshot.policy_schema_version if snapshot is not None else None
+                ),
+                "policy_id": snapshot.policy_id if snapshot is not None else None,
+                "policy_hash": (
+                    snapshot.policy_hash
+                    if snapshot is not None
+                    else durable.policy_hash if durable is not None else None
+                ),
+                "state_version": durable.state_version if durable is not None else None,
+                "idempotency_key": None,
                 "status": "STATE_DEGRADED",
                 "reason": reason,
                 "profile_dispatch_allowed": False,
@@ -2244,6 +2267,54 @@ class ExecutionSupervisor:
             if position.trade_id is not None
             else []
         )
+        partial_intents = [
+            intent for intent in open_intents if intent.action_kind == "partial_scale"
+        ]
+        for intent in partial_intents:
+            broker_order_id = intent.broker_order_id or intent.idempotency_key
+            canceled, cancel_error = await self.planner.order_manager.cancel_order(
+                broker_order_id
+            )
+            await self.event_repository.append(
+                "partial_scale_recovery_cancel",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(
+                        deployment,
+                        position,
+                        idempotency_key=intent.idempotency_key,
+                    ),
+                    "option_symbol": position.option_symbol,
+                    "broker_order_id": broker_order_id,
+                    "canceled_dead_unfilled": canceled,
+                    "error": cancel_error,
+                },
+            )
+            if canceled:
+                await self.exit_state_repository.resolve_action_intent(
+                    intent.idempotency_key,
+                    status="failed",
+                    broker_payload={
+                        "stage": "recovery_cancel_working_partial",
+                        "error": cancel_error,
+                    },
+                )
+                self._rollback_unconfirmed_target_1(position)
+            else:
+                await self._reconcile_open_profile_intents(
+                    deployment,
+                    position,
+                    [intent],
+                )
+        if partial_intents:
+            open_intents = await self.exit_state_repository.get_open_action_intents(
+                position.trade_id
+            )
+            durable = await self.exit_state_repository.get_runtime_state(
+                position.trade_id
+            )
+            if durable is not None:
+                self._durable_exit_states[position.trade_id] = durable
         partial_effect_pending = any(
             intent.action_kind == "partial_scale" for intent in open_intents
         )
@@ -2254,6 +2325,8 @@ class ExecutionSupervisor:
             != durable.seed_quantity - durable.banked_quantity
         )
         if partial_effect_pending or quantity_refresh_pending:
+            if self.reconcile_trigger is not None:
+                self.reconcile_trigger.set()
             await self.event_repository.append(
                 "runtime_issue",
                 {
@@ -2351,11 +2424,9 @@ class ExecutionSupervisor:
             "exit_state_degraded_protection_restored",
             {
                 "deployment_id": deployment.deployment_id,
-                "trade_id": restored.trade_id,
+                **self._exit_event_identity(deployment, restored),
                 "symbol": restored.symbol,
                 "option_symbol": restored.option_symbol,
-                "policy_hash": durable.policy_hash if durable else None,
-                "state_version": durable.state_version if durable else None,
                 "stop_order_id": restored.stop_order_id,
                 "stop_price": restored.stop_price,
                 "quantity": restored.quantity,
@@ -2576,6 +2647,7 @@ class ExecutionSupervisor:
                         "protection_cancel_attempt",
                         {
                             "deployment_id": deployment.deployment_id,
+                            **self._exit_event_identity(deployment, updated),
                             "symbol": updated.symbol,
                             "option_symbol": updated.option_symbol,
                             "stop_order_id": updated.stop_order_id,
@@ -2671,6 +2743,7 @@ class ExecutionSupervisor:
                         "target_cancel_attempt",
                         {
                             "deployment_id": deployment.deployment_id,
+                            **self._exit_event_identity(deployment, updated),
                             "symbol": updated.symbol,
                             "option_symbol": updated.option_symbol,
                             "target_order_id": updated.target_order_id,
@@ -2752,6 +2825,7 @@ class ExecutionSupervisor:
                             "protection_cancel_attempt",
                             {
                                 "deployment_id": deployment.deployment_id,
+                                **self._exit_event_identity(deployment, updated),
                                 "symbol": updated.symbol,
                                 "option_symbol": updated.option_symbol,
                                 "stop_order_id": updated.stop_order_id,
@@ -2894,6 +2968,41 @@ class ExecutionSupervisor:
 
         return updated
 
+    def _exit_event_identity(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        trade_id = position.trade_id
+        snapshot = (
+            self._frozen_exit_policies.get(trade_id) if trade_id is not None else None
+        )
+        durable = (
+            self._durable_exit_states.get(trade_id) if trade_id is not None else None
+        )
+        return {
+            "trade_id": trade_id,
+            "policy_schema_version": (
+                snapshot.policy_schema_version
+                if snapshot is not None
+                else deployment.exit.exit_policy_schema_version
+            ),
+            "policy_id": (
+                snapshot.policy_id
+                if snapshot is not None
+                else deployment.exit.exit_policy_id
+            ),
+            "policy_hash": (
+                snapshot.policy_hash
+                if snapshot is not None
+                else deployment.exit.exit_policy_hash
+            ),
+            "state_version": durable.state_version if durable is not None else None,
+            "idempotency_key": idempotency_key,
+        }
+
     def _supports_concurrent_exit_orders(self) -> bool:
         return bool(getattr(self.planner.order_manager, "supports_concurrent_exit_orders", False))
 
@@ -2924,6 +3033,30 @@ class ExecutionSupervisor:
             # never blocked by this guard. With the operator flag OFF (the only state
             # shipped) the gate is always shut, so this guard never fires and native
             # exit authority is unchanged.
+            if (
+                position.trade_id is not None
+                and position.trade_id in self._profile_exit_degraded_trades
+            ):
+                durable = self._durable_exit_states.get(position.trade_id)
+                snapshot = self._frozen_exit_policies.get(position.trade_id)
+                await self.event_repository.append(
+                    "native_exit_blocked_state_degraded",
+                    {
+                        "deployment_id": deployment.deployment_id,
+                        "trade_id": position.trade_id,
+                        "symbol": position.symbol,
+                        "option_symbol": position.option_symbol,
+                        "policy_schema_version": (
+                            snapshot.policy_schema_version if snapshot else None
+                        ),
+                        "policy_id": snapshot.policy_id if snapshot else None,
+                        "policy_hash": durable.policy_hash if durable else None,
+                        "state_version": durable.state_version if durable else None,
+                        "action": decision.action,
+                        "reason": decision.reason,
+                    },
+                )
+                return None
             if self._profile_exit_is_authoritative(deployment, position):
                 await self.event_repository.append(
                     "native_exit_yielded_to_profile",
@@ -3184,9 +3317,79 @@ class ExecutionSupervisor:
         status_error: str | None,
         canceled_stop_order_id: str | None,
         canceled_target_order_id: str | None,
+        prior_stop_price: float | None,
     ) -> ExitPlan:
         """Keep local quantity unchanged until broker fill truth is available."""
 
+        canceled, cancel_error = await self.planner.order_manager.cancel_order(order_id)
+        await self.event_repository.append(
+            "partial_scale_recovery_cancel",
+            {
+                "deployment_id": deployment.deployment_id,
+                **self._exit_event_identity(
+                    deployment,
+                    position,
+                    idempotency_key=action_intent_key,
+                ),
+                "option_symbol": position.option_symbol,
+                "broker_order_id": order_id,
+                "canceled_dead_unfilled": canceled,
+                "error": cancel_error,
+            },
+        )
+        if canceled:
+            await self.exit_state_repository.resolve_action_intent(
+                action_intent_key,
+                status="failed",
+                broker_payload={
+                    "stage": "cancel_unconfirmed_partial",
+                    "error": cancel_error,
+                },
+            )
+            self._rollback_unconfirmed_target_1(position)
+            restored = await self._retain_or_restore_degraded_protection(
+                deployment,
+                _replace_position(
+                    position,
+                    stop_order_id=None,
+                    stop_price=prior_stop_price,
+                    target_order_id=None,
+                    target_price=None,
+                ),
+                dry_run=False,
+            )
+            plan = ExitPlan(
+                trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+                deployment_id=deployment.deployment_id,
+                symbol=position.symbol,
+                option_symbol=position.option_symbol,
+                quantity=requested_quantity,
+                action=decision.action,
+                reasons=decision.reason,
+                dry_run=False,
+                order_id=order_id,
+                canceled_stop_order_id=canceled_stop_order_id,
+                canceled_target_order_id=canceled_target_order_id,
+                error="partial_scale_canceled_before_fill_confirmation",
+            )
+            await self.event_repository.append(
+                "partial_scale_canceled_and_protection_restored",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(
+                        deployment,
+                        restored,
+                        idempotency_key=action_intent_key,
+                    ),
+                    "option_symbol": position.option_symbol,
+                    "partial_order_id": order_id,
+                    "restored_stop_order_id": restored.stop_order_id,
+                    "restored_stop_price": restored.stop_price,
+                    "quantity": restored.quantity,
+                },
+            )
+            await self.event_repository.append("exit_plan", asdict(plan))
+            return plan
         if position.trade_id is not None:
             open_intents = await self.exit_state_repository.get_open_action_intents(
                 position.trade_id
@@ -3246,7 +3449,9 @@ class ExecutionSupervisor:
             order_id=order_id,
             canceled_stop_order_id=canceled_stop_order_id,
             canceled_target_order_id=canceled_target_order_id,
-            error=status_error or "partial_scale_fill_not_yet_proved",
+            error=status_error
+            or cancel_error
+            or "partial_scale_fill_not_yet_proved",
         )
         await self.event_repository.append("exit_plan", asdict(plan))
         return plan
@@ -3550,6 +3755,7 @@ class ExecutionSupervisor:
                         status_error=status_error,
                         canceled_stop_order_id=canceled_stop_order_id,
                         canceled_target_order_id=canceled_target_order_id,
+                        prior_stop_price=prior_stop_price,
                     )
                 if updated_position.trade_id is not None:
                     await self._confirm_partial_action_intent(
@@ -3934,6 +4140,11 @@ class ExecutionSupervisor:
                     "protection_cancel_attempt",
                     {
                         "deployment_id": deployment.deployment_id,
+                        **self._exit_event_identity(
+                            deployment,
+                            position,
+                            idempotency_key=action_intent_key,
+                        ),
                         "symbol": position.symbol,
                         "option_symbol": position.option_symbol,
                         "stop_order_id": position.stop_order_id,
@@ -4149,6 +4360,7 @@ class ExecutionSupervisor:
                     "exit_market_fallback",
                     {
                         "deployment_id": deployment.deployment_id,
+                        **self._exit_event_identity(deployment, position),
                         "symbol": position.symbol,
                         "option_symbol": position.option_symbol,
                         "exit_mode": exit_mode.value,
@@ -4325,6 +4537,7 @@ class ExecutionSupervisor:
                     "ambiguous_cancel",
                     {
                         "deployment_id": deployment.deployment_id,
+                        **self._exit_event_identity(deployment, position),
                         "symbol": position.symbol,
                         "option_symbol": position.option_symbol,
                         "order_id": position.stop_order_id,
@@ -4337,6 +4550,7 @@ class ExecutionSupervisor:
                 "protection_cancel_attempt",
                 {
                     "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
                     "symbol": position.symbol,
                     "option_symbol": position.option_symbol,
                     "stop_order_id": position.stop_order_id,
@@ -4359,6 +4573,7 @@ class ExecutionSupervisor:
                     "ambiguous_cancel",
                     {
                         "deployment_id": deployment.deployment_id,
+                        **self._exit_event_identity(deployment, position),
                         "symbol": position.symbol,
                         "option_symbol": position.option_symbol,
                         "order_id": position.target_order_id,
@@ -4371,6 +4586,7 @@ class ExecutionSupervisor:
                 "target_cancel_attempt",
                 {
                     "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
                     "symbol": position.symbol,
                     "option_symbol": position.option_symbol,
                     "target_order_id": position.target_order_id,
@@ -4885,6 +5101,7 @@ class ExecutionSupervisor:
                 "ambiguous_cancel",
                 {
                     "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
                     "symbol": position.symbol,
                     "option_symbol": position.option_symbol,
                     "order_id": position.exit_order_id,
@@ -5031,6 +5248,124 @@ class ExecutionSupervisor:
                     return plan
         return None
 
+    async def _prepare_position_for_forced_flat(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        reason: str,
+    ) -> TrackedPosition | None:
+        """Prove that a universal flatten cannot overlap a live partial close.
+
+        Hard-flat and halt-and-flatten remain independent safety authorities even
+        when profile state is degraded.  That authority does not make it safe to
+        submit the tracker's full quantity while a profile partial-close intent is
+        still working or its fill has not yet reached the position snapshot.
+
+        Cancel first.  If the broker proves the partial dead-unfilled, retire the
+        intent and flatten the unchanged quantity.  Otherwise reconcile the
+        intent; a still-working order or a newly-proved fill whose residual
+        quantity has not reached the tracker blocks this sweep and requests a
+        broker position refresh.  The next sweep can flatten the refreshed
+        residual without an overlapping sell.
+        """
+
+        trade_id = position.trade_id
+        if trade_id is None or isinstance(
+            self.exit_state_repository, NullExitStateRepository
+        ):
+            return position
+        open_intents = await self.exit_state_repository.get_open_action_intents(
+            trade_id
+        )
+        partial_intents = [
+            intent for intent in open_intents if intent.action_kind == "partial_scale"
+        ]
+        if not partial_intents:
+            return position
+
+        for intent in partial_intents:
+            broker_order_id = intent.broker_order_id or intent.idempotency_key
+            canceled, cancel_error = await self.planner.order_manager.cancel_order(
+                broker_order_id
+            )
+            await self.event_repository.append(
+                "forced_flat_partial_cancel",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(
+                        deployment,
+                        position,
+                        idempotency_key=intent.idempotency_key,
+                    ),
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "broker_order_id": broker_order_id,
+                    "forced_flat_reason": reason,
+                    "canceled_dead_unfilled": canceled,
+                    "error": cancel_error,
+                },
+            )
+            if canceled:
+                await self.exit_state_repository.resolve_action_intent(
+                    intent.idempotency_key,
+                    status="failed",
+                    broker_payload={
+                        "stage": f"{reason}_cancel_working_partial",
+                        "error": cancel_error,
+                    },
+                )
+                self._rollback_unconfirmed_target_1(position)
+            else:
+                await self._reconcile_open_profile_intents(
+                    deployment,
+                    position,
+                    [intent],
+                )
+
+        open_intents = await self.exit_state_repository.get_open_action_intents(
+            trade_id
+        )
+        durable = await self.exit_state_repository.get_runtime_state(trade_id)
+        if durable is not None:
+            self._durable_exit_states[trade_id] = durable
+        partial_effect_pending = any(
+            intent.action_kind == "partial_scale" for intent in open_intents
+        )
+        quantity_refresh_pending = bool(
+            durable is not None
+            and durable.banked_quantity > 0
+            and position.quantity
+            != durable.seed_quantity - durable.banked_quantity
+        )
+        if partial_effect_pending or quantity_refresh_pending:
+            if self.reconcile_trigger is not None:
+                self.reconcile_trigger.set()
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": f"{reason}_partial_scale_confirmation_pending",
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
+                    "symbol": position.symbol,
+                    "option_symbol": position.option_symbol,
+                    "position_quantity": position.quantity,
+                    "expected_residual_quantity": (
+                        durable.seed_quantity - durable.banked_quantity
+                        if durable is not None
+                        else None
+                    ),
+                    "open_partial_intents": [
+                        intent.idempotency_key
+                        for intent in open_intents
+                        if intent.action_kind == "partial_scale"
+                    ],
+                    "stage": reason,
+                },
+            )
+            return None
+        return self._tracked_position_like(position) or position
+
     async def close_due_positions(
         self,
         deployments_by_id: dict[str, DeploymentManifest],
@@ -5056,6 +5391,15 @@ class ExecutionSupervisor:
             if position.source == LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE:
                 await self._defer_reconcile_hold_flatten(position, reason="hard_flat", dry_run=dry_run)
                 continue
+            if not position_dry_run:
+                prepared = await self._prepare_position_for_forced_flat(
+                    deployment,
+                    position,
+                    reason="hard_flat",
+                )
+                if prepared is None:
+                    continue
+                position = prepared
 
             order_id = "DRY_RUN_CLOSE"
             error = None
@@ -5178,6 +5522,15 @@ class ExecutionSupervisor:
                     dry_run=dry_run,
                 )
                 continue
+            if not position_dry_run:
+                prepared = await self._prepare_position_for_forced_flat(
+                    deployment,
+                    position,
+                    reason="halt_and_flatten",
+                )
+                if prepared is None:
+                    continue
+                position = prepared
 
             order_id = "DRY_RUN_EMERGENCY_FLAT"
             error = None
@@ -5676,11 +6029,19 @@ class ExecutionSupervisor:
             broker_payload=broker_payload,
         )
         self._durable_exit_states[trade_id] = advanced
-        self._profile_exit_degraded_trades.discard(trade_id)
+        # Fill proof advances durable state, but it does not prove that the
+        # position tracker has refreshed to the broker's residual quantity.
+        # Keep the trade degraded until hydration observes that exact quantity;
+        # only that validated path re-enables adaptive exit authority.
+        snapshot = self._frozen_exit_policies.get(trade_id)
         await self.event_repository.append(
             "exit_action_committed",
             {
                 "trade_id": trade_id,
+                "policy_schema_version": (
+                    snapshot.policy_schema_version if snapshot is not None else None
+                ),
+                "policy_id": snapshot.policy_id if snapshot is not None else None,
                 "policy_hash": advanced.policy_hash,
                 "action_kind": "partial_scale",
                 "idempotency_key": intent.idempotency_key,

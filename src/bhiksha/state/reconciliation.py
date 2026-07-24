@@ -149,20 +149,13 @@ def reconcile_public_positions(
                 entry_timestamp=entry_timestamp,
                 source=source,
                 order_id=matched_trade.entry_order_id if matched_trade is not None else None,
-                stop_order_id=stop_order.get("order_id")
-                or (
-                    matched_trade.stop_order_id
-                    if matched_trade is not None and not observed_stop_order
-                    else None
-                ),
-                stop_price=stop_order.get("price")
-                or (
-                    matched_trade.stop_price
-                    if matched_trade is not None and not observed_stop_order
-                    else None
-                ),
-                target_order_id=target_order.get("order_id") or (matched_trade.target_order_id if matched_trade is not None else None),
-                target_price=target_order.get("price") or (matched_trade.target_price if matched_trade is not None else None),
+                # Broker working-order state is the only authority for resting
+                # protection. A durable trade record is history, not proof that
+                # its stop/target still exists after restart.
+                stop_order_id=stop_order.get("order_id"),
+                stop_price=stop_order.get("price"),
+                target_order_id=target_order.get("order_id"),
+                target_price=target_order.get("price"),
                 exit_order_id=exit_order.get("order_id") or (matched_trade.exit_order_id if matched_trade is not None else None),
                 exit_limit_price=exit_order.get("price") or (matched_trade.exit_limit_price if matched_trade is not None else None),
                 exit_submitted_at=matched_trade.exit_submitted_at if matched_trade is not None else None,
