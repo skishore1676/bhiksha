@@ -50,6 +50,7 @@ FILL_MODEL_VERSION = "next-fresh-natural-bid-v2"
 RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION = "exit-edge-risk-envelope.v1"
 RISK_ENVELOPE_EXPERIMENT_ID = "trend-continuation-control-a-b.v1"
 SQLITE_NONBLOCKING_TIMEOUT_SECONDS = 0.001
+SQLITE_READBACK_TIMEOUT_SECONDS = 0.250
 
 
 @dataclass(slots=True, frozen=True)
@@ -120,15 +121,19 @@ class ProspectiveQuoteTapeRepository:
         self.path = Path(path)
         self.read_only = bool(read_only)
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(
+        self,
+        *,
+        timeout_seconds: float = SQLITE_NONBLOCKING_TIMEOUT_SECONDS,
+    ) -> sqlite3.Connection:
         if self.read_only:
             uri = f"file:{self.path.resolve()}?mode=ro"
             conn = sqlite3.connect(
-                uri, uri=True, timeout=SQLITE_NONBLOCKING_TIMEOUT_SECONDS
+                uri, uri=True, timeout=timeout_seconds
             )
             conn.execute("PRAGMA foreign_keys=ON")
             return conn
-        conn = sqlite3.connect(self.path, timeout=SQLITE_NONBLOCKING_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(self.path, timeout=timeout_seconds)
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
@@ -367,7 +372,13 @@ class ProspectiveQuoteTapeRepository:
 
     def registration_summary(self) -> dict[str, int]:
         try:
-            with self._connect() as conn:
+            # This is a status/report read, never a quote-ingestion or trading
+            # write. Give an in-flight schema transaction a small bounded window
+            # to finish while every latency-sensitive repository path retains
+            # the 1 ms nonblocking connection timeout.
+            with self._connect(
+                timeout_seconds=SQLITE_READBACK_TIMEOUT_SECONDS
+            ) as conn:
                 row = conn.execute(
                     "SELECT COUNT(*), SUM(eligible), "
                     "SUM(CASE WHEN outcome='registered' THEN 1 ELSE 0 END), "

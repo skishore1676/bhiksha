@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 import inspect
+import sqlite3
+from threading import Event, Thread
 import time
 
 from bhiksha.config.loader import load_app_config
@@ -201,6 +203,30 @@ def test_registration_summary_is_empty_before_writer_initializes_schema(
         "registered_cohorts": 0,
         "missing_or_ineligible_registrations": 0,
     }
+
+
+def test_registration_summary_waits_for_brief_schema_writer_lock(
+    tmp_path: Path,
+) -> None:
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    repository.initialize()
+    lock_ready = Event()
+
+    def hold_brief_schema_lock() -> None:
+        with sqlite3.connect(repository.path) as conn:
+            conn.execute("BEGIN EXCLUSIVE")
+            lock_ready.set()
+            time.sleep(0.02)
+            conn.commit()
+
+    writer = Thread(target=hold_brief_schema_lock)
+    writer.start()
+    assert lock_ready.wait(timeout=1.0)
+    summary = repository.registration_summary()
+    writer.join(timeout=1.0)
+
+    assert not writer.is_alive()
+    assert summary["confirmed_fill_attempts"] == 0
 
 
 def test_restart_gap_censors_unfinished_persisted_cohort(tmp_path: Path) -> None:
