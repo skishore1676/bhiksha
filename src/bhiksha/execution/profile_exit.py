@@ -224,6 +224,9 @@ class ProfileExitFields:
         kernel import stays optional here.
         """
         get = spec.get if isinstance(spec, dict) else (lambda k, d=None: getattr(spec, k, d))
+        parameters = get("parameters", {}) or {}
+        if not isinstance(parameters, dict):
+            parameters = {}
         policy_hash = get("policy_hash") if isinstance(spec, dict) else None
         if (
             not isinstance(spec, dict)
@@ -245,7 +248,13 @@ class ProfileExitFields:
             breakeven_after_t1=bool(get("breakeven_after_t1", True)),
             eod_flat=bool(get("eod_flat", True)),
             hard_flat_time_et=str(get("hard_flat_time_et", "15:55") or "15:55"),
-            no_progress_favorable_floor_r=float(get("no_progress_favorable_floor_r", 0.25) or 0.25),
+            no_progress_favorable_floor_r=float(
+                parameters.get(
+                    "no_progress_favorable_floor_r",
+                    get("no_progress_favorable_floor_r", 0.25),
+                )
+                or 0.25
+            ),
             policy_schema_version=get("policy_schema_version"),
             policy_id=get("policy_id"),
             policy_hash=policy_hash,

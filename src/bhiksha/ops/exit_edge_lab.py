@@ -1149,8 +1149,11 @@ def _replay_envelope_candidate(
             curvature=float(policy["risk_envelope_curvature"]),
         )
         previous_floor = locked_floor_r
-        locked_floor_r = max(locked_floor_r, candidate_floor_r)
-        would_ratchet = locked_floor_r > previous_floor
+        ratchet_step_r = float(policy["risk_envelope_ratchet_step_r"])
+        improvement_r = candidate_floor_r - previous_floor
+        would_ratchet = improvement_r + 1e-12 >= ratchet_step_r
+        if would_ratchet:
+            locked_floor_r = max(locked_floor_r, candidate_floor_r)
         # The row also advances last_evaluated/last_observation, so every new
         # evaluated observation receives a new revision even when the floor
         # itself remains unchanged. Equal revisions are reserved for exact

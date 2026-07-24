@@ -150,10 +150,10 @@ def test_control_a_b_have_distinct_identity_and_isolated_monotonic_state(
         "candidate_policy_hash"
     ]
     assert states["variant_a"]["candidate_policy_hash"] == (
-        "b10f6888610abc25484199bb3b20692df90d8599ba26d09edf8ae83b9970412e"
+        "40b5bb09cee4f5056e3340d00bf775748b3971666fc7b98971161e248a1936ed"
     )
     assert states["variant_b"]["candidate_policy_hash"] == (
-        "3485c6e78458621b4e596f13c92a5f8f75b5bf873a05a9f9c445c2eefb387f54"
+        "f0e7c4cf325b93b15481e249c80ad6c22aa551773232ad2339a3dc0f3eb82aee"
     )
     assert states["variant_a"]["locked_floor_r"] > states["variant_b"][
         "locked_floor_r"
@@ -172,6 +172,39 @@ def test_control_a_b_have_distinct_identity_and_isolated_monotonic_state(
             for item in observations
             if item["candidate_id"] == candidate_id
         )
+
+
+def test_shadow_envelope_ratchets_only_after_configured_step(tmp_path: Path) -> None:
+    raw = _raw_case()
+    experiment = raw["experiment"]["risk_envelope"]
+    variant_a = next(
+        arm for arm in experiment["arms"] if arm["candidate_id"] == "variant_a"
+    )
+    variant_a["canonical_policy"]["risk_envelope_ratchet_step_r"] = 0.50
+    variant_a["candidate_policy_hash"] = canonical_policy_hash(
+        variant_a["canonical_policy"]
+    )
+    raw["experiment_spec_hash"] = experiment_spec_hash(
+        raw["profile"], raw["legacy"], raw["experiment"]
+    )
+    # This favorable move improves the curve by less than 0.50R.
+    raw["quotes"][0]["bid"] = 2.30
+    raw["quotes"][0]["ask"] = 2.35
+    raw["quotes"][0]["last"] = 2.32
+    raw["quotes"][1]["bid"] = 2.30
+    raw["quotes"][1]["ask"] = 2.35
+    raw["quotes"][1]["last"] = 2.32
+
+    row = analyze_cases(_load(tmp_path, raw))["cases"][0]
+    observations = [
+        item
+        for item in row["risk_envelope_observations"]
+        if item["candidate_id"] == "variant_a"
+    ]
+
+    assert observations[0]["candidate_floor_r"] > -1.0
+    assert observations[0]["locked_floor_r"] == -1.0
+    assert observations[0]["would_ratchet"] is False
 
 
 def test_shadow_candidate_state_repository_rejects_identity_and_floor_regression(

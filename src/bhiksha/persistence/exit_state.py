@@ -13,7 +13,7 @@ from bhiksha.domain.exit_state import (
     ExitRuntimeState,
     TradeExitPolicySnapshot,
 )
-from bhiksha.execution.exit_policy import canonical_policy_hash, canonical_policy_json
+from bhiksha.execution.exit_policy import canonical_policy_hash
 from bhiksha.persistence.sqlite import SQLiteBackend
 
 
@@ -303,7 +303,16 @@ class SQLiteExitStateRepository(ExitStateRepository):
         _validate_snapshot_state_identity(snapshot, state)
         if canonical_policy_hash(snapshot.canonical_policy) != snapshot.policy_hash:
             raise ValueError("frozen policy hash does not match canonical policy")
-        policy_json = canonical_policy_json(snapshot.canonical_policy)
+        # Persist the complete frozen snapshot, including non-semantic
+        # operator/provenance labels. Identity validation above intentionally
+        # hashes only executable fields.
+        policy_json = json.dumps(
+            snapshot.canonical_policy,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         provenance_json = json.dumps(
             snapshot.provenance,
             allow_nan=False,

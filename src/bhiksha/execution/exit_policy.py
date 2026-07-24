@@ -16,11 +16,25 @@ from typing import Any
 
 EXIT_POLICY_SCHEMA_VERSION = "exit-policy.v1"
 RISK_ENVELOPE_CONFORMANCE_VERSION = "dynamic-risk-envelope.v1"
+NON_SEMANTIC_POLICY_FIELDS = frozenset(
+    {
+        "high_water_giveback_policy",
+        "source_config_id",
+    }
+)
+
+
+def canonical_policy_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in NON_SEMANTIC_POLICY_FIELDS
+    }
 
 
 def canonical_policy_json(payload: Mapping[str, Any]) -> str:
     return json.dumps(
-        payload,
+        canonical_policy_payload(payload),
         allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),

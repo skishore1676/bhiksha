@@ -1604,6 +1604,24 @@ def _apply_exit_profile_spec(
             and exit_field in updated
         ):
             resolved_payload[spec_field] = updated[exit_field]
+    # Freeze Bhiksha-native management dials that are executable but do not
+    # have dedicated kernel fields. Keeping them under the kernel's semantic
+    # ``parameters`` bag makes restart behavior and policy identity cover the
+    # fully effective deployment.
+    parameters = dict(resolved_payload.get("parameters") or {})
+    parameters["no_progress_favorable_floor_r"] = float(
+        updated.get("no_progress_favorable_floor_r", 0.25)
+    )
+    for key in (
+        "use_profit_target",
+        "option_profit_target_pct",
+        "profit_target_multiple",
+        "target_approach_offset_pct",
+        "target_pullback_restore_progress_pct",
+        "stop_to_breakeven_after_r_multiple",
+    ):
+        parameters[key] = updated.get(key)
+    resolved_payload["parameters"] = parameters
     resolved_spec = ManagementPolicySpec.model_validate(resolved_payload)
     updated["exit_policy_schema_version"] = resolved_spec.policy_schema_version
     updated["exit_policy_id"] = resolved_spec.policy_id

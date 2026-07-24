@@ -466,6 +466,10 @@ def test_compile_active_plan_carries_exit_profile_spec_onto_manual_exit(tmp_path
         "bhiksha_legacy_compatibility_map"
     )
     assert exit_spec.exit_policy_snapshot["giveback_arm_r"] == 1.25
+    assert exit_spec.exit_policy_snapshot["parameters"][
+        "no_progress_favorable_floor_r"
+    ] == 0.25
+    assert "profit_target_multiple" in exit_spec.exit_policy_snapshot["parameters"]
     assert exit_spec.breakeven_after_t1 is False
     assert exit_spec.eod_flat is False
     # option_stop_fallback_pct -> exit.stop_loss_pct (the resolvable recovery stop)

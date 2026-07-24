@@ -54,3 +54,23 @@ def test_envelope_rejects_non_finite_input() -> None:
             floor_at_t1_r=0.0,
             curvature=1.5,
         )
+
+
+def test_local_policy_identity_excludes_labels_but_hashes_explicit_math() -> None:
+    base = {
+        "policy_schema_version": "exit-policy.v1",
+        "policy_id": "exit.test.v1",
+        "high_water_giveback_policy": "MODERATE",
+        "source_config_id": "sheet-a",
+        "giveback_arm_r": 1.25,
+        "giveback_retrace_fraction": 0.5,
+    }
+    relabeled = {
+        **base,
+        "high_water_giveback_policy": "STRICT",
+        "source_config_id": "sheet-b",
+    }
+    retuned = {**base, "giveback_arm_r": 0.75}
+
+    assert canonical_policy_hash(base) == canonical_policy_hash(relabeled)
+    assert canonical_policy_hash(base) != canonical_policy_hash(retuned)

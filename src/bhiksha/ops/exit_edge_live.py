@@ -545,6 +545,13 @@ class ExitEdgeLiveRecorder:
             for profile_key, policy_key in profile_to_policy_fields.items()
             if profile.get(profile_key) != control_policy.get(policy_key)
         ]
+        policy_parameters = control_policy.get("parameters") or {}
+        if not isinstance(policy_parameters, dict):
+            policy_parameters = {}
+        if profile.get("no_progress_favorable_floor_r") != policy_parameters.get(
+            "no_progress_favorable_floor_r", 0.25
+        ):
+            mismatches.append("no_progress_favorable_floor_r")
         if mismatches:
             attempt["eligible"] = False
             attempt["cohort_id"] = None

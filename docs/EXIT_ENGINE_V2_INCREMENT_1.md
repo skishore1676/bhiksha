@@ -10,20 +10,30 @@ document records only Bhiksha's implementation and operating boundary.
   authority.
 - Active-plan compilation resolves legacy profile labels to explicit
   `exit-policy.v1` numbers, then hashes the fully resolved policy after
-  row-level precedence.
+  row-level precedence. Bhiksha-native management dials are frozen under the
+  policy `parameters` bag, including the no-progress favorable floor and
+  legacy target/breakeven controls.
 - Each confirmed trade freezes one immutable policy snapshot and initializes
   versioned runtime state in the existing runtime SQLite database.
 - Profile-exit events carry stable trade, policy, state, and quote lineage.
 - Partial-scale and breakeven broker effects use durable action intents.
   Confirmed broker readback advances banked/breakeven state; unresolved effects
-  block duplicates.
+  block duplicates. The intent key is also submitted as Public's client order
+  id, so a restart between broker acceptance and the local bind can recover the
+  exact order.
 - Missing, contradictory, or ambiguous restart state emits `STATE_DEGRADED`,
-  keeps the profile dispatcher closed, and retains the existing protection
-  path. Recovery never invents a historical peak.
+  persists that status, keeps every profile action closed, and retains or
+  restores only the last proved protection. Recovery never invents a
+  historical peak and never substitutes the current session policy.
 - The generated session manifest is a review receipt, not a second source of
   configuration.
 - Exit Edge Lab owns Control/Variant A/Variant B counterfactual evidence in its
-  separate sidecar store.
+  separate sidecar store. A candidate floor advances only after the configured
+  `risk_envelope_ratchet_step_r` is crossed.
+
+Canonical identity excludes the friendly giveback label and
+`source_config_id`; both remain in the frozen snapshot for audit/provenance.
+Explicit giveback numbers and all executable fields remain hashed.
 
 ## Safety boundary
 
@@ -48,7 +58,9 @@ and writes:
 
 For each material transition, audit the SQLite policy snapshot, runtime state,
 action intent, trade/fill record, identified event, and broker readback
-together. A local state assertion is not broker proof.
+together. A local state assertion or accepted order response is not broker
+fill proof. Local banked quantity and residual protection advance only after an
+identified SELL/CLOSE fill readback.
 
 ## Release gate
 
