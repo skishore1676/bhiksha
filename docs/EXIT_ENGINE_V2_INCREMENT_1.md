@@ -85,3 +85,18 @@ after the session boundary.
 The Dynamic Risk Envelope remains broker-inert and default-off. Deployment did
 not edit the Google Sheet, enable the live profile route, start the trading
 runtime, or submit/cancel/replace any broker order.
+
+## Weekly evidence projection
+
+The Friday Bhiksha job now emits a stable
+`bhiksha.exit_edge_weekly_evidence.v1` receipt and binds it into the
+content-digested `bhiksha.weekly_trading_decisions.v1` packet. The receipt
+reports current-week and cumulative collection coverage, missingness,
+Control-versus-candidate descriptive outcomes, freshness, and the zero-broker /
+zero-live-activation guardrails.
+
+TradeLab owns the executive interpretation. Missing, stale, censored, or
+incomplete observation data remains an explicit evidence state; it is never
+converted to zero uplift. The existing profile-versus-legacy confidence
+indicator cannot promote Candidate A or B. All Increment 1 receipts remain
+advisory and set `decision_ready=false`.

@@ -176,24 +176,14 @@ def test_control_a_b_have_distinct_identity_and_isolated_monotonic_state(
 
 def test_shadow_envelope_ratchets_only_after_configured_step(tmp_path: Path) -> None:
     raw = _raw_case()
-    experiment = raw["experiment"]["risk_envelope"]
-    variant_a = next(
-        arm for arm in experiment["arms"] if arm["candidate_id"] == "variant_a"
-    )
-    variant_a["canonical_policy"]["risk_envelope_ratchet_step_r"] = 0.50
-    variant_a["candidate_policy_hash"] = canonical_policy_hash(
-        variant_a["canonical_policy"]
-    )
-    raw["experiment_spec_hash"] = experiment_spec_hash(
-        raw["profile"], raw["legacy"], raw["experiment"]
-    )
-    # This favorable move improves the curve by less than 0.50R.
-    raw["quotes"][0]["bid"] = 2.30
-    raw["quotes"][0]["ask"] = 2.35
-    raw["quotes"][0]["last"] = 2.32
-    raw["quotes"][1]["bid"] = 2.30
-    raw["quotes"][1]["ask"] = 2.35
-    raw["quotes"][1]["last"] = 2.32
+    # This favorable move just crosses the fixed 0.25R activation but improves
+    # the curve by less than the catalog's fixed 0.10R ratchet step.
+    raw["quotes"][0]["bid"] = 2.18
+    raw["quotes"][0]["ask"] = 2.23
+    raw["quotes"][0]["last"] = 2.20
+    raw["quotes"][1]["bid"] = 2.18
+    raw["quotes"][1]["ask"] = 2.23
+    raw["quotes"][1]["last"] = 2.20
 
     row = analyze_cases(_load(tmp_path, raw))["cases"][0]
     observations = [
@@ -429,6 +419,147 @@ def test_live_repository_missing_registration_blocks_subset_inference(tmp_path: 
     assert summary["inference_eligible"] is False
     assert summary["confidence"]["indicator"] == "live_collection_inference_blocked"
     assert "eligible_registration_denominator_incomplete" in summary["inference_blockers"]
+
+
+@pytest.mark.parametrize(
+    "health_mutation,blocker",
+    [
+        ({"schema_version": 2}, "live_health_schema_invalid"),
+        ({"enabled": False}, "live_health_disabled"),
+        ({"mode": "execution"}, "live_health_mode_invalid"),
+        ({"enforcement_authority": True}, "live_health_enforcement_authority_invalid"),
+        ({"promotion_eligible": True}, "live_health_promotion_authority_invalid"),
+        ({"broker_calls_added": 1}, "live_health_broker_calls_added"),
+        ({"registration_failures": 1}, "live_health_registration_failure"),
+    ],
+)
+def test_live_repository_health_contract_blocks_inference(
+    tmp_path: Path,
+    health_mutation: dict,
+    blocker: str,
+) -> None:
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "lab.db")
+    repo.initialize()
+    raw = _raw_case()
+    repo.register_cohort(raw)
+    case = _load(tmp_path, raw)[0]
+    for quote in case.quotes:
+        repo.append_quote(case.cohort_id, quote)
+    repo.try_record_registration_attempt({
+        "trade_id": "T1", "deployment_id": "qqq-live", "symbol": "QQQ",
+        "option_symbol": "OPT", "observed_at": ENTRY.isoformat(), "eligible": True,
+        "cohort_id": "C1", "outcome": "registered", "reason": None,
+    })
+    health = {
+        "schema_version": 1,
+        "enabled": True,
+        "mode": "observational_shadow_only",
+        "enforcement_authority": False,
+        "promotion_eligible": False,
+        "broker_calls_added": 0,
+        "storage_failures": 0,
+        "dropped_observations": 0,
+        "missing_registration_attempts": 0,
+        "registration_failures": 0,
+    }
+    health.update(health_mutation)
+    (tmp_path / "exit_edge_live_status.json").write_text(
+        json.dumps(health),
+        encoding="utf-8",
+    )
+
+    summary = analyze_prospective_repository(repo)["summary"]
+
+    assert summary["inference_eligible"] is False
+    assert blocker in summary["inference_blockers"]
+    assert summary["confidence"]["indicator"] == "live_collection_inference_blocked"
+
+
+def test_unexpected_risk_envelope_experiment_id_is_rejected(tmp_path: Path) -> None:
+    raw = _raw_case()
+    raw["experiment"]["risk_envelope"]["experiment_id"] = "self-signed-replacement"
+
+    with pytest.raises(ValueError, match="unsupported risk-envelope experiment_id"):
+        raw["experiment_spec_hash"] = experiment_spec_hash(
+            raw["profile"],
+            raw["legacy"],
+            raw["experiment"],
+        )
+
+
+def test_self_resigned_risk_envelope_catalog_is_rejected(tmp_path: Path) -> None:
+    raw = _raw_case()
+    experiment = raw["experiment"]["risk_envelope"]
+    variant_a = next(
+        arm for arm in experiment["arms"] if arm["candidate_id"] == "variant_a"
+    )
+    variant_a["canonical_policy"]["risk_envelope_curvature"] = 9.0
+    variant_a["candidate_policy_hash"] = canonical_policy_hash(
+        variant_a["canonical_policy"]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the fixed Control/A/B catalog",
+    ):
+        raw["experiment_spec_hash"] = experiment_spec_hash(
+            raw["profile"],
+            raw["legacy"],
+            raw["experiment"],
+        )
+
+
+def test_historical_cutoff_excludes_future_quotes_and_censor(tmp_path: Path) -> None:
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "lab.db")
+    repo.initialize()
+    raw = _raw_case()
+    repo.register_cohort(raw)
+    case = _load(tmp_path, raw)[0]
+    cutoff = ENTRY + timedelta(seconds=20)
+    for quote in case.quotes:
+        repo.append_quote(
+            case.cohort_id,
+            replace(
+                quote,
+                quote_at=quote.quote_at + timedelta(days=1),
+                received_at=quote.received_at + timedelta(days=1),
+            ),
+        )
+    repo.record_censor(case.cohort_id, "session_shutdown")
+    assert repo.try_record_registration_attempt({
+        "trade_id": "T1", "deployment_id": "qqq-live", "symbol": "QQQ",
+        "option_symbol": "OPT", "observed_at": ENTRY.isoformat(), "eligible": True,
+        "cohort_id": "C1", "outcome": "registered", "reason": None,
+    })
+    health = {
+        "schema_version": 1,
+        "enabled": True,
+        "mode": "observational_shadow_only",
+        "enforcement_authority": False,
+        "promotion_eligible": False,
+        "broker_calls_added": 0,
+        "storage_failures": 0,
+        "dropped_observations": 0,
+        "missing_registration_attempts": 0,
+        "registration_failures": 0,
+    }
+    (tmp_path / "exit_edge_live_status.json").write_text(
+        json.dumps(health),
+        encoding="utf-8",
+    )
+
+    report = analyze_prospective_repository(
+        repo,
+        observed_at_end=cutoff,
+    )
+
+    assert report["summary"]["paired_count"] == 0
+    assert report["summary"]["persisted_censor_count"] == 0
+    assert report["cases"][0]["status"] == "insufficient_data"
+    assert all(
+        not row.get("risk_envelope_observations")
+        for row in report["cases"]
+    )
 
 
 def test_live_readback_repository_is_strictly_read_only_and_never_creates_typo(tmp_path: Path) -> None:

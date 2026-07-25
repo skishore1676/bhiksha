@@ -17,6 +17,7 @@ import re
 import sqlite3
 from typing import Any, TYPE_CHECKING
 
+from bhiksha.ops.exit_edge_weekly import write_exit_edge_weekly_evidence
 from bhiksha.ops.shadow_ev_report import build_shadow_ev_report
 from bhiksha.ops.trading_governance_evidence import build_trading_governance_evidence
 from bhiksha.ops.weekly_scorecard import (
@@ -39,6 +40,7 @@ class WeeklyTradingDecisionsWriteResult:
     markdown_path: Path
     facts_path: Path
     governance_path: Path
+    exit_edge_path: Path
 
 
 def write_weekly_trading_decisions(
@@ -47,6 +49,9 @@ def write_weekly_trading_decisions(
     output_dir: str | Path,
     week_end: date | str | None = None,
     deployments: list["DeploymentManifest"] | None = None,
+    exit_edge_db_path: str | Path = "artifacts/observations/exit_edge_live.sqlite3",
+    exit_edge_status_path: str | Path = "artifacts/observations/exit_edge_live_status.json",
+    exit_edge_collector_configured: bool = False,
 ) -> WeeklyTradingDecisionsWriteResult:
     end = _coerce_day(week_end)
     start = end - timedelta(days=end.weekday())
@@ -70,6 +75,23 @@ def write_weekly_trading_decisions(
         through=end,
         deployments=deployments,
     )
+    live_envelope_enabled_count = sum(
+        bool(
+            (
+                getattr(deployment.exit, "exit_policy_snapshot", None) or {}
+            ).get("risk_envelope_enabled")
+        )
+        for deployment in (deployments or [])
+    )
+    exit_edge = write_exit_edge_weekly_evidence(
+        db_path=exit_edge_db_path,
+        status_path=exit_edge_status_path,
+        output_dir=target,
+        week_start=start,
+        week_end=end,
+        collector_configured=exit_edge_collector_configured,
+        live_envelope_enabled_count=live_envelope_enabled_count,
+    )
     stable_id = f"bhiksha-weekly-trading-decisions:{end.isoformat()}"
     facts_path = target / f"trading_decision_facts_{end.isoformat()}.json"
     _atomic_json(facts_path, facts)
@@ -87,15 +109,24 @@ def write_weekly_trading_decisions(
         "facts_export_receipt": facts["receipt"],
         "governance_evidence": str(governance_path),
         "governance_evidence_receipt": governance["receipt"],
+        "exit_edge_evidence": str(exit_edge.json_path),
+        "exit_edge_evidence_receipt": exit_edge.evidence["receipt"],
+        "exit_edge": exit_edge.evidence,
         "workbook_update": {"status": "pending"},
     }
+    report["receipt"] = _weekly_receipt(report)
     stem = f"weekly_trading_decisions_{start.isoformat()}_{end.isoformat()}"
     json_path = target / f"{stem}.json"
     markdown_path = target / f"{stem}.md"
     _atomic_json(json_path, report)
     _atomic_text(markdown_path, render_weekly_trading_decisions_markdown(report))
     return WeeklyTradingDecisionsWriteResult(
-        report, json_path, markdown_path, facts_path, governance_path
+        report,
+        json_path,
+        markdown_path,
+        facts_path,
+        governance_path,
+        exit_edge.json_path,
     )
 
 
@@ -104,6 +135,7 @@ def finalize_weekly_trading_decisions(
     workbook_update: dict[str, Any],
 ) -> WeeklyTradingDecisionsWriteResult:
     result.report["workbook_update"] = workbook_update
+    result.report["receipt"] = _weekly_receipt(result.report)
     _atomic_json(result.json_path, result.report)
     _atomic_text(result.markdown_path, render_weekly_trading_decisions_markdown(result.report))
     return result
@@ -202,6 +234,12 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
     )[:3]
     workbook = report.get("workbook_update") or {}
     governance = report.get("governance_evidence_receipt") or {}
+    exit_edge = report.get("exit_edge") or {}
+    edge_verdict = (exit_edge.get("verdict") or {}).get("status", "unavailable")
+    edge_paired_raw = (exit_edge.get("cumulative") or {}).get("paired_count")
+    edge_paired = (
+        "Unavailable" if edge_paired_raw is None else str(int(edge_paired_raw))
+    )
     lines = [
         f"# Weekly Trading Decisions — Performance, Promotions & Fixes — {report.get('week_end')}",
         "",
@@ -209,6 +247,7 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
         f"- workbook update: `{workbook.get('status', 'pending')}`",
         f"- facts: `{(report.get('facts_export_receipt') or {}).get('fact_count', 0)}` through `{report.get('week_end')}`",
         f"- active Rail B demotions: `{governance.get('active_demotion_count', 0)}`",
+        f"- Dynamic Risk Envelope evidence: `{edge_verdict}`; cumulative paired cohorts: `{edge_paired}`",
         "",
         "## What happened",
         "",
@@ -283,6 +322,49 @@ def _coerce_day(value: date | str | None) -> date:
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     _atomic_text(path, json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def weekly_stable_digest(report: dict[str, Any]) -> str:
+    stable = {
+        key: value
+        for key, value in report.items()
+        if key not in {"generated_at", "receipt"}
+    }
+    if isinstance(stable.get("exit_edge"), dict):
+        edge = {
+            key: value
+            for key, value in stable["exit_edge"].items()
+            if key not in {"generated_at", "receipt"}
+        }
+        collection = edge.get("collection")
+        if isinstance(collection, dict) and isinstance(
+            collection.get("freshness"), dict
+        ):
+            edge["collection"] = dict(collection)
+            edge["collection"]["freshness"] = {
+                key: value
+                for key, value in collection["freshness"].items()
+                if key != "age_seconds"
+            }
+        stable["exit_edge"] = edge
+    return hashlib.sha256(
+        json.dumps(
+            stable,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _weekly_receipt(report: dict[str, Any]) -> dict[str, Any]:
+    workbook_status = (report.get("workbook_update") or {}).get("status", "pending")
+    status = "ok" if workbook_status == "ok" else workbook_status
+    return {
+        "status": status,
+        "sha256": weekly_stable_digest(report),
+        "through": report.get("week_end"),
+    }
 
 
 def _atomic_text(path: Path, text: str) -> None:

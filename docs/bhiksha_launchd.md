@@ -43,7 +43,7 @@ manual Control Tower actions do not need to be duplicated in shell.
 | `com.bhiksha.live-stop` | Weekdays 15:10 CT | Stop the live runtime. It does not skip non-trading days, so stale processes can still be cleaned up. |
 | `com.bhiksha.schwab-guard` | Trading days 07:10 and 15:20 CT | Verify premarket auth and, after close, renew whenever the token will not survive the next full trading session. Skips non-trading days. |
 | `com.bhiksha.session-report` | Weekdays 09:10, 11:45, and 14:45 CT | Send an intraday session report with open positions, realized P&L, protection state, provider/runtime issues, and recent trades early enough for manual action. Skips non-trading days. |
-| `com.bhiksha.weekly-trading-decisions` | Fridays 16:00 CT (after close) | Refresh the canonical Trading Decision Ledger and publish one Obsidian review for performance, promotion decisions, and fixes. Shadow-EV and weekly-scorecard calculations are internal inputs; no Telegram send. |
+| `com.bhiksha.weekly-trading-decisions` | Fridays 16:00 CT (after close) | Refresh the canonical Trading Decision Ledger and write receipted governance plus Exit Edge/Dynamic Risk Envelope evidence for TradeLab's one executive brief. Shadow-EV and weekly-scorecard calculations are internal inputs; no Telegram send. |
 
 Launchd cannot natively express market holidays, so the runner performs the
 trading-day check before doing work.
@@ -79,10 +79,15 @@ scripts/launchd/run_bhiksha_job.sh session-report --report-label manual
 scripts/launchd/run_bhiksha_job.sh weekly-trading-decisions --weekly-review-mode off
 ```
 
-The weekly decision job writes normalized facts, refreshes the canonical Excel
-ledger, and publishes one stable week-keyed card through Lathi Bus's Obsidian
-profile. It never sends Telegram. A failed workbook refresh prevents publication
-so stale math is not presented as a current review.
+The weekly decision job writes normalized facts, a content-digested weekly
+packet, governance evidence, and
+`exit_edge_weekly_evidence_<week-end>.json`, then refreshes the canonical Excel
+ledger. The Exit Edge receipt is valid even when its maturity verdict is
+not-collecting, stale, or inference-blocked; those states remain unavailable
+evidence rather than zero edge. TradeLab independently validates both receipts
+before publishing its one stable week-keyed executive brief. The Bhiksha job
+never sends Telegram. A failed workbook refresh prevents downstream publication
+so stale or altered math is not presented as current.
 
 Use `--force` to bypass the trading-day skip during testing:
 

@@ -5,7 +5,9 @@ from pathlib import Path
 
 from bhiksha.domain.models import TradeRecord
 from bhiksha.ops.weekly_trading_decisions import (
+    finalize_weekly_trading_decisions,
     render_weekly_trading_decisions_markdown,
+    weekly_stable_digest,
     write_weekly_trading_decisions,
 )
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteTradeStateRepository
@@ -76,6 +78,29 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     assert governance["schema"] == "bhiksha.trading_governance_evidence.v1"
     assert governance["receipt"]["status"] == "ok"
     assert result.report["governance_evidence"] == str(result.governance_path)
+    assert result.exit_edge_path.is_file()
+    assert result.report["exit_edge"]["verdict"]["status"] == "not_collecting"
+    assert "cumulative paired cohorts: `Unavailable`" in (
+        result.markdown_path.read_text(encoding="utf-8")
+    )
+    assert (
+        result.report["exit_edge_evidence_receipt"]["sha256"]
+        == json.loads(result.exit_edge_path.read_text(encoding="utf-8"))["receipt"][
+            "sha256"
+        ]
+    )
+
+    finalized = finalize_weekly_trading_decisions(
+        result,
+        {"status": "ok", "receipt": "ledger:test"},
+    )
+    assert finalized.report["receipt"]["status"] == "ok"
+    assert (
+        finalized.report["receipt"]["sha256"]
+        == weekly_stable_digest(finalized.report)
+    )
+    finalized.report["scorecard"]["headline"]["live"]["total_pnl_usd"] = 999_999
+    assert weekly_stable_digest(finalized.report) != finalized.report["receipt"]["sha256"]
 
     rerun = write_weekly_trading_decisions(
         db_path, output_dir=tmp_path / "reports", week_end="2026-07-10",

@@ -299,16 +299,45 @@ class ProspectiveQuoteTapeRepository:
                 (cohort_id, reason, datetime.now(UTC).isoformat()),
             )
 
-    def load_case(self, cohort_id: str) -> ExitEdgeCase:
+    def load_case(
+        self,
+        cohort_id: str,
+        *,
+        observed_at_end: datetime | None = None,
+    ) -> ExitEdgeCase:
+        cutoff = (
+            _parse_datetime(observed_at_end).isoformat()
+            if observed_at_end is not None
+            else None
+        )
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cohort = conn.execute("SELECT * FROM exit_edge_cohorts WHERE cohort_id=?", (cohort_id,)).fetchone()
             if cohort is None:
                 raise ValueError("cohort not found")
-            quotes = conn.execute(
-                "SELECT * FROM exit_edge_quote_tape WHERE cohort_id=? ORDER BY sequence", (cohort_id,)
-            ).fetchall()
-            censor = conn.execute("SELECT reason FROM exit_edge_censors WHERE cohort_id=?", (cohort_id,)).fetchone()
+            if cutoff is None:
+                quotes = conn.execute(
+                    "SELECT * FROM exit_edge_quote_tape "
+                    "WHERE cohort_id=? ORDER BY sequence",
+                    (cohort_id,),
+                ).fetchall()
+                censor = conn.execute(
+                    "SELECT reason FROM exit_edge_censors WHERE cohort_id=?",
+                    (cohort_id,),
+                ).fetchone()
+            else:
+                quotes = conn.execute(
+                    "SELECT * FROM exit_edge_quote_tape "
+                    "WHERE cohort_id=? "
+                    "AND julianday(received_at)<=julianday(?) "
+                    "ORDER BY sequence",
+                    (cohort_id, cutoff),
+                ).fetchall()
+                censor = conn.execute(
+                    "SELECT reason FROM exit_edge_censors "
+                    "WHERE cohort_id=? AND julianday(censored_at)<=julianday(?)",
+                    (cohort_id, cutoff),
+                ).fetchone()
         mapping = {
             "cohort_id": cohort["cohort_id"], "trade_id": cohort["trade_id"],
             "cluster_id": cohort["cluster_id"], "deployment_id": cohort["deployment_id"],
@@ -370,7 +399,21 @@ class ProspectiveQuoteTapeRepository:
         except (KeyError, OSError, sqlite3.Error, TypeError, ValueError):
             return False
 
-    def registration_summary(self) -> dict[str, int]:
+    def registration_summary(
+        self,
+        *,
+        observed_at_start: datetime | None = None,
+        observed_at_end: datetime | None = None,
+    ) -> dict[str, int]:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if observed_at_start is not None:
+            clauses.append("observed_at>=?")
+            parameters.append(_parse_datetime(observed_at_start).isoformat())
+        if observed_at_end is not None:
+            clauses.append("observed_at<=?")
+            parameters.append(_parse_datetime(observed_at_end).isoformat())
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         try:
             # This is a status/report read, never a quote-ingestion or trading
             # write. Give an in-flight schema transaction a small bounded window
@@ -383,7 +426,8 @@ class ProspectiveQuoteTapeRepository:
                     "SELECT COUNT(*), SUM(eligible), "
                     "SUM(CASE WHEN outcome='registered' THEN 1 ELSE 0 END), "
                     "SUM(CASE WHEN outcome!='registered' THEN 1 ELSE 0 END) "
-                    "FROM exit_edge_registration_attempts"
+                    f"FROM exit_edge_registration_attempts{where}",
+                    parameters,
                 ).fetchone()
         except sqlite3.OperationalError as exc:
             # A status reader can create/open the SQLite file in the narrow
@@ -631,11 +675,27 @@ def analyze_cases(cases: list[ExitEdgeCase]) -> dict[str, Any]:
 
 def analyze_prospective_repository(
     repository: ProspectiveQuoteTapeRepository,
+    *,
+    health_path: str | Path | None = None,
+    observed_at_start: datetime | None = None,
+    observed_at_end: datetime | None = None,
 ) -> dict[str, Any]:
     """Build a live-store report with mandatory missingness/inference guards."""
-    cases = [repository.load_case(cohort_id) for cohort_id in repository.list_cohort_ids()]
+    cases = [
+        repository.load_case(cohort_id, observed_at_end=observed_at_end)
+        for cohort_id in repository.list_cohort_ids()
+    ]
+    if observed_at_start is not None:
+        start = _parse_datetime(observed_at_start)
+        cases = [case for case in cases if case.entry_timestamp >= start]
+    if observed_at_end is not None:
+        end = _parse_datetime(observed_at_end)
+        cases = [case for case in cases if case.entry_timestamp <= end]
     report = analyze_cases(cases)
-    denominator = repository.registration_summary()
+    denominator = repository.registration_summary(
+        observed_at_start=observed_at_start,
+        observed_at_end=observed_at_end,
+    )
     summary = report["summary"]
     blockers: list[str] = []
     if denominator["eligible_attempts"] != denominator["registered_cohorts"]:
@@ -647,19 +707,56 @@ def analyze_prospective_repository(
     persisted_censors = sum(1 for case in cases if case.persisted_censor_reason)
     if persisted_censors:
         blockers.append("persisted_censor_present")
-    health_path = repository.path.with_name("exit_edge_live_status.json")
+    missingness = summary["risk_envelope_missingness"]
+    if (
+        int(missingness["candidate_observation_rows"])
+        != int(missingness["expected_candidate_observation_rows"])
+    ):
+        blockers.append("candidate_observation_denominator_incomplete")
+    if int(missingness["identity_or_timestamp_rows"]) > 0:
+        blockers.append("candidate_identity_or_timestamp_missing")
+    if int(missingness["cases_missing_envelope_identity"]) > 0:
+        blockers.append("risk_envelope_experiment_identity_missing")
+    if int(missingness["arm_outcomes_without_post_exit_quote"]) > 0:
+        blockers.append("post_exit_quote_missing")
+    if not summary["homogeneous_experiment_spec"]:
+        blockers.append("heterogeneous_experiment_specs")
+    if not summary["cluster_labels_present"]:
+        blockers.append("cluster_labels_missing")
+    resolved_health_path = (
+        Path(health_path)
+        if health_path is not None
+        else repository.path.with_name("exit_edge_live_status.json")
+    )
     health: dict[str, Any] | None = None
     try:
-        health = json.loads(health_path.read_text(encoding="utf-8"))
+        health = json.loads(resolved_health_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         blockers.append("live_health_readback_missing")
     if health is not None:
+        if int(health.get("schema_version") or 0) != 1:
+            blockers.append("live_health_schema_invalid")
+        if health.get("enabled") is not True:
+            blockers.append("live_health_disabled")
+        if health.get("mode") != "observational_shadow_only":
+            blockers.append("live_health_mode_invalid")
+        if health.get("enforcement_authority") is not False:
+            blockers.append("live_health_enforcement_authority_invalid")
+        if health.get("promotion_eligible") is not False:
+            blockers.append("live_health_promotion_authority_invalid")
+        if int(health.get("broker_calls_added") or 0) != 0:
+            blockers.append("live_health_broker_calls_added")
         if int(health.get("storage_failures") or 0) > 0:
             blockers.append("live_health_storage_failure")
         if int(health.get("dropped_observations") or 0) > 0:
             blockers.append("live_health_observation_drop")
         if int(health.get("missing_registration_attempts") or 0) > 0:
             blockers.append("live_health_missing_registration")
+        if (
+            "registration_failures" not in health
+            or int(health.get("registration_failures") or 0) != 0
+        ):
+            blockers.append("live_health_registration_failure")
     inference_eligible = not blockers
     summary["registration_denominator"] = denominator
     summary["persisted_censor_count"] = persisted_censors
@@ -1498,8 +1595,8 @@ def _normalized_risk_envelope_experiment(value: Any) -> dict[str, Any]:
     if value.get("schema_version") != RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION:
         raise ValueError("unsupported risk-envelope experiment schema")
     experiment_id = str(value.get("experiment_id") or "")
-    if not experiment_id:
-        raise ValueError("risk-envelope experiment_id is required")
+    if experiment_id != RISK_ENVELOPE_EXPERIMENT_ID:
+        raise ValueError("unsupported risk-envelope experiment_id")
     raw_arms = value.get("arms")
     if not isinstance(raw_arms, list):
         raise ValueError("risk-envelope arms must be a list")
@@ -1534,11 +1631,26 @@ def _normalized_risk_envelope_experiment(value: Any) -> dict[str, Any]:
         )
     if seen != {"control", "variant_a", "variant_b"}:
         raise ValueError("risk-envelope experiment requires Control, Variant A, Variant B")
-    return {
+    normalized = {
         "schema_version": RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION,
         "experiment_id": experiment_id,
         "arms": arms,
     }
+    control_arm = next(
+        (arm for arm in arms if arm["candidate_id"] == "control"),
+        None,
+    )
+    if control_arm is None:
+        raise ValueError("risk-envelope experiment requires a control arm")
+    expected = build_risk_envelope_experiment(
+        control_arm["canonical_policy"],
+        control_policy_hash=control_arm["candidate_policy_hash"],
+    )
+    if normalized != expected:
+        raise ValueError(
+            "risk-envelope experiment does not match the fixed Control/A/B catalog"
+        )
+    return normalized
 
 
 def _canonical_json(value: Any)->str:return json.dumps(value,sort_keys=True,separators=(",",":"))

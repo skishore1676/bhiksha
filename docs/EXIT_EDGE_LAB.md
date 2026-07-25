@@ -187,8 +187,9 @@ must say `mode=observational_shadow_only`, `enforcement_authority=false`, and
 `broker_calls_added=0`. Inspect `observed_quote_timestamp_fields`: if
 `quoteTimestamp` is absent, real quotes are truthfully censored and this tee
 cannot produce useful paired cases without a separately approved source.
-Disable by removing the environment variable (the
-checked-in config remains `false`).
+Disable persistently by reinstalling without the opt-in; the installer removes
+both plist environments and the runtime marker. The checked-in config remains
+`false`.
 
 Generate the guarded repository report with:
 
@@ -205,3 +206,38 @@ cohorts. In that state the confidence indicator is forcibly
 `live_collection_inference_blocked`, even if the successful subset looks
 directionally positive. Missing health readback, any storage failure, or any
 recorded observation drop also blocks inference.
+
+## Weekly evidence receipt
+
+The Friday `weekly-trading-decisions` job reads the isolated repository through
+the same guarded analyzer and always writes:
+
+```text
+artifacts/playbook/reports/exit_edge_weekly_evidence_<week-end>.json
+```
+
+Schema `bhiksha.exit_edge_weekly_evidence.v1` separates packet integrity from
+evidence maturity. A valid receipt may truthfully say `not_collecting`,
+`awaiting_first_collection`, `stale_collection`,
+`collecting_inference_blocked`, `inconclusive`, or
+`directional_profile_uplift`. Missing or stale evidence is never rendered as
+zero uplift.
+
+The packet binds the exact reporting cutoff, current-week and cumulative
+registration denominators, paired/insufficient/cluster counts, missingness,
+Control-versus-candidate descriptive outcomes, health freshness, experiment
+identity, and safety invariants. Health older than 12 hours is stale. A
+historical rerun cannot consume a health receipt written after its cutoff.
+
+`directional_profile_uplift` is the existing profile-versus-legacy inference;
+it is not a Candidate A/B promotion gate. Every Increment 1 packet therefore
+sets `decision_ready=false`, `automatic_promotion=false`, and records that a
+candidate-specific promotion gate plus separate Increment 2 approval are still
+missing. TradeLab validates the receipt and presents one compact section in its
+existing executive brief; it does not create another report or trading
+authority.
+
+To disable the scheduled collector, reinstall without the opt-in so the
+installer removes both plist environments and the runtime marker. Removing an
+interactive environment variable alone does not disable a marker-owned
+scheduled context.
