@@ -100,3 +100,21 @@ incomplete observation data remains an explicit evidence state; it is never
 converted to zero uplift. The existing profile-versus-legacy confidence
 indicator cannot promote Candidate A or B. All Increment 1 receipts remain
 advisory and set `decision_ready=false`.
+
+### 2026-07-24 weekly evidence deployment readback
+
+The weekly evidence extension is merged and deployed at Bhiksha `ac9f2a5`.
+The complete Air and oldmac suites both passed with `1017` tests. The post-flat
+install persisted the observational collector marker and the same opt-in in
+the scheduled `live-start` and `live-watchdog` plists; all seven jobs remained
+loaded but stopped, and the production ledger remained `158` closed and `0`
+non-closed trades.
+
+This enables collection for the next scheduled/recovery-context session; it
+does not enable a live risk envelope. The active plan still contains `0`
+risk-envelope-enabled policies, and the deployed weekly receipt proves
+enforcement false, broker calls added zero, and automatic promotion false.
+Because the available health receipt predates the install, the 2026-07-24
+weekly verdict is honestly `stale_collection`. Fresh collection, quote
+timestamp coverage, drop/storage/registration counters, and entry-to-protection
+latency remain next-session readback gates.
