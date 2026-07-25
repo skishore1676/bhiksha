@@ -65,7 +65,11 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
 
     asyncio.run(seed())
     result = write_weekly_trading_decisions(
-        db_path, output_dir=tmp_path / "reports", week_end="2026-07-10",
+        db_path,
+        output_dir=tmp_path / "reports",
+        week_end="2026-07-10",
+        exit_edge_db_path=tmp_path / "missing-exit-edge.db",
+        exit_edge_status_path=tmp_path / "missing-exit-edge-status.json",
     )
     export = json.loads(result.facts_path.read_text(encoding="utf-8"))
     governance = json.loads(result.governance_path.read_text(encoding="utf-8"))
