@@ -14,7 +14,11 @@ import time
 
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
 from bhiksha.tools.runtime_control_lock import runtime_control_lock
-from bhiksha.tools.sync_active_plan import sync_active_plan_once
+from bhiksha.tools.sync_active_plan import (
+    active_plan_id_from_env,
+    normalize_active_plan_id,
+    sync_active_plan_once,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -177,6 +181,14 @@ def _sync_from_args(args: argparse.Namespace):
         raise ValueError("--google-sheet-id or GOOGLE_SHEET_ID is required")
     if not args.credentials_path:
         raise ValueError("--credentials-path or GOOGLE_API_CREDENTIALS_PATH is required")
+    active_plan_id = (
+        normalize_active_plan_id(
+            args.active_plan_id,
+            source="--active-plan-id",
+        )
+        if args.active_plan_id is not None
+        else active_plan_id_from_env()
+    )
     return sync_active_plan_once(
         spreadsheet_id=args.google_sheet_id,
         credentials_path=args.credentials_path,
@@ -188,7 +200,7 @@ def _sync_from_args(args: argparse.Namespace):
         output_path=args.active_plan,
         log_dir=args.sync_log_dir,
         runtime_capabilities_path=None if args.skip_runtime_capability_refresh else args.runtime_capabilities,
-        active_plan_id=args.active_plan_id,
+        active_plan_id=active_plan_id,
         trading_date=args.trading_date,
         source_name=args.source_name,
     )

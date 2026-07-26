@@ -121,8 +121,11 @@ def test_server_session_restart_syncs_stops_and_restarts(tmp_path: Path, monkeyp
 
     running_pids = {11111, 22222}
     started_commands: list[list[str]] = []
+    stable_plan_id = "active_plan_2026-07-27_exit_engine_v2_iwm_canary"
+    monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_ID", stable_plan_id)
 
     def _fake_sync(**kwargs):
+        assert kwargs["active_plan_id"] == stable_plan_id
         return _sync_result(tmp_path / "active_plan.json", tmp_path / "sync.log")
 
     class _FakeProcess:
@@ -226,8 +229,11 @@ def test_server_session_watchdog_syncs_before_recovery_start(
     pid_path = tmp_path / "runtime" / "bhiksha.pid"
     active_plan_path = tmp_path / "active_plan.json"
     events: list[str] = []
+    stable_plan_id = "active_plan_2026-07-27_exit_engine_v2_iwm_canary"
+    monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_ID", stable_plan_id)
 
     def _fake_sync(**kwargs):
+        assert kwargs["active_plan_id"] == stable_plan_id
         events.append("sync")
         active_plan_path.write_text("{}", encoding="utf-8")
         return _sync_result(active_plan_path, tmp_path / "sync.log")

@@ -14,6 +14,7 @@ case "$ACTION" in
     python3 - "$REPO_ROOT" "$LAUNCHD_DIR" "$LOG_DIR" <<'PY'
 import plistlib
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -28,6 +29,23 @@ from bhiksha.ops.launchd_registry import active_launchd_jobs
 exit_edge_enabled = str(
     os.environ.get("BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED", "")
 ).strip().lower() in {"1", "true", "yes", "on"}
+active_plan_id = None
+if "BHIKSHA_ACTIVE_PLAN_ID" in os.environ:
+    raw_active_plan_id = os.environ["BHIKSHA_ACTIVE_PLAN_ID"]
+    active_plan_id = raw_active_plan_id.strip()
+    if (
+        not active_plan_id
+        or active_plan_id != raw_active_plan_id
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+            active_plan_id,
+        )
+        is None
+    ):
+        raise SystemExit(
+            "BHIKSHA_ACTIVE_PLAN_ID must be a nonblank stable id using only "
+            "letters, digits, '.', '_', ':', or '-'"
+        )
 
 for job in active_launchd_jobs():
     label = job.label
@@ -39,13 +57,17 @@ for job in active_launchd_jobs():
         "StandardOutPath": str(log_dir / f"{label}.out.log"),
         "StandardErrorPath": str(log_dir / f"{label}.err.log"),
     }
-    if label in {"com.bhiksha.live-start", "com.bhiksha.live-watchdog"} and exit_edge_enabled:
-        # Install-time opt-in becomes a persistent scheduled-context flag in
-        # the plist. Generic installs remain OFF; an interactive shell export
-        # alone never claims the Monday launchd job is enabled.
-        plist["EnvironmentVariables"] = {
-            "BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED": "true",
-        }
+    if label in {"com.bhiksha.live-start", "com.bhiksha.live-watchdog"}:
+        # Install-time controls become persistent scheduled-context values.
+        # Generic installs omit both; an interactive shell export alone never
+        # changes an already-installed launchd job.
+        environment = {}
+        if exit_edge_enabled:
+            environment["BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED"] = "true"
+        if active_plan_id is not None:
+            environment["BHIKSHA_ACTIVE_PLAN_ID"] = active_plan_id
+        if environment:
+            plist["EnvironmentVariables"] = environment
     path = launchd_dir / f"{label}.plist"
     path.write_bytes(plistlib.dumps(plist, sort_keys=True))
     path.chmod(0o600)

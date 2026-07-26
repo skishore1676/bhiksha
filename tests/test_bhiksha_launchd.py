@@ -1,4 +1,7 @@
+import os
 from pathlib import Path
+import plistlib
+import subprocess
 
 from bhiksha.ops.launchd_registry import active_launchd_jobs
 
@@ -19,8 +22,105 @@ def test_exit_edge_launchd_enable_is_explicit_persistent_for_start_and_watchdog(
     script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
     assert "BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED" in script
     assert '"com.bhiksha.live-start", "com.bhiksha.live-watchdog"' in script
-    assert '"BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED": "true"' in script
+    assert (
+        'environment["BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED"] = "true"'
+        in script
+    )
     assert "exit_edge_live_shadow.enabled" in script
+
+
+def test_installer_persists_stable_plan_id_only_for_live_restart_jobs(
+    tmp_path,
+) -> None:
+    repo = Path.cwd().resolve()
+    launchd_dir = tmp_path / "LaunchAgents"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    launchctl.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BHIKSHA_REPO_ROOT": str(repo),
+        "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
+        "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
+        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+        "BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED": "true",
+        "BHIKSHA_ACTIVE_PLAN_ID": (
+            "active_plan_2026-07-27_exit_engine_v2_iwm_canary"
+        ),
+    }
+
+    subprocess.run(
+        ["bash", "scripts/launchd/install_bhiksha_launchd.sh", "install"],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    for path in launchd_dir.glob("*.plist"):
+        payload = plistlib.loads(path.read_bytes())
+        if payload["Label"] in {
+            "com.bhiksha.live-start",
+            "com.bhiksha.live-watchdog",
+        }:
+            assert payload["EnvironmentVariables"] == {
+                "BHIKSHA_ACTIVE_PLAN_ID": (
+                    "active_plan_2026-07-27_exit_engine_v2_iwm_canary"
+                ),
+                "BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED": "true",
+            }
+        else:
+            assert "EnvironmentVariables" not in payload
+
+
+def test_generic_install_omits_plan_id_and_blank_explicit_value_fails(
+    tmp_path,
+) -> None:
+    repo = Path.cwd().resolve()
+    launchd_dir = tmp_path / "LaunchAgents"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    launchctl.chmod(0o755)
+    base_env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BHIKSHA_REPO_ROOT": str(repo),
+        "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
+        "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
+        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+    }
+    base_env.pop("BHIKSHA_ACTIVE_PLAN_ID", None)
+    base_env.pop("BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED", None)
+
+    subprocess.run(
+        ["bash", "scripts/launchd/install_bhiksha_launchd.sh", "install"],
+        cwd=repo,
+        env=base_env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert all(
+        "EnvironmentVariables" not in plistlib.loads(path.read_bytes())
+        for path in launchd_dir.glob("*.plist")
+    )
+
+    failed = subprocess.run(
+        ["bash", "scripts/launchd/install_bhiksha_launchd.sh", "install"],
+        cwd=repo,
+        env={**base_env, "BHIKSHA_ACTIVE_PLAN_ID": "  "},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert "nonblank stable id" in failed.stderr
 
 
 def test_exit_edge_restart_paths_read_persistent_allowlisted_marker() -> None:

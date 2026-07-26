@@ -185,6 +185,9 @@ Before changing stage:
    `docs/lessons/protective-stop-ratchets-need-proved-handoffs.md`.
 2. Inspect the current active plan and session manifest. Code capability is not
    proof that a canary is armed.
+   For the bounded canary, also prove launchd live-start and live-watchdog carry
+   the exact stable `BHIKSHA_ACTIVE_PLAN_ID` authorized by the Sheet row; a
+   date-derived plan ID will change across days and disarm or reject the plan.
 3. Confirm the runtime defaults still arm zero canaries.
 4. Inspect the active-plan sync log for the DTE/fallback/max-contract fields
    and every operator-supplied risk-envelope authority field, then prove the

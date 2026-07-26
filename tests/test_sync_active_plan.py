@@ -25,6 +25,10 @@ def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setenv("BHIKSHA_STRATEGY_CATALOG_PATH", str(tmp_path / "strategy_catalog"))
     monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_PATH", str(output_path))
     monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_LOG_DIR", str(log_dir))
+    monkeypatch.setenv(
+        "BHIKSHA_ACTIVE_PLAN_ID",
+        "active_plan_2026-07-27_exit_engine_v2_iwm_canary",
+    )
 
     def _fake_compile(**kwargs):
         assert kwargs["spreadsheet_id"] == "spreadsheet123"
@@ -32,7 +36,10 @@ def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.
         assert kwargs["defaults_sheet_name"] == "Operator_Defaults_v1"
         assert kwargs["strategy_sheet_name"] == "active_strategy"
         assert kwargs["manual_sheet_name"] == "manual_entry"
-        return _compiled_plan("active_plan_2026-04-09")
+        assert kwargs["active_plan_id"] == (
+            "active_plan_2026-07-27_exit_engine_v2_iwm_canary"
+        )
+        return _compiled_plan(kwargs["active_plan_id"])
 
     monkeypatch.setattr("bhiksha.tools.sync_active_plan.compile_active_plan_from_google_sheets", _fake_compile)
 
@@ -40,7 +47,9 @@ def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.
 
     assert exit_code == 0
     plan = load_active_plan(output_path)
-    assert plan.active_plan_id == "active_plan_2026-04-09"
+    assert plan.active_plan_id == (
+        "active_plan_2026-07-27_exit_engine_v2_iwm_canary"
+    )
     assert [deployment.deployment_id for deployment in plan.deployments] == ["spy_lane"]
     log_files = sorted(log_dir.glob("active_plan_sync_*.jsonl"))
     assert len(log_files) == 1
@@ -48,6 +57,49 @@ def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.
     assert log_entry["status"] == "ok"
     assert log_entry["summary"]["deployment_count"] == 1
     assert log_entry["suppressed"] == []
+
+
+def test_sync_active_plan_explicit_id_overrides_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "active_plan.json"
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "spreadsheet123")
+    monkeypatch.setenv(
+        "GOOGLE_API_CREDENTIALS_PATH",
+        str(tmp_path / "credentials.json"),
+    )
+    monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_ID", "env-plan")
+
+    def _fake_compile(**kwargs):
+        assert kwargs["active_plan_id"] == "cli-plan"
+        return _compiled_plan(kwargs["active_plan_id"])
+
+    monkeypatch.setattr(
+        "bhiksha.tools.sync_active_plan.compile_active_plan_from_google_sheets",
+        _fake_compile,
+    )
+
+    assert sync_active_plan_main(
+        [
+            "--out",
+            str(output_path),
+            "--active-plan-id",
+            "cli-plan",
+        ]
+    ) == 0
+    assert load_active_plan(output_path).active_plan_id == "cli-plan"
+
+
+def test_sync_active_plan_blank_environment_id_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "spreadsheet123")
+    monkeypatch.setenv("GOOGLE_API_CREDENTIALS_PATH", "credentials.json")
+    monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_ID", "   ")
+
+    with pytest.raises(ValueError, match="nonblank stable active-plan id"):
+        sync_active_plan_main([])
 
 
 def test_sync_active_plan_repeats_without_rewriting_when_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

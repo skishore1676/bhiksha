@@ -12,6 +12,30 @@ From the Bhiksha repo on the runtime Mac:
 scripts/launchd/install_bhiksha_launchd.sh install
 ```
 
+For the bounded IWM Exit Engine V2 canary, persist the exact active-plan
+authority into both scheduled sync paths at install time:
+
+```bash
+BHIKSHA_ACTIVE_PLAN_ID=active_plan_2026-07-27_exit_engine_v2_iwm_canary \
+BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED=true \
+scripts/launchd/install_bhiksha_launchd.sh install
+```
+
+The installer copies a nonblank `BHIKSHA_ACTIVE_PLAN_ID` only into
+`com.bhiksha.live-start` and `com.bhiksha.live-watchdog`; it merges with the
+collector flag when both are enabled. Generic installs omit it, and no report,
+stop, reconciliation, or auth job receives it. Blank, whitespace-padded, or
+malformed values fail installation.
+
+`sync_active_plan` and `server_session` use this environment value only when
+`--active-plan-id` is absent, so an explicit CLI value still wins. The stable
+ID must exactly equal the Sheet row's
+`risk_envelope_live_authorized_active_plan_id`. This is intentional across
+trading days: the default date-derived `active_plan_YYYY-MM-DD` identity would
+change on the next scheduled sync and fail the canary authorization binding.
+After install, inspect both generated plists and the next session manifest
+before treating the canary as armed.
+
 To remove the Bhiksha-owned jobs:
 
 ```bash

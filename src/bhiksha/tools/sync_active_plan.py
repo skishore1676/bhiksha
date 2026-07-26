@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Iterator
@@ -21,6 +22,42 @@ from bhiksha.execution.pricing import (
 )
 from bhiksha.strategy.capabilities import CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST_PATH
 from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
+
+
+_ACTIVE_PLAN_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+)
+
+
+def normalize_active_plan_id(
+    value: str | None,
+    *,
+    source: str,
+) -> str | None:
+    """Fail closed on blank or malformed explicit plan identities."""
+
+    if value is None:
+        return None
+    normalized = value.strip()
+    if (
+        not normalized
+        or normalized != value
+        or _ACTIVE_PLAN_ID_PATTERN.fullmatch(normalized) is None
+    ):
+        raise ValueError(
+            f"{source} must be a nonblank stable active-plan id using only "
+            "letters, digits, '.', '_', ':', or '-'"
+        )
+    return normalized
+
+
+def active_plan_id_from_env() -> str | None:
+    if "BHIKSHA_ACTIVE_PLAN_ID" not in os.environ:
+        return None
+    return normalize_active_plan_id(
+        os.environ.get("BHIKSHA_ACTIVE_PLAN_ID"),
+        source="BHIKSHA_ACTIVE_PLAN_ID",
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -200,6 +237,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval-minutes", type=float, default=default_interval_minutes, help="When set, keep syncing on this interval")
     parser.add_argument("--iterations", type=int, default=1, help="Number of sync attempts to run; ignored unless interval is set")
     args = parser.parse_args(argv)
+    args.active_plan_id = (
+        normalize_active_plan_id(
+            args.active_plan_id,
+            source="--active-plan-id",
+        )
+        if args.active_plan_id is not None
+        else active_plan_id_from_env()
+    )
 
     if not args.google_sheet_id:
         parser.error("--google-sheet-id or GOOGLE_SHEET_ID is required")
