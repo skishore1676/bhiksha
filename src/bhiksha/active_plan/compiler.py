@@ -165,6 +165,7 @@ class ActivePlanSheetRow(BaseModel):
     close_by_factor: float | None = None
     end_in_days: int | None = None
     max_trade_premium_usd: float | None = None
+    max_contracts: int | None = None
     stop_loss_pct: float | None = None
     hard_flat_time_et: str | None = None
     use_profit_target: bool | None = None
@@ -1405,6 +1406,8 @@ def _apply_risk_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> d
     updated = _deep_merge(section, row.risk_overrides)
     if row.max_trade_premium_usd is not None:
         updated["max_trade_premium_usd"] = row.max_trade_premium_usd
+    if row.max_contracts is not None:
+        updated["max_contracts"] = row.max_contracts
     if row.stop_loss_pct is not None:
         updated["stop_loss_pct"] = row.stop_loss_pct
     if row.hard_flat_time_et is not None:
@@ -2167,7 +2170,16 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 # ``_apply_*_overrides`` call site, so no future row-compile path can forget
 # the strip.
 _GATE_EXECUTION_OVERRIDE_KEYS = frozenset({"runtime_mode", "shadow_only"})
-_GATE_EXIT_OVERRIDE_KEYS = frozenset({"profile_exit_drives_live"})
+_GATE_EXIT_OVERRIDE_KEYS = frozenset(
+    {
+        "profile_exit_drives_live",
+        "risk_envelope_live_mode",
+        "risk_envelope_live_candidate_id",
+        "risk_envelope_live_candidate_overlay_hash",
+        "risk_envelope_live_authorization_id",
+        "risk_envelope_live_max_premium_cap_fraction",
+    }
+)
 
 
 def _detect_gate_override_keys(
@@ -2247,6 +2259,7 @@ _COLUMN_ALIASES = {
     "entry_after_et": "after_time_et",
     "max_premium": "max_trade_premium_usd",
     "premium_cap": "max_trade_premium_usd",
+    "contract_cap": "max_contracts",
     "stop_pct": "stop_loss_pct",
     "target_r": "profit_target_multiple",
     "profit_target_r": "profit_target_multiple",

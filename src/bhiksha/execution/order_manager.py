@@ -209,6 +209,42 @@ class OrderManager:
         payload = await self._apply_increment_correction(payload, side="SELL", price_key="stopPrice")
         return await self._submit_with_increment_retry(payload, side="SELL", price_key="stopPrice")
 
+    async def canonicalize_stop_price(
+        self,
+        option_symbol: str,
+        stop_price: float,
+        quantity: int,
+    ) -> tuple[float, float]:
+        """Return the exact broker-tick SELL stop before an intent is persisted.
+
+        The live ratchet must freeze, submit, and prove one identical price.  This
+        uses the same preflight/cache and SELL-side floor semantics as
+        ``place_stop_loss_order``; unlike submission, it fails closed when Public
+        does not disclose a positive increment.
+        """
+
+        payload = {
+            "instrument": {
+                "symbol": normalize_option_symbol(option_symbol),
+                "type": "OPTION",
+            },
+            "orderSide": "SELL",
+            "orderType": "STOP",
+            "expiration": {"timeInForce": "DAY"},
+            "quantity": str(int(quantity)),
+            "openCloseIndicator": "CLOSE",
+            "stopPrice": f"{round_price(stop_price):.2f}",
+        }
+        payload = await self._apply_increment_correction(
+            payload,
+            side="SELL",
+            price_key="stopPrice",
+        )
+        increment = self._lookup_price_increment(option_symbol)
+        if increment is None or increment <= 0:
+            raise ValueError("broker_stop_price_increment_unavailable")
+        return float(payload["stopPrice"]), float(increment)
+
     async def place_target_order(
         self,
         option_symbol: str,

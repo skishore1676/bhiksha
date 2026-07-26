@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from contextlib import closing
 from datetime import UTC, datetime
 import json
+from pathlib import Path
+import sqlite3
 
 from bhiksha.domain.exit_state import (
     ExitActionIntent,
@@ -15,6 +17,41 @@ from bhiksha.domain.exit_state import (
 )
 from bhiksha.execution.exit_policy import canonical_policy_hash
 from bhiksha.persistence.sqlite import SQLiteBackend
+
+
+def inspect_risk_envelope_rollback_latches(
+    database_path: str | Path,
+    *,
+    deployment_ids: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """Read durable canary rollback state without creating or mutating SQLite."""
+
+    path = Path(database_path)
+    if not path.is_file():
+        return []
+    uri = f"file:{path.resolve()}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            rows = conn.execute(
+                """
+                SELECT deployment_id, reason, latched_at
+                FROM risk_envelope_rollback_latches
+                ORDER BY deployment_id
+                """
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+    return [
+        {
+            "deployment_id": str(row[0]),
+            "reason": str(row[1]),
+            "latched_at": str(row[2]),
+        }
+        for row in rows
+        if deployment_ids is None or str(row[0]) in deployment_ids
+    ]
 
 
 class ExitStateRepository(ABC):
@@ -60,6 +97,17 @@ class ExitStateRepository(ABC):
         """Bind broker identity immediately after accepted submission."""
 
     @abstractmethod
+    async def update_action_handoff(
+        self,
+        idempotency_key: str,
+        *,
+        handoff_stage: str,
+        restore_order_id: str | None = None,
+        broker_payload: dict | None = None,
+    ) -> None:
+        """Advance restart-visible handoff stage and bind restore identity."""
+
+    @abstractmethod
     async def resolve_action_intent(
         self,
         idempotency_key: str,
@@ -74,6 +122,22 @@ class ExitStateRepository(ABC):
         self, trade_id: str
     ) -> list[ExitActionIntent]:
         """Return prepared/submitted intents that block duplicate effects."""
+
+    @abstractmethod
+    async def latch_risk_envelope_rollback(
+        self,
+        deployment_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Durably disable new canary treatment for a deployment."""
+
+    @abstractmethod
+    async def get_risk_envelope_rollback(
+        self,
+        deployment_id: str,
+    ) -> dict | None:
+        """Return the durable rollback latch, if any."""
 
 
 class NullExitStateRepository(ExitStateRepository):
@@ -114,6 +178,16 @@ class NullExitStateRepository(ExitStateRepository):
     ) -> None:
         del idempotency_key, broker_order_id, broker_payload
 
+    async def update_action_handoff(
+        self,
+        idempotency_key: str,
+        *,
+        handoff_stage: str,
+        restore_order_id: str | None = None,
+        broker_payload: dict | None = None,
+    ) -> None:
+        del idempotency_key, handoff_stage, restore_order_id, broker_payload
+
     async def resolve_action_intent(
         self,
         idempotency_key: str,
@@ -128,6 +202,21 @@ class NullExitStateRepository(ExitStateRepository):
     ) -> list[ExitActionIntent]:
         del trade_id
         return []
+
+    async def latch_risk_envelope_rollback(
+        self,
+        deployment_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        del deployment_id, reason
+
+    async def get_risk_envelope_rollback(
+        self,
+        deployment_id: str,
+    ) -> dict | None:
+        del deployment_id
+        return None
 
 
 class SQLiteExitStateRepository(ExitStateRepository):
@@ -199,6 +288,23 @@ class SQLiteExitStateRepository(ExitStateRepository):
             broker_payload,
         )
 
+    async def update_action_handoff(
+        self,
+        idempotency_key: str,
+        *,
+        handoff_stage: str,
+        restore_order_id: str | None = None,
+        broker_payload: dict | None = None,
+    ) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(
+            self._update_action_handoff_sync,
+            idempotency_key,
+            handoff_stage,
+            restore_order_id,
+            broker_payload,
+        )
+
     async def resolve_action_intent(
         self,
         idempotency_key: str,
@@ -221,6 +327,29 @@ class SQLiteExitStateRepository(ExitStateRepository):
         return await self.backend.run_read(
             self._get_open_action_intents_sync,
             trade_id,
+        )
+
+    async def latch_risk_envelope_rollback(
+        self,
+        deployment_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        await self._ensure_initialized()
+        await self.backend.run_write(
+            self._latch_risk_envelope_rollback_sync,
+            deployment_id,
+            reason,
+        )
+
+    async def get_risk_envelope_rollback(
+        self,
+        deployment_id: str,
+    ) -> dict | None:
+        await self._ensure_initialized()
+        return await self.backend.run_read(
+            self._get_risk_envelope_rollback_sync,
+            deployment_id,
         )
 
     def _init_db(self) -> None:
@@ -280,8 +409,13 @@ class SQLiteExitStateRepository(ExitStateRepository):
                     expected_state_version INTEGER NOT NULL,
                     requested_quantity INTEGER,
                     requested_stop_price REAL,
+                    requested_floor_r REAL,
+                    prior_stop_order_id TEXT,
+                    prior_stop_price REAL,
+                    handoff_stage TEXT NOT NULL DEFAULT 'prepared',
                     status TEXT NOT NULL,
                     broker_order_id TEXT,
+                    restore_order_id TEXT,
                     broker_payload_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -293,7 +427,73 @@ class SQLiteExitStateRepository(ExitStateRepository):
                 "CREATE INDEX IF NOT EXISTS idx_exit_action_intents_trade "
                 "ON exit_action_intents(trade_id, status)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS risk_envelope_rollback_latches (
+                    deployment_id TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    latched_at TEXT NOT NULL
+                )
+                """
+            )
+            intent_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(exit_action_intents)")
+            }
+            for column, declaration in (
+                ("requested_floor_r", "REAL"),
+                ("prior_stop_order_id", "TEXT"),
+                ("prior_stop_price", "REAL"),
+                ("handoff_stage", "TEXT NOT NULL DEFAULT 'prepared'"),
+                ("restore_order_id", "TEXT"),
+            ):
+                if column not in intent_columns:
+                    conn.execute(
+                        f"ALTER TABLE exit_action_intents "
+                        f"ADD COLUMN {column} {declaration}"
+                    )
             conn.commit()
+
+    def _latch_risk_envelope_rollback_sync(
+        self,
+        deployment_id: str,
+        reason: str,
+    ) -> None:
+        if not deployment_id.strip() or not reason.strip():
+            raise ValueError("deployment_id and rollback reason are required")
+        now = datetime.now(UTC).isoformat()
+        with closing(self.backend.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO risk_envelope_rollback_latches (
+                    deployment_id, reason, latched_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(deployment_id) DO NOTHING
+                """,
+                (deployment_id, reason, now),
+            )
+            conn.commit()
+
+    def _get_risk_envelope_rollback_sync(
+        self,
+        deployment_id: str,
+    ) -> dict | None:
+        with closing(self.backend.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT deployment_id, reason, latched_at
+                FROM risk_envelope_rollback_latches
+                WHERE deployment_id=?
+                """,
+                (deployment_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "deployment_id": row[0],
+            "reason": row[1],
+            "latched_at": row[2],
+        }
 
     def _freeze_policy_and_initialize_state_sync(
         self,
@@ -525,9 +725,11 @@ class SQLiteExitStateRepository(ExitStateRepository):
                     INSERT INTO exit_action_intents (
                         idempotency_key, trade_id, policy_hash, action_kind,
                         action_slot, expected_state_version, requested_quantity,
-                        requested_stop_price, status, broker_order_id,
+                        requested_stop_price, requested_floor_r,
+                        prior_stop_order_id, prior_stop_price,
+                        handoff_stage, status, broker_order_id, restore_order_id,
                         broker_payload_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, NULL, ?, ?)
                     """,
                     (
                         intent.idempotency_key,
@@ -538,6 +740,10 @@ class SQLiteExitStateRepository(ExitStateRepository):
                         intent.expected_state_version,
                         intent.requested_quantity,
                         intent.requested_stop_price,
+                        intent.requested_floor_r,
+                        intent.prior_stop_order_id,
+                        intent.prior_stop_price,
+                        intent.handoff_stage,
                         created_at,
                         now,
                     ),
@@ -547,7 +753,8 @@ class SQLiteExitStateRepository(ExitStateRepository):
                     """
                     SELECT idempotency_key, policy_hash, action_kind,
                            expected_state_version, requested_quantity,
-                           requested_stop_price
+                           requested_stop_price, requested_floor_r,
+                           prior_stop_order_id, prior_stop_price, handoff_stage
                     FROM exit_action_intents
                     WHERE trade_id = ? AND action_slot = ?
                     """,
@@ -560,12 +767,71 @@ class SQLiteExitStateRepository(ExitStateRepository):
                     intent.expected_state_version,
                     intent.requested_quantity,
                     intent.requested_stop_price,
+                    intent.requested_floor_r,
+                    intent.prior_stop_order_id,
+                    intent.prior_stop_price,
+                    intent.handoff_stage,
                 )
                 if existing is None or tuple(existing) != expected:
                     raise ValueError(
                         f"trade {intent.trade_id!r} action slot "
                         f"{intent.action_slot!r} already has a different intent"
                     )
+            conn.commit()
+
+    def _update_action_handoff_sync(
+        self,
+        idempotency_key: str,
+        handoff_stage: str,
+        restore_order_id: str | None,
+        broker_payload: dict | None,
+    ) -> None:
+        if not handoff_stage.strip():
+            raise ValueError("handoff_stage is required")
+        now = datetime.now(UTC).isoformat()
+        payload = (
+            json.dumps(broker_payload, default=str, sort_keys=True)
+            if broker_payload is not None
+            else None
+        )
+        with closing(self.backend.connect()) as conn:
+            row = conn.execute(
+                "SELECT status, restore_order_id, handoff_stage FROM exit_action_intents "
+                "WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown exit action intent {idempotency_key!r}")
+            if row[0] not in {"prepared", "submitted"}:
+                raise ValueError(f"cannot update terminal exit action intent {row[0]!r}")
+            if (
+                row[1] is not None
+                and restore_order_id is not None
+                and row[1] != restore_order_id
+                and row[2] != "restore_submit_pending"
+            ):
+                raise ValueError("exit action intent restore order identity conflict")
+            conn.execute(
+                """
+                UPDATE exit_action_intents
+                SET handoff_stage=?,
+                    restore_order_id=CASE
+                        WHEN ? IS NOT NULL THEN ?
+                        ELSE restore_order_id
+                    END,
+                    broker_payload_json=COALESCE(?, broker_payload_json),
+                    updated_at=?
+                WHERE idempotency_key=?
+                """,
+                (
+                    handoff_stage,
+                    restore_order_id,
+                    restore_order_id,
+                    payload,
+                    now,
+                    idempotency_key,
+                ),
+            )
             conn.commit()
 
     def _bind_action_order_sync(
@@ -640,7 +906,9 @@ class SQLiteExitStateRepository(ExitStateRepository):
                 """
                 SELECT idempotency_key, trade_id, policy_hash, action_kind,
                        action_slot, expected_state_version, requested_quantity,
-                       requested_stop_price, status, broker_order_id,
+                       requested_stop_price, requested_floor_r,
+                       prior_stop_order_id, prior_stop_price,
+                       handoff_stage, status, broker_order_id, restore_order_id,
                        broker_payload_json, created_at, updated_at
                 FROM exit_action_intents
                 WHERE trade_id=? AND status IN ('prepared', 'submitted')
@@ -785,9 +1053,14 @@ def _intent_from_row(row) -> ExitActionIntent:
         expected_state_version=int(row[5]),
         requested_quantity=int(row[6]) if row[6] is not None else None,
         requested_stop_price=float(row[7]) if row[7] is not None else None,
-        status=row[8],
-        broker_order_id=row[9],
-        broker_payload=json.loads(row[10]) if row[10] else None,
-        created_at=datetime.fromisoformat(row[11]),
-        updated_at=datetime.fromisoformat(row[12]),
+        requested_floor_r=float(row[8]) if row[8] is not None else None,
+        prior_stop_order_id=row[9],
+        prior_stop_price=float(row[10]) if row[10] is not None else None,
+        handoff_stage=row[11],
+        status=row[12],
+        broker_order_id=row[13],
+        restore_order_id=row[14],
+        broker_payload=json.loads(row[15]) if row[15] else None,
+        created_at=datetime.fromisoformat(row[16]),
+        updated_at=datetime.fromisoformat(row[17]),
     )

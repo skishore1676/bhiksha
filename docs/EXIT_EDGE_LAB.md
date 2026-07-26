@@ -8,9 +8,9 @@ The lab has two deliberately separate modes.
    buckets in the weekly scorecard contain different trades and are confounded
    by entry, contract, time, and lane selection.
 2. Prospective mode replays the current profile, legacy mechanics, and the
-   Exit Engine V2 Control/Variant A/Variant B arms from one immutable actual
-   entry and one append-only executable quote tape. It admits a case only after
-   every compared arm has a terminal modeled fill.
+   Exit Engine V2 six-arm registry from one immutable actual entry and one
+   append-only executable quote tape. It admits a case only after every
+   compared arm has a terminal modeled fill.
 
 This is observational counterfactual evidence, not causal proof. Per tradelab
 ADR-011 it cannot discover or validate other exit profiles.
@@ -25,18 +25,24 @@ experiment spec. Each quote record must carry provider `quote_at`, local
 `received_at`, monotonic `sequence`, provider/cache `source` and `feed`, bid,
 ask, last, spread, and derived freshness.
 
-The frozen experiment also carries the exact canonical Control policy and the
-two named shadow candidate policies. Each arm has a canonical policy id and
-hash. Control retains the trade's immutable live-policy identity and has no
-pre-T1 envelope. Variant A uses activation `0.25R`, curvature `1.5`, and a
-`0.0R` floor at T1; Variant B differs only in curvature `2.0`. The candidates
-are built from the exact Control canonical payload, so unrelated stop, target,
-giveback, time-stop, and EOD semantics do not drift.
+New cohorts also persist additive selection dimensions: selected DTE, absolute
+delta, bid/ask spread, fallback policy, runtime mode, and authorization mode.
+Older rows read as an empty dimension object rather than being rewritten.
+
+The frozen v2 experiment carries Control plus five named shadow candidates.
+Each arm has a canonical policy id, type, and hash. Control retains the trade's
+immutable live-policy identity. Variant A uses activation `0.25R`, curvature
+`1.5`, and a `0.0R` floor at T1; Variant B differs only in curvature `2.0`.
+Common Giveback arms at `0.75R` and allows a `60%` retrace. Safety Stack composes
+Variant A with that giveback and selects the stricter floor. Profit Preservation
+uses a discrete `0R` floor after a `0.75R` peak. The candidates are built from
+the exact Control canonical payload, so unrelated stop, target, time-stop, and
+EOD semantics do not drift. Legacy v1 Control/A/B rows remain replayable.
 
 Every candidate receives every captured quote row. Its shadow state is keyed by
 `(trade_id, experiment_id, candidate_id)` and carries that candidate's policy
-hash, monotonic locked floor, last observation, and revision. Variant A and
-Variant B never share a mutable floor. The report emits quote/provider
+hash, monotonic locked floor, last observation, and revision. Candidates never
+share a mutable floor. The report emits quote/provider
 timestamps, age, spread, executable bid, current and peak R, candidate and
 locked floors, hypothetical stop premium, would-ratchet/would-breach flags, and
 the Control decision from the same row. Missing identity/timestamp and
@@ -213,29 +219,30 @@ The Friday `weekly-trading-decisions` job reads the isolated repository through
 the same guarded analyzer and always writes:
 
 ```text
-artifacts/playbook/reports/exit_edge_weekly_evidence_<week-end>.json
+artifacts/playbook/reports/exit_policy_weekly_evidence_<week-end>.json
 ```
 
-Schema `bhiksha.exit_edge_weekly_evidence.v1` separates packet integrity from
+Schema `trading.exit_policy_weekly_evidence.v2` separates packet integrity from
 evidence maturity. A valid receipt may truthfully say `not_collecting`,
 `awaiting_first_collection`, `stale_collection`,
-`collecting_inference_blocked`, `inconclusive`, or
+`insufficient`, `inconclusive`, or
 `directional_profile_uplift`. Missing or stale evidence is never rendered as
 zero uplift.
 
 The packet binds the exact reporting cutoff, current-week and cumulative
 registration denominators, paired/insufficient/cluster counts, missingness,
 Control-versus-candidate descriptive outcomes, health freshness, experiment
-identity, and safety invariants. Health older than 12 hours is stale. A
+identity, W1/W2/W3 mature-cohort counters, additive entry dimensions, the
+authorized-canary manifest, and safety invariants. A checkpoint without a
+mature cohort is `insufficient_evidence`, never zero uplift. Health older than
+12 hours is stale. A
 historical rerun cannot consume a health receipt written after its cutoff.
 
 `directional_profile_uplift` is the existing profile-versus-legacy inference;
-it is not a Candidate A/B promotion gate. Every Increment 1 packet therefore
-sets `decision_ready=false`, `automatic_promotion=false`, and records that a
-candidate-specific promotion gate plus separate Increment 2 approval are still
-missing. TradeLab validates the receipt and presents one compact section in its
-existing executive brief; it does not create another report or trading
-authority.
+it is not a candidate promotion gate. Every packet sets
+`decision_ready=false` and `automatic_promotion=false`. TradeLab validates the
+receipt and presents one compact section in its existing executive brief; it
+does not create another report or trading authority.
 
 To disable the scheduled collector, reinstall without the opt-in so the
 installer removes both plist environments and the runtime marker. Removing an

@@ -14,6 +14,11 @@ from bhiksha.config.loader import (
     load_runtime_deployments,
     load_strategy_catalog,
 )
+from bhiksha.config.models import ActivePlan
+from bhiksha.execution.exit_policy import canonical_policy_hash
+from bhiksha.risk_envelope_authority import (
+    risk_envelope_authorization_fingerprint,
+)
 from historical_config import HISTORICAL_DEPLOYMENTS_DIR, HISTORICAL_STRATEGY_CATALOG_DIR
 
 
@@ -387,6 +392,143 @@ def test_load_deployments_rejects_reprice_chase_cap_above_one(tmp_path: Path) ->
     (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(ValidationError, match="less than or equal to 1"):
+        load_deployments(root)
+
+
+def test_risk_envelope_canary_is_default_off_and_rejects_wrong_candidate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    baseline = _manifest_dict("manual_qqq")
+    (root / "baseline.yaml").write_text(
+        yaml.safe_dump(baseline, sort_keys=False), encoding="utf-8"
+    )
+    loaded = load_deployments(root)[0]
+    assert loaded.exit.risk_envelope_live_mode == "off"
+    assert loaded.exit.risk_envelope_live_candidate_id is None
+
+    wrong = _manifest_dict("wrong_canary")
+    wrong["exit"].update(
+        {
+            "profile_exit_drives_live": True,
+            "risk_envelope_live_mode": "canary",
+            "risk_envelope_live_candidate_id": "variant_a",
+            "risk_envelope_live_candidate_overlay_hash": (
+                "9f0542fce8f8f7b04e5636bcf3e6dcfffcde15bbb26c1a5cfa4cb1ea5674252e"
+            ),
+            "risk_envelope_live_authorization_id": "test-auth",
+            "risk_envelope_live_max_premium_cap_fraction": 0.20,
+        }
+    )
+    wrong["execution"].update(
+        {
+            "runtime_mode": "live_approval_gated",
+            "dte_min": 4,
+            "dte_max": 7,
+        }
+    )
+    wrong["risk"]["max_contracts"] = 1
+    (root / "wrong.yaml").write_text(
+        yaml.safe_dump(wrong, sort_keys=False), encoding="utf-8"
+    )
+
+    with pytest.raises(ValidationError, match="safety_stack"):
+        load_deployments(root)
+
+
+def test_risk_envelope_canary_requires_one_contract_strict_4_to_7_dte(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "deployments"
+    root.mkdir(parents=True)
+    payload = _manifest_dict(
+        "strategy_market_impulse_all_basket_discovery_iwm_long_live_row_3",
+        symbol="IWM",
+    )
+    payload["exit"].update(
+        {
+            "profile_exit_id": "profile__trend_continuation",
+            "target_1_r": 1.0,
+            "target_2_r": 2.0,
+            "target_1_quantity": 0.60,
+            "no_progress_seconds": 2_700,
+            "max_hold_seconds": 10_800,
+            "breakeven_after_t1": True,
+            "eod_flat": True,
+            "profile_exit_drives_live": True,
+            "risk_envelope_live_mode": "canary",
+            "risk_envelope_live_candidate_id": "safety_stack",
+            "risk_envelope_live_candidate_overlay_hash": (
+                "9f0542fce8f8f7b04e5636bcf3e6dcfffcde15bbb26c1a5cfa4cb1ea5674252e"
+            ),
+            "risk_envelope_live_authorization_id": "test-auth",
+            "risk_envelope_live_start_at": "2026-07-20T00:00:00+00:00",
+            "risk_envelope_live_expires_at": "2026-08-01T00:00:00+00:00",
+            "risk_envelope_live_authorized_deployment_id": (
+                "strategy_market_impulse_all_basket_discovery_iwm_long_live_row_3"
+            ),
+            "risk_envelope_live_authorized_symbol": "IWM",
+            "risk_envelope_live_authorized_active_plan_id": "active-plan-test",
+            "risk_envelope_live_rollback_action": (
+                "disable_canary_restore_control"
+            ),
+            "risk_envelope_live_max_premium_cap_fraction": 0.20,
+        }
+    )
+    payload["execution"].update(
+        {
+            "runtime_mode": "live_approval_gated",
+            "dte_min": 4,
+            "dte_max": 7,
+            "dte_fallback_policy": "strict",
+        }
+    )
+    payload["risk"]["max_contracts"] = 1
+    payload["risk"]["max_trade_premium_usd"] = 2_000.0
+    frozen_policy = {
+        "policy_schema_version": "exit-policy.v1",
+        "policy_id": "profile__trend_continuation",
+        "target_1_r": 1.0,
+        "target_2_r": 2.0,
+        "target_1_quantity": 0.60,
+        "no_progress_seconds": 2_700,
+        "max_hold_seconds": 10_800,
+        "breakeven_after_t1": True,
+        "eod_flat": True,
+    }
+    payload["exit"].update(
+        {
+            "exit_policy_schema_version": "exit-policy.v1",
+            "exit_policy_id": "profile__trend_continuation",
+            "exit_policy_snapshot": frozen_policy,
+            "exit_policy_hash": canonical_policy_hash(frozen_policy),
+        }
+    )
+    path = root / "canary.yaml"
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    canary = load_deployments(root)[0]
+    assert canary.risk.max_contracts == 1
+    plan = ActivePlan(
+        active_plan_id="active-plan-test",
+        deployments=[canary],
+    )
+    assert plan.risk_envelope_authorization_fingerprint == (
+        risk_envelope_authorization_fingerprint(
+            active_plan_id=plan.active_plan_id,
+            deployments=plan.deployments,
+        )
+    )
+
+    payload["risk"]["max_contracts"] = 2
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValidationError, match="max_contracts=1"):
+        load_deployments(root)
+
+    payload["risk"]["max_contracts"] = 1
+    payload["execution"]["dte_min"] = 5
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValidationError, match="dte_min=4,dte_max=7"):
         load_deployments(root)
 
 

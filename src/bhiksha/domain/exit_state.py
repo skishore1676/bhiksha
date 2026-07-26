@@ -56,8 +56,13 @@ class ExitActionIntent:
     expected_state_version: int
     requested_quantity: int | None = None
     requested_stop_price: float | None = None
+    requested_floor_r: float | None = None
+    prior_stop_order_id: str | None = None
+    prior_stop_price: float | None = None
+    handoff_stage: str = "prepared"
     status: str = "prepared"
     broker_order_id: str | None = None
+    restore_order_id: str | None = None
     broker_payload: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None

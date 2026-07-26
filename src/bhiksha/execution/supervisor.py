@@ -49,7 +49,10 @@ from bhiksha.execution.profile_exit import (
     profile_exit_dispatch_allowed,
 )
 from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit, ProfileExitDispatchError
-from bhiksha.execution.exit_policy import canonical_policy_hash
+from bhiksha.execution.exit_policy import (
+    canonical_policy_hash,
+    compose_safety_stack_floor_r,
+)
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -210,6 +213,7 @@ class ExecutionSupervisor:
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._disabled_entry_deployments: set[str] = set()
+        self._canary_rollback_deployments: set[str] = set()
         # H3: per-position profile-exit ladder state (peak premium, T1-banked,
         # banked_quantity, breakeven_emitted). Keyed by a stable position id so it
         # survives across monitor ticks; the supervisor is the lifecycle owner and
@@ -295,6 +299,7 @@ class ExecutionSupervisor:
         entry_premium: float,
         quantity: int,
         committed_stop_price: float | None,
+        entry_context: dict[str, Any] | None = None,
     ) -> None:
         """Atomically freeze policy and initial state after confirmed fill.
 
@@ -326,6 +331,16 @@ class ExecutionSupervisor:
             return
         fields = ProfileExitFields.from_exit_spec(exit_spec)
         initial_risk = fields.stop_pct * entry_premium
+        from bhiksha.risk_envelope_authority import (
+            risk_envelope_authorization_fingerprint,
+        )
+
+        startup_authority_fingerprint = (
+            risk_envelope_authorization_fingerprint(
+                active_plan_id=self.active_plan_id,
+                deployments=[deployment],
+            )
+        )
         snapshot = TradeExitPolicySnapshot(
             trade_id=trade_id,
             deployment_id=deployment.deployment_id,
@@ -336,7 +351,54 @@ class ExecutionSupervisor:
             policy_id=policy_id,
             policy_hash=policy_hash,
             canonical_policy=policy,
-            provenance=dict(exit_spec.exit_policy_provenance),
+            provenance={
+                **dict(exit_spec.exit_policy_provenance),
+                "entry_context": dict(entry_context or {}),
+                "risk_envelope_live": {
+                    "mode": exit_spec.risk_envelope_live_mode,
+                    "candidate_id": exit_spec.risk_envelope_live_candidate_id,
+                    "candidate_overlay_hash": (
+                        exit_spec.risk_envelope_live_candidate_overlay_hash
+                    ),
+                    "authorization_id": (
+                        exit_spec.risk_envelope_live_authorization_id
+                    ),
+                    "start_at": (
+                        exit_spec.risk_envelope_live_start_at.isoformat()
+                        if exit_spec.risk_envelope_live_start_at
+                        else None
+                    ),
+                    "expires_at": (
+                        exit_spec.risk_envelope_live_expires_at.isoformat()
+                        if exit_spec.risk_envelope_live_expires_at
+                        else None
+                    ),
+                    "authorized_deployment_id": (
+                        exit_spec.risk_envelope_live_authorized_deployment_id
+                    ),
+                    "authorized_symbol": (
+                        exit_spec.risk_envelope_live_authorized_symbol
+                    ),
+                    "authorized_active_plan_id": (
+                        exit_spec.risk_envelope_live_authorized_active_plan_id
+                    ),
+                    "startup_authorization_fingerprint": (
+                        startup_authority_fingerprint
+                    ),
+                    "rollback_action": (
+                        exit_spec.risk_envelope_live_rollback_action
+                    ),
+                    "max_premium_cap_fraction": (
+                        exit_spec.risk_envelope_live_max_premium_cap_fraction
+                    ),
+                    "max_quote_age_ms": (
+                        exit_spec.risk_envelope_live_max_quote_age_ms
+                    ),
+                    "max_spread_pct": (
+                        exit_spec.risk_envelope_live_max_spread_pct
+                    ),
+                },
+            },
             frozen_at=datetime.now(UTC),
         )
         state = ExitRuntimeState(
@@ -527,6 +589,13 @@ class ExecutionSupervisor:
         """Resolve broker-provable action outcomes before enabling profile exits."""
 
         for intent in intents:
+            if intent.action_kind == "stop_ratchet":
+                await self._reconcile_stop_ratchet_intent(
+                    deployment,
+                    position,
+                    intent,
+                )
+                continue
             # New profile actions use the idempotency key as Public's client
             # orderId. If the process died after broker acceptance but before
             # binding the response, the prepared intent can still be recovered
@@ -554,11 +623,22 @@ class ExecutionSupervisor:
                     broker_stop_price = _maybe_float(
                         payload.get("stopPrice") or payload.get("stop_price")
                     )
+                    broker_order_type = str(
+                        payload.get("type") or payload.get("orderType") or ""
+                    ).upper()
+                    broker_option_symbol = normalize_option_symbol(
+                        str(
+                            (payload.get("instrument") or {}).get("symbol")
+                            or ""
+                        )
+                    )
                     if (
                         not _matches_exit_order_identity(
                             payload,
                             option_symbol=position.option_symbol,
                         )
+                        or broker_option_symbol
+                        != normalize_option_symbol(position.option_symbol or "")
                         or intent.requested_stop_price is None
                         or broker_stop_price is None
                         or round(broker_stop_price, 2)
@@ -572,15 +652,19 @@ class ExecutionSupervisor:
                     )
                     if durable is None:
                         continue
-                    advanced = replace(
-                        durable,
-                        committed_stop_price=intent.requested_stop_price,
-                        breakeven_emitted=True,
-                        runner_state="post_t1",
-                        recovery_status="active",
-                        degraded_reason=None,
-                        state_version=durable.state_version + 1,
+                    updates: dict[str, Any] = {
+                        "committed_stop_price": intent.requested_stop_price,
+                        "recovery_status": "active",
+                        "degraded_reason": None,
+                        "state_version": durable.state_version + 1,
+                    }
+                    updates.update(
+                        {
+                            "breakeven_emitted": True,
+                            "runner_state": "post_t1",
+                        }
                     )
+                    advanced = replace(durable, **updates)
                     await self.exit_state_repository.transition_runtime_state(
                         advanced,
                         expected_version=durable.state_version,
@@ -651,6 +735,316 @@ class ExecutionSupervisor:
                     status="failed",
                     broker_payload=payload,
                 )
+
+    async def _reconcile_stop_ratchet_intent(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        intent: ExitActionIntent,
+    ) -> None:
+        """Resume one ratchet handoff from its exact durable broker stage."""
+
+        if (
+            position.option_symbol is None
+            or intent.prior_stop_order_id is None
+            or intent.prior_stop_price is None
+            or intent.requested_stop_price is None
+        ):
+            return
+        quantity = int(intent.requested_quantity or position.quantity)
+        stage = intent.handoff_stage or "prepared"
+        if stage == "prepared" and intent.broker_order_id is not None:
+            stage = "replacement_submitted"
+        now = datetime.now(UTC)
+
+        if stage in {"prepared", "prior_stop_cancel_pending"}:
+            prior_outcome, prior_status, prior_payload, _ = (
+                await self._classify_stop_readback(
+                    order_id=intent.prior_stop_order_id,
+                    option_symbol=position.option_symbol,
+                    quantity=quantity,
+                    stop_price=float(intent.prior_stop_price),
+                )
+            )
+            if prior_outcome in {"full_fill", "partial_fill"}:
+                await self.exit_state_repository.resolve_action_intent(
+                    intent.idempotency_key,
+                    status="confirmed",
+                    broker_payload={
+                        "stage": "prior_stop_filled_during_handoff",
+                        "classification": prior_outcome,
+                        "order": prior_payload,
+                    },
+                )
+                await self._finalize_pending_exit_fill(
+                    deployment,
+                    position,
+                    exit_order_id=intent.prior_stop_order_id,
+                    status=prior_status,
+                    payload=prior_payload,
+                    now=now,
+                    reason="risk_envelope_prior_stop_filled",
+                )
+                return
+            if prior_outcome != "dead_zero_fill":
+                canceled, cancel_error = (
+                    await self.planner.order_manager.cancel_order(
+                        intent.prior_stop_order_id
+                    )
+                )
+                if not canceled:
+                    return
+            await self.exit_state_repository.update_action_handoff(
+                intent.idempotency_key,
+                handoff_stage="prior_stop_dead_zero_fill",
+                broker_payload={"prior_stop": prior_payload},
+            )
+            stage = "prior_stop_dead_zero_fill"
+
+        replacement_id = intent.broker_order_id or intent.idempotency_key
+        if stage in {
+            "prior_stop_dead_zero_fill",
+            "replacement_submit_pending",
+        }:
+            await self.exit_state_repository.update_action_handoff(
+                intent.idempotency_key,
+                handoff_stage="replacement_submit_pending",
+            )
+            result = await self.planner.order_manager.place_stop_loss_order(
+                position.option_symbol,
+                float(intent.requested_stop_price),
+                quantity,
+                order_id=intent.idempotency_key,
+            )
+            replacement_id = result.order_id or intent.idempotency_key
+            if result.order_id is not None and intent.broker_order_id is None:
+                await self.exit_state_repository.bind_action_order(
+                    intent.idempotency_key,
+                    broker_order_id=result.order_id,
+                )
+            await self.exit_state_repository.update_action_handoff(
+                intent.idempotency_key,
+                handoff_stage="replacement_submitted",
+                broker_payload={"submission_error": result.error},
+            )
+            stage = "replacement_submitted"
+
+        if stage == "replacement_submitted":
+            outcome, status, payload, _ = await self._classify_stop_readback(
+                order_id=replacement_id,
+                option_symbol=position.option_symbol,
+                quantity=quantity,
+                stop_price=float(intent.requested_stop_price),
+            )
+            if outcome == "working":
+                durable = await self.exit_state_repository.get_runtime_state(
+                    intent.trade_id
+                )
+                if durable is None:
+                    return
+                requested_floor = intent.requested_floor_r
+                if requested_floor is None:
+                    requested_floor = (
+                        float(intent.requested_stop_price)
+                        - durable.seed_entry_premium
+                    ) / durable.initial_risk_per_contract
+                advanced = replace(
+                    durable,
+                    locked_floor_r=max(
+                        durable.locked_floor_r
+                        if durable.locked_floor_r is not None
+                        else requested_floor,
+                        requested_floor,
+                    ),
+                    committed_stop_price=float(intent.requested_stop_price),
+                    recovery_status="active",
+                    degraded_reason=None,
+                    state_version=durable.state_version + 1,
+                )
+                await self.exit_state_repository.transition_runtime_state(
+                    advanced,
+                    expected_version=durable.state_version,
+                )
+                await self._adopt_recovered_ratchet_stop(
+                    deployment,
+                    position,
+                    order_id=replacement_id,
+                    stop_price=float(intent.requested_stop_price),
+                )
+                await self.exit_state_repository.resolve_action_intent(
+                    intent.idempotency_key,
+                    status="confirmed",
+                    broker_payload=payload,
+                )
+                self._durable_exit_states[intent.trade_id] = advanced
+                return
+            if outcome in {"full_fill", "partial_fill"}:
+                await self.exit_state_repository.resolve_action_intent(
+                    intent.idempotency_key,
+                    status="confirmed",
+                    broker_payload={
+                        "stage": "replacement_filled_on_recovery",
+                        "classification": outcome,
+                        "order": payload,
+                    },
+                )
+                await self._finalize_pending_exit_fill(
+                    deployment,
+                    position,
+                    exit_order_id=replacement_id,
+                    status=status,
+                    payload=payload,
+                    now=now,
+                    reason="risk_envelope_stop_filled_on_recovery",
+                )
+                return
+            if outcome != "dead_zero_fill":
+                return
+            restore_key = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{intent.idempotency_key}:restore",
+                )
+            )
+            await self.exit_state_repository.update_action_handoff(
+                intent.idempotency_key,
+                handoff_stage="restore_submit_pending",
+                restore_order_id=restore_key,
+                broker_payload={"replacement": payload},
+            )
+            stage = "restore_submit_pending"
+
+        restore_id = intent.restore_order_id or str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{intent.idempotency_key}:restore",
+            )
+        )
+        if stage == "restore_submit_pending":
+            result = await self.planner.order_manager.place_stop_loss_order(
+                position.option_symbol,
+                float(intent.prior_stop_price),
+                quantity,
+                order_id=restore_id,
+            )
+            restore_id = result.order_id or restore_id
+            await self.exit_state_repository.update_action_handoff(
+                intent.idempotency_key,
+                handoff_stage="restore_submitted",
+                restore_order_id=restore_id,
+                broker_payload={"restore_submission_error": result.error},
+            )
+            stage = "restore_submitted"
+        if stage != "restore_submitted":
+            return
+        outcome, status, payload, _ = await self._classify_stop_readback(
+            order_id=restore_id,
+            option_symbol=position.option_symbol,
+            quantity=quantity,
+            stop_price=float(intent.prior_stop_price),
+        )
+        if outcome == "working":
+            await self._adopt_recovered_ratchet_stop(
+                deployment,
+                position,
+                order_id=restore_id,
+                stop_price=float(intent.prior_stop_price),
+            )
+            await self.exit_state_repository.resolve_action_intent(
+                intent.idempotency_key,
+                status="failed",
+                broker_payload={"stage": "old_stop_restored", "order": payload},
+            )
+        elif outcome in {"full_fill", "partial_fill"}:
+            await self.exit_state_repository.resolve_action_intent(
+                intent.idempotency_key,
+                status="confirmed",
+                broker_payload={
+                    "stage": "restore_filled_on_recovery",
+                    "classification": outcome,
+                    "order": payload,
+                },
+            )
+            await self._finalize_pending_exit_fill(
+                deployment,
+                position,
+                exit_order_id=restore_id,
+                status=status,
+                payload=payload,
+                now=now,
+                reason="risk_envelope_restore_stop_filled_on_recovery",
+            )
+        elif outcome == "dead_zero_fill":
+            await self.exit_state_repository.resolve_action_intent(
+                intent.idempotency_key,
+                status="failed",
+                broker_payload={"stage": "restore_dead_zero_fill", "order": payload},
+            )
+
+    async def _adopt_recovered_ratchet_stop(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        order_id: str,
+        stop_price: float,
+    ) -> None:
+        """Attach proved recovered protection before an intent may resolve."""
+
+        adopted = _replace_position(
+            position,
+            stop_order_id=order_id,
+            stop_price=stop_price,
+        )
+        self.planner.position_tracker.open_position(
+            adopted.symbol,
+            adopted.deployment_id,
+            trade_id=adopted.trade_id,
+            option_symbol=adopted.option_symbol,
+            quantity=adopted.quantity,
+            entry_price=adopted.entry_price,
+            underlying_entry_price=adopted.underlying_entry_price,
+            entry_timestamp=adopted.entry_timestamp,
+            source=adopted.source,
+            order_id=adopted.order_id,
+            stop_order_id=adopted.stop_order_id,
+            stop_price=adopted.stop_price,
+            target_order_id=adopted.target_order_id,
+            target_price=adopted.target_price,
+            exit_order_id=adopted.exit_order_id,
+            exit_limit_price=adopted.exit_limit_price,
+            exit_submitted_at=adopted.exit_submitted_at,
+            exit_mode=adopted.exit_mode,
+            exit_reprice_count=adopted.exit_reprice_count,
+        )
+        if adopted.trade_id is not None and adopted.option_symbol is not None:
+            await self._upsert_trade_record(
+                TradeRecord(
+                    trade_id=adopted.trade_id,
+                    deployment_id=adopted.deployment_id,
+                    symbol=adopted.symbol,
+                    option_symbol=adopted.option_symbol,
+                    quantity=adopted.quantity,
+                    entry_price=adopted.entry_price,
+                    underlying_entry_price=adopted.underlying_entry_price,
+                    entry_timestamp=adopted.entry_timestamp,
+                    status="open_protected",
+                    entry_order_id=adopted.order_id,
+                    stop_order_id=order_id,
+                    stop_price=stop_price,
+                )
+            )
+        transition = self.lifecycle_store.mark_open(
+            adopted.symbol,
+            adopted.deployment_id,
+            option_symbol=adopted.option_symbol,
+            order_id=order_id,
+            protected=True,
+        )
+        await self._emit_lifecycle_transition(
+            transition,
+            reason="risk_envelope_recovered_stop_adopted",
+        )
 
     async def _mark_exit_state_degraded(
         self,
@@ -1208,6 +1602,16 @@ class ExecutionSupervisor:
         simulate_only: bool = False,
         live_entry_block_reason: str | None = None,
     ) -> TradePlan | None:
+        if deployment.exit.risk_envelope_live_mode == "canary":
+            rollback = (
+                await self.exit_state_repository.get_risk_envelope_rollback(
+                    deployment.deployment_id
+                )
+            )
+            if rollback is not None:
+                self._canary_rollback_deployments.add(
+                    deployment.deployment_id
+                )
         await self.event_repository.append(
             "signal_decision",
             {
@@ -1424,6 +1828,11 @@ class ExecutionSupervisor:
     def can_submit_deployment_entry(self, deployment: DeploymentManifest) -> bool:
         if not deployment.enabled:
             return False
+        if (
+            deployment.exit.risk_envelope_live_mode == "canary"
+            and deployment.deployment_id in self._canary_rollback_deployments
+        ):
+            return False
         if _is_self_disarming_manual_deployment(deployment):
             return deployment.deployment_id not in self._disabled_entry_deployments
         return True
@@ -1541,6 +1950,7 @@ class ExecutionSupervisor:
                 entry_timestamp=confirmed_at,
                 entry_premium=confirmed_price,
                 quantity=confirmed_quantity,
+                entry_context=dict(plan.risk_details),
             )
         stop_result, stop_price, target_order_id, target_price = await self._arm_position_protection(
             deployment,
@@ -1608,6 +2018,7 @@ class ExecutionSupervisor:
             entry_premium=plan.estimated_entry_price,
             quantity=plan.quantity,
             committed_stop_price=stop_price,
+            entry_context=dict(plan.risk_details),
         )
         await self._commit_entry_risk_reservation(plan.trade_id)
         if protection_error is not None:
@@ -2230,6 +2641,47 @@ class ExecutionSupervisor:
             "exit_policy_snapshot": dict(policy),
             "exit_policy_provenance": dict(snapshot.provenance),
         }
+        frozen_live = snapshot.provenance.get("risk_envelope_live") or {}
+        if isinstance(frozen_live, dict):
+            updates.update(
+                {
+                    "risk_envelope_live_mode": frozen_live.get("mode", "off"),
+                    "risk_envelope_live_candidate_id": frozen_live.get(
+                        "candidate_id"
+                    ),
+                    "risk_envelope_live_candidate_overlay_hash": frozen_live.get(
+                        "candidate_overlay_hash"
+                    ),
+                    "risk_envelope_live_authorization_id": frozen_live.get(
+                        "authorization_id"
+                    ),
+                    "risk_envelope_live_start_at": frozen_live.get("start_at"),
+                    "risk_envelope_live_expires_at": frozen_live.get(
+                        "expires_at"
+                    ),
+                    "risk_envelope_live_authorized_deployment_id": frozen_live.get(
+                        "authorized_deployment_id"
+                    ),
+                    "risk_envelope_live_authorized_symbol": frozen_live.get(
+                        "authorized_symbol"
+                    ),
+                    "risk_envelope_live_authorized_active_plan_id": frozen_live.get(
+                        "authorized_active_plan_id"
+                    ),
+                    "risk_envelope_live_rollback_action": frozen_live.get(
+                        "rollback_action"
+                    ),
+                    "risk_envelope_live_max_premium_cap_fraction": frozen_live.get(
+                        "max_premium_cap_fraction"
+                    ),
+                    "risk_envelope_live_max_quote_age_ms": frozen_live.get(
+                        "max_quote_age_ms", 2_000
+                    ),
+                    "risk_envelope_live_max_spread_pct": frozen_live.get(
+                        "max_spread_pct", 0.15
+                    ),
+                }
+            )
         for key in (
             "use_profit_target",
             "option_profit_target_pct",
@@ -2318,13 +2770,17 @@ class ExecutionSupervisor:
         partial_effect_pending = any(
             intent.action_kind == "partial_scale" for intent in open_intents
         )
+        stop_handoff_pending = any(
+            intent.action_kind in {"stop_to_breakeven", "stop_ratchet"}
+            for intent in open_intents
+        )
         quantity_refresh_pending = bool(
             durable is not None
             and durable.banked_quantity > 0
             and position.quantity
             != durable.seed_quantity - durable.banked_quantity
         )
-        if partial_effect_pending or quantity_refresh_pending:
+        if partial_effect_pending or stop_handoff_pending or quantity_refresh_pending:
             if self.reconcile_trigger is not None:
                 self.reconcile_trigger.set()
             await self.event_repository.append(
@@ -2338,6 +2794,7 @@ class ExecutionSupervisor:
                     "status": "STATE_DEGRADED",
                     "protection_action": "deferred_while_partial_effect_or_quantity_is_ambiguous",
                     "open_partial_intent": partial_effect_pending,
+                    "open_stop_handoff_intent": stop_handoff_pending,
                     "quantity_refresh_pending": quantity_refresh_pending,
                 },
             )
@@ -2481,6 +2938,15 @@ class ExecutionSupervisor:
                 deployment,
                 updated,
             )
+            # Hydration may reconcile a durable stop-ratchet intent and adopt
+            # its later-proved replacement/restore into the tracker (or close
+            # the position on a proved fill).  The caller's local snapshot is
+            # now stale, so re-read execution truth before the degraded check
+            # or generic missing-protection restore can place another STOP.
+            refreshed = self._tracked_position_like(updated)
+            if refreshed is None:
+                return None
+            updated = refreshed
             if updated.trade_id in self._profile_exit_degraded_trades:
                 return await self._retain_or_restore_degraded_protection(
                     deployment,
@@ -2871,6 +3337,18 @@ class ExecutionSupervisor:
                     protected=True,
                 )
                 await self._emit_lifecycle_transition(transition, reason="breakeven_stop_promotion")
+
+        if deployment.exit.risk_envelope_live_mode == "canary":
+            current_quote = await ensure_quote()
+            ratcheted = await self._apply_live_safety_stack_ratchet(
+                deployment,
+                updated,
+                current_quote,
+                dry_run=dry_run,
+            )
+            if ratcheted is None:
+                return None
+            updated = ratcheted
 
         if updated != position:
             self.planner.position_tracker.open_position(
@@ -4026,6 +4504,645 @@ class ExecutionSupervisor:
         state.banked_quantity = 0
         state.stop_at_breakeven = False
         state.breakeven_emitted = False
+
+    async def _classify_stop_readback(
+        self,
+        *,
+        order_id: str,
+        option_symbol: str,
+        quantity: int,
+        stop_price: float,
+    ) -> tuple[str, str | None, dict[str, Any] | None, str | None]:
+        """Classify exact stop truth as working, fill, dead-zero-fill, or ambiguous."""
+
+        last: tuple[str | None, dict[str, Any] | None, str | None] = (
+            None,
+            None,
+            None,
+        )
+        for _ in range(3):
+            last = await self.planner.order_manager.get_order_status(order_id)
+            status, payload, error = last
+            if payload is not None:
+                normalized = str(status or payload.get("status") or "").upper()
+                broker_stop = _maybe_float(
+                    payload.get("stopPrice") or payload.get("stop_price")
+                )
+                side = str(
+                    payload.get("side") or payload.get("orderSide") or ""
+                ).upper()
+                order_type = str(
+                    payload.get("type") or payload.get("orderType") or ""
+                ).upper()
+                broker_option_symbol = normalize_option_symbol(
+                    str((payload.get("instrument") or {}).get("symbol") or "")
+                )
+                exact_identity = (
+                    _matches_exit_order_identity(
+                        payload,
+                        option_symbol=option_symbol,
+                    )
+                    and broker_option_symbol
+                    == normalize_option_symbol(option_symbol)
+                    and side == "SELL"
+                    and order_type == "STOP"
+                )
+                raw_filled = payload.get("filledQuantity")
+                filled = _maybe_int(raw_filled)
+                if exact_identity and (
+                    normalized == "FILLED"
+                    or (filled is not None and filled > 0)
+                ):
+                    outcome = (
+                        "full_fill"
+                        if normalized == "FILLED"
+                        or (filled is not None and filled >= quantity)
+                        else "partial_fill"
+                    )
+                    return outcome, status, payload, None
+                working = (
+                    exact_identity
+                    and normalized in PUBLIC_WORKING_ORDER_STATUSES
+                    and _remaining_order_quantity(payload) == quantity
+                    and broker_stop is not None
+                    and round(broker_stop, 2) == round(stop_price, 2)
+                )
+                if working:
+                    return "working", status, payload, None
+                if (
+                    exact_identity
+                    and normalized in _EXIT_ORDER_DEAD_STATUSES
+                    and filled == 0
+                ):
+                    return "dead_zero_fill", status, payload, None
+            if error != "order_not_indexed_yet":
+                break
+            await asyncio.sleep(0)
+        return "ambiguous", last[0], last[1], last[2] or "stop_truth_unproved"
+
+    async def _apply_live_safety_stack_ratchet(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        quote: Any,
+        *,
+        dry_run: bool,
+    ) -> TrackedPosition | None:
+        """Apply the sole Increment-2 live treatment through a proved handoff.
+
+        The default path returns immediately.  A live ratchet requires the exact
+        frozen ``safety_stack`` canary identity, one contract, actual 4-7 DTE,
+        fresh quote lineage, and an existing broker stop.
+        """
+
+        if (
+            dry_run
+            or deployment.exit.risk_envelope_live_mode != "canary"
+            or deployment.exit.risk_envelope_live_candidate_id != "safety_stack"
+            or deployment.exit.profile_exit_drives_live is not True
+            or not profile_exit_dispatch_allowed(
+                live=True,
+                deployment_shadow_only=False,
+                position_source=position.source,
+                runtime_mode=self._resolved_runtime_mode(deployment),
+            )
+            or position.trade_id is None
+            or position.stop_order_id is None
+            or position.stop_price is None
+            or position.quantity != 1
+            or position.option_symbol is None
+        ):
+            return position
+        rollback = await self.exit_state_repository.get_risk_envelope_rollback(
+            deployment.deployment_id
+        )
+        if rollback is not None:
+            self._canary_rollback_deployments.add(deployment.deployment_id)
+            return position
+        trade_id = position.trade_id
+        snapshot = self._frozen_exit_policies.get(trade_id)
+        durable = self._durable_exit_states.get(trade_id)
+        if snapshot is None or durable is None:
+            return position
+        frozen_live = snapshot.provenance.get("risk_envelope_live") or {}
+        from bhiksha.risk_envelope_authority import (
+            risk_envelope_authorization_fingerprint,
+        )
+
+        expected_startup_authority_fingerprint = (
+            risk_envelope_authorization_fingerprint(
+                active_plan_id=snapshot.active_plan_id,
+                deployments=[deployment],
+            )
+        )
+        now = datetime.now(UTC)
+        authorization_start = _maybe_datetime(
+            deployment.exit.risk_envelope_live_start_at
+        )
+        authorization_expiry = _maybe_datetime(
+            deployment.exit.risk_envelope_live_expires_at
+        )
+        if (
+            not isinstance(frozen_live, dict)
+            or frozen_live.get("candidate_id") != "safety_stack"
+            or frozen_live.get("candidate_overlay_hash")
+            != deployment.exit.risk_envelope_live_candidate_overlay_hash
+            or frozen_live.get("authorization_id")
+            != deployment.exit.risk_envelope_live_authorization_id
+            or _maybe_datetime(frozen_live.get("start_at"))
+            != authorization_start
+            or _maybe_datetime(frozen_live.get("expires_at"))
+            != authorization_expiry
+            or frozen_live.get("authorized_deployment_id")
+            != deployment.deployment_id
+            or str(frozen_live.get("authorized_symbol") or "").upper()
+            != deployment.symbol.upper()
+            or frozen_live.get("authorized_active_plan_id")
+            != snapshot.active_plan_id
+            or snapshot.active_plan_id
+            != deployment.exit.risk_envelope_live_authorized_active_plan_id
+            or snapshot.startup_config_id != self.startup_config_id
+            or frozen_live.get("startup_authorization_fingerprint")
+            != expected_startup_authority_fingerprint
+            or frozen_live.get("rollback_action")
+            != deployment.exit.risk_envelope_live_rollback_action
+            or frozen_live.get("max_premium_cap_fraction")
+            != deployment.exit.risk_envelope_live_max_premium_cap_fraction
+            or frozen_live.get("max_quote_age_ms")
+            != deployment.exit.risk_envelope_live_max_quote_age_ms
+            or frozen_live.get("max_spread_pct")
+            != deployment.exit.risk_envelope_live_max_spread_pct
+            or authorization_start is None
+            or authorization_expiry is None
+            or not authorization_start <= now < authorization_expiry
+            or deployment.execution.dte_min != 4
+            or deployment.execution.dte_max != 7
+            or deployment.execution.dte_fallback_policy != "strict"
+            or deployment.risk.max_contracts != 1
+            or deployment.risk.max_trade_premium_usd != 2_000.0
+            or deployment.exit.risk_envelope_live_max_premium_cap_fraction
+            != 0.20
+        ):
+            return position
+        if (
+            durable.committed_stop_price is None
+            or round(durable.committed_stop_price, 2)
+            != round(position.stop_price, 2)
+        ):
+            await self.event_repository.append(
+                "risk_envelope_ratchet_suppressed",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
+                    "reason": "broker_and_durable_stop_disagree",
+                    "broker_proved_stop_price": position.stop_price,
+                    "durable_committed_stop_price": (
+                        durable.committed_stop_price
+                    ),
+                },
+            )
+            return position
+        entry_context = snapshot.provenance.get("entry_context") or {}
+        selected_dte = (
+            entry_context.get("selected_dte")
+            if isinstance(entry_context, dict)
+            else None
+        )
+        if (
+            isinstance(selected_dte, bool)
+            or not isinstance(selected_dte, (int, float))
+            or not 4 <= int(selected_dte) <= 7
+            or durable.runner_state != "pre_t1"
+            or durable.target_1_banked
+        ):
+            return position
+        quote_at = _maybe_datetime(getattr(quote, "quote_timestamp", None))
+        quote_age_ms = (
+            (now - quote_at.astimezone(UTC)).total_seconds() * 1000
+            if quote_at is not None
+            else None
+        )
+        bid = _maybe_float(getattr(quote, "bid", None))
+        ask = _maybe_float(getattr(quote, "ask", None))
+        spread_pct = _maybe_float(getattr(quote, "spread_pct", None))
+        if (
+            normalize_option_symbol(str(getattr(quote, "symbol", "") or ""))
+            != normalize_option_symbol(position.option_symbol)
+            or
+            getattr(quote, "quote_timestamp_field", None) != "quoteTimestamp"
+            or quote_age_ms is None
+            or quote_age_ms < 0
+            or quote_age_ms
+            > deployment.exit.risk_envelope_live_max_quote_age_ms
+            or bid is None
+            or ask is None
+            or bid <= 0
+            or ask < bid
+            or spread_pct is None
+            or spread_pct
+            > deployment.exit.risk_envelope_live_max_spread_pct
+        ):
+            await self.event_repository.append(
+                "risk_envelope_ratchet_suppressed",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
+                    "reason": "quote_gate_closed",
+                    "quote_age_ms": quote_age_ms,
+                    "spread_pct": spread_pct,
+                    "quote_timestamp_field": getattr(
+                        quote, "quote_timestamp_field", None
+                    ),
+                },
+            )
+            return position
+        open_intents = await self.exit_state_repository.get_open_action_intents(
+            trade_id
+        )
+        if open_intents:
+            return position
+
+        current_peak_r = max(
+            0.0,
+            (bid - durable.seed_entry_premium)
+            / durable.initial_risk_per_contract,
+        )
+        confirmed_peak_r = max(durable.confirmed_peak_r, current_peak_r)
+        raw_peak = max(durable.raw_peak_premium, bid)
+        working = durable
+        if (
+            raw_peak > durable.raw_peak_premium
+            or confirmed_peak_r > durable.confirmed_peak_r
+        ):
+            working = replace(
+                durable,
+                raw_peak_premium=raw_peak,
+                confirmed_peak_r=confirmed_peak_r,
+                peak_timestamp=quote_at,
+                last_evaluated_at=now,
+                state_version=durable.state_version + 1,
+            )
+            await self.exit_state_repository.transition_runtime_state(
+                working, expected_version=durable.state_version
+            )
+            self._durable_exit_states[trade_id] = working
+
+        broker_floor_r = (
+            position.stop_price - working.seed_entry_premium
+        ) / working.initial_risk_per_contract
+        existing_floor_r = max(
+            broker_floor_r,
+            working.locked_floor_r
+            if working.locked_floor_r is not None
+            else broker_floor_r,
+        )
+        if existing_floor_r - broker_floor_r > 0.02:
+            await self.event_repository.append(
+                "risk_envelope_ratchet_suppressed",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
+                    "reason": "durable_floor_exceeds_broker_proved_stop",
+                    "broker_floor_r": broker_floor_r,
+                    "durable_locked_floor_r": working.locked_floor_r,
+                },
+            )
+            return position
+        target_1_r = _maybe_float(
+            snapshot.canonical_policy.get("target_1_r")
+        )
+        if target_1_r is None:
+            return position
+        requested_floor_r, components = compose_safety_stack_floor_r(
+            confirmed_peak_r=confirmed_peak_r,
+            target_1_r=target_1_r,
+            existing_floor_r=existing_floor_r,
+        )
+        if requested_floor_r - existing_floor_r + 1e-12 < 0.10:
+            return position
+        requested_stop = round_price(
+            working.seed_entry_premium
+            + requested_floor_r * working.initial_risk_per_contract
+        )
+        max_valid = _max_valid_sell_stop_price(bid)
+        if max_valid is None:
+            return position
+        requested_stop = min(requested_stop, max_valid)
+        try:
+            requested_stop, broker_increment = (
+                await self.planner.order_manager.canonicalize_stop_price(
+                    position.option_symbol,
+                    requested_stop,
+                    position.quantity,
+                )
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            await self._latch_canary_rollback(
+                deployment,
+                reason=f"broker_tick_unavailable:{exc}",
+            )
+            await self.event_repository.append(
+                "risk_envelope_ratchet_suppressed",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    **self._exit_event_identity(deployment, position),
+                    "reason": "broker_tick_unavailable",
+                    "error": str(exc),
+                },
+            )
+            return position
+        committed_floor_r = (
+            requested_stop - working.seed_entry_premium
+        ) / working.initial_risk_per_contract
+        if committed_floor_r - existing_floor_r + 1e-12 < 0.10:
+            return position
+
+        intent_key = str(uuid.uuid4())
+        intent = ExitActionIntent(
+            idempotency_key=intent_key,
+            trade_id=trade_id,
+            policy_hash=working.policy_hash,
+            action_kind="stop_ratchet",
+            action_slot=f"stop_ratchet:v{working.state_version}",
+            expected_state_version=working.state_version,
+            requested_quantity=position.quantity,
+            requested_stop_price=requested_stop,
+            requested_floor_r=committed_floor_r,
+            prior_stop_order_id=position.stop_order_id,
+            prior_stop_price=position.stop_price,
+            handoff_stage="prior_stop_cancel_pending",
+        )
+        await self.exit_state_repository.prepare_action_intent(intent)
+        canceled, cancel_error = await self.planner.order_manager.cancel_order(
+            position.stop_order_id
+        )
+        await self.event_repository.append(
+            "stop_ratchet_handoff",
+            {
+                "deployment_id": deployment.deployment_id,
+                **self._exit_event_identity(
+                    deployment, position, idempotency_key=intent_key
+                ),
+                "stage": "old_stop_cancel_readback",
+                "old_stop_order_id": position.stop_order_id,
+                "old_stop_price": position.stop_price,
+                "cancel_confirmed_dead_unfilled": canceled,
+                "error": cancel_error,
+            },
+        )
+        if not canceled:
+            degraded_position = _replace_position(
+                position,
+                stop_order_id=None,
+                stop_price=None,
+            )
+            await self._mark_exit_state_degraded(
+                trade_id,
+                deployment=deployment,
+                option_symbol=position.option_symbol,
+                reason=f"stop_ratchet_prior_stop_cancel_ambiguous:{cancel_error}",
+                open_intents=[intent],
+            )
+            await self._latch_canary_rollback(
+                deployment,
+                reason=f"prior_stop_cancel_ambiguous:{cancel_error}",
+            )
+            return degraded_position
+
+        await self.exit_state_repository.update_action_handoff(
+            intent_key,
+            handoff_stage="prior_stop_dead_zero_fill",
+            broker_payload={"prior_stop_order_id": position.stop_order_id},
+        )
+        await self.exit_state_repository.update_action_handoff(
+            intent_key,
+            handoff_stage="replacement_submit_pending",
+        )
+
+        result = await self.planner.order_manager.place_stop_loss_order(
+            position.option_symbol,
+            requested_stop,
+            position.quantity,
+            order_id=intent_key,
+        )
+        replacement_id = result.order_id or intent_key
+        if result.order_id is not None:
+            await self.exit_state_repository.bind_action_order(
+                intent_key, broker_order_id=result.order_id
+            )
+        await self.exit_state_repository.update_action_handoff(
+            intent_key,
+            handoff_stage="replacement_submitted",
+            broker_payload={"submission_error": result.error},
+        )
+        replacement_outcome, status, payload, readback_error = (
+            await self._classify_stop_readback(
+                order_id=replacement_id,
+                option_symbol=position.option_symbol,
+                quantity=position.quantity,
+                stop_price=requested_stop,
+            )
+        )
+        if replacement_outcome in {"full_fill", "partial_fill"}:
+            await self.exit_state_repository.resolve_action_intent(
+                intent_key,
+                status="confirmed",
+                broker_payload={
+                    "stage": "replacement_filled",
+                    "classification": replacement_outcome,
+                    "order": payload,
+                },
+            )
+            await self._finalize_pending_exit_fill(
+                deployment,
+                position,
+                exit_order_id=replacement_id,
+                status=status,
+                payload=payload,
+                now=now,
+                reason="risk_envelope_stop_filled",
+            )
+            return None
+        if replacement_outcome != "working":
+            if replacement_outcome == "dead_zero_fill":
+                restore_key = str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"{intent_key}:restore")
+                )
+                await self.exit_state_repository.update_action_handoff(
+                    intent_key,
+                    handoff_stage="restore_submit_pending",
+                    restore_order_id=restore_key,
+                    broker_payload={"replacement": payload},
+                )
+                restored_result = (
+                    await self.planner.order_manager.place_stop_loss_order(
+                        position.option_symbol,
+                        position.stop_price,
+                        position.quantity,
+                        order_id=restore_key,
+                    )
+                )
+                restore_id = restored_result.order_id or restore_key
+                await self.exit_state_repository.update_action_handoff(
+                    intent_key,
+                    handoff_stage="restore_submitted",
+                    restore_order_id=restore_id,
+                    broker_payload={"restore_submission_error": restored_result.error},
+                )
+                restore_outcome, restore_status, restore_payload, restore_error = (
+                    await self._classify_stop_readback(
+                        order_id=restore_id,
+                        option_symbol=position.option_symbol,
+                        quantity=position.quantity,
+                        stop_price=position.stop_price,
+                    )
+                )
+                if restore_outcome == "working":
+                    await self.exit_state_repository.resolve_action_intent(
+                        intent_key,
+                        status="failed",
+                        broker_payload={
+                            "stage": "old_stop_restored",
+                            "replacement": payload,
+                            "restored": restore_payload,
+                        },
+                    )
+                    return _replace_position(
+                        position,
+                        stop_order_id=restore_id,
+                        stop_price=position.stop_price,
+                    )
+                if restore_outcome in {"full_fill", "partial_fill"}:
+                    await self.exit_state_repository.resolve_action_intent(
+                        intent_key,
+                        status="confirmed",
+                        broker_payload={
+                            "stage": "restore_filled",
+                            "classification": restore_outcome,
+                            "order": restore_payload,
+                        },
+                    )
+                    await self._finalize_pending_exit_fill(
+                        deployment,
+                        position,
+                        exit_order_id=restore_id,
+                        status=restore_status,
+                        payload=restore_payload,
+                        now=now,
+                        reason="risk_envelope_restore_stop_filled",
+                    )
+                    return None
+                if restore_outcome == "dead_zero_fill":
+                    await self.exit_state_repository.resolve_action_intent(
+                        intent_key,
+                        status="failed",
+                        broker_payload={
+                            "stage": "restore_dead_zero_fill",
+                            "replacement": payload,
+                            "restore": restore_payload,
+                        },
+                    )
+                readback_error = (
+                    f"{readback_error};restore_{restore_outcome}:{restore_error}"
+                )
+            degraded_position = _replace_position(
+                position, stop_order_id=None, stop_price=None
+            )
+            await self._mark_exit_state_degraded(
+                trade_id,
+                deployment=deployment,
+                option_symbol=position.option_symbol,
+                reason=f"stop_ratchet_replacement_unproved:{readback_error}",
+                open_intents=[intent],
+            )
+            await self._latch_canary_rollback(
+                deployment,
+                reason=(
+                    "stop_handoff_unproved:"
+                    f"{replacement_outcome}:{readback_error}"
+                ),
+            )
+            await self.event_repository.append(
+                "runtime_issue",
+                {
+                    "category": "protective_stop_failure",
+                    "deployment_id": deployment.deployment_id,
+                    "trade_id": trade_id,
+                    "option_symbol": position.option_symbol,
+                    "stage": "stop_ratchet_replacement_readback",
+                    "error": readback_error or result.error,
+                },
+            )
+            return degraded_position
+
+        advanced = replace(
+            working,
+            locked_floor_r=max(
+                working.locked_floor_r
+                if working.locked_floor_r is not None
+                else existing_floor_r,
+                committed_floor_r,
+            ),
+            committed_stop_price=requested_stop,
+            last_evaluated_at=now,
+            state_version=working.state_version + 1,
+        )
+        await self.exit_state_repository.transition_runtime_state(
+            advanced, expected_version=working.state_version
+        )
+        await self.exit_state_repository.resolve_action_intent(
+            intent_key, status="confirmed", broker_payload=payload
+        )
+        self._durable_exit_states[trade_id] = advanced
+        await self.event_repository.append(
+            "stop_ratchet_committed",
+            {
+                "deployment_id": deployment.deployment_id,
+                **self._exit_event_identity(
+                    deployment, position, idempotency_key=intent_key
+                ),
+                "candidate_id": "safety_stack",
+                "broker_order_id": replacement_id,
+                "committed_stop_price": requested_stop,
+                "broker_price_increment": broker_increment,
+                "committed_floor_r": committed_floor_r,
+                "confirmed_peak_r": confirmed_peak_r,
+                "components": components,
+                "state_version": advanced.state_version,
+            },
+        )
+        return _replace_position(
+            position,
+            stop_order_id=replacement_id,
+            stop_price=requested_stop,
+        )
+
+    async def _latch_canary_rollback(
+        self,
+        deployment: DeploymentManifest,
+        *,
+        reason: str,
+    ) -> None:
+        """Session- and SQLite-durably stop new treatment after a safety breach."""
+
+        self._canary_rollback_deployments.add(deployment.deployment_id)
+        await self.exit_state_repository.latch_risk_envelope_rollback(
+            deployment.deployment_id,
+            reason=reason,
+        )
+        await self.event_repository.append(
+            "risk_envelope_rollback_latched",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": deployment.symbol,
+                "rollback_action": "disable_canary_restore_control",
+                "new_entries": "blocked_for_deployment",
+                "open_trade": (
+                    "retain_or_reconcile_current_broker_stop_without_new_ratchets"
+                ),
+                "reason": reason,
+            },
+        )
 
     async def _apply_replacement_stop(
         self,
@@ -5278,6 +6395,55 @@ class ExecutionSupervisor:
         open_intents = await self.exit_state_repository.get_open_action_intents(
             trade_id
         )
+        stop_ratchet_intents = [
+            intent
+            for intent in open_intents
+            if intent.action_kind == "stop_ratchet"
+        ]
+        for intent in stop_ratchet_intents:
+            await self._reconcile_stop_ratchet_intent(
+                deployment,
+                position,
+                intent,
+            )
+        if stop_ratchet_intents:
+            tracked = self._tracked_position_like(position)
+            if tracked is None:
+                return None
+            position = tracked
+            open_intents = (
+                await self.exit_state_repository.get_open_action_intents(
+                    trade_id
+                )
+            )
+            unresolved_stop_handoffs = [
+                intent
+                for intent in open_intents
+                if intent.action_kind == "stop_ratchet"
+            ]
+            if unresolved_stop_handoffs:
+                if self.reconcile_trigger is not None:
+                    self.reconcile_trigger.set()
+                await self.event_repository.append(
+                    "runtime_issue",
+                    {
+                        "category": f"{reason}_stop_ratchet_confirmation_pending",
+                        "deployment_id": deployment.deployment_id,
+                        **self._exit_event_identity(deployment, position),
+                        "stage": reason,
+                        "open_stop_ratchet_intents": [
+                            {
+                                "idempotency_key": intent.idempotency_key,
+                                "handoff_stage": intent.handoff_stage,
+                                "prior_stop_order_id": intent.prior_stop_order_id,
+                                "replacement_order_id": intent.broker_order_id,
+                                "restore_order_id": intent.restore_order_id,
+                            }
+                            for intent in unresolved_stop_handoffs
+                        ],
+                    },
+                )
+                return None
         partial_intents = [
             intent for intent in open_intents if intent.action_kind == "partial_scale"
         ]

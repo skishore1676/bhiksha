@@ -166,6 +166,54 @@ def test_lane_config_snapshot_skips_malformed_deployments() -> None:
     assert snapshot["ok_lane"]["max_trade_premium_usd"] is None
 
 
+def test_lane_config_snapshot_receipts_all_canary_authority_fields() -> None:
+    lane = lane_config_snapshot(
+        {
+            "deployments": [
+                {
+                    "deployment_id": "iwm_canary",
+                    "symbol": "IWM",
+                    "execution": {
+                        "dte_min": 4,
+                        "dte_max": 7,
+                        "dte_fallback_policy": "strict",
+                    },
+                    "risk": {
+                        "max_trade_premium_usd": 2_000.0,
+                        "max_contracts": 1,
+                    },
+                    "exit": {
+                        "risk_envelope_live_mode": "canary",
+                        "risk_envelope_live_candidate_id": "safety_stack",
+                        "risk_envelope_live_candidate_overlay_hash": "overlay",
+                        "risk_envelope_live_authorization_id": "auth",
+                        "risk_envelope_live_start_at": "2026-07-20T00:00:00Z",
+                        "risk_envelope_live_expires_at": "2026-08-01T00:00:00Z",
+                        "risk_envelope_live_authorized_deployment_id": "iwm_canary",
+                        "risk_envelope_live_authorized_symbol": "IWM",
+                        "risk_envelope_live_authorized_active_plan_id": "plan",
+                        "risk_envelope_live_rollback_action": (
+                            "disable_canary_restore_control"
+                        ),
+                        "risk_envelope_live_max_premium_cap_fraction": 0.20,
+                        "risk_envelope_live_max_quote_age_ms": 2_000,
+                        "risk_envelope_live_max_spread_pct": 0.15,
+                    },
+                }
+            ]
+        }
+    )["iwm_canary"]
+
+    assert lane["dte_min"] == 4
+    assert lane["dte_max"] == 7
+    assert lane["dte_fallback_policy"] == "strict"
+    assert lane["max_contracts"] == 1
+    assert lane["risk_envelope_live_authorized_active_plan_id"] == "plan"
+    assert lane["risk_envelope_live_rollback_action"] == (
+        "disable_canary_restore_control"
+    )
+
+
 def test_lane_config_diff_surfaces_patient_entry_policy_changes() -> None:
     before = lane_config_snapshot(
         {

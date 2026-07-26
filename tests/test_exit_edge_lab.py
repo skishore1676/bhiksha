@@ -12,6 +12,9 @@ import pytest
 from bhiksha.ops.exit_edge_lab import (
     ProspectiveQuoteTapeRepository,
     QuoteTapeMark,
+    LEGACY_RISK_ENVELOPE_EXPERIMENT_ID,
+    LEGACY_RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION,
+    SHADOW_CANDIDATE_IDS,
     analyze_cases,
     analyze_prospective_repository,
     build_risk_envelope_experiment,
@@ -43,8 +46,8 @@ def _control_policy() -> dict:
         "target_1_quantity": 0.6,
         "initial_stop_pct": 0.35,
         "premium_disaster_stop_pct": 0.45,
-        "no_progress_seconds": None,
-        "max_hold_seconds": None,
+        "no_progress_seconds": 2700,
+        "max_hold_seconds": 10800,
         "high_water_giveback_policy": "MODERATE",
         "giveback_arm_r": 1.25,
         "giveback_retrace_fraction": 0.5,
@@ -101,6 +104,51 @@ def _load(tmp_path: Path, raw: dict):
     return load_fixture_cases(path)
 
 
+def test_repository_reports_w1_w2_w3_maturity_without_promotion_claim(
+    tmp_path: Path,
+) -> None:
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    repository.initialize()
+    repository.register_cohort(_raw_case())
+
+    maturity = repository.cohort_maturity_summary(
+        as_of=ENTRY + timedelta(days=15)
+    )
+
+    assert maturity["checkpoints"]["W1"]["mature_cohort_count"] == 1
+    assert maturity["checkpoints"]["W2"]["mature_cohort_count"] == 1
+    assert maturity["checkpoints"]["W3"]["mature_cohort_count"] == 0
+
+
+def test_legacy_three_arm_experiment_remains_replayable(tmp_path: Path) -> None:
+    raw = _raw_case()
+    current = raw["experiment"]["risk_envelope"]
+    raw["experiment"]["risk_envelope"] = {
+        "schema_version": LEGACY_RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION,
+        "experiment_id": LEGACY_RISK_ENVELOPE_EXPERIMENT_ID,
+        "arms": [
+            {
+                key: value
+                for key, value in arm.items()
+                if key != "candidate_type"
+            }
+            for arm in current["arms"]
+            if arm["candidate_id"] in {"control", "variant_a", "variant_b"}
+        ],
+    }
+    raw["experiment_spec_hash"] = experiment_spec_hash(
+        raw["profile"], raw["legacy"], raw["experiment"]
+    )
+
+    row = analyze_cases(_load(tmp_path, raw))["cases"][0]
+
+    assert set(row["risk_envelope_outcomes"]) == {
+        "control",
+        "variant_a",
+        "variant_b",
+    }
+
+
 def test_next_tick_bid_fill_pairs_partial_and_runner(tmp_path: Path) -> None:
     row=analyze_cases(_load(tmp_path,_raw_case()))["cases"][0]
     assert row["status"] == "paired"
@@ -112,10 +160,10 @@ def test_next_tick_bid_fill_pairs_partial_and_runner(tmp_path: Path) -> None:
     assert row["profile_outcome"]["realized_pnl_usd"] == 990.0
     assert row["paired_delta_pnl_usd"] == 240.0
     assert row["profile_outcome"]["legs"][1]["fill_sequence"] == 5
-    assert set(row["risk_envelope_outcomes"]) == {
-        "control", "variant_a", "variant_b"
-    }
-    assert len(row["risk_envelope_observations"]) == len(_raw_case()["quotes"]) * 3
+    assert set(row["risk_envelope_outcomes"]) == set(SHADOW_CANDIDATE_IDS)
+    assert len(row["risk_envelope_observations"]) == (
+        len(_raw_case()["quotes"]) * len(SHADOW_CANDIDATE_IDS)
+    )
     assert row["missingness"]["identity_or_timestamp_rows"] == 0
 
 
@@ -145,15 +193,25 @@ def test_control_a_b_have_distinct_identity_and_isolated_monotonic_state(
         state["candidate_id"]: state
         for state in row["shadow_envelope_states"]
     }
-    assert set(states) == {"variant_a", "variant_b"}
+    assert set(states) == set(SHADOW_CANDIDATE_IDS) - {"control"}
     assert states["variant_a"]["candidate_policy_hash"] != states["variant_b"][
         "candidate_policy_hash"
     ]
-    assert states["variant_a"]["candidate_policy_hash"] == (
-        "40b5bb09cee4f5056e3340d00bf775748b3971666fc7b98971161e248a1936ed"
+    frozen_arms = {
+        arm["candidate_id"]: arm
+        for arm in raw["experiment"]["risk_envelope"]["arms"]
+    }
+    assert states["variant_a"]["candidate_policy_hash"] == frozen_arms[
+        "variant_a"
+    ]["candidate_policy_hash"]
+    assert states["variant_b"]["candidate_policy_hash"] == frozen_arms[
+        "variant_b"
+    ]["candidate_policy_hash"]
+    assert frozen_arms["variant_a"]["candidate_overlay_hash"] == (
+        "15351843271c171bf400a570a77b98fdb9b676263b8888acc6d521c1a2d26e8e"
     )
-    assert states["variant_b"]["candidate_policy_hash"] == (
-        "f0e7c4cf325b93b15481e249c80ad6c22aa551773232ad2339a3dc0f3eb82aee"
+    assert frozen_arms["variant_b"]["candidate_overlay_hash"] == (
+        "c681ce54724540a48985e29973643a267dbfc073d4bd0a5d8c6bd0746efe5a2d"
     )
     assert states["variant_a"]["locked_floor_r"] > states["variant_b"][
         "locked_floor_r"
@@ -213,9 +271,9 @@ def test_shadow_candidate_state_repository_rejects_identity_and_floor_regression
     )
     repo.persist_shadow_envelope_states(states)
     loaded = repo.load_shadow_envelope_states("T1")
-    assert {state.candidate_id for state in loaded} == {
-        "variant_a", "variant_b"
-    }
+    assert {state.candidate_id for state in loaded} == (
+        set(SHADOW_CANDIDATE_IDS) - {"control"}
+    )
     regressed = replace(
         states[0],
         locked_floor_r=float(states[0].locked_floor_r) - 0.1,
@@ -277,7 +335,7 @@ def test_tape_end_before_second_arm_fill_is_right_censored(tmp_path: Path) -> No
     row=analyze_cases(_load(tmp_path,raw))["cases"][0]
     assert row["status"] == "insufficient_data"
     assert row["insufficient_reason"] == (
-        "right_censored:control,variant_a,variant_b"
+        "right_censored:" + ",".join(SHADOW_CANDIDATE_IDS)
     )
 
 
@@ -500,7 +558,7 @@ def test_self_resigned_risk_envelope_catalog_is_rejected(tmp_path: Path) -> None
 
     with pytest.raises(
         ValueError,
-        match="does not match the fixed Control/A/B catalog",
+        match="does not match the fixed shadow registry",
     ):
         raw["experiment_spec_hash"] = experiment_spec_hash(
             raw["profile"],

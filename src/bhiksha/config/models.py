@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any, ClassVar, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
@@ -11,6 +12,12 @@ from bhiksha.strategy.capabilities import supports_native_algorithmic_exit
 from bhiksha.time_utils import normalize_time_text, parse_time_text
 
 RangeValueT = TypeVar("RangeValueT", int, float)
+
+INCREMENT_2_CANARY_DEPLOYMENT_ID = (
+    "strategy_market_impulse_all_basket_discovery_iwm_long_live_row_3"
+)
+INCREMENT_2_CANARY_SYMBOL = "IWM"
+INCREMENT_2_CANARY_ROLLBACK_ACTION = "disable_canary_restore_control"
 
 
 def _parse_compact_range(
@@ -320,6 +327,7 @@ class RiskSpec(BaseModel):
     max_open_positions_per_symbol: int | None = None
     max_open_positions_per_deployment: int | None = None
     max_trade_premium_usd: float | None = None
+    max_contracts: int | None = Field(default=None, ge=1)
     hard_flat_time_et: str | None = None
     stop_loss_pct: float = 0.45
 
@@ -399,6 +407,27 @@ class ExitSpec(BaseModel):
     risk_envelope_curvature: float | None = None
     risk_envelope_floor_at_t1_r: float | None = None
     risk_envelope_ratchet_step_r: float | None = None
+    # Mathematical candidate configuration is not live authority.  Increment
+    # 2 uses this separate, default-off switch for one bounded treatment.
+    risk_envelope_live_mode: Literal["off", "canary"] = "off"
+    risk_envelope_live_candidate_id: str | None = None
+    risk_envelope_live_candidate_overlay_hash: str | None = None
+    risk_envelope_live_authorization_id: str | None = None
+    risk_envelope_live_start_at: datetime | None = None
+    risk_envelope_live_expires_at: datetime | None = None
+    risk_envelope_live_authorized_deployment_id: str | None = None
+    risk_envelope_live_authorized_symbol: str | None = None
+    risk_envelope_live_authorized_active_plan_id: str | None = None
+    risk_envelope_live_rollback_action: Literal[
+        "disable_canary_restore_control"
+    ] | None = None
+    risk_envelope_live_max_premium_cap_fraction: float | None = Field(
+        default=None, gt=0.0, le=0.20
+    )
+    risk_envelope_live_max_quote_age_ms: int = Field(default=2_000, ge=0)
+    risk_envelope_live_max_spread_pct: float = Field(
+        default=0.15, ge=0.0, le=1.0
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -465,6 +494,88 @@ class ExitSpec(BaseModel):
             raise ValueError(
                 "disabled risk envelope cannot carry envelope parameter values"
             )
+        if self.risk_envelope_live_mode == "off":
+            if (
+                self.risk_envelope_live_candidate_id is not None
+                or self.risk_envelope_live_candidate_overlay_hash is not None
+                or self.risk_envelope_live_authorization_id is not None
+                or self.risk_envelope_live_start_at is not None
+                or self.risk_envelope_live_expires_at is not None
+                or self.risk_envelope_live_authorized_deployment_id is not None
+                or self.risk_envelope_live_authorized_symbol is not None
+                or self.risk_envelope_live_authorized_active_plan_id is not None
+                or self.risk_envelope_live_rollback_action is not None
+                or self.risk_envelope_live_max_premium_cap_fraction is not None
+            ):
+                raise ValueError(
+                    "off risk-envelope live mode cannot carry canary authority"
+                )
+        else:
+            if self.risk_envelope_live_candidate_id != "safety_stack":
+                raise ValueError(
+                    "Increment 2 canary may arm only the frozen safety_stack candidate"
+                )
+            from bhiksha.shared_kernel import ensure_kernel_on_path
+
+            ensure_kernel_on_path()
+            from mala_bhiksha_kernel import (  # noqa: PLC0415
+                load_protective_floor_conformance_vectors,
+            )
+
+            expected_overlay_hash = (
+                load_protective_floor_conformance_vectors()[
+                    "expected_candidate_overlay_hashes"
+                ]["safety_stack"]
+            )
+            if (
+                self.risk_envelope_live_candidate_overlay_hash
+                != expected_overlay_hash
+            ):
+                raise ValueError(
+                    "risk-envelope canary must bind the canonical "
+                    "safety_stack overlay hash"
+                )
+            if not str(self.risk_envelope_live_authorization_id or "").strip():
+                raise ValueError(
+                    "risk-envelope canary requires an explicit authorization id"
+                )
+            if (
+                self.risk_envelope_live_start_at is None
+                or self.risk_envelope_live_expires_at is None
+                or self.risk_envelope_live_start_at.tzinfo is None
+                or self.risk_envelope_live_expires_at.tzinfo is None
+                or self.risk_envelope_live_start_at
+                >= self.risk_envelope_live_expires_at
+            ):
+                raise ValueError(
+                    "risk-envelope canary requires an aware start_at before expires_at"
+                )
+            if (
+                self.risk_envelope_live_authorized_deployment_id
+                != INCREMENT_2_CANARY_DEPLOYMENT_ID
+                or str(self.risk_envelope_live_authorized_symbol or "").upper()
+                != INCREMENT_2_CANARY_SYMBOL
+            ):
+                raise ValueError(
+                    "Increment 2 canary authority is restricted to the exact IWM deployment"
+                )
+            if not str(
+                self.risk_envelope_live_authorized_active_plan_id or ""
+            ).strip():
+                raise ValueError(
+                    "risk-envelope canary requires an active-plan binding"
+                )
+            if (
+                self.risk_envelope_live_rollback_action
+                != INCREMENT_2_CANARY_ROLLBACK_ACTION
+            ):
+                raise ValueError(
+                    "risk-envelope canary requires the supported rollback action"
+                )
+            if self.risk_envelope_live_max_premium_cap_fraction != 0.20:
+                raise ValueError(
+                    "risk-envelope canary requires the exact 0.20 premium cap fraction"
+                )
         return self
 
 
@@ -499,6 +610,86 @@ class DeploymentManifest(BaseModel):
             exit_spec=self.exit,
             risk_spec=self.risk,
         )
+        if self.exit.risk_envelope_live_mode == "canary":
+            if (
+                self.deployment_id != INCREMENT_2_CANARY_DEPLOYMENT_ID
+                or self.symbol.upper() != INCREMENT_2_CANARY_SYMBOL
+                or self.exit.risk_envelope_live_authorized_deployment_id
+                != self.deployment_id
+                or str(
+                    self.exit.risk_envelope_live_authorized_symbol or ""
+                ).upper()
+                != self.symbol.upper()
+            ):
+                raise ValueError(
+                    "Increment 2 canary must bind the exact authorized IWM deployment"
+                )
+            if (
+                not self.exit.exit_policy_hash
+                or not self.exit.exit_policy_snapshot
+            ):
+                raise ValueError(
+                    "risk-envelope canary requires a frozen Bhiksha "
+                    "runtime/source policy hash"
+                )
+            if (
+                self.exit.profile_exit_id != "profile__trend_continuation"
+                or self.exit.target_1_r != 1.0
+                or self.exit.target_2_r != 2.0
+                or self.exit.target_1_quantity != 0.60
+                or self.exit.no_progress_seconds != 2_700
+                or self.exit.max_hold_seconds != 10_800
+                or self.exit.breakeven_after_t1 is not True
+                or self.exit.eod_flat is not True
+                or self.exit.exit_policy_snapshot.get("target_1_r") != 1.0
+                or self.exit.exit_policy_snapshot.get("target_2_r") != 2.0
+                or self.exit.exit_policy_snapshot.get("target_1_quantity")
+                != 0.60
+                or self.exit.exit_policy_snapshot.get("no_progress_seconds")
+                != 2_700
+                or self.exit.exit_policy_snapshot.get("max_hold_seconds")
+                != 10_800
+                or self.exit.exit_policy_snapshot.get("breakeven_after_t1")
+                is not True
+                or self.exit.exit_policy_snapshot.get("eod_flat") is not True
+            ):
+                raise ValueError(
+                    "risk-envelope canary requires the exact kernel "
+                    "TREND_CONTINUATION shared core"
+                )
+            if self.exit.profile_exit_drives_live is not True:
+                raise ValueError(
+                    "risk-envelope canary requires profile_exit_drives_live=true"
+                )
+            if self.execution.runtime_mode != "live_approval_gated":
+                raise ValueError(
+                    "risk-envelope canary requires runtime_mode=live_approval_gated"
+                )
+            if self.execution.shadow_only:
+                raise ValueError(
+                    "risk-envelope canary cannot run on a shadow-only deployment"
+                )
+            if self.execution.dte_fallback_policy != "strict":
+                raise ValueError(
+                    "risk-envelope canary requires strict DTE selection"
+                )
+            if self.execution.dte_min != 4 or self.execution.dte_max != 7:
+                raise ValueError(
+                    "risk-envelope canary requires configured dte_min=4,dte_max=7"
+                )
+            if self.risk.max_contracts != 1:
+                raise ValueError(
+                    "risk-envelope canary requires risk.max_contracts=1"
+                )
+            if self.risk.max_trade_premium_usd != 2_000.0:
+                raise ValueError(
+                    "risk-envelope canary requires base max_trade_premium_usd=2000"
+                )
+            if self.exit.stop_to_breakeven_after_r_multiple is not None:
+                raise ValueError(
+                    "risk-envelope canary requires the legacy "
+                    "stop_to_breakeven_after_r_multiple dial to be disabled"
+                )
         return self
 
 
@@ -508,10 +699,52 @@ class ActivePlan(BaseModel):
     active_plan_id: str
     trading_date: str | None = None
     generated_at: str | None = None
+    risk_envelope_authorization_fingerprint: str | None = None
     source: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     suppressed: list[dict[str, Any]] = Field(default_factory=list)
     deployments: list[DeploymentManifest] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_single_risk_envelope_canary(self) -> "ActivePlan":
+        from bhiksha.risk_envelope_authority import (
+            risk_envelope_authorization_fingerprint,
+        )
+
+        armed = [
+            deployment.deployment_id
+            for deployment in self.deployments
+            if deployment.enabled
+            and deployment.exit.risk_envelope_live_mode == "canary"
+        ]
+        if len(armed) > 1:
+            raise ValueError(
+                "active plan may arm at most one risk-envelope canary: "
+                + ", ".join(sorted(armed))
+            )
+        for deployment in self.deployments:
+            if (
+                deployment.enabled
+                and deployment.exit.risk_envelope_live_mode == "canary"
+                and deployment.exit.risk_envelope_live_authorized_active_plan_id
+                != self.active_plan_id
+            ):
+                raise ValueError(
+                    "risk-envelope canary authorization must bind this active_plan_id"
+                )
+        computed = risk_envelope_authorization_fingerprint(
+            active_plan_id=self.active_plan_id,
+            deployments=self.deployments,
+        )
+        if (
+            self.risk_envelope_authorization_fingerprint is not None
+            and self.risk_envelope_authorization_fingerprint != computed
+        ):
+            raise ValueError(
+                "risk-envelope authorization fingerprint does not match active plan"
+            )
+        self.risk_envelope_authorization_fingerprint = computed
+        return self
     # Carries the flat ``Operator_Defaults_v1`` "default"-section dict (see
     # ``load_operator_defaults_sheet_rows`` in ``bhiksha.active_plan.compiler``)
     # through into the compiled plan payload so the live runtime can read

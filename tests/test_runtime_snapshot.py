@@ -201,6 +201,7 @@ def test_runtime_startup_snapshot_includes_fingerprint_and_enabled_deployments()
 
     snapshot = runtime.startup_snapshot(live=False, max_bars=5)
 
+    json.dumps(snapshot)
     assert "config_fingerprint" in snapshot
     assert len(snapshot["config_fingerprint"]) == 16
     assert snapshot["session"] == {"live": False, "max_bars": 5}
@@ -616,6 +617,11 @@ def test_build_runtime_uses_active_plan_as_sole_authority(tmp_path: Path) -> Non
     assert runtime.deployment_selection["mode"] == "active_plan"
     assert runtime.active_plan is not None
     assert runtime.active_plan["active_plan_id"] == "active_plan_2026-04-01"
+    startup = runtime.startup_snapshot(live=False, max_bars=5)
+    assert startup["risk_envelope_authorization_fingerprint"] == (
+        runtime.active_plan["risk_envelope_authorization_fingerprint"]
+    )
+    json.dumps(startup)
 
 
 def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:

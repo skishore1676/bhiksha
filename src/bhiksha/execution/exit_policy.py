@@ -85,3 +85,48 @@ def evaluate_risk_envelope(
         (floor_at_t1_r - initial_floor_r) * (progress**curvature)
     )
     return float(min(floor_at_t1_r, max(initial_floor_r, candidate)))
+
+
+def compose_safety_stack_floor_r(
+    *,
+    confirmed_peak_r: float,
+    target_1_r: float,
+    existing_floor_r: float,
+    envelope_activation_r: float = 0.25,
+    envelope_curvature: float = 1.5,
+    envelope_initial_floor_r: float = -1.0,
+    envelope_floor_at_t1_r: float = 0.0,
+    giveback_arm_r: float = 0.75,
+    giveback_retrace_fraction: float = 0.60,
+) -> tuple[float, dict[str, float | None]]:
+    """Return the tightest non-loosening pre-T1 safety floor.
+
+    Increment 2's sole live candidate is ``safety_stack``: the current broker
+    stop, Envelope A, and the canonical 0.75R/60% giveback floor.  The maximum
+    is protective for a long-premium position.  This function is pure so the
+    same vectors can be shared by replay, runtime, and audit tests.
+    """
+
+    envelope_floor = evaluate_risk_envelope(
+        peak_r=confirmed_peak_r,
+        activation_r=envelope_activation_r,
+        target_1_r=target_1_r,
+        initial_floor_r=envelope_initial_floor_r,
+        floor_at_t1_r=envelope_floor_at_t1_r,
+        curvature=envelope_curvature,
+    )
+    giveback_floor = (
+        confirmed_peak_r * (1.0 - giveback_retrace_fraction)
+        if confirmed_peak_r >= giveback_arm_r
+        else None
+    )
+    candidates = [float(existing_floor_r), float(envelope_floor)]
+    if giveback_floor is not None:
+        candidates.append(float(giveback_floor))
+    return max(candidates), {
+        "existing_floor_r": float(existing_floor_r),
+        "envelope_floor_r": float(envelope_floor),
+        "giveback_floor_r": (
+            float(giveback_floor) if giveback_floor is not None else None
+        ),
+    }

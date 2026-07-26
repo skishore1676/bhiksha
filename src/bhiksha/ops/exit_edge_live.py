@@ -82,7 +82,7 @@ class ExitEdgeLiveRecorder:
         self._pending_censors: dict[str, str] = {}
         self._pending_registration_attempts: dict[str, dict[str, Any]] = {}
         self._health: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "enabled": True,
             "mode": "observational_shadow_only",
             "enforcement_authority": False,
@@ -90,6 +90,9 @@ class ExitEdgeLiveRecorder:
             "inference_eligible": False,
             "inference_blockers": ["guarded_repository_report_required"],
             "broker_calls_added": 0,
+            "post_exit_quote_continuation": (
+                "not_enabled_protection_priority_unproved"
+            ),
             "quote_source": QUOTE_SOURCE,
             "quote_feed": QUOTE_FEED,
             "observed_quote_timestamp_fields": {},
@@ -132,6 +135,7 @@ class ExitEdgeLiveRecorder:
         entry_timestamp: datetime | None,
         entry_premium: float | None,
         quantity: int | None,
+        entry_context: dict[str, Any] | None = None,
     ) -> bool:
         """Freeze actual entry identity and both policies without waiting on I/O."""
         try:
@@ -139,6 +143,7 @@ class ExitEdgeLiveRecorder:
                 deployment=deployment, trade_id=trade_id,
                 option_symbol=option_symbol, entry_timestamp=entry_timestamp,
                 entry_premium=entry_premium, quantity=quantity,
+                entry_context=entry_context,
             )
             self._increment_health("confirmed_fill_attempts")
             if payload is None:
@@ -486,6 +491,7 @@ class ExitEdgeLiveRecorder:
         entry_timestamp: datetime | None,
         entry_premium: float | None,
         quantity: int | None,
+        entry_context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         symbol = str(deployment.symbol).upper()
         profile_id = getattr(deployment.exit, "profile_exit_id", None)
@@ -605,6 +611,51 @@ class ExitEdgeLiveRecorder:
             "entry_timestamp": entry_at.isoformat(),
             "entry_premium": float(entry_premium),
             "quantity": int(quantity),
+            "cohort_dimensions": {
+                "selected_dte": (entry_context or {}).get("selected_dte"),
+                "selected_abs_delta": (entry_context or {}).get(
+                    "selected_abs_delta"
+                ),
+                "entry_spread_pct": (entry_context or {}).get(
+                    "selected_spread_pct"
+                ),
+                "dte_fallback_policy": (entry_context or {}).get(
+                    "dte_fallback_policy"
+                )
+                or getattr(
+                    getattr(deployment, "execution", None),
+                    "dte_fallback_policy",
+                    None,
+                ),
+                "configured_dte_min": getattr(
+                    getattr(deployment, "execution", None), "dte_min", None
+                ),
+                "configured_dte_max": getattr(
+                    getattr(deployment, "execution", None), "dte_max", None
+                ),
+                "strategy_policy_hash": str(control_policy_hash),
+                "runtime_mode": getattr(
+                    getattr(deployment, "execution", None),
+                    "runtime_mode",
+                    None,
+                ),
+                "authorization_mode": (
+                    "shadow"
+                    if bool(
+                        getattr(
+                            getattr(deployment, "execution", None),
+                            "shadow_only",
+                            False,
+                        )
+                    )
+                    else "live"
+                ),
+                "authorization_id": getattr(
+                    deployment.exit,
+                    "risk_envelope_live_authorization_id",
+                    None,
+                ),
+            },
             "profile": profile,
             "legacy": legacy,
             "experiment": experiment,

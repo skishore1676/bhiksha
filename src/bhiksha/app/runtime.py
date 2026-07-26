@@ -433,10 +433,22 @@ class BhikshaRuntime:
 
         try:
             try:
+                rollback_latches = []
+                for deployment in self.enabled_deployments:
+                    if deployment.exit.risk_envelope_live_mode != "canary":
+                        continue
+                    latch = (
+                        await exit_state_repository.get_risk_envelope_rollback(
+                            deployment.deployment_id
+                        )
+                    )
+                    if latch is not None:
+                        rollback_latches.append(latch)
                 receipt = write_session_manifest(
                     startup_snapshot,
                     output_dir=Path(self.app_config.playbook_artifacts_dir)
                     / "session_manifests",
+                    rollback_latches=rollback_latches,
                 )
                 output(
                     "SESSION_MANIFEST "
@@ -674,12 +686,19 @@ class BhikshaRuntime:
             self.stop()
 
     def startup_snapshot(self, *, live: bool, max_bars: int | None) -> dict:
+        from bhiksha.risk_envelope_authority import (
+            risk_envelope_authorization_fingerprint,
+        )
+
         warmup_by_symbol = effective_warmup_trading_days_by_symbol(self.app_config, self.enabled_deployments)
         warmup_by_deployment = effective_warmup_trading_days_by_deployment(self.app_config, self.enabled_deployments)
         payload = {
-            "app": self.app_config.model_dump(),
-            "providers": self.provider_config.model_dump(),
-            "deployments": [deployment.model_dump() for deployment in self.enabled_deployments],
+            "app": self.app_config.model_dump(mode="json"),
+            "providers": self.provider_config.model_dump(mode="json"),
+            "deployments": [
+                deployment.model_dump(mode="json")
+                for deployment in self.enabled_deployments
+            ],
             "effective_exit_policies": effective_exit_policy_records(
                 self.enabled_deployments
             ),
@@ -707,7 +726,10 @@ class BhikshaRuntime:
                 }
                 for entry in self.strategy_catalog
             ],
-            "bias_inputs": [selection.model_dump() for selection in self.bias_inputs],
+            "bias_inputs": [
+                selection.model_dump(mode="json")
+                for selection in self.bias_inputs
+            ],
             "emergency_controls": {
                 "halt_and_flatten": self.halt_and_flatten,
                 "risk_manager_flatten": self.risk_manager_flatten,
@@ -717,6 +739,16 @@ class BhikshaRuntime:
                 "max_bars": max_bars,
             },
         }
+        active_plan_id = (
+            (self.deployment_selection or {}).get("active_plan_id")
+            or (self.active_plan or {}).get("active_plan_id")
+        )
+        payload["risk_envelope_authorization_fingerprint"] = (
+            risk_envelope_authorization_fingerprint(
+                active_plan_id=active_plan_id,
+                deployments=self.enabled_deployments,
+            )
+        )
         payload["config_fingerprint"] = hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]

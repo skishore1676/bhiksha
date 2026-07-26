@@ -1,5 +1,9 @@
 # Exit Engine V2 Increment 1 — Bhiksha Implementation
 
+> Superseded for current stage operations by
+> `docs/EXIT_ENGINE_V2_INCREMENT_2.md`. This file remains the Increment 1
+> deployment record.
+
 The cross-repository product contract is owned by TradeLab:
 `docs/EXIT_ENGINE_V2_INCREMENT_1.md` in the sibling `tradelab` repository. This
 document records only Bhiksha's implementation and operating boundary.
@@ -27,9 +31,10 @@ document records only Bhiksha's implementation and operating boundary.
   historical peak and never substitutes the current session policy.
 - The generated session manifest is a review receipt, not a second source of
   configuration.
-- Exit Edge Lab owns Control/Variant A/Variant B counterfactual evidence in its
-  separate sidecar store. A candidate floor advances only after the configured
-  `risk_envelope_ratchet_step_r` is crossed.
+- Exit Edge Lab initially owned Control/Variant A/Variant B counterfactual
+  evidence in its separate sidecar store. Increment 2 expands new cohorts to a
+  fixed six-arm registry while retaining replay compatibility for these v1
+  three-arm rows.
 
 Canonical identity excludes the friendly giveback label and
 `source_config_id`; both remain in the frozen snapshot for audit/provenance.

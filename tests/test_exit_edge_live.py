@@ -12,7 +12,10 @@ from bhiksha.config.loader import load_app_config
 from bhiksha.execution.order_manager import OrderManager
 from bhiksha.execution.supervisor import _confirmed_entry_fill_facts
 from bhiksha.ops import exit_edge_live
-from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository
+from bhiksha.ops.exit_edge_lab import (
+    ProspectiveQuoteTapeRepository,
+    SHADOW_CANDIDATE_IDS,
+)
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
 from bhiksha.execution.exit_policy import canonical_policy_hash
 
@@ -40,8 +43,8 @@ def _deployment():
         "target_1_quantity": 0.6,
         "initial_stop_pct": 0.35,
         "premium_disaster_stop_pct": 0.45,
-        "no_progress_seconds": None,
-        "max_hold_seconds": None,
+        "no_progress_seconds": 2700,
+        "max_hold_seconds": 10800,
         "high_water_giveback_policy": "OFF",
         "giveback_arm_r": None,
         "giveback_retrace_fraction": None,
@@ -69,8 +72,8 @@ def _deployment():
             profit_target_multiple=1.0,
             option_profit_target_pct=None,
             use_profit_target=True,
-            no_progress_seconds=None,
-            max_hold_seconds=None,
+            no_progress_seconds=2700,
+            max_hold_seconds=10800,
             high_water_giveback_policy="OFF",
             breakeven_after_t1=True,
             eod_flat=True,
@@ -138,9 +141,9 @@ def test_live_recorder_pairs_from_reused_quotes_and_stops_observing(tmp_path: Pa
     assert case.persisted_censor_reason is None
     assert case.legacy_config["comparator_version"] == "bhiksha-native-premium-stop-full-target-eod-v1"
     states = repository.load_shadow_envelope_states("T1")
-    assert {state.candidate_id for state in states} == {
-        "variant_a", "variant_b"
-    }
+    assert {state.candidate_id for state in states} == (
+        set(SHADOW_CANDIDATE_IDS) - {"control"}
+    )
 
 
 def test_full_queue_and_slow_storage_never_block_quote_observer(tmp_path: Path) -> None:

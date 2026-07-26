@@ -256,9 +256,30 @@ class ExecutionPlanner:
                 },
             )
 
-        max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
+        base_max_trade_premium = (
+            deployment.risk.max_trade_premium_usd or 300.0
+        )
+        max_trade_premium = base_max_trade_premium
+        cap_fraction: float | None = None
+        if deployment.exit.risk_envelope_live_mode == "canary":
+            configured_cap_fraction = (
+                deployment.exit.risk_envelope_live_max_premium_cap_fraction
+            )
+            if configured_cap_fraction is None:
+                raise ValueError(
+                    "armed risk-envelope canary is missing its premium cap"
+                )
+            cap_fraction = float(configured_cap_fraction)
+            max_trade_premium = base_max_trade_premium * cap_fraction
+        premium_cap_receipt = {
+            "base_max_trade_premium_usd": base_max_trade_premium,
+            "risk_envelope_cap_fraction": cap_fraction,
+            "effective_max_trade_premium_usd": max_trade_premium,
+        }
         min_contract_cost = entry_price * 100
         quantity = int(max_trade_premium // (entry_price * 100))
+        if deployment.risk.max_contracts is not None:
+            quantity = min(quantity, int(deployment.risk.max_contracts))
         if quantity <= 0:
             return TradePlan(
                 trade_id=trade_id,
@@ -279,6 +300,7 @@ class ExecutionPlanner:
                     "entry_price": entry_price,
                     "min_contract_cost": min_contract_cost,
                     "entry_pricing": pricing_evidence,
+                    **premium_cap_receipt,
                     **selection_details,
                 },
             )
@@ -314,7 +336,11 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence, **selection_details},
+                risk_details={
+                    "entry_pricing": pricing_evidence,
+                    **premium_cap_receipt,
+                    **selection_details,
+                },
             )
 
         if dry_run:
@@ -332,7 +358,11 @@ class ExecutionPlanner:
                     order_id=None,
                     underlying_entry_price=underlying_entry_price,
                     entry_timestamp=decision.timestamp,
-                    risk_details={"entry_pricing": pricing_evidence, **selection_details},
+                    risk_details={
+                        "entry_pricing": pricing_evidence,
+                        **premium_cap_receipt,
+                        **selection_details,
+                    },
                 )
             self.position_tracker.open_position(
                 deployment.symbol,
@@ -358,7 +388,11 @@ class ExecutionPlanner:
                 order_id="DRY_RUN",
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence, **selection_details},
+                risk_details={
+                    "entry_pricing": pricing_evidence,
+                    **premium_cap_receipt,
+                    **selection_details,
+                },
             )
 
         try:
@@ -377,7 +411,11 @@ class ExecutionPlanner:
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
-                risk_details={"entry_pricing": pricing_evidence, **selection_details},
+                risk_details={
+                    "entry_pricing": pricing_evidence,
+                    **premium_cap_receipt,
+                    **selection_details,
+                },
             )
 
         final_limit_price = float(preflight.payload["limitPrice"])
@@ -429,6 +467,7 @@ class ExecutionPlanner:
                         "buying_power_requirement": preflight.buying_power_requirement,
                         "estimated_cost": preflight.estimated_cost,
                         "entry_pricing": pricing_evidence,
+                        **premium_cap_receipt,
                         **selection_details,
                         **sized_risk_details,
                     },
@@ -462,6 +501,7 @@ class ExecutionPlanner:
                         "buying_power_requirement": preflight.buying_power_requirement,
                         "estimated_cost": preflight.estimated_cost,
                         "entry_pricing": pricing_evidence,
+                        **premium_cap_receipt,
                         **selection_details,
                         **sized_risk_details,
                         **cash_guard_details,
@@ -514,6 +554,7 @@ class ExecutionPlanner:
                 "buying_power_requirement": preflight.buying_power_requirement,
                 "estimated_cost": preflight.estimated_cost,
                 "entry_pricing": pricing_evidence,
+                **premium_cap_receipt,
                 **selection_details,
                 **sized_risk_details,
                 **cash_guard_details,
@@ -593,9 +634,19 @@ def _risk_profile_for_deployment(
 
 
 def _selection_details(selection) -> dict:
+    selected_spread_pct = None
+    if selection.bid is not None and selection.ask is not None:
+        mid = (float(selection.bid) + float(selection.ask)) / 2
+        if mid > 0:
+            selected_spread_pct = abs(float(selection.ask) - float(selection.bid)) / mid
     details = {
         "selected_open_interest": selection.open_interest,
         "open_interest_percentile": selection.open_interest_percentile,
+        "selected_dte": selection.dte,
+        "selected_abs_delta": selection.abs_delta,
+        "selected_bid": selection.bid,
+        "selected_ask": selection.ask,
+        "selected_spread_pct": selected_spread_pct,
     }
     if selection.dte_fallback_policy is not None:
         details.update(
@@ -603,7 +654,6 @@ def _selection_details(selection) -> dict:
                 "dte_fallback_policy": selection.dte_fallback_policy,
                 "requested_dte_min": selection.requested_dte_min,
                 "requested_dte_max": selection.requested_dte_max,
-                "selected_dte": selection.dte,
             }
         )
     return details

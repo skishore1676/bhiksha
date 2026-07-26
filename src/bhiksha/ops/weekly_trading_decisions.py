@@ -28,6 +28,12 @@ from bhiksha.ops.weekly_scorecard import (
     _load_window_trades,
     build_weekly_scorecard,
 )
+from bhiksha.risk_envelope_authority import (
+    risk_envelope_authorization_fingerprint,
+)
+from bhiksha.persistence.exit_state import (
+    inspect_risk_envelope_rollback_latches,
+)
 
 if TYPE_CHECKING:
     from bhiksha.config.models import DeploymentManifest
@@ -75,13 +81,91 @@ def write_weekly_trading_decisions(
         through=end,
         deployments=deployments,
     )
-    live_envelope_enabled_count = sum(
-        bool(
-            (
-                getattr(deployment.exit, "exit_policy_snapshot", None) or {}
-            ).get("risk_envelope_enabled")
-        )
+    authorized_canaries = [
+        {
+            "deployment_id": deployment.deployment_id,
+            "candidate_id": deployment.exit.risk_envelope_live_candidate_id,
+            "candidate_overlay_hash": (
+                deployment.exit.risk_envelope_live_candidate_overlay_hash
+            ),
+            "runtime_source_policy_hash": deployment.exit.exit_policy_hash,
+            "authorization_id": (
+                deployment.exit.risk_envelope_live_authorization_id
+            ),
+            "start_at": (
+                deployment.exit.risk_envelope_live_start_at.isoformat()
+                if deployment.exit.risk_envelope_live_start_at
+                else None
+            ),
+            "expires_at": (
+                deployment.exit.risk_envelope_live_expires_at.isoformat()
+                if deployment.exit.risk_envelope_live_expires_at
+                else None
+            ),
+            "authorized_deployment_id": (
+                deployment.exit.risk_envelope_live_authorized_deployment_id
+            ),
+            "authorized_symbol": (
+                deployment.exit.risk_envelope_live_authorized_symbol
+            ),
+            "authorized_active_plan_id": (
+                deployment.exit.risk_envelope_live_authorized_active_plan_id
+            ),
+            "rollback_action": (
+                deployment.exit.risk_envelope_live_rollback_action
+            ),
+            "max_premium_cap_fraction": (
+                deployment.exit.risk_envelope_live_max_premium_cap_fraction
+            ),
+            "base_max_trade_premium_usd": (
+                deployment.risk.max_trade_premium_usd
+            ),
+            "effective_max_trade_premium_usd": (
+                float(deployment.risk.max_trade_premium_usd or 0)
+                * float(
+                    deployment.exit.risk_envelope_live_max_premium_cap_fraction
+                    or 0
+                )
+            ),
+            "symbol": deployment.symbol,
+            "runtime_mode": deployment.execution.runtime_mode,
+            "dte_min": deployment.execution.dte_min,
+            "dte_max": deployment.execution.dte_max,
+            "dte_fallback_policy": deployment.execution.dte_fallback_policy,
+            "max_contracts": deployment.risk.max_contracts,
+        }
         for deployment in (deployments or [])
+        if deployment.enabled
+        and deployment.exit.risk_envelope_live_mode == "canary"
+    ]
+    if authorized_canaries:
+        active_plan_ids = {
+            str(item["authorized_active_plan_id"])
+            for item in authorized_canaries
+            if item.get("authorized_active_plan_id")
+        }
+        active_plan_id = (
+            next(iter(active_plan_ids))
+            if len(active_plan_ids) == 1
+            else None
+        )
+        authorization_fingerprint = (
+            risk_envelope_authorization_fingerprint(
+                active_plan_id=active_plan_id,
+                deployments=deployments or [],
+            )
+        )
+        for canary in authorized_canaries:
+            canary["startup_authorization_fingerprint"] = (
+                authorization_fingerprint
+            )
+    live_envelope_enabled_count = len(authorized_canaries)
+    rollback_latches = inspect_risk_envelope_rollback_latches(
+        db_path,
+        deployment_ids={
+            str(item["deployment_id"])
+            for item in authorized_canaries
+        },
     )
     exit_edge = write_exit_edge_weekly_evidence(
         db_path=exit_edge_db_path,
@@ -91,6 +175,8 @@ def write_weekly_trading_decisions(
         week_end=end,
         collector_configured=exit_edge_collector_configured,
         live_envelope_enabled_count=live_envelope_enabled_count,
+        authorized_canaries=authorized_canaries,
+        rollback_latches=rollback_latches,
     )
     stable_id = f"bhiksha-weekly-trading-decisions:{end.isoformat()}"
     facts_path = target / f"trading_decision_facts_{end.isoformat()}.json"
@@ -237,8 +323,11 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
     exit_edge = report.get("exit_edge") or {}
     edge_verdict = (exit_edge.get("verdict") or {}).get("status", "unavailable")
     edge_paired_raw = (exit_edge.get("cumulative") or {}).get("paired_count")
+    edge_source_error = (exit_edge.get("collection") or {}).get("source_error")
     edge_paired = (
-        "Unavailable" if edge_paired_raw is None else str(int(edge_paired_raw))
+        "Unavailable"
+        if edge_source_error or edge_paired_raw is None
+        else str(int(edge_paired_raw))
     )
     lines = [
         f"# Weekly Trading Decisions — Performance, Promotions & Fixes — {report.get('week_end')}",

@@ -81,13 +81,35 @@ scripts/launchd/run_bhiksha_job.sh weekly-trading-decisions --weekly-review-mode
 
 The weekly decision job writes normalized facts, a content-digested weekly
 packet, governance evidence, and
-`exit_edge_weekly_evidence_<week-end>.json`, then refreshes the canonical Excel
+`exit_policy_weekly_evidence_<week-end>.json`, then refreshes the canonical Excel
 ledger. The Exit Edge receipt is valid even when its maturity verdict is
 not-collecting, stale, or inference-blocked; those states remain unavailable
 evidence rather than zero edge. TradeLab independently validates both receipts
 before publishing its one stable week-keyed executive brief. The Bhiksha job
 never sends Telegram. A failed workbook refresh prevents downstream publication
 so stale or altered math is not presented as current.
+
+The Exit Edge receipt now uses
+`trading.exit_policy_weekly_evidence.v2`. It includes the six-arm shadow universe,
+W1/W2/W3 mature-cohort counters, and any exact authorized Safety Stack canary
+manifest. A live-capable mathematical candidate is not counted as an armed
+canary. Missing canary manifest proof is `safety_blocked`; immature cohorts are
+`insufficient_evidence`. Expired and not-yet-valid authority is disarmed, never
+reported as armed. Week 3 economics additionally requires complete terminal,
+post-exit, uncensored evidence across all six candidates; elapsed age alone is
+not enough.
+
+Inspect a durable Dynamic Risk Envelope rollback latch without mutating it:
+
+```bash
+python -m bhiksha.tools.risk_envelope_rollback_status --db bhiksha.db
+```
+
+When present, session and weekly receipts say
+`disarmed_rollback_latched` with reason and timestamp. Restarting Bhiksha or
+editing an authorization window does not clear it. Reset/re-arm requires a
+separate, explicitly approved post-flat admin change and a fresh active-plan
+authorization; no automatic reset exists.
 
 Use `--force` to bypass the trading-day skip during testing:
 

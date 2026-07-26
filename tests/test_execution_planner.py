@@ -779,10 +779,18 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
         "reason": "insufficient_budget",
         "max_premium": 300.0,
         "entry_price": 9.1,
-        "min_contract_cost": 910.0,
+            "min_contract_cost": 910.0,
+            "base_max_trade_premium_usd": 300.0,
+            "risk_envelope_cap_fraction": None,
+            "effective_max_trade_premium_usd": 300.0,
         "entry_pricing": plan.risk_details["entry_pricing"],
         "selected_open_interest": 500,
         "open_interest_percentile": 1.0,
+        "selected_dte": 0,
+        "selected_abs_delta": 0.31,
+        "selected_bid": 3.0,
+        "selected_ask": 2.9,
+        "selected_spread_pct": pytest.approx(0.03389830508474579),
     }
     assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 9.1
 
@@ -816,7 +824,10 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
     assert plan.risk_details == {
         "required_cash": 290.04,
         "buying_power_requirement": 290.04,
-        "estimated_cost": 289.98,
+            "estimated_cost": 289.98,
+            "base_max_trade_premium_usd": 300.0,
+            "risk_envelope_cap_fraction": None,
+            "effective_max_trade_premium_usd": 300.0,
         "entry_pricing": plan.risk_details["entry_pricing"],
         "remaining_budget": 142.5,
         "usable_budget": 142.5,
@@ -826,6 +837,11 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
         "cash_guard_mode": "on",
         "selected_open_interest": 500,
         "open_interest_percentile": 1.0,
+        "selected_dte": 0,
+        "selected_abs_delta": 0.31,
+        "selected_bid": 3.0,
+        "selected_ask": 2.9,
+        "selected_spread_pct": pytest.approx(0.03389830508474579),
     }
     assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.85
     assert order_manager.place_entry_order_calls == 0
@@ -980,6 +996,75 @@ def test_execution_planner_snapshot_repository_failure_does_not_mask_selector_em
 
     with pytest.raises(SelectorEmptyError):
         asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
+
+
+def test_execution_planner_applies_manifest_contract_cap() -> None:
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "risk": base.risk.model_copy(
+                update={"max_trade_premium_usd": 1_000.0, "max_contracts": 1}
+            )
+        }
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=0,
+            delta=-0.31,
+        ),
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+
+    plan = asyncio.run(
+        planner.plan_entry(
+            deployment, _short_decision(deployment), dry_run=True
+        )
+    )
+
+    assert plan is not None
+    assert plan.quantity == 1
+
+
+def test_execution_planner_receipts_exact_2000_times_point20_canary_cap() -> None:
+    base = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = base.model_copy(
+        update={
+            "risk": base.risk.model_copy(
+                update={"max_trade_premium_usd": 2_000.0, "max_contracts": 1}
+            ),
+            "exit": base.exit.model_copy(
+                update={
+                    "risk_envelope_live_mode": "canary",
+                    "risk_envelope_live_max_premium_cap_fraction": 0.20,
+                }
+            ),
+        }
+    )
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=5,
+            delta=-0.31,
+        ),
+        order_manager=StubOrderManager(),
+        position_tracker=PositionTracker(),
+    )
+
+    plan = asyncio.run(
+        planner.plan_entry(
+            deployment, _short_decision(deployment), dry_run=True
+        )
+    )
+
+    assert plan is not None
+    assert plan.quantity == 1
+    assert plan.risk_details["base_max_trade_premium_usd"] == 2_000.0
+    assert plan.risk_details["risk_envelope_cap_fraction"] == 0.20
+    assert plan.risk_details["effective_max_trade_premium_usd"] == 400.0
 
 
 def _low_oi_get_chain(chain_service: StubChainService):

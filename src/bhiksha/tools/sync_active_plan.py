@@ -45,7 +45,12 @@ _LANE_CONFIG_FIELDS: tuple[tuple[str, str], ...] = (
     ("exit", "use_profit_target"),
     ("exit", "hard_flat_time_et"),
     ("risk", "max_trade_premium_usd"),
+    ("risk", "max_contracts"),
     ("execution", "shadow_only"),
+    ("execution", "runtime_mode"),
+    ("execution", "dte_min"),
+    ("execution", "dte_max"),
+    ("execution", "dte_fallback_policy"),
     ("execution", "entry_execution_profile"),
     ("execution", "min_open_interest"),
     ("execution", "max_bid_ask_spread_pct"),
@@ -56,6 +61,19 @@ _LANE_CONFIG_FIELDS: tuple[tuple[str, str], ...] = (
     ("execution", "entry_reprice_cancel_after_seconds"),
     ("execution", "entry_reprice_spread_fractions"),
     ("execution", "entry_reprice_max_chase_pct"),
+    ("exit", "risk_envelope_live_mode"),
+    ("exit", "risk_envelope_live_candidate_id"),
+    ("exit", "risk_envelope_live_candidate_overlay_hash"),
+    ("exit", "risk_envelope_live_authorization_id"),
+    ("exit", "risk_envelope_live_start_at"),
+    ("exit", "risk_envelope_live_expires_at"),
+    ("exit", "risk_envelope_live_authorized_deployment_id"),
+    ("exit", "risk_envelope_live_authorized_symbol"),
+    ("exit", "risk_envelope_live_authorized_active_plan_id"),
+    ("exit", "risk_envelope_live_rollback_action"),
+    ("exit", "risk_envelope_live_max_premium_cap_fraction"),
+    ("exit", "risk_envelope_live_max_quote_age_ms"),
+    ("exit", "risk_envelope_live_max_spread_pct"),
 )
 
 
@@ -233,6 +251,14 @@ def main(argv: list[str] | None = None) -> int:
                     f" profit_target_pct={lane.get('option_profit_target_pct')}"
                     f" use_profit_target={lane.get('use_profit_target')}"
                     f" max_trade_premium_usd={lane.get('max_trade_premium_usd')}"
+                    f" max_contracts={lane.get('max_contracts')}"
+                    f" dte={lane.get('dte_min')}-{lane.get('dte_max')}"
+                    f" dte_fallback={lane.get('dte_fallback_policy')}"
+                    f" risk_envelope_mode={lane.get('risk_envelope_live_mode')}"
+                    f" risk_envelope_auth={lane.get('risk_envelope_live_authorization_id')}"
+                    f" risk_envelope_start={lane.get('risk_envelope_live_start_at')}"
+                    f" risk_envelope_expires={lane.get('risk_envelope_live_expires_at')}"
+                    f" risk_envelope_rollback={lane.get('risk_envelope_live_rollback_action')}"
                     f" min_open_interest={lane.get('min_open_interest')}"
                     f" max_spread_pct={lane.get('max_bid_ask_spread_pct')}"
                     f" entry_profile={lane.get('entry_execution_profile')}"
