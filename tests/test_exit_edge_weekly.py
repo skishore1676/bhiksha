@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import UTC, date, datetime
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 from bhiksha.ops.exit_edge_lab import (
@@ -412,16 +413,24 @@ def test_rollback_latch_overrides_valid_canary_arming_and_validates(
 
 
 def _current_tradelab_validator():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "tradelab"
-        / "scripts"
-        / "review"
-        / "trading_governance_review.py"
-    )
-    if not path.is_file():
+    repo = Path(__file__).resolve().parents[1]
+    roots = [
+        Path(os.environ["TRADELAB_REPO"])
+        if os.environ.get("TRADELAB_REPO")
+        else None,
+        repo.parent / "tradelab",
+        Path.home() / "code" / "tradelab",
+    ]
+    paths = [
+        root / "scripts" / "review" / "trading_governance_review.py"
+        for root in roots
+        if root is not None
+    ]
+    path = next((candidate for candidate in paths if candidate.is_file()), None)
+    if path is None:
         raise AssertionError(
-            f"current sister-repo TradeLab validator not found: {path}"
+            "current sister-repo TradeLab validator not found; "
+            "set TRADELAB_REPO"
         )
     spec = importlib.util.spec_from_file_location(
         "current_tradelab_governance_review",
