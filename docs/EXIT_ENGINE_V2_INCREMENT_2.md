@@ -219,11 +219,47 @@ The precise broker fill remains the durable economic seed; it is not rewritten
 to the rounded ledger value. The separate stale-ladder backstop retains its
 existing greater-than-10% rule.
 
-Source validation: the complete Bhiksha suite passes (`1082 passed`). The first
-adversarial design review rejected a broad 10%/`$0.25` tolerance because it
-could revive a stale low-premium post-partial ladder; the corrected half-cent
-rule passed the original exploit replay and an independent delta audit.
-Deployment status: pending the normal post-flat oldmac release boundary.
+The money-path repair is commit
+`78725a6f87fae660e51f7d8703940b27f57ce4f4`. During the required after-hours
+oldmac suite, one pre-existing shadow-recovery test proved wall-clock
+dependent: its four-day-old synthetic position reached the real end-of-day
+flat gate. Commit `cdfc105fc0f3655c759bd1adddd406c2ae75c359` changes only
+that test setup to disable EOD flat and use a current synthetic entry; it does
+not change runtime code.
+
+Release validation is complete:
+
+- local source, `origin/main`, and oldmac first converged on `cdfc105`; both
+  local and oldmac complete suites passed (`1082 passed`);
+- the first adversarial design review rejected a broad 10%/`$0.25` tolerance
+  because it could revive a stale low-premium post-partial ladder; the
+  corrected half-cent rule passed the original exploit replay, an independent
+  delta audit, and the exhaustive nearest-cent grid;
+- the 2026-07-28 post-15:00 CT gate proved a clean oldmac checkout, a stopped
+  process, zero Public positions, zero non-closed database trades, and zero
+  rollback latches before deployment;
+- the bounded after-hours restart started PID `38892` at
+  `2026-07-28T20:29:17.403490+00:00` while every live lane was
+  `time_window_blocked`;
+- fresh manifest
+  `artifacts/playbook/session_manifests/session_manifest_2026-07-28_c61405d3e2a75974.json`
+  binds code commit `cdfc105`, clean source, config digest
+  `c61405d3e2a75974`, active plan
+  `active_plan_2026-07-27_exit_engine_v2_iwm_canary`, and exactly one armed
+  `IWM` `safety_stack` canary with matching authorization fingerprint
+  `dd4f0a1454d91605d9390ff8dfb13d2733032861182272ea3cf7975a00ed3f84`;
+- only startup and runtime-metric events were written after the deployment
+  baseline; there were zero submission, fill, exit-action, partial-scale,
+  stop-ratchet, or order-placement effects; and
+- the bounded process was then stopped. Final readback again proved no
+  Bhiksha process, zero Public positions, zero non-closed trades, zero rollback
+  latches, and both launchd jobs not running with the exact active-plan id and
+  `BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=true`.
+
+This is deployment and stop/start robustness proof, not a manufactured strategy
+observation. The 2026-07-28 IWM trade remains infrastructure-invalid and
+censored; the next natural eligible trade is the first clean post-repair
+strategy sample.
 
 ## Next-agent checklist
 
