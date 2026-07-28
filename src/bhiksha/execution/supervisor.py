@@ -28,6 +28,7 @@ from bhiksha.domain.exit_state import (
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
+from bhiksha.execution.quote_lineage import proved_quote_timestamp_lineage
 from bhiksha.execution.brokers.public.order_status import (
     PUBLIC_DEAD_ORDER_STATUSES,
     PUBLIC_WORKING_ORDER_STATUSES,
@@ -454,6 +455,17 @@ class ExecutionSupervisor:
 
         trade_id = position.trade_id
         current_fields = ProfileExitFields.from_exit_spec(deployment.exit)
+        if position.source in NON_LIVE_POSITION_SOURCES:
+            if trade_id is not None:
+                self._profile_exit_degraded_trades.discard(trade_id)
+                self._profile_exit_recovery_events.discard(trade_id)
+            return (
+                current_fields,
+                self.get_or_create_profile_exit_state(
+                    position,
+                    entry_premium=position.entry_price or 0.0,
+                ),
+            )
         if trade_id is None or isinstance(
             self.exit_state_repository, NullExitStateRepository
         ):
@@ -2912,8 +2924,10 @@ class ExecutionSupervisor:
         # confirmed. Hydrate that authority before any restore/replace/target
         # logic can consult the current session's deployment.
         frozen_snapshot = None
+        broker_protected_position = updated.source not in NON_LIVE_POSITION_SOURCES
         if (
-            updated.trade_id is not None
+            broker_protected_position
+            and updated.trade_id is not None
             and not isinstance(self.exit_state_repository, NullExitStateRepository)
         ):
             frozen_snapshot = self._frozen_exit_policies.get(updated.trade_id)
@@ -2927,7 +2941,8 @@ class ExecutionSupervisor:
                 if frozen_snapshot is not None:
                     self._frozen_exit_policies[updated.trade_id] = frozen_snapshot
         if (
-            updated.trade_id is not None
+            broker_protected_position
+            and updated.trade_id is not None
             and not isinstance(self.exit_state_repository, NullExitStateRepository)
             and (
                 self._deployment_carries_exit_profile(deployment)
@@ -3512,7 +3527,8 @@ class ExecutionSupervisor:
             # shipped) the gate is always shut, so this guard never fires and native
             # exit authority is unchanged.
             if (
-                position.trade_id is not None
+                position.source not in NON_LIVE_POSITION_SOURCES
+                and position.trade_id is not None
                 and position.trade_id in self._profile_exit_degraded_trades
             ):
                 durable = self._durable_exit_states.get(position.trade_id)
@@ -4716,10 +4732,21 @@ class ExecutionSupervisor:
             or durable.target_1_banked
         ):
             return position
-        quote_at = _maybe_datetime(getattr(quote, "quote_timestamp", None))
+        quote_lineage = proved_quote_timestamp_lineage(
+            quote,
+            observed_at=now,
+        )
+        quote_at = (
+            quote_lineage.quote_at if quote_lineage is not None else None
+        )
+        side_quote_ages_ms = (
+            quote_lineage.ages_ms(now)
+            if quote_lineage is not None
+            else None
+        )
         quote_age_ms = (
-            (now - quote_at.astimezone(UTC)).total_seconds() * 1000
-            if quote_at is not None
+            max(side_quote_ages_ms)
+            if side_quote_ages_ms is not None
             else None
         )
         bid = _maybe_float(getattr(quote, "bid", None))
@@ -4729,9 +4756,8 @@ class ExecutionSupervisor:
             normalize_option_symbol(str(getattr(quote, "symbol", "") or ""))
             != normalize_option_symbol(position.option_symbol)
             or
-            getattr(quote, "quote_timestamp_field", None) != "quoteTimestamp"
+            quote_lineage is None
             or quote_age_ms is None
-            or quote_age_ms < 0
             or quote_age_ms
             > deployment.exit.risk_envelope_live_max_quote_age_ms
             or bid is None

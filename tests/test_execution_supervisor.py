@@ -1892,6 +1892,9 @@ def test_execution_supervisor_records_shadow_exit_pnl(tmp_path) -> None:
         reason=["test_exit"],
         features={},
     )
+    # A stale in-process degraded marker from an older runtime must never turn
+    # a paper position into a blocked live-protection incident.
+    supervisor._profile_exit_degraded_trades.add("SHADOW1")
 
     plan = asyncio.run(supervisor.handle_exit(deployment, tracked_position, decision, dry_run=True))
 
@@ -1901,7 +1904,9 @@ def test_execution_supervisor_records_shadow_exit_pnl(tmp_path) -> None:
     assert recent[0].exit_price == 3.0
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
-    assert "shadow_exit_assumed" in [row[0] for row in rows]
+    event_types = [row[0] for row in rows]
+    assert "shadow_exit_assumed" in event_types
+    assert "native_exit_blocked_state_degraded" not in event_types
     shadow_exit_payload = next(json.loads(row[1]) for row in rows if row[0] == "shadow_exit_assumed")
     assert shadow_exit_payload["realized_pnl_usd"] == 100.0
 

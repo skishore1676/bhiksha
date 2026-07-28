@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 
@@ -427,6 +427,52 @@ def test_restart_missing_policy_snapshot_persists_state_degraded(tmp_path) -> No
             ).fetchone()[0]
         )
     assert event["state_version"] == recovered.state_version
+
+
+def test_shadow_position_never_enters_live_exit_state_recovery_or_protection(
+    tmp_path,
+) -> None:
+    exit_repo = SQLiteExitStateRepository(str(tmp_path / "exit.db"))
+    manager = _WorkingPartialOrderManager(
+        {"status": "NEW"},
+        status="NEW",
+    )
+    supervisor, live_position = _supervisor(tmp_path, manager, exit_repo)
+    shadow_position = replace(
+        live_position,
+        source="shadow",
+        order_id="SHADOW_ENTRY",
+        stop_order_id=None,
+        stop_price=None,
+    )
+
+    fields, state = asyncio.run(
+        supervisor._hydrate_frozen_profile_state(
+            _deployment(),
+            shadow_position,
+        )
+    )
+    managed = asyncio.run(
+        supervisor.manage_open_position(
+            _deployment(),
+            shadow_position,
+            dry_run=True,
+        )
+    )
+
+    assert fields.profile_id == "TEST"
+    assert state.seed_entry_premium == 3.0
+    assert managed is not None
+    assert manager.stop_placements == 0
+    assert "T1" not in supervisor._profile_exit_degraded_trades
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        event_types = {
+            row[0]
+            for row in conn.execute("SELECT event_type FROM events").fetchall()
+        }
+    assert "exit_state_recovery" not in event_types
+    assert "exit_state_degraded_protection" not in event_types
+    assert "native_exit_blocked_state_degraded" not in event_types
 
 
 def test_partial_fill_confirmation_waits_for_hydration_to_clear_degraded(
@@ -1134,6 +1180,85 @@ def test_live_safety_stack_ratchet_commits_only_after_working_stop_readback(
     assert durable.locked_floor_r is not None
     assert asyncio.run(exit_repo.get_open_action_intents("T1")) == []
     assert len(manager.placements) == 1
+
+
+def test_live_safety_stack_ratchet_accepts_proved_public_side_timestamps(
+    tmp_path,
+) -> None:
+    supervisor, position, deployment, _, exit_repo, manager = (
+        _ratchet_fixture(tmp_path, outcome="working")
+    )
+    now = datetime.now(UTC)
+    quote = PublicQuote(
+        symbol=OPTION,
+        bid=3.60,
+        ask=3.65,
+        last=3.62,
+        quote_timestamp=(now - timedelta(milliseconds=150)).isoformat(),
+        quote_timestamp_field="bidTimestamp+askTimestamp",
+        bid_timestamp=(now - timedelta(milliseconds=100)).isoformat(),
+        ask_timestamp=(now - timedelta(milliseconds=150)).isoformat(),
+        outcome="SUCCESS",
+    )
+
+    updated = asyncio.run(
+        supervisor._apply_live_safety_stack_ratchet(
+            deployment,
+            position,
+            quote,
+            dry_run=False,
+        )
+    )
+
+    durable = asyncio.run(exit_repo.get_runtime_state("T1"))
+    assert updated.stop_order_id == "STOP_NEW"
+    assert durable.committed_stop_price == updated.stop_price
+    assert len(manager.placements) == 1
+
+
+@pytest.mark.parametrize(
+    ("bid_offset_ms", "ask_offset_ms"),
+    [
+        (-100, 5_000),
+        (-100, -2_001),
+    ],
+)
+def test_live_safety_stack_ratchet_rejects_future_or_stale_public_side(
+    tmp_path,
+    bid_offset_ms,
+    ask_offset_ms,
+) -> None:
+    supervisor, position, deployment, _, exit_repo, manager = (
+        _ratchet_fixture(tmp_path, outcome="working")
+    )
+    now = datetime.now(UTC)
+    bid_at = now + timedelta(milliseconds=bid_offset_ms)
+    ask_at = now + timedelta(milliseconds=ask_offset_ms)
+    quote = PublicQuote(
+        symbol=OPTION,
+        bid=3.60,
+        ask=3.65,
+        last=3.62,
+        quote_timestamp=min(bid_at, ask_at).isoformat(),
+        quote_timestamp_field="bidTimestamp+askTimestamp",
+        bid_timestamp=bid_at.isoformat(),
+        ask_timestamp=ask_at.isoformat(),
+        outcome="SUCCESS",
+    )
+
+    updated = asyncio.run(
+        supervisor._apply_live_safety_stack_ratchet(
+            deployment,
+            position,
+            quote,
+            dry_run=False,
+        )
+    )
+
+    durable = asyncio.run(exit_repo.get_runtime_state("T1"))
+    assert updated == position
+    assert durable.committed_stop_price == 2.0
+    assert manager.placements == []
 
 
 def test_live_safety_stack_ratchet_restores_prior_stop_after_explicit_rejection(

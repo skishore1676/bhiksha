@@ -18,6 +18,10 @@ from threading import Event, Lock, Thread
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from bhiksha.execution.quote_lineage import (
+    PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS,
+    proved_quote_timestamp_lineage,
+)
 from bhiksha.execution.profile_exit import ProfileExitFields
 from bhiksha.ops.exit_edge_lab import (
     EVALUATOR_VERSION,
@@ -171,15 +175,20 @@ class ExitEdgeLiveRecorder:
         """Enqueue a completed existing quote fetch; never raise or wait."""
         try:
             timestamp_field = getattr(quote, "quote_timestamp_field", None)
+            received_at = _aware_utc(received_at)
+            lineage = proved_quote_timestamp_lineage(
+                quote,
+                observed_at=received_at,
+            )
             with self._lock:
                 fields = self._health["observed_quote_timestamp_fields"]
                 key = str(timestamp_field or "missing")
                 fields[key] = int(fields.get(key, 0)) + 1
             observed = _ObservedQuote(
                 option_symbol=_normalize_option_symbol(option_symbol),
-                quote_at=_parse_provider_timestamp(getattr(quote, "quote_timestamp", None)),
+                quote_at=lineage.quote_at if lineage is not None else None,
                 quote_timestamp_field=timestamp_field,
-                received_at=_aware_utc(received_at),
+                received_at=received_at,
                 bid=_maybe_float(getattr(quote, "bid", None)),
                 ask=_maybe_float(getattr(quote, "ask", None)),
                 last=_maybe_float(getattr(quote, "last", None)),
@@ -318,7 +327,10 @@ class ExitEdgeLiveRecorder:
     ) -> None:
         cohort_ids = self._active_for(observed.option_symbol)
         for cohort_id in cohort_ids:
-            if observed.quote_timestamp_field != "quoteTimestamp":
+            if (
+                observed.quote_timestamp_field
+                not in PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
+            ):
                 self._censor(
                     repository,
                     cohort_id,
@@ -661,29 +673,6 @@ class ExitEdgeLiveRecorder:
             "experiment": experiment,
             "experiment_spec_hash": experiment_spec_hash(profile, legacy, experiment),
         }
-
-
-def _parse_provider_timestamp(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return _aware_utc(value)
-    raw = str(value).strip()
-    if not raw:
-        return None
-    try:
-        numeric = float(raw)
-    except ValueError:
-        numeric = None
-    if numeric is not None:
-        if numeric > 10_000_000_000:
-            numeric /= 1_000.0
-        return datetime.fromtimestamp(numeric, tz=UTC)
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return _aware_utc(parsed)
 
 
 def _aware_utc(value: datetime) -> datetime:

@@ -70,10 +70,12 @@ predict the digest of the startup document that the row helps create.
 
 The runtime also checks the actual selected DTE from frozen entry provenance,
 the one-contract position, pre-T1 state, an existing proved protective stop,
-Public `quoteTimestamp`, an exact quote/position option-symbol match, quote age,
-two-sided spread, live position source, authorization time window, and frozen
-active-plan/startup bindings. Any missing, expired, or contradictory fact
-suppresses the ratchet.
+Public's explicit two-sided `quoteTimestamp` or the validated
+`bidTimestamp+askTimestamp` pair, an exact quote/position option-symbol match,
+quote age for both sides, two-sided spread, live position source, authorization
+time window, and frozen active-plan/startup bindings. For the paired form, the
+older side is authoritative; either missing, malformed, stale, or future side
+suppresses the ratchet. Generic and last-trade timestamps are never accepted.
 
 ## Broker-proved ratchet contract
 
@@ -176,6 +178,16 @@ separate poller proves explicit quota accounting and zero competition with
 protection, reports must preserve
 `no_post_exit_quote_source_session_shutdown_before_virtual_arms_terminal`
 instead of filling missing marks.
+
+Paper-shadow and dry-run positions do not own broker protection. They therefore
+never hydrate durable live exit state, restore broker stops, enter
+`STATE_DEGRADED`, or emit `exit_state_degraded_protection` /
+`native_exit_blocked_state_degraded`. They continue through the in-memory
+profile evaluator and paper-close ledger, including the existing synthetic
+`DRY_RUN_STOP` used for simulation; that id is never a broker order. Live
+positions retain the complete durable recovery and degradation behavior above.
+Weekly reporting must not reclassify paper positions as live protection
+incidents.
 
 ## Next-agent checklist
 

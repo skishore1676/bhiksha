@@ -150,13 +150,16 @@ surfaced in the health artifact; a permanent storage outage still requires
 reconciliation against Bhiksha's authoritative `entry_fill_check` history
 before inference.
 
-Quote timestamps are accepted only when Public identifies the field as
-`quoteTimestamp`. Generic response timestamps and trade timestamps do not prove
-the age of the bid/ask and censor the cohort. The recorder assigns a local
-sequence only after the observation enters its bounded queue; any active-cohort
-queue drop permanently censors the tape, so a synthetic contiguous sequence
-cannot hide missed observations. An unfinished cohort found after restart is
-censored as `restart_gap_unobserved_quotes`.
+Quote timestamps are accepted only when Public supplies either its explicit
+two-sided `quoteTimestamp`, or **both** `bidTimestamp` and `askTimestamp`. For
+the side-specific form, the older side becomes the effective `quote_at`; this
+makes the freshness test cover both sides. A missing, malformed, or future
+side fails closed. Generic response timestamps, `lastTimestamp`, and trade
+timestamps do not prove the age of the bid/ask and censor the cohort. The
+recorder assigns a local sequence only after the observation enters its bounded
+queue; any active-cohort queue drop permanently censors the tape, so a
+synthetic contiguous sequence cannot hide missed observations. An unfinished
+cohort found after restart is censored as `restart_gap_unobserved_quotes`.
 
 This tee normally stops receiving marks when the actual position closes. It
 keeps the cohort open in case another existing request happens to fetch the
@@ -190,9 +193,17 @@ A live session writes the isolated
 database to `artifacts/observations/exit_edge_live.sqlite3` and atomic health
 readback to `artifacts/observations/exit_edge_live_status.json`. The status
 must say `mode=observational_shadow_only`, `enforcement_authority=false`, and
-`broker_calls_added=0`. Inspect `observed_quote_timestamp_fields`: if
-`quoteTimestamp` is absent, real quotes are truthfully censored and this tee
-cannot produce useful paired cases without a separately approved source.
+`broker_calls_added=0`. Inspect `observed_quote_timestamp_fields`: at least one
+proved lineage (`quoteTimestamp` or `bidTimestamp+askTimestamp`) must be present.
+Any other field remains truthfully censored and cannot produce a useful paired
+case.
+
+The 2026-07-27 day-one cohorts were censored because the normalizer discarded
+Public's side-specific timestamps before they reached the recorder. They remain
+immutable censored evidence; this repair does not rewrite their tapes. Sessions
+starting from the repaired release preserve and validate the paired Public
+fields prospectively.
+
 Disable persistently by reinstalling without the opt-in; the installer removes
 both plist environments and the runtime marker. The checked-in config remains
 `false`.

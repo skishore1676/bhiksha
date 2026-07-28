@@ -20,6 +20,7 @@ from bhiksha.execution.brokers.public.order_status import (
     PUBLIC_DEAD_ORDER_STATUSES,
     public_order_confirmed_dead_unfilled,
 )
+from bhiksha.execution.quote_lineage import extract_public_quote_timestamp
 
 DEFAULT_OPTION_TICK_INCREMENT = 0.05
 CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
@@ -53,6 +54,8 @@ class PublicQuote:
     open_interest: int | None = None
     quote_timestamp: str | None = None
     quote_timestamp_field: str | None = None
+    bid_timestamp: str | None = None
+    ask_timestamp: str | None = None
     outcome: str | None = None
 
     @property
@@ -131,7 +134,12 @@ class OrderManager:
         if not quotes:
             raise ValueError(f"No Public quote returned for {option_symbol}")
         quote = quotes[0]
-        quote_timestamp, quote_timestamp_field = _quote_timestamp(quote)
+        (
+            quote_timestamp,
+            quote_timestamp_field,
+            bid_timestamp,
+            ask_timestamp,
+        ) = extract_public_quote_timestamp(quote)
         result = PublicQuote(
             symbol=normalize_option_symbol(quote.get("instrument", {}).get("symbol", option_symbol)),
             bid=_maybe_float(quote.get("bid")),
@@ -140,6 +148,8 @@ class OrderManager:
             open_interest=_maybe_int(quote.get("openInterest")),
             quote_timestamp=quote_timestamp,
             quote_timestamp_field=quote_timestamp_field,
+            bid_timestamp=bid_timestamp,
+            ask_timestamp=ask_timestamp,
             outcome=quote.get("outcome"),
         )
         if self._quote_observer is not None:
@@ -514,11 +524,8 @@ def _maybe_int(value) -> int | None:
 
 
 def _quote_timestamp(quote: dict[str, Any]) -> tuple[str | None, str | None]:
-    for key in ("quoteTimestamp", "timestamp", "lastTradeTime", "updatedAt", "asOf"):
-        value = quote.get(key)
-        if value is not None:
-            return str(value), key
-    return None, None
+    timestamp, field, _, _ = extract_public_quote_timestamp(quote)
+    return timestamp, field
 
 
 _PRICE_INCREMENT_RE = re.compile(r"(?:increment|increments)[^\$]*\$(?P<increment>\d+(?:\.\d+)?)", re.IGNORECASE)

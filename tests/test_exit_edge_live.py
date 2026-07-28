@@ -94,6 +94,18 @@ def _quote(at: datetime, bid: float):
     )
 
 
+def _paired_quote(bid_at: datetime, ask_at: datetime, bid: float):
+    return SimpleNamespace(
+        quote_timestamp=min(bid_at, ask_at).isoformat(),
+        quote_timestamp_field="bidTimestamp+askTimestamp",
+        bid_timestamp=bid_at.isoformat(),
+        ask_timestamp=ask_at.isoformat(),
+        bid=bid,
+        ask=bid + 0.05,
+        last=bid + 0.02,
+    )
+
+
 def _wait_until(predicate, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -293,7 +305,10 @@ def test_order_manager_tee_adds_no_broker_call_and_is_failure_isolated() -> None
             self.calls += 1
             return {"quotes": [{
                 "instrument": {"symbol": OPTION}, "bid": "2.00", "ask": "2.05",
-                "last": "2.02", "timestamp": ENTRY.isoformat(),
+                "last": "2.02",
+                "bidTimestamp": (ENTRY + timedelta(milliseconds=10)).isoformat(),
+                "askTimestamp": ENTRY.isoformat(),
+                "timestamp": (ENTRY + timedelta(seconds=1)).isoformat(),
             }]}
 
     def broken_observer(*args):
@@ -305,6 +320,12 @@ def test_order_manager_tee_adds_no_broker_call_and_is_failure_isolated() -> None
     manager = OrderManager(broker=broker, quote_observer=broken_observer)
     quote = asyncio.run(manager.get_option_quote(OPTION))
     assert quote.bid == 2.0
+    assert quote.quote_timestamp == ENTRY.isoformat()
+    assert quote.quote_timestamp_field == "bidTimestamp+askTimestamp"
+    assert quote.bid_timestamp == (
+        ENTRY + timedelta(milliseconds=10)
+    ).isoformat()
+    assert quote.ask_timestamp == ENTRY.isoformat()
     assert broker.calls == 1
 
 
@@ -312,10 +333,112 @@ def test_quote_timestamp_prefers_bid_ask_timestamp_when_multiple_fields_exist() 
     from bhiksha.execution.order_manager import _quote_timestamp
 
     value, field = _quote_timestamp({
-        "timestamp": "generic", "quoteTimestamp": "bid-ask-specific",
+        "timestamp": "generic", "quoteTimestamp": ENTRY.isoformat(),
         "lastTradeTime": "trade-time",
     })
-    assert (value, field) == ("bid-ask-specific", "quoteTimestamp")
+    assert (value, field) == (ENTRY.isoformat(), "quoteTimestamp")
+
+
+def test_quote_timestamp_uses_older_side_when_public_supplies_both_sides() -> None:
+    from bhiksha.execution.order_manager import _quote_timestamp
+
+    bid_at = ENTRY + timedelta(milliseconds=200)
+    ask_at = ENTRY + timedelta(milliseconds=100)
+    value, field = _quote_timestamp(
+        {
+            "bidTimestamp": bid_at.isoformat(),
+            "askTimestamp": ask_at.isoformat(),
+            "lastTimestamp": (ENTRY + timedelta(seconds=1)).isoformat(),
+            "timestamp": "generic",
+        }
+    )
+
+    assert value == ask_at.isoformat()
+    assert field == "bidTimestamp+askTimestamp"
+
+
+def test_quote_timestamp_rejects_one_sided_and_generic_timestamps() -> None:
+    from bhiksha.execution.order_manager import _quote_timestamp
+
+    assert _quote_timestamp(
+        {
+            "bidTimestamp": ENTRY.isoformat(),
+            "lastTimestamp": ENTRY.isoformat(),
+            "timestamp": ENTRY.isoformat(),
+        }
+    ) == (None, None)
+
+
+def test_live_recorder_accepts_proved_public_side_timestamp_pair(
+    tmp_path: Path,
+) -> None:
+    recorder = _recorder(tmp_path)
+    recorder.start()
+    assert recorder.try_register_entry(
+        deployment=_deployment(),
+        trade_id="T1",
+        option_symbol=OPTION,
+        entry_timestamp=ENTRY,
+        entry_premium=2.0,
+        quantity=10,
+    )
+    _wait_until(lambda: recorder.snapshot()["active_cohorts"] == 1)
+
+    for sequence, bid in enumerate([2.10, 2.70, 2.75, 3.40, 3.35], start=1):
+        received_at = ENTRY + timedelta(seconds=15 * sequence)
+        recorder.observe_quote(
+            OPTION,
+            _paired_quote(
+                received_at - timedelta(milliseconds=150),
+                received_at - timedelta(milliseconds=100),
+                bid,
+            ),
+            received_at,
+        )
+    _wait_until(lambda: recorder.snapshot()["paired_cohorts"] == 1)
+    recorder.close()
+
+    case = ProspectiveQuoteTapeRepository(tmp_path / "edge.db").load_case(
+        "exit-edge:T1"
+    )
+    assert len(case.quotes) == 5
+    assert case.persisted_censor_reason is None
+    assert recorder.snapshot()["observed_quote_timestamp_fields"] == {
+        "bidTimestamp+askTimestamp": 5
+    }
+
+
+def test_live_recorder_censors_pair_with_future_side_timestamp(
+    tmp_path: Path,
+) -> None:
+    recorder = _recorder(tmp_path)
+    recorder.start()
+    assert recorder.try_register_entry(
+        deployment=_deployment(),
+        trade_id="T1",
+        option_symbol=OPTION,
+        entry_timestamp=ENTRY,
+        entry_premium=2.0,
+        quantity=10,
+    )
+    _wait_until(lambda: recorder.snapshot()["active_cohorts"] == 1)
+    received_at = ENTRY + timedelta(seconds=15)
+    recorder.observe_quote(
+        OPTION,
+        _paired_quote(
+            received_at - timedelta(milliseconds=100),
+            received_at + timedelta(milliseconds=1),
+            2.10,
+        ),
+        received_at,
+    )
+    _wait_until(lambda: recorder.snapshot()["censored_cohorts"] == 1)
+    recorder.close()
+
+    case = ProspectiveQuoteTapeRepository(tmp_path / "edge.db").load_case(
+        "exit-edge:T1"
+    )
+    assert case.persisted_censor_reason == "missing_provider_quote_timestamp"
 
 
 def test_bounded_tee_stays_fast_with_many_same_contract_cohorts(tmp_path: Path) -> None:
