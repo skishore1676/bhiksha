@@ -438,23 +438,32 @@ def test_shadow_position_never_enters_live_exit_state_recovery_or_protection(
         status="NEW",
     )
     supervisor, live_position = _supervisor(tmp_path, manager, exit_repo)
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={
+            "exit": deployment.exit.model_copy(
+                update={"eod_flat": False},
+            )
+        }
+    )
     shadow_position = replace(
         live_position,
         source="shadow",
         order_id="SHADOW_ENTRY",
         stop_order_id=None,
         stop_price=None,
+        entry_timestamp=datetime.now(UTC),
     )
 
     fields, state = asyncio.run(
         supervisor._hydrate_frozen_profile_state(
-            _deployment(),
+            deployment,
             shadow_position,
         )
     )
     managed = asyncio.run(
         supervisor.manage_open_position(
-            _deployment(),
+            deployment,
             shadow_position,
             dry_run=True,
         )
