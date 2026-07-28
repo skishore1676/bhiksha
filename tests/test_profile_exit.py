@@ -1108,6 +1108,13 @@ def test_profile_state_identity_mismatch_reseeds_ladder() -> None:
     assert _profile_state_identity_mismatch(state, entry_premium=24.4) is False
 
 
+def test_durable_entry_premium_rounding_tolerance_boundary() -> None:
+    from bhiksha.execution.supervisor import _entry_premiums_are_same_fill
+
+    assert _entry_premiums_are_same_fill(0.975, 0.98) is True
+    assert _entry_premiums_are_same_fill(0.974_999, 0.98) is False
+
+
 def test_post_partial_residual_tick_does_not_reseed() -> None:
     """RE-AUDIT BLOCKER (2026-07-02): after a routine T1 partial the tracked
     position holds only the RESIDUAL quantity, so banked > residual is the

@@ -510,7 +510,12 @@ class ExecutionSupervisor:
         elif canonical_policy_hash(cached.canonical_policy) != cached.policy_hash:
             reason = "frozen_policy_hash_verification_failed"
         elif (
-            durable.seed_entry_premium != position.entry_price
+            position.entry_price is None
+            or position.entry_price <= 0
+            or not _entry_premiums_are_same_fill(
+                durable.seed_entry_premium,
+                position.entry_price,
+            )
             or durable.deployment_id != position.deployment_id
             or durable.option_symbol != position.option_symbol
         ):
@@ -8427,6 +8432,36 @@ def _tracked_trade_status(position: TrackedPosition) -> str:
     if position.target_order_id:
         return "target_active"
     return "open_protected" if position.stop_order_id else "open_unprotected"
+
+
+_ENTRY_PREMIUM_LEDGER_ROUNDING_TOLERANCE = 0.005
+
+
+def _entry_premiums_are_same_fill(
+    seed_entry_premium: float,
+    tracked_entry_premium: float,
+) -> bool:
+    """True when broker precision and the option-tick ledger describe one fill.
+
+    Public can report a confirmed average fill with sub-cent precision while
+    the position ledger stores the same fill at option-tick precision. Price is
+    corroborating evidence, not primary identity, but it remains a safety
+    backstop against a stale trade id being attached to a new same-contract
+    fill. Accept only the half-cent envelope created by rounding a precise fill
+    to the nearest option cent; wider differences fail closed.
+    """
+
+    if (
+        not math.isfinite(seed_entry_premium)
+        or not math.isfinite(tracked_entry_premium)
+        or seed_entry_premium <= 0
+        or tracked_entry_premium <= 0
+    ):
+        return False
+    return (
+        abs(seed_entry_premium - tracked_entry_premium)
+        <= _ENTRY_PREMIUM_LEDGER_ROUNDING_TOLERANCE + 1e-12
+    )
 
 
 def _profile_state_identity_mismatch(

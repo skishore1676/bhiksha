@@ -539,6 +539,138 @@ def test_restart_contradictory_policy_hash_persists_state_degraded(tmp_path) -> 
     assert recovered.degraded_reason == "policy_hash_mismatch"
 
 
+def test_restart_accepts_same_fill_with_broker_subcent_precision(tmp_path) -> None:
+    """A precise broker fill and its cent-rounded ledger value are one trade."""
+
+    exit_repo = SQLiteExitStateRepository(str(tmp_path / "exit.db"))
+    _seed(exit_repo)
+    db_path = tmp_path / "exit.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE trade_exit_runtime_state "
+            "SET seed_entry_premium=0.9798, initial_risk_per_contract=0.24495, "
+            "raw_peak_premium=0.9798, recovery_status='STATE_DEGRADED', "
+            "degraded_reason='runtime_state_identity_mismatch', state_version=2 "
+            "WHERE trade_id='T1'"
+        )
+    supervisor, position = _supervisor(
+        tmp_path,
+        _StatusOrderManager("NEW", {"status": "NEW"}),
+        exit_repo,
+    )
+    position = replace(position, entry_price=0.98)
+
+    _, profile_state = asyncio.run(
+        supervisor._hydrate_frozen_profile_state(_deployment(), position)
+    )
+
+    recovered = asyncio.run(exit_repo.get_runtime_state("T1"))
+    assert recovered.recovery_status == "active"
+    assert recovered.degraded_reason is None
+    assert recovered.state_version == 3
+    assert recovered.seed_entry_premium == pytest.approx(0.9798)
+    assert profile_state.seed_entry_premium == pytest.approx(0.9798)
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        degraded = conn.execute(
+            "SELECT COUNT(*) FROM events "
+            "WHERE event_type='exit_state_recovery'"
+        ).fetchone()[0]
+    assert degraded == 0
+
+
+def test_restart_rejects_gross_entry_premium_contradiction(tmp_path) -> None:
+    exit_repo = SQLiteExitStateRepository(str(tmp_path / "exit.db"))
+    _seed(exit_repo)
+    supervisor, position = _supervisor(
+        tmp_path,
+        _StatusOrderManager("NEW", {"status": "NEW"}),
+        exit_repo,
+    )
+    position = replace(position, entry_price=4.0)
+
+    asyncio.run(supervisor._hydrate_frozen_profile_state(_deployment(), position))
+
+    recovered = asyncio.run(exit_repo.get_runtime_state("T1"))
+    assert recovered.recovery_status == "STATE_DEGRADED"
+    assert recovered.degraded_reason == "runtime_state_identity_mismatch"
+
+
+def test_restart_rejects_stale_low_premium_post_partial_state(tmp_path) -> None:
+    """A 24-cent difference can be a new fill when the option is inexpensive."""
+
+    exit_repo = SQLiteExitStateRepository(str(tmp_path / "exit.db"))
+    _seed(exit_repo)
+    db_path = tmp_path / "exit.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE trade_exit_runtime_state "
+            "SET seed_entry_premium=0.10, seed_quantity=2, "
+            "initial_risk_per_contract=0.025, raw_peak_premium=0.50, "
+            "confirmed_peak_r=16.0, target_1_banked=1, banked_quantity=1, "
+            "breakeven_emitted=1, runner_state='post_t1', "
+            "recovery_status='STATE_DEGRADED', "
+            "degraded_reason='prior_recovery_failure', state_version=2 "
+            "WHERE trade_id='T1'"
+        )
+    manager = _WorkingPartialOrderManager(
+        {"status": "NEW"},
+        status="NEW",
+    )
+    supervisor, position = _supervisor(
+        tmp_path,
+        manager,
+        exit_repo,
+        quantity=1,
+    )
+    position = replace(position, entry_price=0.34, stop_price=0.06)
+    supervisor.planner.position_tracker.replace_positions([position])
+
+    managed = asyncio.run(
+        supervisor.manage_open_position(
+            _deployment(),
+            position,
+            dry_run=False,
+        )
+    )
+
+    recovered = asyncio.run(exit_repo.get_runtime_state("T1"))
+    profile_state = supervisor._profile_exit_states[
+        supervisor._profile_state_key(position)
+    ]
+    assert managed == position
+    assert recovered.recovery_status == "STATE_DEGRADED"
+    assert recovered.degraded_reason == "runtime_state_identity_mismatch"
+    assert profile_state.seed_entry_premium == pytest.approx(0.34)
+    assert profile_state.banked_quantity == 0
+    assert profile_state.breakeven_emitted is False
+    assert manager.stop_placements == 0
+    assert manager.close_placements == 0
+
+
+@pytest.mark.parametrize(
+    "tracked_entry_premium",
+    [None, 0.0, -1.0, float("nan"), float("inf"), float("-inf")],
+)
+def test_restart_rejects_invalid_tracked_entry_premium(
+    tmp_path,
+    tracked_entry_premium,
+) -> None:
+    exit_repo = SQLiteExitStateRepository(str(tmp_path / "exit.db"))
+    _seed(exit_repo)
+    supervisor, position = _supervisor(
+        tmp_path,
+        _StatusOrderManager("NEW", {"status": "NEW"}),
+        exit_repo,
+    )
+    position = replace(position, entry_price=tracked_entry_premium)
+
+    asyncio.run(supervisor._hydrate_frozen_profile_state(_deployment(), position))
+
+    recovered = asyncio.run(exit_repo.get_runtime_state("T1"))
+    assert recovered.recovery_status == "STATE_DEGRADED"
+    assert recovered.degraded_reason == "runtime_state_identity_mismatch"
+
+
 def test_working_partial_does_not_overlap_with_full_size_restored_stop(
     tmp_path,
 ) -> None:

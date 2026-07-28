@@ -198,6 +198,33 @@ The 2026-07-27 database readback contains 16,943 paper-shadow
 `exit_state_degraded_protection` events and one live event; the former remain
 auditable diagnostics, while the live event remains an operational issue.
 
+## 2026-07-28 canary infrastructure incident
+
+The first natural IWM Safety Stack canary exposed an application identity bug,
+not strategy evidence. Public's confirmed average fill was `0.9798`; the
+reconciled trade/position ledger represented the same fill as `0.98`. Durable
+restart hydration used exact float equality, falsely classified the position as
+`runtime_state_identity_mismatch`, and closed profile/native exit authority
+while the proved broker STOP remained in place.
+
+This trade is infrastructure-invalid for Dynamic Risk Envelope evaluation. It
+must not support acceptance, rejection, or expansion because the candidate did
+not receive a valid execution trial.
+
+The repair contract makes `trade_id`, deployment id, and option contract the
+identity authority. Entry premium remains corroboration: invalid values fail
+closed, and two valid prices represent the same fill only within the half-cent
+envelope created by rounding a sub-cent average to the nearest option cent.
+The precise broker fill remains the durable economic seed; it is not rewritten
+to the rounded ledger value. The separate stale-ladder backstop retains its
+existing greater-than-10% rule.
+
+Source validation: the complete Bhiksha suite passes (`1082 passed`). The first
+adversarial design review rejected a broad 10%/`$0.25` tolerance because it
+could revive a stale low-premium post-partial ladder; the corrected half-cent
+rule passed the original exploit replay and an independent delta audit.
+Deployment status: pending the normal post-flat oldmac release boundary.
+
 ## Next-agent checklist
 
 Before changing stage:
