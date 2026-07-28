@@ -108,6 +108,74 @@ def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_pat
     }
 
 
+def test_daily_report_separates_shadow_degradation_from_live_health(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="shadow-noise",
+                deployment_id="qqq-shadow",
+                symbol="QQQ",
+                option_symbol="QQQ260727P00500000",
+                quantity=1,
+                entry_price=2.0,
+                entry_timestamp=datetime(2026, 7, 27, 14, 0, tzinfo=UTC),
+                status="open_unprotected",
+                entry_order_id="SHADOW_ENTRY",
+            )
+        )
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="live-issue",
+                deployment_id="qqq-live",
+                symbol="QQQ",
+                option_symbol="QQQ260727P00510000",
+                quantity=1,
+                entry_price=2.0,
+                entry_timestamp=datetime(2026, 7, 27, 14, 0, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY_LIVE",
+                stop_order_id="STOP_LIVE",
+            )
+        )
+        for trade_id in ("shadow-noise", "live-issue"):
+            await events.append(
+                "runtime_issue",
+                {
+                    "category": "exit_state_degraded_protection",
+                    "trade_id": trade_id,
+                    "symbol": "QQQ",
+                },
+            )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE events SET created_at='2026-07-27T15:00:00+00:00'"
+        )
+        conn.commit()
+
+    report = build_daily_report(
+        db_path,
+        trading_date="2026-07-27",
+    )
+
+    assert report["provider_health"]["runtime_issue_counts"] == {
+        "exit_state_degraded_protection": 1
+    }
+    assert report["provider_health"][
+        "suppressed_shadow_runtime_issue_counts"
+    ] == {"exit_state_degraded_protection": 1}
+    markdown = render_daily_report_markdown(report)
+    assert "Shadow-only Diagnostics (excluded from operational health)" in markdown
+
+
 def test_daily_report_summarizes_entry_profile_quote_comparisons(tmp_path) -> None:
     db_path = tmp_path / "bhiksha.db"
     backend = SQLiteBackend(str(db_path))

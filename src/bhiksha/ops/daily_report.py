@@ -31,6 +31,9 @@ _OPTION_SYMBOL_RE = re.compile(r"^[A-Z]+\d{6}[CP](\d{8})$")
 # convention of not importing bhiksha.risk.risk_manager -- see the
 # "risk_manager_startup"/"risk_manager_decision" literals below.
 OPEN_DRAWDOWN_WARNING_EVENT_TYPE = "risk_open_drawdown_warning"
+SHADOW_ONLY_DIAGNOSTIC_CATEGORIES = frozenset(
+    {"exit_state_degraded_protection"}
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -115,14 +118,16 @@ def build_daily_report(
     for event in events:
         if event["event_type"] == "startup_config":
             code_version = (event["payload"] or {}).get("code_version") or code_version
-    runtime_issue_counts = dict(
-        sorted(
-            Counter(
-                str((event["payload"] or {}).get("category") or "exception")
-                for event in events
-                if event["event_type"] == "runtime_issue"
-            ).items()
-        )
+    (
+        runtime_issue_counts,
+        suppressed_shadow_runtime_issue_counts,
+    ) = _runtime_issue_summaries(
+        events,
+        shadow_trade_ids={
+            str(trade["trade_id"])
+            for trade in shadow_trades
+            if trade.get("trade_id")
+        },
     )
     entry_selector_empty_by_deployment = _entry_selector_empty_by_deployment(events, deployments)
     entry_profile_comparison = _entry_profile_comparison_summary(events)
@@ -136,6 +141,9 @@ def build_daily_report(
         "provider_health": {
             "reconciliation": provider_events,
             "runtime_issue_counts": runtime_issue_counts,
+            "suppressed_shadow_runtime_issue_counts": (
+                suppressed_shadow_runtime_issue_counts
+            ),
             "entry_selector_empty_by_deployment": entry_selector_empty_by_deployment,
         },
         "trade_summary": {
@@ -342,6 +350,23 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
     if runtime_issue_counts:
         lines.extend(["", "## Runtime Issues"])
         for category, count in sorted(runtime_issue_counts.items()):
+            lines.append(f"- `{category}`: `{count}`")
+    suppressed_shadow_runtime_issue_counts = (
+        (report.get("provider_health") or {}).get(
+            "suppressed_shadow_runtime_issue_counts"
+        )
+        or {}
+    )
+    if suppressed_shadow_runtime_issue_counts:
+        lines.extend(
+            [
+                "",
+                "## Shadow-only Diagnostics (excluded from operational health)",
+            ]
+        )
+        for category, count in sorted(
+            suppressed_shadow_runtime_issue_counts.items()
+        ):
             lines.append(f"- `{category}`: `{count}`")
 
     # Item C (2026-07-08 hygiene batch): a filtered-out live signal (selector
@@ -603,6 +628,46 @@ def _compact_warning_message(value: Any) -> str:
     return f"{message[:69]}..."
 
 
+def _runtime_issue_summaries(
+    events: list[dict[str, Any]],
+    *,
+    shadow_trade_ids: set[str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Separate known paper-only diagnostics from operational health.
+
+    Historical events remain counted in the explicit suppressed bucket.  Only
+    the exact live-protection category is eligible, and only when the trade is
+    independently proved paper by its trade row, shadow-entry event, or source.
+    """
+
+    proved_shadow_ids = set(shadow_trade_ids)
+    for event in events:
+        payload = event.get("payload") or {}
+        trade_id = _maybe_str(payload.get("trade_id"))
+        if trade_id and (
+            event.get("event_type") == "shadow_entry_assumed"
+            or _maybe_str(payload.get("source")) in {"shadow", "dry_run"}
+        ):
+            proved_shadow_ids.add(trade_id)
+
+    actionable: Counter[str] = Counter()
+    suppressed: Counter[str] = Counter()
+    for event in events:
+        if event.get("event_type") != "runtime_issue":
+            continue
+        payload = event.get("payload") or {}
+        category = _maybe_str(payload.get("category")) or "exception"
+        trade_id = _maybe_str(payload.get("trade_id"))
+        if (
+            category in SHADOW_ONLY_DIAGNOSTIC_CATEGORIES
+            and trade_id in proved_shadow_ids
+        ):
+            suppressed[category] += 1
+        else:
+            actionable[category] += 1
+    return dict(sorted(actionable.items())), dict(sorted(suppressed.items()))
+
+
 def _empty_report(day: date) -> dict[str, Any]:
     return {
         "trading_date": day.isoformat(),
@@ -612,6 +677,7 @@ def _empty_report(day: date) -> dict[str, Any]:
         "provider_health": {
             "reconciliation": _empty_reconciliation(),
             "runtime_issue_counts": {},
+            "suppressed_shadow_runtime_issue_counts": {},
             "entry_selector_empty_by_deployment": [],
         },
         "trade_summary": {

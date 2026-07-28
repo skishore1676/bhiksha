@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, date, datetime
 import json
 from pathlib import Path
+import sqlite3
 
 from bhiksha.domain.models import TradeRecord
 from bhiksha.ops.weekly_trading_decisions import (
@@ -10,7 +11,11 @@ from bhiksha.ops.weekly_trading_decisions import (
     weekly_stable_digest,
     write_weekly_trading_decisions,
 )
-from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteTradeStateRepository
+from bhiksha.persistence.sqlite import (
+    SQLiteBackend,
+    SQLiteEventRepository,
+    SQLiteTradeStateRepository,
+)
 
 
 def test_weekly_decision_renderer_names_outcome_and_human_gate() -> None:
@@ -111,6 +116,87 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     )
     rerun_export = json.loads(rerun.facts_path.read_text(encoding="utf-8"))
     assert rerun_export["receipt"]["sha256"] == export["receipt"]["sha256"]
+
+
+def test_weekly_export_reclassifies_historical_shadow_degradation(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="shadow-noise",
+                deployment_id="qqq-shadow",
+                symbol="QQQ",
+                option_symbol="QQQ260727P00500000",
+                quantity=1,
+                entry_price=2.0,
+                entry_timestamp=datetime(
+                    2026,
+                    7,
+                    27,
+                    14,
+                    0,
+                    tzinfo=UTC,
+                ),
+                status="open_unprotected",
+                entry_order_id="SHADOW_ENTRY",
+            )
+        )
+        await events.append(
+            "runtime_issue",
+            {
+                "category": "exit_state_degraded_protection",
+                "trade_id": "shadow-noise",
+                "symbol": "QQQ",
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE events SET created_at='2026-07-27T15:00:00+00:00'"
+        )
+        conn.commit()
+    (reports / "trade_session_report_2026-07-27.json").write_text(
+        json.dumps(
+            {
+                "trading_date": "2026-07-27",
+                "event_type_counts": {"runtime_issue": 16_416},
+                "provider_health": {
+                    "reconciliation": {},
+                    "runtime_issue_counts": {
+                        "exit_state_degraded_protection": 16_416
+                    },
+                },
+                "status": {"level": "YELLOW"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = write_weekly_trading_decisions(
+        db_path,
+        output_dir=reports,
+        week_end="2026-07-31",
+        exit_edge_db_path=tmp_path / "missing-exit-edge.db",
+        exit_edge_status_path=tmp_path / "missing-exit-edge-status.json",
+    )
+    export = json.loads(result.facts_path.read_text(encoding="utf-8"))
+    row = next(
+        item
+        for item in export["daily_status"]
+        if item["date"] == "2026-07-27"
+    )
+
+    assert row["operational_issue_count"] == 0
+    assert row["shadow_diagnostic_count"] == 1
 
 
 def test_weekly_publisher_binds_stable_review_id() -> None:

@@ -189,6 +189,15 @@ positions retain the complete durable recovery and degradation behavior above.
 Weekly reporting must not reclassify paper positions as live protection
 incidents.
 
+Daily reports retain those historical paper events under
+`suppressed_shadow_runtime_issue_counts` and exclude them from status /
+operational-health counts. The Friday facts export re-evaluates an older daily
+JSON from immutable database facts when that JSON predates this classification,
+then publishes the excluded total separately as `shadow_diagnostic_count`.
+The 2026-07-27 database readback contains 16,943 paper-shadow
+`exit_state_degraded_protection` events and one live event; the former remain
+auditable diagnostics, while the live event remains an operational issue.
+
 ## Next-agent checklist
 
 Before changing stage:

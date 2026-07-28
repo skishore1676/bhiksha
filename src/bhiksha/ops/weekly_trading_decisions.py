@@ -17,6 +17,7 @@ import re
 import sqlite3
 from typing import Any, TYPE_CHECKING
 
+from bhiksha.ops.daily_report import build_daily_report
 from bhiksha.ops.exit_edge_weekly import write_exit_edge_weekly_evidence
 from bhiksha.ops.shadow_ev_report import build_shadow_ev_report
 from bhiksha.ops.trading_governance_evidence import build_trading_governance_evidence
@@ -288,7 +289,11 @@ def build_trading_decision_export(
                 "exported_at": exported_at,
             }
         )
-    daily_status = _daily_status_rows(report_dir, through)
+    daily_status = _daily_status_rows(
+        report_dir,
+        through,
+        db_path=path,
+    )
     body = {"schema": "bhiksha.trading_decision_facts.v1", "generated_at": exported_at, "facts": facts, "daily_status": daily_status}
     # The receipt identifies evidence, not run time. A retry with unchanged
     # facts must reuse the same digest so the workbook and Obsidian card can be
@@ -379,7 +384,12 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _daily_status_rows(report_dir: Path, through: date) -> list[dict[str, Any]]:
+def _daily_status_rows(
+    report_dir: Path,
+    through: date,
+    *,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
     rows = []
     for path in sorted(report_dir.glob("trade_session_report_*.json")):
         try:
@@ -387,11 +397,52 @@ def _daily_status_rows(report_dir: Path, through: date) -> list[dict[str, Any]]:
             day = str(report.get("trading_date") or "")
             if not day or day > through.isoformat():
                 continue
+            stored_provider_health = report.get("provider_health") or {}
+            stored_runtime_counts = (
+                stored_provider_health.get("runtime_issue_counts") or {}
+            )
+            needs_shadow_reclassification = (
+                "suppressed_shadow_runtime_issue_counts"
+                not in stored_provider_health
+                and bool(
+                    stored_runtime_counts.get(
+                        "exit_state_degraded_protection"
+                    )
+                )
+            )
+            if (
+                needs_shadow_reclassification
+                and db_path is not None
+                and db_path.exists()
+            ):
+                # Recompute the read-only classification from immutable event
+                # and trade facts. This lets a Friday export apply newer
+                # report semantics to an already-written Monday report without
+                # rewriting that historical artifact.
+                report = build_daily_report(
+                    db_path,
+                    trading_date=day,
+                )
             provider = (report.get("provider_health") or {}).get("reconciliation") or {}
+            runtime_issue_counts = (
+                (report.get("provider_health") or {}).get(
+                    "runtime_issue_counts"
+                )
+                or {}
+            )
+            suppressed_shadow_counts = (
+                (report.get("provider_health") or {}).get(
+                    "suppressed_shadow_runtime_issue_counts"
+                )
+                or {}
+            )
             rows.append({
                 "date": day,
                 "risk_event_count": sum((report.get("event_type_counts") or {}).get(key, 0) for key in ("risk_halt", "risk_flatten", "risk_open_drawdown_warning")),
-                "operational_issue_count": sum(((report.get("provider_health") or {}).get("runtime_issue_counts") or {}).values()),
+                "operational_issue_count": sum(runtime_issue_counts.values()),
+                "shadow_diagnostic_count": sum(
+                    suppressed_shadow_counts.values()
+                ),
                 "reconciliation_status": "DEGRADED" if provider.get("degraded_count") else ("WARNING" if provider.get("warning_count") else "OK"),
                 "report_status": ((report.get("status") or {}).get("level") or "UNKNOWN"),
             })
