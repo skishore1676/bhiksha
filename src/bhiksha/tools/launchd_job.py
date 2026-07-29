@@ -261,7 +261,10 @@ def _reconciliation_supervisor_job(args: argparse.Namespace, *, repo_root: Path)
 def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) -> int:
     """Refresh the ledger, then publish exactly one Obsidian decision packet."""
     runtime = build_runtime(active_plan_path=args.active_plan)
-    output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
+    output_dir = _weekly_report_output_dir(
+        runtime.app_config.playbook_artifacts_dir,
+        workbook_update_mode=args.workbook_update_mode,
+    )
     result = write_weekly_trading_decisions(
         Path(runtime.app_config.sqlite_path),
         output_dir=output_dir,
@@ -325,6 +328,18 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
         "telegram_sent": False,
     })
     return 0 if ok else 2
+
+
+def _weekly_report_output_dir(
+    playbook_artifacts_dir: str | Path,
+    *,
+    workbook_update_mode: str,
+) -> Path:
+    """Keep preview evidence from replacing the last passing weekly receipt."""
+    reports = Path(playbook_artifacts_dir) / "reports"
+    if workbook_update_mode == "off":
+        return reports / "previews"
+    return reports
 
 
 def _update_trading_decision_ledger(

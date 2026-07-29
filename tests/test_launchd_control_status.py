@@ -8,7 +8,7 @@ import pytest
 
 from bhiksha.ops.launchd_registry import control_lock_dir, latest_status_path
 from bhiksha.ops.launchd_status_store import write_latest_status
-from bhiksha.tools import launchd_control, launchd_status
+from bhiksha.tools import launchd_control, launchd_job, launchd_status
 
 
 def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path) -> None:
@@ -509,6 +509,19 @@ def test_launchd_job_writes_latest_status(tmp_path, monkeypatch) -> None:
     assert written["schema"] == "bhiksha.launchd.latest_status.v1"
     assert written["jobs"]["session-report"]["label"] == "com.bhiksha.session-report"
     assert written["jobs"]["session-report"]["payload"]["status"] == "ok"
+
+
+def test_weekly_preview_cannot_replace_passing_report(tmp_path) -> None:
+    artifacts = tmp_path / "artifacts" / "playbook"
+
+    assert launchd_job._weekly_report_output_dir(
+        artifacts,
+        workbook_update_mode="on",
+    ) == artifacts / "reports"
+    assert launchd_job._weekly_report_output_dir(
+        artifacts,
+        workbook_update_mode="off",
+    ) == artifacts / "reports" / "previews"
 
 
 def test_launchd_control_live_status(monkeypatch, tmp_path) -> None:
