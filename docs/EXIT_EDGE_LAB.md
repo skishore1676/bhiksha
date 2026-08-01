@@ -240,6 +240,12 @@ evidence maturity. A valid receipt may truthfully say `not_collecting`,
 `directional_profile_uplift`. Missing or stale evidence is never rendered as
 zero uplift.
 
+The outer `bhiksha.weekly_trading_decisions.v1` packet binds this artifact under
+`exit_policy_evidence.bhiksha` and binds its digest-bearing receipt under
+`exit_policy_evidence_receipts.bhiksha`. The older singular `exit_edge_*` fields
+remain temporarily for compatible readers, but the per-producer v2 binding is the
+authoritative TradeLab handoff.
+
 The packet binds the exact reporting cutoff, current-week and cumulative
 registration denominators, paired/insufficient/cluster counts, missingness,
 Control-versus-candidate descriptive outcomes, health freshness, experiment

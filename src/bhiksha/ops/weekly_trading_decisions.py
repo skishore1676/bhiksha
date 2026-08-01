@@ -196,6 +196,13 @@ def write_weekly_trading_decisions(
         "facts_export_receipt": facts["receipt"],
         "governance_evidence": str(governance_path),
         "governance_evidence_receipt": governance["receipt"],
+        # Canonical cross-desk contract consumed by TradeLab. Keep the legacy
+        # singular fields below during the migration because older readers and
+        # operator tooling still display them.
+        "exit_policy_evidence": {"bhiksha": str(exit_edge.json_path)},
+        "exit_policy_evidence_receipts": {
+            "bhiksha": exit_edge.evidence["receipt"]
+        },
         "exit_edge_evidence": str(exit_edge.json_path),
         "exit_edge_evidence_receipt": exit_edge.evidence["receipt"],
         "exit_edge": exit_edge.evidence,

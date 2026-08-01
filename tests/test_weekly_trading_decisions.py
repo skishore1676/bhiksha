@@ -89,6 +89,15 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     assert result.report["governance_evidence"] == str(result.governance_path)
     assert result.exit_edge_path.is_file()
     assert result.report["exit_edge"]["verdict"]["status"] == "not_collecting"
+    assert result.report["exit_policy_evidence"] == {
+        "bhiksha": str(result.exit_edge_path)
+    }
+    assert (
+        result.report["exit_policy_evidence_receipts"]["bhiksha"]["sha256"]
+        == json.loads(result.exit_edge_path.read_text(encoding="utf-8"))["receipt"][
+            "sha256"
+        ]
+    )
     assert "cumulative paired cohorts: `Unavailable`" in (
         result.markdown_path.read_text(encoding="utf-8")
     )
