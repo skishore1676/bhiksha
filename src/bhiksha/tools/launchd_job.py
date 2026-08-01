@@ -64,6 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--active-plan", default="artifacts/playbook/active_plan.json")
     parser.add_argument("--report-label", default="scheduled")
+    parser.add_argument(
+        "--week-end",
+        help="explicit reporting cutoff for a weekly-decisions replay (YYYY-MM-DD)",
+    )
     parser.add_argument("--alert-mode", default=os.getenv("BHIKSHA_LAUNCHD_ALERT_MODE", "live"), choices=["off", "spool", "live"])
     parser.add_argument("--alert-profile", default=os.getenv("BHIKSHA_LATHI_PROFILE", "bhiksha-northstar"))
     parser.add_argument(
@@ -268,6 +272,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
     result = write_weekly_trading_decisions(
         Path(runtime.app_config.sqlite_path),
         output_dir=output_dir,
+        week_end=args.week_end,
         deployments=runtime.deployments,
         exit_edge_db_path=runtime.app_config.exit_edge_live_shadow_db_path,
         exit_edge_status_path=runtime.app_config.exit_edge_live_shadow_status_path,

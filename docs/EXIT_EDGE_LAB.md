@@ -233,6 +233,10 @@ the same guarded analyzer and always writes:
 artifacts/playbook/reports/exit_policy_weekly_evidence_<week-end>.json
 ```
 
+An operator replay uses `weekly-trading-decisions --week-end YYYY-MM-DD`; this
+keeps a weekend recovery bound to the original Friday instead of silently creating
+a second weekly identity for Saturday.
+
 Schema `trading.exit_policy_weekly_evidence.v2` separates packet integrity from
 evidence maturity. A valid receipt may truthfully say `not_collecting`,
 `awaiting_first_collection`, `stale_collection`,
