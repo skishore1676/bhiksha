@@ -11,6 +11,7 @@ from bhiksha.ops.exit_edge_lab import (
 )
 from bhiksha.ops.exit_edge_weekly import (
     _cohort_rows,
+    _fail_closed_heterogeneity,
     _maturity_stage,
     _v2_summary,
     build_exit_edge_weekly_evidence,
@@ -89,6 +90,25 @@ def test_missing_collection_is_explicitly_unavailable_not_zero_edge(tmp_path) ->
     assert evidence["cumulative"]["paired_count"] == 0
     assert evidence["inference"]["decision_ready"] is False
     assert evidence["receipt"]["status"] == "ok"
+
+
+def test_heterogeneous_v2_summary_uses_explicit_fail_closed_verdict() -> None:
+    homogeneous = {
+        "homogeneous_catalog": True,
+        "homogeneous_fill_model": True,
+        "homogeneous_executable_reference": True,
+    }
+    heterogeneous = {**homogeneous, "homogeneous_catalog": False}
+
+    verdict, reason = _fail_closed_heterogeneity(
+        "insufficient", "generic blockers", homogeneous, heterogeneous
+    )
+
+    assert verdict == "heterogeneous_specs"
+    assert "non-comparable" in reason
+    assert _fail_closed_heterogeneity(
+        "stale_collection", "stale first", homogeneous, heterogeneous
+    ) == ("stale_collection", "stale first")
 
 
 def test_weekly_cohort_rows_preserve_full_policy_and_execution_identity() -> None:

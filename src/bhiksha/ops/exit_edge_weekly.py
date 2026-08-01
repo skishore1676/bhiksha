@@ -282,6 +282,9 @@ def build_exit_edge_weekly_evidence(
     )
     weekly_v2 = _v2_summary(weekly_summary, weekly_cases)
     cumulative_v2 = _v2_summary(cumulative_summary, cumulative_cases)
+    verdict, reason = _fail_closed_heterogeneity(
+        verdict, reason, weekly_v2, cumulative_v2
+    )
     maturity_stage = _maturity_stage(maturity, cumulative=cumulative_v2)
     evidence: dict[str, Any] = {
         "schema": SCHEMA,
@@ -758,6 +761,36 @@ def _v2_verdict(value: str) -> str:
         "heterogeneous_specs",
         "safety_blocked",
     } else "inconclusive")
+
+
+def _fail_closed_heterogeneity(
+    verdict: str,
+    reason: str,
+    *summaries: dict[str, Any],
+) -> tuple[str, str]:
+    homogeneous = all(
+        summary[dimension]
+        for summary in summaries
+        for dimension in (
+            "homogeneous_catalog",
+            "homogeneous_fill_model",
+            "homogeneous_executable_reference",
+        )
+    )
+    if homogeneous or verdict in {
+        "unavailable",
+        "not_collecting",
+        "awaiting_first_collection",
+        "stale_collection",
+        "collection_unreadable",
+        "safety_blocked",
+    }:
+        return verdict, reason
+    return (
+        "heterogeneous_specs",
+        "The collected cohorts do not share one experiment catalog, fill "
+        "model, and executable reference; economics remain non-comparable.",
+    )
 
 
 def _safety_count(value: Any) -> int:
