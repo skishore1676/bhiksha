@@ -1208,7 +1208,10 @@ def _ratchet_deployment():
                         datetime(2026, 7, 20, tzinfo=UTC)
                     ),
                     "risk_envelope_live_expires_at": (
-                        datetime(2026, 8, 1, tzinfo=UTC)
+                        # Ratchet tests exercise handoff behavior, not expiry.
+                        # Keep this synthetic authorization intentionally valid;
+                        # dedicated expiry tests cover the fail-closed boundary.
+                        datetime(2099, 8, 1, tzinfo=UTC)
                     ),
                     "risk_envelope_live_authorized_deployment_id": (
                         "strategy_market_impulse_all_basket_discovery_iwm_long_live_row_3"
@@ -1253,7 +1256,7 @@ def _ratchet_fixture(tmp_path, *, outcome: str):
                 ),
                 "authorization_id": "test-auth",
                 "start_at": "2026-07-20T00:00:00+00:00",
-                "expires_at": "2026-08-01T00:00:00+00:00",
+                "expires_at": "2099-08-01T00:00:00+00:00",
                 "authorized_deployment_id": (
                     "strategy_market_impulse_all_basket_discovery_iwm_long_live_row_3"
                 ),
