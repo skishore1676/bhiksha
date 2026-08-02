@@ -19,6 +19,7 @@ from bhiksha.execution.supervisor import (
     _entry_reprice_spread_fraction,
 )
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
+from bhiksha.risk.cash_guard import CashGuardResult
 from bhiksha.risk.risk_manager import EntryDecision
 from bhiksha.state.lifecycle import TradeLifecycleStore
 from bhiksha.state.position_tracker import LIVE_ENTRY_RECONCILIATION_HOLD_SOURCE, PositionTracker
@@ -101,6 +102,26 @@ class RecordingCashGuard:
     async def sync_positions(self, positions, trades) -> None:
         del positions, trades
         return None
+
+
+class BlockingReservationCashGuard(RecordingCashGuard):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.proceed = asyncio.Event()
+
+    async def reserve_entry(self, **kwargs) -> CashGuardResult:
+        del kwargs
+        self.started.set()
+        await self.proceed.wait()
+        return CashGuardResult(enforced=True, blocked=False, details={"reserved_cash": 300.0})
+
+
+class ImmediateReservationCashGuard(RecordingCashGuard):
+    async def reserve_entry(self, *, trade_id: str, **kwargs) -> CashGuardResult:
+        del kwargs
+        self.calls.append(("reserve", trade_id))
+        return CashGuardResult(enforced=True, blocked=False, details={"reserved_cash": 300.0})
 
 
 class RecordingOrderManager(StubOrderManager):
@@ -281,6 +302,12 @@ class RecordingSizedRiskManager:
 
     async def commit_sized_entry(self, trade_id: str) -> None:
         self.commit_calls.append(trade_id)
+
+
+class ExplodingSizedRiskManager(RecordingSizedRiskManager):
+    async def reserve_sized_entry(self, **kwargs):
+        self.reserve_calls.append(kwargs)
+        raise RuntimeError("risk-store-io")
 
 
 class RecordingManualStatusWriter:
@@ -715,6 +742,104 @@ def test_reprice_rechecks_sized_risk_after_confirmed_cancel(tmp_path) -> None:
     with sqlite3.connect(tmp_path / "events.db") as conn:
         event_types = [row[0] for row in conn.execute("SELECT event_type FROM events")]
     assert "entry_reprice_sized_risk_blocked" in event_types
+
+
+def test_reprice_rechecks_canary_after_awaited_cash_reservation(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RepricingOrderManager(
+        fill_after_orders=99,
+        quote_bid=2.90,
+        quote_ask=3.00,
+    )
+    risk_manager = RecordingSizedRiskManager()
+    planner = RecordingPlanner(order_manager, risk_manager=risk_manager)
+    cash_guard = BlockingReservationCashGuard()
+    planner.cash_guard = cash_guard
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        app_config=AppConfig(entry_reprice_enabled=False),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_CANARY_REPRICE",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.80,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_CANARY",
+    )
+
+    async def run():
+        task = asyncio.create_task(
+            supervisor._reprice_live_entry(plan, deployment, attempt=1)
+        )
+        await cash_guard.started.wait()
+        risk_manager.allowed = False
+        risk_manager.reason = "risk_canary_inhibited"
+        cash_guard.proceed.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    assert result.cancelled_without_fill is True
+    assert result.error == "risk_canary_inhibited"
+    assert order_manager.cancel_calls == ["ENTRY_CANARY"]
+    assert order_manager.entry_calls == []
+    assert len(risk_manager.reserve_calls) == 1
+    assert risk_manager.release_calls == ["TRADE_CANARY_REPRICE"]
+    assert cash_guard.calls == [
+        ("release", "TRADE_CANARY_REPRICE"),
+        ("release", "TRADE_CANARY_REPRICE"),
+    ]
+
+
+def test_reprice_releases_cash_and_risk_when_final_risk_check_raises(tmp_path) -> None:
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    order_manager = RepricingOrderManager(
+        fill_after_orders=99,
+        quote_bid=2.90,
+        quote_ask=3.00,
+    )
+    risk_manager = ExplodingSizedRiskManager()
+    planner = RecordingPlanner(order_manager, risk_manager=risk_manager)
+    cash_guard = ImmediateReservationCashGuard()
+    planner.cash_guard = cash_guard
+    supervisor = ExecutionSupervisor(
+        planner=planner,
+        event_repository=repo,
+        app_config=AppConfig(entry_reprice_enabled=False),
+    )
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    plan = TradePlan(
+        trade_id="TRADE_RISK_EXCEPTION_REPRICE",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.80,
+        risk_reasons=["approved"],
+        dry_run=False,
+        order_id="ENTRY_RISK_EXCEPTION",
+    )
+
+    result = asyncio.run(supervisor._reprice_live_entry(plan, deployment, attempt=1))
+
+    assert result.cancelled_without_fill is True
+    assert result.error == "entry_reprice_sized_risk_check_failed:risk-store-io"
+    assert order_manager.cancel_calls == ["ENTRY_RISK_EXCEPTION"]
+    assert order_manager.entry_calls == []
+    assert risk_manager.release_calls == ["TRADE_RISK_EXCEPTION_REPRICE"]
+    assert cash_guard.calls == [
+        ("release", "TRADE_RISK_EXCEPTION_REPRICE"),
+        ("reserve", "TRADE_RISK_EXCEPTION_REPRICE"),
+        ("release", "TRADE_RISK_EXCEPTION_REPRICE"),
+    ]
 
 
 def test_reprice_submit_exception_releases_sized_risk(tmp_path) -> None:
@@ -6313,3 +6438,48 @@ def test_new4_reconcile_pending_entry_release_clears_profile_exit_state(tmp_path
     )
     asyncio.run(supervisor._reconcile_pending_entry_release(trade))
     assert key not in supervisor._profile_exit_states  # NEW-4: cleared
+
+
+def test_trade_upsert_freezes_deployment_evidence_identity(tmp_path) -> None:
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "events.db"))
+    identity = {
+        "research_run_id": "triage-w1w2-20260710-pdd-long",
+        "evidence_packet_id": "a" * 64,
+        "evidence_artifact_sha256": "b" * 64,
+        "evidence_artifact_uri": "mala-evidence://sha256/packet/pdd.json",
+        "canary_id": "pdd-v1",
+        "canary_authorization_sha256": "c" * 64,
+        "canary_start_at": "2026-08-03T00:00:00-05:00",
+        "canary_expires_at": "2026-08-28T15:15:00-05:00",
+        "plan_revision_id": "sha256:plan-revision",
+        "session_id": "active_plan_2026-08-03_pdd_canary_v1:session",
+        "stop_loss_pct": 0.35,
+        "round_trip_cost_per_contract_usd": 2.0,
+    }
+    supervisor = ExecutionSupervisor(
+        trade_state_repository=trade_repo,
+        active_plan_id="active_plan_2026-08-03_pdd_canary_v1",
+        deployment_evidence_identity={"pdd_live_canary": identity},
+    )
+
+    asyncio.run(
+        supervisor._upsert_trade_record(
+            TradeRecord(
+                trade_id="PDD-IDENTITY",
+                deployment_id="pdd_live_canary",
+                symbol="PDD",
+                quantity=1,
+                entry_price=1.0,
+                status="pending_entry",
+            )
+        )
+    )
+
+    record = asyncio.run(trade_repo.get_recent_trades(limit=1))[0]
+    assert record.active_plan_id == "active_plan_2026-08-03_pdd_canary_v1"
+    for key, value in identity.items():
+        if hasattr(record, key):
+            assert getattr(record, key) == value
+    assert record.fact_receipt_id is not None
+    assert record.frozen_entry_risk_usd == 35.0
+    assert record.frozen_round_trip_cost_usd == 2.0

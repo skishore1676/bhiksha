@@ -106,6 +106,7 @@ def test_trader_desk_consult_defaults_to_market_now(tmp_path: Path, monkeypatch:
             direction="short",
             timestamp=kwargs["timestamp"],
             chart_read=kwargs["chart_read"],
+            chart_read_role="operator_journal_only_not_model_input",
             compile_eligibility="eligible",
             compile_decision="take",
             compile_block_reasons=[],

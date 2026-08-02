@@ -178,7 +178,9 @@ def build_session_manifest(
         "artifact_role": "generated_receipt_only",
         "configuration_authority": ["active_plan", "startup_config"],
         "session_manifest_id": f"{active_plan_id}:{fingerprint or 'unfingerprinted'}",
+        "session_id": f"{active_plan_id}:{fingerprint or 'unfingerprinted'}",
         "active_plan_id": active_plan_id,
+        "plan_revision_id": active_plan.get("plan_revision_id"),
         "trading_date": active_plan.get("trading_date"),
         "config_fingerprint": fingerprint,
         "risk_envelope_authorization_fingerprint": (
@@ -201,6 +203,7 @@ def render_session_manifest_markdown(manifest: dict[str, Any]) -> str:
         "# Exit Engine Session Manifest",
         "",
         f"- Session manifest: `{manifest['session_manifest_id']}`",
+        f"- Plan revision: `{manifest.get('plan_revision_id')}`",
         f"- Active plan: `{manifest['active_plan_id']}`",
         f"- Config fingerprint: `{manifest.get('config_fingerprint')}`",
         "- Authority: `active_plan` + `startup_config` (this file is a receipt)",

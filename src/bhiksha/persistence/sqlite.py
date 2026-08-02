@@ -276,6 +276,20 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_broker_payload TEXT,
                     exit_rule TEXT,
                     can_ladder INTEGER,
+                    active_plan_id TEXT,
+                    research_run_id TEXT,
+                    evidence_packet_id TEXT,
+                    evidence_artifact_sha256 TEXT,
+                    evidence_artifact_uri TEXT,
+                    canary_id TEXT,
+                    canary_authorization_sha256 TEXT,
+                    canary_start_at TEXT,
+                    canary_expires_at TEXT,
+                    plan_revision_id TEXT,
+                    session_id TEXT,
+                    fact_receipt_id TEXT,
+                    frozen_entry_risk_usd REAL,
+                    frozen_round_trip_cost_usd REAL,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -310,6 +324,27 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN exit_rule TEXT")
             if "can_ladder" not in existing_columns:
                 conn.execute("ALTER TABLE trade_sessions ADD COLUMN can_ladder INTEGER")
+            identity_columns = {
+                "active_plan_id": "TEXT",
+                "research_run_id": "TEXT",
+                "evidence_packet_id": "TEXT",
+                "evidence_artifact_sha256": "TEXT",
+                "evidence_artifact_uri": "TEXT",
+                "canary_id": "TEXT",
+                "canary_authorization_sha256": "TEXT",
+                "canary_start_at": "TEXT",
+                "canary_expires_at": "TEXT",
+                "plan_revision_id": "TEXT",
+                "session_id": "TEXT",
+                "fact_receipt_id": "TEXT",
+                "frozen_entry_risk_usd": "REAL",
+                "frozen_round_trip_cost_usd": "REAL",
+            }
+            for column_name, column_type in identity_columns.items():
+                if column_name not in existing_columns:
+                    conn.execute(
+                        f"ALTER TABLE trade_sessions ADD COLUMN {column_name} {column_type}"
+                    )
             # get_recent_trades orders by updated_at DESC on every risk-manager
             # consult (2-3x per entry attempt + once per bar); without this
             # index that is a full-table scan + temp b-tree sort that grows
@@ -478,8 +513,13 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                     exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
                     exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
+                    active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
+                    evidence_artifact_uri, canary_id, canary_authorization_sha256,
+                    canary_start_at, canary_expires_at,
+                    plan_revision_id, session_id, fact_receipt_id,
+                    frozen_entry_risk_usd, frozen_round_trip_cost_usd,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     deployment_id=excluded.deployment_id,
                     symbol=excluded.symbol,
@@ -546,6 +586,20 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_broker_payload=COALESCE(excluded.exit_broker_payload, trade_sessions.exit_broker_payload),
                     exit_rule=COALESCE(excluded.exit_rule, trade_sessions.exit_rule),
                     can_ladder=COALESCE(excluded.can_ladder, trade_sessions.can_ladder),
+                    active_plan_id=COALESCE(trade_sessions.active_plan_id, excluded.active_plan_id),
+                    research_run_id=COALESCE(trade_sessions.research_run_id, excluded.research_run_id),
+                    evidence_packet_id=COALESCE(trade_sessions.evidence_packet_id, excluded.evidence_packet_id),
+                    evidence_artifact_sha256=COALESCE(trade_sessions.evidence_artifact_sha256, excluded.evidence_artifact_sha256),
+                    evidence_artifact_uri=COALESCE(trade_sessions.evidence_artifact_uri, excluded.evidence_artifact_uri),
+                    canary_id=COALESCE(trade_sessions.canary_id, excluded.canary_id),
+                    canary_authorization_sha256=COALESCE(trade_sessions.canary_authorization_sha256, excluded.canary_authorization_sha256),
+                    canary_start_at=COALESCE(trade_sessions.canary_start_at, excluded.canary_start_at),
+                    canary_expires_at=COALESCE(trade_sessions.canary_expires_at, excluded.canary_expires_at),
+                    plan_revision_id=COALESCE(trade_sessions.plan_revision_id, excluded.plan_revision_id),
+                    session_id=COALESCE(trade_sessions.session_id, excluded.session_id),
+                    fact_receipt_id=COALESCE(trade_sessions.fact_receipt_id, excluded.fact_receipt_id),
+                    frozen_entry_risk_usd=COALESCE(trade_sessions.frozen_entry_risk_usd, excluded.frozen_entry_risk_usd),
+                    frozen_round_trip_cost_usd=COALESCE(trade_sessions.frozen_round_trip_cost_usd, excluded.frozen_round_trip_cost_usd),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -575,6 +629,20 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     json.dumps(record.exit_broker_payload, default=str) if record.exit_broker_payload is not None else None,
                     record.exit_rule,
                     None if record.can_ladder is None else int(record.can_ladder),
+                    record.active_plan_id,
+                    record.research_run_id,
+                    record.evidence_packet_id,
+                    record.evidence_artifact_sha256,
+                    record.evidence_artifact_uri,
+                    record.canary_id,
+                    record.canary_authorization_sha256,
+                    record.canary_start_at,
+                    record.canary_expires_at,
+                    record.plan_revision_id,
+                    record.session_id,
+                    record.fact_receipt_id,
+                    record.frozen_entry_risk_usd,
+                    record.frozen_round_trip_cost_usd,
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -631,7 +699,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
+                       active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
+                       evidence_artifact_uri, canary_id, canary_authorization_sha256,
+                       canary_start_at, canary_expires_at, plan_revision_id,
+                       session_id, fact_receipt_id, frozen_entry_risk_usd,
+                       frozen_round_trip_cost_usd
                 FROM trade_sessions
                 WHERE status != 'closed'
                 ORDER BY updated_at DESC
@@ -646,7 +719,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
                        entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
+                       active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
+                       evidence_artifact_uri, canary_id, canary_authorization_sha256,
+                       canary_start_at, canary_expires_at, plan_revision_id,
+                       session_id, fact_receipt_id, frozen_entry_risk_usd,
+                       frozen_round_trip_cost_usd
                 FROM trade_sessions
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -1248,6 +1326,20 @@ def _trade_record_from_row(row) -> TradeRecord:
         exit_broker_payload=json.loads(row[23]) if len(row) > 23 and row[23] else None,
         exit_rule=row[24] if len(row) > 24 else None,
         can_ladder=(bool(row[25]) if row[25] is not None else None) if len(row) > 25 else None,
+        active_plan_id=row[26] if len(row) > 26 else None,
+        research_run_id=row[27] if len(row) > 27 else None,
+        evidence_packet_id=row[28] if len(row) > 28 else None,
+        evidence_artifact_sha256=row[29] if len(row) > 29 else None,
+        evidence_artifact_uri=row[30] if len(row) > 30 else None,
+        canary_id=row[31] if len(row) > 31 else None,
+        canary_authorization_sha256=row[32] if len(row) > 32 else None,
+        canary_start_at=row[33] if len(row) > 33 else None,
+        canary_expires_at=row[34] if len(row) > 34 else None,
+        plan_revision_id=row[35] if len(row) > 35 else None,
+        session_id=row[36] if len(row) > 36 else None,
+        fact_receipt_id=row[37] if len(row) > 37 else None,
+        frozen_entry_risk_usd=row[38] if len(row) > 38 else None,
+        frozen_round_trip_cost_usd=row[39] if len(row) > 39 else None,
     )
 
 

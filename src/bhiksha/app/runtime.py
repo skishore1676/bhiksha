@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -25,6 +25,9 @@ from bhiksha.domain.events import BarClosedEvent
 from bhiksha.domain.models import Bar, SignalDecision
 from bhiksha.domain.runtime import ProviderHealth, StartupReport
 from bhiksha.execution.order_manager import OrderManager
+from bhiksha.execution.brokers.public.order_status import (
+    PUBLIC_WORKING_ORDER_STATUSES,
+)
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.position_monitor import PositionMonitor
 from bhiksha.execution.supervisor import ExecutionSupervisor
@@ -53,6 +56,7 @@ from bhiksha.ops.session_manifest import (
     effective_exit_policy_records,
     write_session_manifest,
 )
+from bhiksha.ops.trade_observation import terminal_entry_observation
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.sqlite import (
     SQLiteBackend,
@@ -61,8 +65,10 @@ from bhiksha.persistence.sqlite import (
     SQLiteEventRepository,
     SQLiteTradeStateRepository,
 )
+from bhiksha.persistence.repository import EvidenceIdentityEventRepository
 from bhiksha.persistence.exit_state import SQLiteExitStateRepository
 from bhiksha.risk.cash_guard import CashGuard, trade_date_et
+from bhiksha.risk.canary_inhibition_store import CanaryInhibitionStore
 from bhiksha.risk.plan_operator_defaults_source import PlanOperatorDefaultsSource
 from bhiksha.risk.risk_manager import RiskManager
 from bhiksha.risk.risk_settings import resolve_risk_settings
@@ -84,6 +90,13 @@ _DEAD_LANE_FAILURE_THRESHOLD = 3
 # table bounded without a separate scheduled job). See
 # bhiksha.persistence.sqlite.SQLiteChainSnapshotRepository.purge_older_than.
 _CHAIN_SNAPSHOT_RETENTION_DAYS = 30
+
+
+def _optional_identity_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 async def record_signal_evaluation(event_repository, decision: SignalDecision) -> None:
@@ -301,12 +314,165 @@ class BhikshaRuntime:
             quote = await order_manager.get_option_quote(option_symbol)
             return quote.exit_reference_price
 
+        async def _confirmed_canary_zero_fill(trade_id: str) -> bool:
+            def _read() -> bool:
+                with closing(sqlite_backend.connect()) as conn:
+                    trade_row = conn.execute(
+                        "SELECT status, exit_order_id, exit_price, "
+                        "exit_filled_quantity, exit_filled_at, "
+                        "exit_order_status FROM trade_sessions "
+                        "WHERE trade_id = ?",
+                        (trade_id,),
+                    ).fetchone()
+                    if trade_row is not None:
+                        status = str(trade_row[0] or "").lower()
+                        positive_exit = (
+                            int(trade_row[3] or 0) > 0
+                            or (
+                                trade_row[1] is not None
+                                and trade_row[2] is not None
+                                and trade_row[4] is not None
+                                and str(trade_row[5] or "").upper()
+                                == "FILLED"
+                            )
+                        )
+                        if positive_exit or status in {
+                            "open_protected",
+                            "open_unprotected",
+                            "exit_pending",
+                            "closed",
+                        }:
+                            return False
+                    table = conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='events'"
+                    ).fetchone()
+                    if table is None:
+                        return False
+                    rows = conn.execute(
+                        """
+                        SELECT id, created_at, event_type, payload
+                        FROM events
+                        WHERE event_type IN (
+                            'entry_reconcile_released',
+                            'entry_reprice_blocked',
+                            'entry_reprice_cancel_after_timeout'
+                        )
+                        ORDER BY id DESC
+                        LIMIT 2000
+                        """
+                    ).fetchall()
+                for event_id, created_at, event_type, raw_payload in rows:
+                    try:
+                        payload = json.loads(raw_payload)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    observation = terminal_entry_observation(
+                        {
+                            "event_id": event_id,
+                            "created_at": created_at,
+                            "event_type": event_type,
+                            "payload": payload,
+                        }
+                    )
+                    if (
+                        observation is not None
+                        and observation.get("trade_id") == trade_id
+                    ):
+                        return True
+                return False
+
+            return await sqlite_backend.run_read(_read)
+
+        async def _confirmed_canary_protection(trade) -> bool:
+            stop_order_id = str(trade.stop_order_id or "").strip()
+            if not stop_order_id:
+                return False
+            status, _payload, error = await order_manager.get_order_status(
+                stop_order_id
+            )
+            return (
+                error is None
+                and str(status or "").upper()
+                in PUBLIC_WORKING_ORDER_STATUSES
+            )
+
+        canary_policies: dict[str, dict[str, object]] = {}
+        deployment_evidence_identity: dict[str, dict[str, object]] = {}
+        plan_revision_id = _optional_identity_text(
+            (self.active_plan or {}).get("plan_revision_id")
+        )
+        session_id = (
+            f"{active_plan_id}:{startup_config_id}"
+            if active_plan_id and startup_config_id
+            else None
+        )
+        for deployment in self.deployments:
+            metadata = deployment.source.metadata
+            deployment_evidence_identity[deployment.deployment_id] = {
+                "active_plan_id": active_plan_id,
+                "research_run_id": _optional_identity_text(metadata.get("run_id")),
+                "evidence_packet_id": _optional_identity_text(
+                    metadata.get("evidence_packet_id")
+                ),
+                "evidence_artifact_sha256": _optional_identity_text(
+                    metadata.get("artifact_sha256")
+                ),
+                "evidence_artifact_uri": _optional_identity_text(
+                    metadata.get("artifact_uri")
+                ),
+                "canary_id": _optional_identity_text(metadata.get("canary_id")),
+                "canary_authorization_sha256": _optional_identity_text(
+                    metadata.get("authorization_sha256")
+                ),
+                "canary_start_at": _optional_identity_text(
+                    metadata.get("canary_start_at")
+                ),
+                "canary_expires_at": _optional_identity_text(
+                    metadata.get("canary_expires_at")
+                ),
+                "plan_revision_id": plan_revision_id,
+                "session_id": session_id,
+                "stop_loss_pct": deployment.risk.stop_loss_pct,
+                "round_trip_cost_per_contract_usd": (
+                    raw_policy.get("round_trip_cost_per_contract_usd")
+                    if isinstance(raw_policy := metadata.get("canary_policy"), dict)
+                    else None
+                ),
+            }
+            raw_policy = metadata.get("canary_policy")
+            if (
+                isinstance(raw_policy, dict)
+                and str(metadata.get("authorization_mode") or "").lower()
+                == "live"
+            ):
+                canary_policies[deployment.deployment_id] = {
+                    **raw_policy,
+                    "canary_id": metadata.get("canary_id"),
+                    "start_at": metadata.get("canary_start_at"),
+                    "expires_at": metadata.get("canary_expires_at"),
+                    "stop_loss_pct": deployment.risk.stop_loss_pct,
+                    "evidence_packet_id": metadata.get("evidence_packet_id"),
+                }
+
+        event_repository = EvidenceIdentityEventRepository(
+            event_repository,
+            deployment_evidence_identity,
+        )
+        canary_inhibition_store = CanaryInhibitionStore()
+        canary_inhibition_store.initialize()
         self.risk_manager = RiskManager(
             settings=resolve_risk_settings(settings_source=risk_settings_source),
             cash_budget_repository=cash_budget_repository,
             trade_state_repository=trade_state_repository,
             event_repository=event_repository,
             mark_price_provider=_mark_price_provider,
+            canary_policies=canary_policies,
+            canary_zero_fill_evidence_provider=_confirmed_canary_zero_fill,
+            canary_protection_evidence_provider=(
+                _confirmed_canary_protection
+            ),
+            canary_inhibition_store=canary_inhibition_store,
         )
         await self.risk_manager.startup_log()
         planner = ExecutionPlanner(
@@ -335,6 +501,7 @@ class BhikshaRuntime:
             exit_state_repository=exit_state_repository,
             active_plan_id=active_plan_id,
             startup_config_id=startup_config_id,
+            deployment_evidence_identity=deployment_evidence_identity,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker

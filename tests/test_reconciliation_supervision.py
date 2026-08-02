@@ -321,8 +321,13 @@ def test_daily_report_treats_released_zero_fill_as_recovery_not_trade(tmp_path) 
                         "trade_id": "hold-amd",
                         "deployment_id": "amd_short_live",
                         "symbol": "AMD",
-                        "entry_order_id": "PUBLIC-AMD-ORDER",
-                        "status": "CANCELLED",
+                            "entry_order_id": "PUBLIC-AMD-ORDER",
+                            "status": "CANCELLED",
+                            "safe_to_close": True,
+                            "payload": {
+                                "status": "CANCELLED",
+                                "filledQuantity": None,
+                            },
                     }
                 ),
             ),

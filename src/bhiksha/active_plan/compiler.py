@@ -6,6 +6,7 @@ import csv
 import copy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -19,6 +20,11 @@ from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
 from bhiksha.execution.pricing import resolve_entry_reprice_max_chase_pct
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
+from bhiksha.risk.canary_inhibition_store import (
+    CanaryInhibitionRecord,
+    CanaryInhibitionStore,
+    CanaryInhibitionStoreError,
+)
 from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.strategy.capabilities import (
     NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS,
@@ -27,6 +33,9 @@ from bhiksha.strategy.capabilities import (
 )
 from bhiksha.strategy.registry import default_strategy_registry
 from bhiksha.time_utils import normalize_time_text, parse_time_text
+
+
+LIVE_TRIAGE_PROVIDER_OVERLAP_FLOOR = 0.90
 
 
 class StrategyCatalogSheetRow(BaseModel):
@@ -342,6 +351,7 @@ def compile_active_plan_from_rows(
     operator_defaults: dict[str, Any] | None = None,
     suppressed: list[dict[str, Any]] | None = None,
     risk_demotion_store: DemotionStore | None = None,
+    canary_inhibition_store: CanaryInhibitionStore | None = None,
 ) -> CompiledActivePlan:
     suppressed_rows = list(suppressed or [])
     if google_strategy_catalog is not None:
@@ -392,10 +402,23 @@ def compile_active_plan_from_rows(
         deployments.append(deployment)
         row_type_counts[row.row_type] = row_type_counts.get(row.row_type, 0) + 1
 
-    deployments, demotion_warnings = apply_risk_demotion_overrides(deployments, demotion_store=risk_demotion_store)
-
+    deployments, provider_overlap_warnings = (
+        apply_live_triage_provider_overlap_floor(deployments)
+    )
     effective_trading_date = trading_date or datetime.now(UTC).date().isoformat()
     effective_active_plan_id = active_plan_id or f"active_plan_{effective_trading_date}"
+    _validate_compiled_live_triage_authority(
+        deployments,
+        active_plan_id=effective_active_plan_id,
+        trading_date=effective_trading_date,
+    )
+
+    deployments, demotion_warnings = apply_risk_demotion_overrides(deployments, demotion_store=risk_demotion_store)
+    deployments, canary_inhibition_warnings = apply_canary_inhibition_overrides(
+        deployments,
+        inhibition_store=canary_inhibition_store,
+    )
+
     source = {
         "name": source_name,
         "strategy_catalog_path": str(Path(strategy_catalog_path).resolve()),
@@ -417,6 +440,8 @@ def compile_active_plan_from_rows(
             "symbols": sorted({deployment.symbol for deployment in deployments}),
             "gate_override_key_warnings": gate_override_warnings,
             "risk_demotion_warnings": demotion_warnings,
+            "live_triage_provider_overlap_warnings": provider_overlap_warnings,
+            "canary_inhibition_warnings": canary_inhibition_warnings,
         },
         suppressed=suppressed_rows,
         deployments=deployments,
@@ -765,6 +790,165 @@ def apply_risk_demotion_overrides(
     return updated, warnings
 
 
+def apply_canary_inhibition_overrides(
+    deployments: list[DeploymentManifest],
+    *,
+    inhibition_store: CanaryInhibitionStore | None = None,
+) -> tuple[list[DeploymentManifest], list[dict[str, Any]]]:
+    """Force inhibited live-triage deployments to compile shadow-only.
+
+    A missing store is the compatible empty state. An unreadable or malformed
+    store is unknown safety state, so every otherwise-live triage deployment
+    is forced shadow-only and receives an explicit warning. Non-triage lanes
+    and the existing Rail B override remain unchanged.
+    """
+
+    store = inhibition_store or CanaryInhibitionStore()
+    try:
+        records = store.load()
+    except CanaryInhibitionStoreError as exc:
+        warnings: list[dict[str, Any]] = []
+        updated: list[DeploymentManifest] = []
+        for deployment in deployments:
+            if not _is_live_triage_deployment(deployment):
+                updated.append(deployment)
+                continue
+            updated.append(_force_shadow_only(deployment))
+            warnings.append(
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "canary_id": deployment.source.metadata.get("canary_id"),
+                    "reason": "canary_inhibition_state_unavailable",
+                    "message": (
+                        "Canary inhibition state is unreadable; live triage "
+                        "deployment forced shadow_only at compile."
+                    ),
+                    "error": str(exc),
+                }
+            )
+        return updated, warnings
+
+    if not records:
+        return deployments, []
+
+    records_by_deployment: dict[str, list[CanaryInhibitionRecord]] = {}
+    for record in records.values():
+        records_by_deployment.setdefault(record.deployment_id, []).append(record)
+
+    known_ids = {deployment.deployment_id for deployment in deployments}
+    warnings = []
+    updated = []
+    for deployment in deployments:
+        matching = records_by_deployment.get(deployment.deployment_id, [])
+        if not matching or not _is_triage_deployment(deployment):
+            updated.append(deployment)
+            continue
+        was_live = not deployment.execution.shadow_only
+        updated.append(_force_shadow_only(deployment))
+        warnings.append(
+            {
+                "deployment_id": deployment.deployment_id,
+                "canary_id": deployment.source.metadata.get("canary_id"),
+                "latched_canary_ids": sorted(
+                    {record.canary_id for record in matching}
+                ),
+                "latched_at": sorted({record.latched_at for record in matching}),
+                "reasons": sorted({record.reason for record in matching}),
+                "reason": "live_triage_canary_inhibited",
+                "message": (
+                    "Live triage canary inhibition forced this deployment to "
+                    "shadow_only at compile."
+                    if was_live
+                    else "Live triage canary inhibition remains latched; deployment was already shadow_only."
+                ),
+            }
+        )
+
+    for deployment_id in sorted(set(records_by_deployment) - known_ids):
+        warnings.append(
+            {
+                "deployment_id": deployment_id,
+                "latched_canary_ids": sorted(
+                    {
+                        record.canary_id
+                        for record in records_by_deployment[deployment_id]
+                    }
+                ),
+                "reason": "unknown_deployment_id",
+                "message": (
+                    "Canary inhibition references a deployment id not present "
+                    "in this compiled plan; latch remains preserved."
+                ),
+            }
+        )
+    return updated, warnings
+
+
+def apply_live_triage_provider_overlap_floor(
+    deployments: list[DeploymentManifest],
+) -> tuple[list[DeploymentManifest], list[dict[str, Any]]]:
+    """Fail closed to shadow when live-triage provider parity is insufficient."""
+
+    updated: list[DeploymentManifest] = []
+    warnings: list[dict[str, Any]] = []
+    for deployment in deployments:
+        if not _is_live_triage_deployment(deployment):
+            updated.append(deployment)
+            continue
+        metadata = deployment.source.metadata
+        policy = metadata.get("canary_policy") or {}
+        floor = policy.get("provider_overlap_floor")
+        observed = metadata.get("provider_signal_overlap")
+        reason: str | None = None
+        if isinstance(floor, bool) or not isinstance(floor, (int, float)):
+            reason = "provider_overlap_floor_missing_or_invalid"
+        elif isinstance(observed, bool) or not isinstance(observed, (int, float)):
+            reason = "provider_signal_overlap_missing_or_invalid"
+        elif float(observed) < float(floor):
+            reason = "provider_signal_overlap_below_floor"
+        if reason is None:
+            updated.append(deployment)
+            continue
+        updated.append(_force_shadow_only(deployment))
+        warnings.append(
+            {
+                "deployment_id": deployment.deployment_id,
+                "canary_id": metadata.get("canary_id"),
+                "reason": reason,
+                "provider_signal_overlap": observed,
+                "provider_overlap_floor": floor,
+                "message": (
+                    "Live triage provider overlap did not clear its static "
+                    "floor; deployment forced shadow_only at compile."
+                ),
+            }
+        )
+    return updated, warnings
+
+
+def _force_shadow_only(deployment: DeploymentManifest) -> DeploymentManifest:
+    if deployment.execution.shadow_only:
+        return deployment
+    return deployment.model_copy(
+        update={
+            "execution": deployment.execution.model_copy(
+                update={"shadow_only": True}
+            )
+        }
+    )
+
+
+def _is_triage_deployment(deployment: DeploymentManifest) -> bool:
+    strategy_id = str(
+        deployment.source.metadata.get("strategy_id") or ""
+    )
+    return strategy_id.startswith("triage-")
+
+
+def _is_live_triage_deployment(deployment: DeploymentManifest) -> bool:
+    return _is_triage_deployment(deployment) and not deployment.execution.shadow_only
+
+
 def _compile_row(
     row: ActivePlanSheetRow,
     catalog_by_id: dict[str, StrategyCatalogEntry],
@@ -843,7 +1027,211 @@ def _compile_strategy_row(
             **({"evidence_gates_relaxed": relaxed_evidence_gates} if relaxed_evidence_gates else {}),
         },
     )
-    return DeploymentManifest.model_validate(payload)
+    deployment = DeploymentManifest.model_validate(payload)
+    _validate_live_triage_canary(deployment, strategy_id=strategy_id)
+    return deployment
+
+
+def _validate_live_triage_canary(deployment: DeploymentManifest, *, strategy_id: str) -> None:
+    """Fail closed when a triage row crosses from evidence collection to live.
+
+    Existing non-triage live lanes retain their current contract.  A triage
+    promotion is a distinct canary class and must carry immutable evidence
+    identity plus the operator's bounded admission/stop/scale policy through
+    the compiled plan.
+    """
+
+    if not strategy_id.startswith("triage-") or deployment.execution.shadow_only:
+        return
+    metadata = deployment.source.metadata
+    required_text = (
+        "run_id",
+        "evidence_packet_id",
+        "artifact_sha256",
+        "artifact_uri",
+        "canary_id",
+        "canary_start_at",
+        "canary_expires_at",
+        "authorized_active_plan_id",
+        "authorized_deployment_id",
+        "authorization_sha256",
+    )
+    missing = [key for key in required_text if not isinstance(metadata.get(key), str) or not metadata[key].strip()]
+    if missing:
+        raise ValueError(
+            f"live triage canary {strategy_id!r} missing identity metadata: {', '.join(missing)}"
+        )
+    packet_id = str(metadata["evidence_packet_id"]).strip().lower()
+    artifact_sha = str(metadata["artifact_sha256"]).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", packet_id) is None:
+        raise ValueError(f"live triage canary {strategy_id!r} has invalid evidence_packet_id")
+    if re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None:
+        raise ValueError(f"live triage canary {strategy_id!r} has invalid artifact_sha256")
+    expected_uri_prefix = f"mala-evidence://sha256/{packet_id}/"
+    if not str(metadata["artifact_uri"]).startswith(expected_uri_prefix):
+        raise ValueError(f"live triage canary {strategy_id!r} artifact_uri is not packet-bound")
+    if deployment.risk.max_contracts != 1:
+        raise ValueError(f"live triage canary {strategy_id!r} requires max_contracts=1")
+    if deployment.risk.max_trade_premium_usd > 300:
+        raise ValueError(f"live triage canary {strategy_id!r} requires max_trade_premium_usd<=300")
+    if deployment.execution.runtime_mode != "live_approval_gated":
+        raise ValueError(f"live triage canary {strategy_id!r} requires runtime_mode=live_approval_gated")
+    if deployment.exit.profile_exit_drives_live is not True:
+        raise ValueError(f"live triage canary {strategy_id!r} requires profile_exit_drives_live=true")
+
+    policy = metadata.get("canary_policy")
+    required_policy = {
+        "max_cumulative_loss_r": -2.0,
+        "stop_on_unprotected_position": True,
+        "stop_on_missing_attribution": True,
+        "stop_on_failed_exit_receipt": True,
+        "scale_min_clean_closes": 10,
+        "r_definition": "sum_after_cost_trade_pnl_over_frozen_entry_stop_risk",
+        "scale_fraction_of_baseline": 0.20,
+        "round_trip_cost_per_contract_usd": 2.0,
+    }
+    if not isinstance(policy, dict):
+        raise ValueError(f"live triage canary {strategy_id!r} is missing canary_policy")
+    mismatched = [key for key, expected in required_policy.items() if policy.get(key) != expected]
+    provider_overlap_floor = policy.get("provider_overlap_floor")
+    if (
+        isinstance(provider_overlap_floor, bool)
+        or not isinstance(provider_overlap_floor, (int, float))
+        or not LIVE_TRIAGE_PROVIDER_OVERLAP_FLOOR
+        <= float(provider_overlap_floor)
+        <= 1.0
+    ):
+        mismatched.append("provider_overlap_floor")
+    if mismatched:
+        raise ValueError(
+            f"live triage canary {strategy_id!r} has invalid canary_policy fields: {', '.join(mismatched)}"
+        )
+    baseline_cap = metadata.get("baseline_max_trade_premium_usd")
+    if (
+        isinstance(baseline_cap, bool)
+        or not isinstance(baseline_cap, (int, float))
+        or float(baseline_cap) <= 0
+    ):
+        raise ValueError(
+            f"live triage canary {strategy_id!r} requires "
+            "baseline_max_trade_premium_usd"
+        )
+    expected_cap = min(300.0, float(baseline_cap) * 0.20)
+    if abs(deployment.risk.max_trade_premium_usd - expected_cap) > 1e-9:
+        raise ValueError(
+            f"live triage canary {strategy_id!r} premium cap must equal "
+            "min(300, 20% of baseline_max_trade_premium_usd)"
+        )
+
+
+def _validate_compiled_live_triage_authority(
+    deployments: list[DeploymentManifest],
+    *,
+    active_plan_id: str,
+    trading_date: str,
+) -> None:
+    candidates = [
+        deployment
+        for deployment in deployments
+        if _is_live_triage_deployment(deployment)
+        and str(
+            deployment.source.metadata.get("authorization_mode") or ""
+        ).lower()
+        == "live"
+    ]
+    if len(candidates) > 1:
+        raise ValueError(
+            "only one live triage entry canary may be authorized per plan"
+        )
+    for deployment in candidates:
+        metadata = deployment.source.metadata
+        if metadata.get("authorized_active_plan_id") != active_plan_id:
+            raise ValueError(
+                f"live triage canary {deployment.deployment_id!r} is not "
+                "bound to the compiled active_plan_id"
+            )
+        if metadata.get("authorized_deployment_id") != deployment.deployment_id:
+            raise ValueError(
+                f"live triage canary {deployment.deployment_id!r} is not "
+                "bound to its compiled deployment_id"
+            )
+        if (
+            deployment.execution.dte_min != 0
+            or deployment.execution.dte_max != 3
+            or deployment.execution.dte_fallback_policy != "allow_nearest_after"
+        ):
+            raise ValueError(
+                f"live triage canary {deployment.deployment_id!r} requires "
+                "frozen 0-3 DTE with allow_nearest_after"
+            )
+        start = _parse_authorization_time(
+            metadata.get("canary_start_at"), "canary_start_at"
+        )
+        expires = _parse_authorization_time(
+            metadata.get("canary_expires_at"), "canary_expires_at"
+        )
+        if expires <= start:
+            raise ValueError("live triage canary expiry must be after start")
+        effective_date = datetime.fromisoformat(trading_date).date()
+        if not start.date() <= effective_date <= expires.date():
+            raise ValueError(
+                f"live triage canary {deployment.deployment_id!r} is outside "
+                "its authorization window"
+            )
+        expected = compute_live_triage_authorization_sha256(
+            deployment, active_plan_id=active_plan_id
+        )
+        if str(metadata.get("authorization_sha256") or "").lower() != expected:
+            raise ValueError(
+                f"live triage canary {deployment.deployment_id!r} has an "
+                "invalid authorization_sha256"
+            )
+
+
+def compute_live_triage_authorization_sha256(
+    deployment: DeploymentManifest, *, active_plan_id: str
+) -> str:
+    # Bind the complete compiled deployment contract, not a hand-picked
+    # subset of fields.  Otherwise an operator-sheet edit to (for example)
+    # symbol, direction, strategy params, runtime mode, or exit behavior could
+    # retain a valid digest while materially changing what is authorized.
+    # The digest itself is removed to avoid self-reference; every other source
+    # field remains part of the signed payload.
+    deployment_payload = deployment.model_dump(mode="json")
+    source = deployment_payload.get("source")
+    if isinstance(source, dict):
+        source_metadata = source.get("metadata")
+        if isinstance(source_metadata, dict):
+            source_metadata.pop("authorization_sha256", None)
+    payload = {
+        "active_plan_id": active_plan_id,
+        "deployment": deployment_payload,
+    }
+    return compute_live_triage_authorization_payload_sha256(payload)
+
+
+def compute_live_triage_authorization_payload_sha256(
+    payload: dict[str, Any]
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _parse_authorization_time(value: Any, field_name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"live triage canary has invalid {field_name}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"live triage canary {field_name} must be timezone-aware"
+        )
+    return parsed
 
 
 def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:

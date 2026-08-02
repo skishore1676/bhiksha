@@ -6,11 +6,13 @@ import sqlite3
 
 from bhiksha.domain.models import TradeRecord
 from bhiksha.ops.weekly_trading_decisions import (
+    build_trading_decision_export,
     finalize_weekly_trading_decisions,
     render_weekly_trading_decisions_markdown,
     weekly_stable_digest,
     write_weekly_trading_decisions,
 )
+from bhiksha.ops.weekly_scorecard import build_weekly_scorecard
 from bhiksha.persistence.sqlite import (
     SQLiteBackend,
     SQLiteEventRepository,
@@ -60,12 +62,23 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
             option_symbol="QQQ260713P00560000", quantity=1, entry_price=1.0,
             entry_timestamp=datetime(2026, 7, 10, 14, 0, tzinfo=UTC),
             status="open_protected", entry_order_id="SHADOW_ENTRY",
+            active_plan_id="plan-shadow",
+            plan_revision_id="sha256:plan-shadow",
+            session_id="plan-shadow:session",
+            research_run_id="run-shadow",
+            evidence_packet_id="a" * 64,
+            evidence_artifact_sha256="b" * 64,
+            evidence_artifact_uri="mala-evidence://shadow",
+            canary_id="shadow-v1",
+            canary_authorization_sha256="c" * 64,
+            fact_receipt_id="sha256:fact-shadow",
         ))
         await trades.mark_closed(
             "shadow-1", exit_order_id="DRY_RUN", exit_price=1.5,
             exit_filled_quantity=1,
             exit_filled_at=datetime(2026, 7, 10, 15, 0, tzinfo=UTC),
             exit_order_status="FILLED", exit_order_type="PAPER",
+            exit_rule="strategy:paper_close",
         )
 
     asyncio.run(seed())
@@ -84,6 +97,10 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     assert export["receipt"]["fact_count"] == 1
     assert export["facts"][0]["lane"] == "shadow"
     assert export["facts"][0]["realized_pnl_usd"] == 50.0
+    assert export["facts"][0]["plan_revision_id"] == "sha256:plan-shadow"
+    assert export["facts"][0]["session_id"] == "plan-shadow:session"
+    assert export["facts"][0]["fact_receipt_id"] == "sha256:fact-shadow"
+    assert export["facts"][0]["evidence_packet_id"] == "a" * 64
     assert governance["schema"] == "bhiksha.trading_governance_evidence.v1"
     assert governance["receipt"]["status"] == "ok"
     assert result.report["governance_evidence"] == str(result.governance_path)
@@ -125,6 +142,177 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     )
     rerun_export = json.loads(rerun.facts_path.read_text(encoding="utf-8"))
     assert rerun_export["receipt"]["sha256"] == export["receipt"]["sha256"]
+
+
+def test_weekly_export_separates_terminal_no_fill_and_unknown_exit_observations(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="FILLED-CLOSED",
+                deployment_id="filled_lane",
+                symbol="QQQ",
+                option_symbol="QQQ260713P00560000",
+                quantity=1,
+                entry_price=1.0,
+                entry_timestamp=datetime(2026, 7, 10, 14, 0, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY-FILLED",
+            )
+        )
+        await trades.mark_closed(
+            "FILLED-CLOSED",
+            exit_order_id="EXIT-FILLED",
+            exit_price=1.5,
+            exit_filled_quantity=1,
+            exit_filled_at=datetime(2026, 7, 10, 15, 0, tzinfo=UTC),
+            exit_order_status="FILLED",
+            exit_order_type="LIMIT",
+        )
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="AMD-UNFILLED",
+                deployment_id="amd_live",
+                symbol="AMD",
+                option_symbol="AMD260717C00260000",
+                quantity=1,
+                entry_price=6.60,
+                entry_timestamp=datetime(2026, 7, 10, 14, 1, tzinfo=UTC),
+                status="pending_entry",
+                entry_order_id="ENTRY-AMD-UNFILLED",
+            )
+        )
+        await trades.mark_closed("AMD-UNFILLED")
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="FILLED-EXIT-MISSING",
+                deployment_id="missing_exit_lane",
+                symbol="NVDA",
+                option_symbol="NVDA260717C00200000",
+                quantity=1,
+                entry_price=2.0,
+                entry_timestamp=datetime(2026, 7, 10, 14, 2, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY-NVDA",
+                stop_order_id="STOP-NVDA",
+            )
+        )
+        await trades.mark_closed("FILLED-EXIT-MISSING")
+
+        await events.append(
+            "entry_reconcile_released",
+            {
+                "deployment_id": "amd_live",
+                "trade_id": "AMD-UNFILLED",
+                "order_id": "ENTRY-AMD-UNFILLED",
+                "status": "CANCELED",
+                "payload": {"status": "CANCELED", "filledQuantity": None},
+            },
+        )
+        await events.append(
+            "entry_reconcile_released",
+            {
+                "deployment_id": "no_fill_lane",
+                "trade_id": "REJECTED-NO-FILL",
+                "order_id": "ENTRY-REJECTED",
+                "status": "REJECTED",
+                "payload": {"status": "REJECTED", "filledQuantity": 0},
+            },
+        )
+        await events.append(
+            "signal_decision",
+            {
+                "deployment_id": "no_signal_lane",
+                "symbol": "IWM",
+                "signal": False,
+            },
+        )
+        await events.append(
+            "signal_decision",
+            {
+                "deployment_id": "blocked_lane",
+                "symbol": "META",
+                "signal": True,
+            },
+        )
+        await events.append(
+            "lifecycle_entry_blocked",
+            {
+                "deployment_id": "blocked_lane",
+                "symbol": "META",
+                "state": "open_protected",
+            },
+        )
+        await events.append(
+            "trade_plan",
+            {
+                "trade_id": "PLAN-WITHOUT-RECEIPT",
+                "deployment_id": "missing_plan_lane",
+                "symbol": "PDD",
+                "order_id": "ENTRY-PDD-MISSING",
+                "risk_reasons": ["approved"],
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE events SET created_at='2026-07-10T14:05:00+00:00'")
+        conn.commit()
+
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    export = build_trading_decision_export(
+        db_path,
+        through=date(2026, 7, 10),
+        deployments=None,
+        report_dir=report_dir,
+    )
+
+    assert export["receipt"]["fact_count"] == 1
+    assert export["facts"][0]["trade_id"] == "FILLED-CLOSED"
+    assert export["facts"][0]["observation_outcome"] == "FILLED/CLOSED"
+    assert export["facts"][0]["pnl_eligible"] is True
+    outcomes = {
+        (row.get("trade_id"), row["observation_outcome"])
+        for row in export["observations"]
+    }
+    assert ("AMD-UNFILLED", "ENTRY_CANCELLED_UNFILLED") in outcomes
+    assert ("FILLED-EXIT-MISSING", "MISSING") in outcomes
+    assert ("REJECTED-NO-FILL", "NO_FILL") in outcomes
+    assert (None, "NO_SIGNAL") in outcomes
+    assert (None, "BLOCKED") in outcomes
+    assert ("PLAN-WITHOUT-RECEIPT", "MISSING") in outcomes
+    amd = next(
+        row
+        for row in export["observations"]
+        if row.get("trade_id") == "AMD-UNFILLED"
+    )
+    assert amd["pnl_eligible"] is False
+    assert amd["source_receipt"].startswith("bhiksha.db#events/")
+    assert export["receipt"]["observation_count"] == 6
+
+    scorecard = build_weekly_scorecard(
+        db_path,
+        week_start="2026-07-06",
+        week_end="2026-07-10",
+    )
+    assert scorecard["headline"]["live"]["closed"] == 2
+    assert scorecard["headline"]["live"]["missing_pnl_count"] == 1
+    assert scorecard["headline"]["live"]["total_pnl_usd"] is None
+    assert {
+        row["trade_id"]: row["observation_outcome"]
+        for row in scorecard["observation_outcomes"]
+    } == {
+        "AMD-UNFILLED": "ENTRY_CANCELLED_UNFILLED",
+        "FILLED-CLOSED": "FILLED/CLOSED",
+        "FILLED-EXIT-MISSING": "MISSING",
+    }
 
 
 def test_weekly_export_reclassifies_historical_shadow_degradation(

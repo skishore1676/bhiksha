@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
+import uuid
 
 from bhiksha.packets.runtime_compile import (
     PacketCompileResult,
@@ -40,6 +41,7 @@ class ConsultationBridgeResult:
     direction: str
     timestamp: str
     chart_read: str
+    chart_read_role: str
     compile_eligibility: str
     compile_decision: str
     compile_block_reasons: list[str]
@@ -100,7 +102,7 @@ def consult_mala_playbook(
     effective_run_dir = mala_run_dir or _source_run_dir(packet, mala_repo)
     effective_python = mala_python or mala_repo / ".venv" / "bin" / "python"
     artifact_dir = out_root / _consultation_id(packet, normalized_symbol, normalized_direction, timestamp)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir.mkdir(parents=True, exist_ok=False)
     env = _mala_env(mala_repo)
     run = runner or _run_command
 
@@ -149,6 +151,7 @@ def consult_mala_playbook(
         direction=normalized_direction,
         timestamp=timestamp,
         chart_read=chart_read.strip(),
+        chart_read_role="operator_journal_only_not_model_input",
         compile_eligibility=compile_result.eligibility,
         compile_decision=compile_result.decision,
         compile_block_reasons=compile_result.block_reasons,
@@ -258,9 +261,13 @@ def _consultation_id(
     direction: str,
     timestamp: str,
 ) -> str:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
     timestamp_slug = re.sub(r"[^A-Za-z0-9]+", "_", timestamp).strip("_")[:48]
-    return f"{stamp}_{packet.packet_id}_v{packet.version}_{symbol}_{direction}_{timestamp_slug}"
+    nonce = uuid.uuid4().hex
+    return (
+        f"{stamp}_{nonce}_{packet.packet_id}_v{packet.version}_"
+        f"{symbol}_{direction}_{timestamp_slug}"
+    )
 
 
 def _write_bridge_artifacts(
@@ -297,6 +304,8 @@ def _bridge_markdown(payload: dict[str, Any]) -> str:
             f"- policy_card: `{payload['policy_card']}`",
             "",
             "## Chart Read",
+            "",
+            "Role: operator journal context only; it was not an input to the model verdict.",
             "",
             str(payload["chart_read"]),
             "",

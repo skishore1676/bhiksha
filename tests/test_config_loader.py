@@ -519,6 +519,37 @@ def test_risk_envelope_canary_requires_one_contract_strict_4_to_7_dte(
             deployments=plan.deployments,
         )
     )
+    pdd_entry_canary = canary.model_copy(
+        update={
+            "deployment_id": "pdd_live_canary",
+            "symbol": "PDD",
+            "execution": canary.execution.model_copy(
+                update={"shadow_only": False, "dte_min": 0, "dte_max": 3}
+            ),
+            "risk": canary.risk.model_copy(
+                update={"max_trade_premium_usd": 300.0}
+            ),
+            "exit": canary.exit.model_copy(
+                update={"risk_envelope_live_mode": "off"}
+            ),
+            "source": canary.source.model_copy(
+                update={
+                    "metadata": {
+                        "strategy_id": "triage-market_impulse-PDD__pdd_long",
+                        "authorization_mode": "live",
+                    }
+                }
+            ),
+        }
+    )
+    with pytest.raises(
+        ValidationError,
+        match="at most one experimental live authority",
+    ):
+        ActivePlan(
+            active_plan_id="active-plan-test",
+            deployments=[canary, pdd_entry_canary],
+        )
 
     payload["risk"]["max_contracts"] = 2
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

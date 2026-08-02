@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from bhiksha.packets.consultation_bridge import consult_mala_playbook
+from bhiksha.packets.consultation_bridge import (
+    _consultation_id,
+    consult_mala_playbook,
+)
 from bhiksha.shared_kernel import ensure_kernel_on_path
 
 ensure_kernel_on_path()
@@ -94,14 +97,24 @@ def test_consultation_bridge_runs_mala_query_and_writes_bhiksha_artifact(tmp_pat
     assert result.compile_decision == "take"
     assert result.selected_exit == "vwap_return"
     assert result.allowed_management_policy_ids == ["reversal_extreme__fixed_1r"]
+    assert result.chart_read_role == "operator_journal_only_not_model_input"
 
     artifact = json.loads(Path(result.artifact_json).read_text(encoding="utf-8"))
     assert artifact["packet_id"] == "execution.mean_reversion_at_extremes.iwm_qqq"
     assert artifact["chart_read"] == "price stretched above VWAP and started rejecting the push"
+    assert artifact["chart_read_role"] == "operator_journal_only_not_model_input"
     assert artifact["compile_eligibility"] == "eligible"
     assert artifact["policy"] == "take"
     assert artifact["selected_exit"] == "vwap_return"
     assert Path(result.artifact_md).exists()
+
+
+def test_consultation_artifact_ids_do_not_collide_for_identical_requests() -> None:
+    packet = _execution_packet()
+    first = _consultation_id(packet, "IWM", "short", "2026-05-11T09:40:00-05:00")
+    second = _consultation_id(packet, "IWM", "short", "2026-05-11T09:40:00-05:00")
+
+    assert first != second
 
 
 def _fake_runner(calls: list[list[str]]):

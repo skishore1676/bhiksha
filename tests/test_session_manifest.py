@@ -73,6 +73,7 @@ def test_session_manifest_is_projection_of_startup_snapshot(tmp_path) -> None:
     snapshot = {
         "active_plan": {
             "active_plan_id": "active_plan_2026-07-24",
+            "plan_revision_id": "sha256:" + "1" * 64,
             "trading_date": "2026-07-24",
             "source": {"name": "test"},
             "suppressed": [{"row_id": "bad", "reason": "invalid"}],
@@ -89,6 +90,8 @@ def test_session_manifest_is_projection_of_startup_snapshot(tmp_path) -> None:
     assert manifest["artifact_role"] == "generated_receipt_only"
     assert manifest["configuration_authority"] == ["active_plan", "startup_config"]
     assert manifest["session_manifest_id"] == "active_plan_2026-07-24:abc123"
+    assert manifest["session_id"] == "active_plan_2026-07-24:abc123"
+    assert manifest["plan_revision_id"] == "sha256:" + "1" * 64
     assert manifest["rejected_or_suppressed_inputs"][0]["row_id"] == "bad"
     assert manifest["risk_envelope_canaries"] == []
 

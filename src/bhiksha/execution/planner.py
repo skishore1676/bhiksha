@@ -433,45 +433,6 @@ class ExecutionPlanner:
             final_limit_price * quantity * 100,
         )
         sized_risk_details: dict[str, object] = {}
-        if self.risk_manager is not None:
-            stop_loss_pct, stop_loss_source = resolve_planned_stop_loss_pct(deployment)
-            sized_risk = await self.risk_manager.reserve_sized_entry(
-                trade_id=trade_id,
-                deployment_id=deployment.deployment_id,
-                symbol=deployment.symbol,
-                entry_price=final_limit_price,
-                quantity=quantity,
-                stop_loss_pct=stop_loss_pct,
-            )
-            sized_risk_details = {
-                "sized_entry_risk": dict(sized_risk.details),
-                "planned_stop_loss_pct": stop_loss_pct,
-                "planned_stop_loss_source": stop_loss_source,
-            }
-            if not sized_risk.allowed:
-                return TradePlan(
-                    trade_id=trade_id,
-                    deployment_id=deployment.deployment_id,
-                    symbol=deployment.symbol,
-                    direction=decision.direction,
-                    option_symbol=selection.option_symbol,
-                    quantity=quantity,
-                    estimated_entry_price=final_limit_price,
-                    risk_reasons=[sized_risk.reason or "sized_entry_risk_blocked"],
-                    dry_run=False,
-                    order_id=None,
-                    underlying_entry_price=underlying_entry_price,
-                    entry_timestamp=decision.timestamp,
-                    risk_details={
-                        "required_cash": required_cash,
-                        "buying_power_requirement": preflight.buying_power_requirement,
-                        "estimated_cost": preflight.estimated_cost,
-                        "entry_pricing": pricing_evidence,
-                        **premium_cap_receipt,
-                        **selection_details,
-                        **sized_risk_details,
-                    },
-                )
         cash_guard_details: dict[str, object] = {}
         if self.cash_guard is not None:
             cash_guard_result = await self.cash_guard.reserve_entry(
@@ -481,8 +442,6 @@ class ExecutionPlanner:
             )
             cash_guard_details = dict(cash_guard_result.details)
             if cash_guard_result.blocked:
-                if self.risk_manager is not None:
-                    await self.risk_manager.release_sized_entry(trade_id)
                 return TradePlan(
                     trade_id=trade_id,
                     deployment_id=deployment.deployment_id,
@@ -505,6 +464,84 @@ class ExecutionPlanner:
                         **selection_details,
                         **sized_risk_details,
                         **cash_guard_details,
+                    },
+                )
+        # Cash reservation can await broker/account state.  It must therefore
+        # happen before the final sized-risk/canary reservation.  Once the
+        # final reservation returns, the next awaited operation is the broker
+        # submission itself: a latch or expiry observed while cash was being
+        # reserved cannot slip through on a stale earlier approval.
+        if self.risk_manager is not None:
+            stop_loss_pct, stop_loss_source = resolve_planned_stop_loss_pct(deployment)
+            try:
+                sized_risk = await self.risk_manager.reserve_sized_entry(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    entry_price=final_limit_price,
+                    quantity=quantity,
+                    stop_loss_pct=stop_loss_pct,
+                )
+            except Exception as exc:
+                if self.cash_guard is not None:
+                    await self.cash_guard.release_entry(trade_id)
+                # The risk operation may have persisted its reservation before
+                # failing during a later receipt/event write. Clean it up
+                # idempotently before returning a fail-closed plan.
+                await self.risk_manager.release_sized_entry(trade_id)
+                return TradePlan(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol=selection.option_symbol,
+                    quantity=quantity,
+                    estimated_entry_price=final_limit_price,
+                    risk_reasons=[f"sized_entry_risk_check_failed:{exc}"],
+                    dry_run=False,
+                    order_id=None,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
+                    risk_details={
+                        "required_cash": required_cash,
+                        "buying_power_requirement": preflight.buying_power_requirement,
+                        "estimated_cost": preflight.estimated_cost,
+                        "entry_pricing": pricing_evidence,
+                        **premium_cap_receipt,
+                        **selection_details,
+                        **cash_guard_details,
+                    },
+                )
+            sized_risk_details = {
+                "sized_entry_risk": dict(sized_risk.details),
+                "planned_stop_loss_pct": stop_loss_pct,
+                "planned_stop_loss_source": stop_loss_source,
+            }
+            if not sized_risk.allowed:
+                if self.cash_guard is not None:
+                    await self.cash_guard.release_entry(trade_id)
+                return TradePlan(
+                    trade_id=trade_id,
+                    deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol,
+                    direction=decision.direction,
+                    option_symbol=selection.option_symbol,
+                    quantity=quantity,
+                    estimated_entry_price=final_limit_price,
+                    risk_reasons=[sized_risk.reason or "sized_entry_risk_blocked"],
+                    dry_run=False,
+                    order_id=None,
+                    underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp,
+                    risk_details={
+                        "required_cash": required_cash,
+                        "buying_power_requirement": preflight.buying_power_requirement,
+                        "estimated_cost": preflight.estimated_cost,
+                        "entry_pricing": pricing_evidence,
+                        **premium_cap_receipt,
+                        **selection_details,
+                        **cash_guard_details,
+                        **sized_risk_details,
                     },
                 )
         try:

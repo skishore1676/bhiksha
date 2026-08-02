@@ -48,6 +48,11 @@ from bhiksha.ops.daily_report import (
     _parse_option_strike,
     _round_money,
 )
+from bhiksha.ops.trade_observation import (
+    NON_TRADE_OUTCOMES,
+    classify_trade_observation,
+    index_terminal_entry_observations,
+)
 
 if TYPE_CHECKING:
     from bhiksha.config.models import DeploymentManifest
@@ -133,12 +138,25 @@ def build_weekly_scorecard(
         conn.row_factory = sqlite3.Row
         rows = _load_window_trades(conn, start, end)
         partials_by_trade = _load_partials(conn, [row["trade_id"] for row in rows])
+        terminal_events = _load_terminal_entry_events(conn, start, end)
         cumulative_rows = _load_live_cumulative_rows(conn, exp_start, end, shadow_by_deployment)
 
-    trades = [
-        _augment_trade(dict(row), partials_by_trade.get(row["trade_id"], []), shadow_by_deployment)
-        for row in rows
-    ]
+    terminal_by_trade = index_terminal_entry_observations(terminal_events)
+    observation_outcomes: list[dict[str, Any]] = []
+    trades = []
+    for row in rows:
+        trade = _augment_trade(
+            dict(row),
+            partials_by_trade.get(row["trade_id"], []),
+            shadow_by_deployment,
+        )
+        observation = classify_trade_observation(trade, terminal_by_trade)
+        if observation is not None:
+            trade["observation_outcome"] = observation["observation_outcome"]
+            trade["pnl_eligible"] = observation["pnl_eligible"]
+            observation_outcomes.append(observation)
+        if trade.get("observation_outcome") not in NON_TRADE_OUTCOMES:
+            trades.append(trade)
     closed = [trade for trade in trades if not trade["is_open"]]
 
     lanes = _lane_rollups(trades, relaxed_by_deployment)
@@ -160,6 +178,7 @@ def build_weekly_scorecard(
         "promotion_candidates": promotion,
         "live_cumulative": live_cumulative,
         "data_quality_warnings": data_quality_warnings,
+        "observation_outcomes": observation_outcomes,
     }
 
 
@@ -197,6 +216,20 @@ def _load_window_trades(conn: sqlite3.Connection, start: date, end: date) -> lis
         "exit_mode",
         "exit_rule",
         "can_ladder",
+        "active_plan_id",
+        "research_run_id",
+        "evidence_packet_id",
+        "evidence_artifact_sha256",
+        "evidence_artifact_uri",
+        "canary_id",
+        "canary_authorization_sha256",
+        "canary_start_at",
+        "canary_expires_at",
+        "plan_revision_id",
+        "session_id",
+        "fact_receipt_id",
+        "frozen_entry_risk_usd",
+        "frozen_round_trip_cost_usd",
     ]
     selected = [column for column in desired if column in columns]
     start_text = start.isoformat()
@@ -244,6 +277,51 @@ def _load_partials(conn: sqlite3.Connection, trade_ids: list[str]) -> dict[str, 
     for row in rows:
         out.setdefault(row["trade_id"], []).append(dict(row))
     return out
+
+
+def _load_terminal_entry_events(
+    conn: sqlite3.Connection,
+    start: date,
+    end: date,
+) -> list[dict[str, Any]]:
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "events" not in tables:
+        return []
+    rows = conn.execute(
+        """
+        SELECT id, created_at, event_type, payload
+        FROM events
+        WHERE event_type IN (
+            'entry_reconcile_released',
+            'entry_reprice_blocked',
+            'entry_reprice_cancel_after_timeout'
+        )
+          AND substr(replace(COALESCE(created_at, ''), ' ', 'T'), 1, 10)
+              BETWEEN ? AND ?
+        ORDER BY id
+        """,
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        events.append(
+            {
+                "event_id": row["id"],
+                "created_at": row["created_at"],
+                "event_type": row["event_type"],
+                "payload": payload if isinstance(payload, dict) else {},
+            }
+        )
+    return events
 
 
 def _load_live_cumulative_rows(
@@ -377,12 +455,20 @@ def _augment_trade(
 def _headline(trades: list[dict[str, Any]]) -> dict[str, Any]:
     def _side(subset: list[dict[str, Any]]) -> dict[str, Any]:
         closed = [t for t in subset if not t["is_open"]]
+        missing_pnl = [t for t in closed if t["realized_pnl_usd"] is None]
         return {
             "trades": len(subset),
             "closed": len(closed),
             "open": len(subset) - len(closed),
             "wins": sum(1 for t in closed if t["is_win"]),
-            "total_pnl_usd": _round_money(sum(t["realized_pnl_usd"] or 0.0 for t in closed)),
+            "total_pnl_usd": (
+                None
+                if missing_pnl
+                else _round_money(
+                    sum(t["realized_pnl_usd"] or 0.0 for t in closed)
+                )
+            ),
+            "missing_pnl_count": len(missing_pnl),
         }
 
     live = [t for t in trades if t["lane"] == "live"]
@@ -401,6 +487,7 @@ def _lane_rollups(
     lanes: list[dict[str, Any]] = []
     for deployment_id, lane_trades in grouped.items():
         closed = [t for t in lane_trades if not t["is_open"]]
+        missing_pnl = [t for t in closed if t["realized_pnl_usd"] is None]
         returns = [t["return_pct"] for t in closed if t["return_pct"] is not None]
         exit_counts = Counter(
             t["exit_attribution"] for t in closed if t["exit_attribution"]
@@ -415,7 +502,14 @@ def _lane_rollups(
                 "closed": len(closed),
                 "open": len(lane_trades) - len(closed),
                 "wins": sum(1 for t in closed if t["is_win"]),
-                "total_pnl_usd": _round_money(sum(t["realized_pnl_usd"] or 0.0 for t in closed)),
+                "total_pnl_usd": (
+                    None
+                    if missing_pnl
+                    else _round_money(
+                        sum(t["realized_pnl_usd"] or 0.0 for t in closed)
+                    )
+                ),
+                "missing_pnl_count": len(missing_pnl),
                 "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
                 "exit_rule_counts": dict(sorted(exit_counts.items())),
                 "evidence_gates_relaxed": relaxed,
@@ -430,10 +524,17 @@ def _lane_rollups(
 
 def _bucket(trades: list[dict[str, Any]]) -> dict[str, Any]:
     returns = [t["return_pct"] for t in trades if t["return_pct"] is not None]
+    missing_pnl = [t for t in trades if t["realized_pnl_usd"] is None]
     return {
         "n": len(trades),
         "wins": sum(1 for t in trades if t["is_win"]),
-        "total_pnl_usd": _round_money(sum(t["realized_pnl_usd"] or 0.0 for t in trades)),
+        "total_pnl_usd": (
+            None
+            if missing_pnl
+            else _round_money(
+                sum(t["realized_pnl_usd"] or 0.0 for t in trades)
+            )
+        ),
         "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
     }
 
@@ -597,11 +698,11 @@ def render_weekly_scorecard_markdown(report: dict[str, Any]) -> str:
         "",
         "## Week Headline",
         "",
-        f"- live: `${live.get('total_pnl_usd', 0.0):.2f}` "
+        f"- live: `{_fmt_money_or_na(live.get('total_pnl_usd'))}` "
         f"({live.get('closed', 0)} closed, {live.get('wins', 0)} wins)",
-        f"- shadow: `${shadow.get('total_pnl_usd', 0.0):.2f}` "
+        f"- shadow: `{_fmt_money_or_na(shadow.get('total_pnl_usd'))}` "
         f"({shadow.get('closed', 0)} closed, {shadow.get('wins', 0)} wins)",
-        f"- combined realized: `${total.get('total_pnl_usd', 0.0):.2f}` "
+        f"- combined realized: `{_fmt_money_or_na(total.get('total_pnl_usd'))}` "
         f"({total.get('closed', 0)} closed trades)",
     ]
     if not report.get("deployments_supplied"):
@@ -760,9 +861,9 @@ def render_weekly_scorecard_telegram_summary(
         f"Bhiksha Weekly Scorecard - {report.get('week_start')} to {report.get('week_end')}",
         "",
         "Verdict read",
-        f"- Live: ${live.get('total_pnl_usd', 0.0):.2f} "
+        f"- Live: {_fmt_money_or_na(live.get('total_pnl_usd'))} "
         f"({live.get('closed', 0)} closed, {live.get('wins', 0)} wins)",
-        f"- Shadow: ${shadow.get('total_pnl_usd', 0.0):.2f} "
+        f"- Shadow: {_fmt_money_or_na(shadow.get('total_pnl_usd'))} "
         f"({shadow.get('closed', 0)} closed, {shadow.get('wins', 0)} wins)",
         (
             "- Profile vs legacy (all): "
@@ -837,6 +938,7 @@ def _empty_report(start: date, end: date, exp_start: date, db_path: str) -> dict
         },
         "live_cumulative": {"since": exp_start.isoformat(), "by_day": [], "total_pnl_usd": 0.0, "total_trades": 0},
         "data_quality_warnings": [],
+        "observation_outcomes": [],
     }
 
 

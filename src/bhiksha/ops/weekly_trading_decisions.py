@@ -21,6 +21,17 @@ from bhiksha.ops.daily_report import build_daily_report
 from bhiksha.ops.exit_edge_weekly import write_exit_edge_weekly_evidence
 from bhiksha.ops.shadow_ev_report import build_shadow_ev_report
 from bhiksha.ops.trading_governance_evidence import build_trading_governance_evidence
+from bhiksha.ops.trade_observation import (
+    BLOCKED,
+    FILLED_CLOSED,
+    MISSING,
+    NON_TRADE_OUTCOMES,
+    NO_SIGNAL,
+    classify_trade_observation,
+    group_events_by_deployment_day,
+    index_terminal_entry_observations,
+    terminal_entry_observation,
+)
 from bhiksha.ops.weekly_scorecard import (
     _augment_trade,
     _data_quality_warnings,
@@ -246,17 +257,56 @@ def build_trading_decision_export(
     shadow_by_deployment, _relaxed = _deployment_lookup(deployments)
     rows: list[sqlite3.Row] = []
     partials: dict[str, list[dict[str, Any]]] = {}
+    terminal_events: list[dict[str, Any]] = []
+    weekly_observation_events: list[dict[str, Any]] = []
     if path.exists():
         with closing(sqlite3.connect(path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = _load_window_trades(conn, date(2000, 1, 1), through)
             partials = _load_partials(conn, [str(row["trade_id"]) for row in rows])
+            terminal_events = _load_observation_events(
+                conn,
+                start=date(2000, 1, 1),
+                end=through,
+                terminal_only=True,
+            )
+            weekly_observation_events = _load_observation_events(
+                conn,
+                start=through - timedelta(days=through.weekday()),
+                end=through,
+                terminal_only=False,
+            )
     exported_at = datetime.now(UTC).isoformat()
     facts = []
+    observations: list[dict[str, Any]] = []
+    terminal_by_trade = index_terminal_entry_observations(terminal_events)
     for raw in rows:
         row = dict(raw)
         trade = _augment_trade(row, partials.get(str(row.get("trade_id")), []), shadow_by_deployment)
+        observation = classify_trade_observation(trade, terminal_by_trade)
+        if observation is not None:
+            trade["observation_outcome"] = observation["observation_outcome"]
+            trade["pnl_eligible"] = observation["pnl_eligible"]
         if trade.get("realized_pnl_usd") is None:
+            if observation is not None:
+                observations.append(
+                    _normalized_observation(
+                        observation,
+                        row=row,
+                        db_path=path,
+                        exported_at=exported_at,
+                    )
+                )
+            continue
+        if trade.get("observation_outcome") in NON_TRADE_OUTCOMES:
+            observations.append(
+                _normalized_observation(
+                    observation or {},
+                    row=row,
+                    db_path=path,
+                    exported_at=exported_at,
+                )
+            )
             continue
         banked_qty = int(trade.get("original_entry_qty") or 0) - int(row.get("exit_filled_quantity") or row.get("quantity") or 0)
         entry = float(row.get("entry_price") or 0.0)
@@ -269,6 +319,11 @@ def build_trading_decision_export(
         deployment_id = str(row.get("deployment_id") or "")
         exit_attribution = str(trade.get("exit_attribution") or "")
         quality_warnings = _data_quality_warnings([trade])
+        if not exit_attribution:
+            quality_warnings = [
+                {"message": "missing_explicit_exit_attribution"},
+                *quality_warnings,
+            ]
         facts.append(
             {
                 "trade_id": str(row.get("trade_id")),
@@ -288,31 +343,307 @@ def build_trading_decision_export(
                 "realized_pnl_usd": trade.get("realized_pnl_usd"),
                 "cost_basis_usd": trade.get("cost_basis_usd"),
                 "return_pct": (float(trade.get("return_pct") or 0.0) / 100.0),
+                "observation_outcome": FILLED_CLOSED,
+                "pnl_eligible": True,
                 "exit_attribution": exit_attribution,
-                "exit_class": "profile" if exit_attribution.startswith("profile:") else "legacy",
+                "exit_class": (
+                    "profile"
+                    if exit_attribution.startswith("profile:")
+                    else "strategy"
+                    if exit_attribution
+                    else "missing"
+                ),
                 "data_quality_status": quality_warnings[0]["message"] if quality_warnings else "OK",
+                "active_plan_id": row.get("active_plan_id"),
+                "plan_revision_id": row.get("plan_revision_id"),
+                "session_id": row.get("session_id"),
+                "research_run_id": row.get("research_run_id"),
+                "evidence_packet_id": row.get("evidence_packet_id"),
+                "evidence_artifact_sha256": row.get(
+                    "evidence_artifact_sha256"
+                ),
+                "evidence_artifact_uri": row.get("evidence_artifact_uri"),
+                "canary_id": row.get("canary_id"),
+                "canary_authorization_sha256": row.get(
+                    "canary_authorization_sha256"
+                ),
+                "fact_receipt_id": row.get("fact_receipt_id"),
+                "frozen_entry_risk_usd": row.get("frozen_entry_risk_usd"),
+                "frozen_round_trip_cost_usd": row.get(
+                    "frozen_round_trip_cost_usd"
+                ),
                 "source_receipt": f"{path.name}#trade_sessions/{row.get('trade_id')}",
                 "source_hash": f"sha256:{source_hash}",
                 "exported_at": exported_at,
             }
         )
+    observations.extend(
+        _event_only_observations(
+            weekly_observation_events,
+            facts=facts,
+            existing=observations,
+            db_path=path,
+            exported_at=exported_at,
+        )
+    )
+    observations.sort(
+        key=lambda row: (
+            str(row.get("observation_date") or ""),
+            str(row.get("deployment_id") or ""),
+            str(row.get("trade_id") or ""),
+            str(row.get("observation_outcome") or ""),
+        )
+    )
     daily_status = _daily_status_rows(
         report_dir,
         through,
         db_path=path,
     )
-    body = {"schema": "bhiksha.trading_decision_facts.v1", "generated_at": exported_at, "facts": facts, "daily_status": daily_status}
+    body = {
+        "schema": "bhiksha.trading_decision_facts.v1",
+        "generated_at": exported_at,
+        "facts": facts,
+        "observations": observations,
+        "daily_status": daily_status,
+    }
     # The receipt identifies evidence, not run time. A retry with unchanged
     # facts must reuse the same digest so the workbook and Obsidian card can be
     # updated idempotently rather than creating weekly churn.
     digest_payload = {
         "schema": body["schema"],
         "facts": [{key: value for key, value in fact.items() if key != "exported_at"} for fact in facts],
+        "observations": [
+            {key: value for key, value in row.items() if key != "exported_at"}
+            for row in observations
+        ],
         "daily_status": daily_status,
     }
     digest = hashlib.sha256(json.dumps(digest_payload, sort_keys=True, default=str).encode()).hexdigest()
-    body["receipt"] = {"status": "ok", "sha256": digest, "fact_count": len(facts), "through": through.isoformat()}
+    body["receipt"] = {
+        "status": "ok",
+        "sha256": digest,
+        "fact_count": len(facts),
+        "observation_count": len(observations),
+        "through": through.isoformat(),
+    }
     return body
+
+
+def _load_observation_events(
+    conn: sqlite3.Connection,
+    *,
+    start: date,
+    end: date,
+    terminal_only: bool,
+) -> list[dict[str, Any]]:
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "events" not in tables:
+        return []
+    event_types = [
+        "entry_reconcile_released",
+        "entry_reprice_blocked",
+        "entry_reprice_cancel_after_timeout",
+    ]
+    if not terminal_only:
+        event_types.extend(
+            [
+                "lifecycle_entry_blocked",
+                "signal_decision",
+                "signal_evaluation",
+                "trade_plan",
+            ]
+        )
+    placeholders = ", ".join("?" for _ in event_types)
+    rows = conn.execute(
+        f"""
+        SELECT id, created_at, event_type, payload
+        FROM events
+        WHERE event_type IN ({placeholders})
+          AND substr(replace(COALESCE(created_at, ''), ' ', 'T'), 1, 10)
+              BETWEEN ? AND ?
+        ORDER BY id
+        """,
+        [*event_types, start.isoformat(), end.isoformat()],
+    ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        events.append(
+            {
+                "event_id": row["id"],
+                "created_at": row["created_at"],
+                "event_type": row["event_type"],
+                "payload": payload if isinstance(payload, dict) else {},
+            }
+        )
+    return events
+
+
+def _normalized_observation(
+    observation: dict[str, Any],
+    *,
+    row: dict[str, Any] | None,
+    db_path: Path,
+    exported_at: str,
+) -> dict[str, Any]:
+    source_payload = row or observation
+    source_hash = hashlib.sha256(
+        json.dumps(source_payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    event_id = observation.get("source_event_id")
+    trade_id = observation.get("trade_id") or (row or {}).get("trade_id")
+    source_receipt = (
+        f"{db_path.name}#events/{event_id}"
+        if event_id is not None
+        else f"{db_path.name}#trade_sessions/{trade_id}"
+    )
+    observed_at = observation.get("observed_at") or (row or {}).get(
+        "entry_timestamp"
+    )
+    return {
+        **observation,
+        "trade_id": str(trade_id or "") or None,
+        "deployment_id": observation.get("deployment_id")
+        or (row or {}).get("deployment_id"),
+        "symbol": observation.get("symbol") or (row or {}).get("symbol"),
+        "observation_date": str(observed_at or "").replace(" ", "T")[:10]
+        or None,
+        "source_receipt": source_receipt,
+        "source_hash": f"sha256:{source_hash}",
+        "exported_at": exported_at,
+    }
+
+
+def _event_only_observations(
+    events: list[dict[str, Any]],
+    *,
+    facts: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+    db_path: Path,
+    exported_at: str,
+) -> list[dict[str, Any]]:
+    """Emit only outcomes directly supported by the week's event receipts."""
+
+    emitted_trade_outcomes = {
+        (str(row.get("trade_id") or ""), str(row.get("observation_outcome") or ""))
+        for row in existing
+    }
+    covered_deployment_days = {
+        (
+            str(row.get("deployment_id") or ""),
+            str(row.get("entry_timestamp") or row.get("exit_timestamp") or "")[:10],
+        )
+        for row in facts
+    }
+    covered_deployment_days.update(
+        (
+            str(row.get("deployment_id") or ""),
+            str(row.get("observation_date") or ""),
+        )
+        for row in existing
+    )
+    results: list[dict[str, Any]] = []
+
+    for event in events:
+        terminal = terminal_entry_observation(event)
+        if terminal is None:
+            continue
+        key = (
+            str(terminal.get("trade_id") or ""),
+            str(terminal.get("observation_outcome") or ""),
+        )
+        if key in emitted_trade_outcomes:
+            continue
+        normalized = _normalized_observation(
+            terminal,
+            row=None,
+            db_path=db_path,
+            exported_at=exported_at,
+        )
+        results.append(normalized)
+        emitted_trade_outcomes.add(key)
+        covered_deployment_days.add(
+            (
+                str(normalized.get("deployment_id") or ""),
+                str(normalized.get("observation_date") or ""),
+            )
+        )
+
+    for (deployment_id, day), grouped in group_events_by_deployment_day(
+        events
+    ).items():
+        if (deployment_id, day) in covered_deployment_days:
+            continue
+        signal_events = [
+            event
+            for event in grouped
+            if event.get("event_type") in {"signal_decision", "signal_evaluation"}
+        ]
+        true_signal = any(
+            (event.get("payload") or {}).get("signal") is True
+            for event in signal_events
+        )
+        lifecycle_blocks = [
+            event
+            for event in grouped
+            if event.get("event_type") == "lifecycle_entry_blocked"
+        ]
+        trade_plans = [
+            event for event in grouped if event.get("event_type") == "trade_plan"
+        ]
+
+        outcome: str | None = None
+        source_event: dict[str, Any] | None = None
+        missing_reason: str | None = None
+        if true_signal and lifecycle_blocks:
+            outcome = BLOCKED
+            source_event = lifecycle_blocks[-1]
+        elif trade_plans and any(
+            not (event.get("payload") or {}).get("order_id")
+            for event in trade_plans
+        ):
+            outcome = BLOCKED
+            source_event = trade_plans[-1]
+        elif signal_events and not true_signal:
+            outcome = NO_SIGNAL
+            source_event = signal_events[-1]
+        elif trade_plans:
+            outcome = MISSING
+            source_event = trade_plans[-1]
+            missing_reason = "trade_plan_has_no_trade_or_terminal_entry_receipt"
+        if outcome is None or source_event is None:
+            continue
+
+        payload = source_event.get("payload") or {}
+        observation = {
+            "observation_outcome": outcome,
+            "trade_id": payload.get("trade_id"),
+            "deployment_id": deployment_id,
+            "symbol": payload.get("symbol"),
+            "pnl_eligible": False,
+            "source_event_type": source_event.get("event_type"),
+            "source_event_id": source_event.get("event_id"),
+            "observed_at": source_event.get("created_at"),
+        }
+        if missing_reason is not None:
+            observation["missing_reason"] = missing_reason
+        results.append(
+            _normalized_observation(
+                observation,
+                row=None,
+                db_path=db_path,
+                exported_at=exported_at,
+            )
+        )
+    return results
 
 
 def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
@@ -352,15 +683,15 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
         "",
         "## What happened",
         "",
-        f"- live: `{live.get('trades', 0)}` trades, `${live.get('total_pnl_usd', 0.0):.2f}`",
-        f"- shadow: `{shadow.get('trades', 0)}` trades, `${shadow.get('total_pnl_usd', 0.0):.2f}`",
+        f"- live: `{live.get('trades', 0)}` trades, `{_decision_pnl(live.get('total_pnl_usd'))}`",
+        f"- shadow: `{shadow.get('trades', 0)}` trades, `{_decision_pnl(shadow.get('total_pnl_usd'))}`",
         "",
         "## Decisions to make",
         "",
     ]
     if candidates:
         for candidate in candidates:
-            lines.append(f"- **PROMOTION REVIEW:** `{candidate.get('display_id')}` — {candidate.get('closed', 0)} closed, `${candidate.get('total_pnl_usd', 0.0):.2f}`. Decide promote / observe / reject.")
+            lines.append(f"- **PROMOTION REVIEW:** `{candidate.get('display_id')}` — {candidate.get('closed', 0)} closed, `{_decision_pnl(candidate.get('total_pnl_usd'))}`. Decide promote / observe / reject.")
     else:
         lines.append("- **PROMOTION:** no lane currently clears the visible evidence threshold; no promotion decision is required.")
     if near_misses:
@@ -372,7 +703,7 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
             continue
         lines.append(
             f"- **PERFORMANCE FIX REVIEW:** `{lane.get('display_id')}` ({lane.get('mode')}) — "
-            f"{lane.get('closed', 0)} closed, `${lane.get('total_pnl_usd', 0.0):.2f}`, "
+            f"{lane.get('closed', 0)} closed, `{_decision_pnl(lane.get('total_pnl_usd'))}`, "
             f"avg return `{lane.get('avg_return_pct', 0.0):.1f}%`. Decide diagnose / keep observing / retire."
         )
     issues = len(score.get("data_quality_warnings") or [])
@@ -389,6 +720,12 @@ def render_weekly_trading_decisions_markdown(report: dict[str, Any]) -> str:
         "",
     ])
     return "\n".join(lines)
+
+
+def _decision_pnl(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "unknown"
+    return f"${value:.2f}"
 
 
 def _daily_status_rows(

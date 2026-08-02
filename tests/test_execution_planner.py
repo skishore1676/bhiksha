@@ -10,7 +10,7 @@ from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.repository import ChainSnapshotRepository
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
-from bhiksha.risk.cash_guard import CashGuard
+from bhiksha.risk.cash_guard import CashGuard, CashGuardResult
 from bhiksha.risk.risk_manager import EntryDecision
 from bhiksha.state.position_tracker import PositionTracker
 from historical_config import historical_deployment
@@ -197,6 +197,41 @@ class StubRiskManager:
         self.release_calls.append(trade_id)
 
 
+class BlockingCashGuard:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.proceed = asyncio.Event()
+        self.release_calls: list[str] = []
+
+    async def reserve_entry(self, **kwargs) -> CashGuardResult:
+        del kwargs
+        self.started.set()
+        await self.proceed.wait()
+        return CashGuardResult(enforced=True, blocked=False, details={"reserved_cash": 290.04})
+
+    async def release_entry(self, trade_id: str) -> None:
+        self.release_calls.append(trade_id)
+
+
+class RecordingAllowedCashGuard:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def reserve_entry(self, *, trade_id: str, **kwargs) -> CashGuardResult:
+        del kwargs
+        self.calls.append(("reserve", trade_id))
+        return CashGuardResult(enforced=True, blocked=False, details={"reserved_cash": 290.04})
+
+    async def release_entry(self, trade_id: str) -> None:
+        self.calls.append(("release", trade_id))
+
+
+class ExplodingRiskManager(StubRiskManager):
+    async def reserve_sized_entry(self, **kwargs):
+        self.reserve_calls.append(kwargs)
+        raise RuntimeError("risk-store-io")
+
+
 def _cash_guard(order_manager, tmp_path) -> CashGuard:
     backend = SQLiteBackend(str(tmp_path / "bhiksha.db"))
     return CashGuard(
@@ -263,7 +298,7 @@ def test_live_planner_blocks_before_order_when_sized_risk_rejects() -> None:
     assert risk_manager.reserve_calls[0]["quantity"] == 1
 
 
-def test_live_planner_releases_sized_risk_when_cash_guard_blocks(tmp_path) -> None:
+def test_live_planner_does_not_reserve_sized_risk_when_cash_guard_blocks(tmp_path) -> None:
     deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     order_manager = LowCashOrderManager()
     risk_manager = StubRiskManager()
@@ -285,6 +320,75 @@ def test_live_planner_releases_sized_risk_when_cash_guard_blocks(tmp_path) -> No
     assert plan is not None
     assert plan.order_id is None
     assert plan.risk_reasons == ["insufficient_internal_settled_cash_budget"]
+    assert risk_manager.reserve_calls == []
+    assert risk_manager.release_calls == []
+    assert order_manager.place_entry_order_calls == 0
+
+
+def test_live_planner_rechecks_canary_after_awaited_cash_reservation() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    order_manager = StubOrderManager()
+    risk_manager = StubRiskManager()
+    cash_guard = BlockingCashGuard()
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=0,
+            delta=-0.31,
+        ),
+        order_manager=order_manager,
+        position_tracker=PositionTracker(),
+        cash_guard=cash_guard,
+        risk_manager=risk_manager,
+    )
+
+    async def run():
+        task = asyncio.create_task(
+            planner.plan_entry(deployment, _short_decision(deployment), dry_run=False)
+        )
+        await cash_guard.started.wait()
+        risk_manager.allowed = False
+        risk_manager.reason = "risk_canary_inhibited"
+        cash_guard.proceed.set()
+        return await task
+
+    plan = asyncio.run(run())
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.risk_reasons == ["risk_canary_inhibited"]
+    assert len(risk_manager.reserve_calls) == 1
+    assert cash_guard.release_calls == [plan.trade_id]
+    assert order_manager.place_entry_order_calls == 0
+
+
+def test_live_planner_releases_cash_and_risk_when_final_risk_check_raises() -> None:
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    order_manager = StubOrderManager()
+    risk_manager = ExplodingRiskManager()
+    cash_guard = RecordingAllowedCashGuard()
+    planner = ExecutionPlanner(
+        chain_service=StubChainService(
+            symbol="QQQ",
+            option_symbol="QQQ260330P00558000",
+            dte=0,
+            delta=-0.31,
+        ),
+        order_manager=order_manager,
+        position_tracker=PositionTracker(),
+        cash_guard=cash_guard,
+        risk_manager=risk_manager,
+    )
+
+    plan = asyncio.run(
+        planner.plan_entry(deployment, _short_decision(deployment), dry_run=False)
+    )
+
+    assert plan is not None
+    assert plan.order_id is None
+    assert plan.risk_reasons == ["sized_entry_risk_check_failed:risk-store-io"]
+    assert cash_guard.calls == [("reserve", plan.trade_id), ("release", plan.trade_id)]
     assert risk_manager.release_calls == [plan.trade_id]
     assert order_manager.place_entry_order_calls == 0
 

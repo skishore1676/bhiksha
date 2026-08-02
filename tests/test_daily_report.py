@@ -276,6 +276,192 @@ def test_daily_report_marks_closed_live_trade_with_missing_exit_truth_unknown(tm
     assert "P&L unknown" in telegram
 
 
+def test_daily_report_excludes_terminal_cancelled_zero_fill_entry_from_trade_pnl(
+    tmp_path,
+) -> None:
+    """AMD regression: estimated entry row + terminal zero-fill is not a trade."""
+
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="AMD-UNFILLED",
+                deployment_id="amd_live",
+                symbol="AMD",
+                option_symbol="AMD260717C00260000",
+                quantity=1,
+                entry_price=6.60,
+                underlying_entry_price=259.0,
+                entry_timestamp=datetime(2026, 7, 13, 14, 0, tzinfo=UTC),
+                status="pending_entry",
+                entry_order_id="ENTRY-AMD-UNFILLED",
+            )
+        )
+        await trades.mark_closed("AMD-UNFILLED")
+        await events.append(
+            "entry_reconcile_released",
+            {
+                "deployment_id": "amd_live",
+                "trade_id": "AMD-UNFILLED",
+                "order_id": "ENTRY-AMD-UNFILLED",
+                "status": "CANCELED",
+                "safe_to_close": True,
+                "payload": {
+                    "status": "CANCELED",
+                    "filledQuantity": None,
+                },
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE events SET created_at='2026-07-13T14:02:30+00:00'"
+        )
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-07-13")
+
+    assert report["trade_summary"]["live_count"] == 0
+    assert report["trade_summary"]["live_missing_exit_truth_count"] == 0
+    assert report["trade_summary"]["live_realized_pnl_usd"] == 0.0
+    assert report["trade_summary"]["entry_cancelled_unfilled_count"] == 1
+    assert report["trades"] == []
+    assert report["data_quality_warnings"] == []
+    assert report["observation_outcomes"] == [
+        {
+            "observation_outcome": "ENTRY_CANCELLED_UNFILLED",
+            "trade_id": "AMD-UNFILLED",
+            "deployment_id": "amd_live",
+            "symbol": "AMD",
+            "order_id": "ENTRY-AMD-UNFILLED",
+            "order_status": "CANCELED",
+            "source_event_type": "entry_reconcile_released",
+            "source_event_id": 1,
+            "observed_at": "2026-07-13T14:02:30+00:00",
+            "pnl_eligible": False,
+        }
+    ]
+    markdown = render_daily_report_markdown(report)
+    assert "cancelled unfilled 1" in markdown
+
+
+def test_daily_report_does_not_call_cancelled_positive_fill_an_unfilled_entry(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="AMD-CANCEL-RACE-FILL",
+                deployment_id="amd_live",
+                symbol="AMD",
+                option_symbol="AMD260717C00260000",
+                quantity=1,
+                entry_price=6.60,
+                entry_timestamp=datetime(2026, 7, 13, 14, 0, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="ENTRY-AMD-FILLED",
+                stop_order_id="STOP-AMD-FILLED",
+            )
+        )
+        await trades.mark_closed("AMD-CANCEL-RACE-FILL")
+        await events.append(
+            "entry_reconcile_released",
+            {
+                "deployment_id": "amd_live",
+                "trade_id": "AMD-CANCEL-RACE-FILL",
+                "order_id": "ENTRY-AMD-FILLED",
+                "status": "CANCELED",
+                "safe_to_close": True,
+                "payload": {
+                    "status": "CANCELED",
+                    "filledQuantity": 1,
+                },
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE events SET created_at='2026-07-13T14:02:30+00:00'"
+        )
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-07-13")
+
+    assert report["trade_summary"]["live_count"] == 1
+    assert report["trade_summary"]["live_missing_exit_truth_count"] == 1
+    assert report["trade_summary"]["live_realized_pnl_usd"] is None
+    assert report["trade_summary"]["entry_cancelled_unfilled_count"] == 0
+    assert report["trades"][0]["observation_outcome"] == "MISSING"
+    assert report["data_quality_warnings"][0]["category"] == "live_exit_truth_missing"
+
+
+def test_cancelled_zero_fill_conflicting_with_filled_close_is_missing_not_nontrade(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    backend = SQLiteBackend(str(db_path))
+    events = SQLiteEventRepository(str(db_path), backend=backend)
+    trades = SQLiteTradeStateRepository(str(db_path), backend=backend)
+
+    async def seed() -> None:
+        await trades.upsert_trade(
+            TradeRecord(
+                trade_id="PDD-CONFLICT",
+                deployment_id="pdd_live",
+                symbol="PDD",
+                quantity=1,
+                entry_price=1.0,
+                entry_timestamp=datetime(2026, 8, 3, 14, tzinfo=UTC),
+                status="closed",
+                entry_order_id="ENTRY-PDD",
+                exit_order_id="EXIT-PDD",
+                exit_price=2.0,
+                exit_filled_quantity=1,
+                exit_filled_at=datetime(2026, 8, 3, 15, tzinfo=UTC),
+                exit_order_status="FILLED",
+                exit_rule="profile:target_1",
+            )
+        )
+        await events.append(
+            "entry_reconcile_released",
+            {
+                "deployment_id": "pdd_live",
+                "trade_id": "PDD-CONFLICT",
+                "order_id": "ENTRY-PDD",
+                "status": "CANCELED",
+                "safe_to_close": True,
+                "payload": {"status": "CANCELED", "filledQuantity": None},
+            },
+        )
+
+    asyncio.run(seed())
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE events SET created_at='2026-08-03T14:02:30+00:00'"
+        )
+        conn.commit()
+
+    report = build_daily_report(db_path, trading_date="2026-08-03")
+    assert report["trade_summary"]["entry_cancelled_unfilled_count"] == 0
+    assert report["trade_summary"]["live_count"] == 1
+    assert report["trades"][0]["observation_outcome"] == "MISSING"
+    assert report["trades"][0]["pnl_eligible"] is False
+    assert report["observation_outcomes"][0]["missing_reason"] == (
+        "contradictory_terminal_zero_fill_and_filled_trade"
+    )
+
+
 def test_daily_report_includes_banked_partial_fill_pnl(tmp_path) -> None:
     db_path = tmp_path / "bhiksha.db"
     backend = SQLiteBackend(str(db_path))
@@ -1193,3 +1379,38 @@ def test_daily_report_renders_open_drawdown_warning_events(tmp_path) -> None:
     assert "day MTM -$350.00 (realized $0.00 + unrealized open -$350.00 across 2 position(s)) <= threshold -$100.00" in markdown
 # --- end open-book MTM warning section tests ---------------------------------
 # --- end risk rails section tests -------------------------------------------
+
+
+def test_daily_report_exposes_trade_evidence_identity(tmp_path) -> None:
+    db_path = tmp_path / "bhiksha.db"
+    trades = SQLiteTradeStateRepository(str(db_path))
+
+    asyncio.run(
+        trades.upsert_trade(
+            TradeRecord(
+                trade_id="PDD-IDENTITY",
+                deployment_id="pdd_live_canary",
+                symbol="PDD",
+                quantity=1,
+                entry_price=1.0,
+                entry_timestamp=datetime(2026, 8, 3, 14, tzinfo=UTC),
+                status="open_protected",
+                stop_order_id="STOP-PDD",
+                active_plan_id="active_plan_2026-08-03_pdd_canary_v1",
+                research_run_id="triage-w1w2-20260710-pdd-long",
+                evidence_packet_id="a" * 64,
+                evidence_artifact_sha256="b" * 64,
+                evidence_artifact_uri="mala-evidence://sha256/packet/pdd.json",
+                canary_id="pdd-v1",
+                canary_authorization_sha256="c" * 64,
+                canary_start_at="2026-08-03T00:00:00-05:00",
+                canary_expires_at="2026-08-28T15:15:00-05:00",
+            )
+        )
+    )
+
+    report = build_daily_report(db_path, trading_date="2026-08-03")
+    trade = report["trades"][0]
+    assert trade["active_plan_id"] == "active_plan_2026-08-03_pdd_canary_v1"
+    assert trade["evidence_packet_id"] == "a" * 64
+    assert trade["canary_authorization_sha256"] == "c" * 64

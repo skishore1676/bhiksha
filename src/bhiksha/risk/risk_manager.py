@@ -67,6 +67,10 @@ from datetime import UTC, datetime, timedelta
 from bhiksha.domain.models import EntryRiskReservation, PartialFillRecord, TradeRecord
 from bhiksha.ops.alerts import AlertMode, send_lathi_alert
 from bhiksha.persistence.repository import CashBudgetRepository, EventRepository, TradeStateRepository
+from bhiksha.risk.canary_inhibition_store import (
+    CanaryInhibitionStore,
+    CanaryInhibitionStoreError,
+)
 from bhiksha.risk.clusters import correlation_cluster
 from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.risk.planned_loss import planned_stop_loss_usd
@@ -77,6 +81,10 @@ SHADOW_ENTRY_ORDER_ID = "SHADOW_ENTRY"
 TIER1_HALT_REASON = "risk_rail_a_tier1_halt"
 TIER2_FLATTEN_REASON = "risk_rail_a_tier2_flatten"
 RAIL_B_DEMOTED_REASON = "risk_rail_b_demoted"
+CANARY_INHIBITED_REASON = "risk_live_triage_canary_inhibited"
+CANARY_INHIBITION_STATE_UNAVAILABLE_REASON = (
+    "risk_live_triage_canary_inhibition_state_unavailable"
+)
 BUDGET_UNAVAILABLE_REASON = "risk_rail_a_budget_unavailable"
 OPEN_DRAWDOWN_WARNING_REASON = "risk_open_drawdown_warning"
 PROSPECTIVE_LOSS_HEADROOM_REASON = "risk_prospective_loss_headroom_exceeded"
@@ -94,6 +102,10 @@ SIZED_ENTRY_RESERVATION_TTL = timedelta(minutes=30)
 # quote could not be obtained for that symbol this tick (fail-safe: that
 # position is simply excluded from the unrealized sum, never estimated).
 MarkPriceProvider = Callable[[str], Awaitable[float | None]]
+CanaryZeroFillEvidenceProvider = Callable[[str], Awaitable[bool]]
+CanaryProtectionEvidenceProvider = Callable[
+    [TradeRecord], Awaitable[bool]
+]
 
 # Rail-A-active-but-can't-tell-if-it's-breached reasons (see
 # _compute_rail_a_status): only these two mean "the budget/pnl read failed or
@@ -238,6 +250,101 @@ def _as_utc(timestamp: datetime) -> datetime:
     return timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp.astimezone(UTC)
 
 
+def _trade_is_in_canary_window(
+    trade: TradeRecord, policy: dict[str, object]
+) -> bool:
+    raw_start = str(policy.get("start_at") or "").strip()
+    if not raw_start or trade.entry_timestamp is None:
+        raise ValueError("canary start_at and trade entry_timestamp are required")
+    start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+    return _as_utc(trade.entry_timestamp) >= _as_utc(start)
+
+
+def _canary_policy_time(
+    policy: dict[str, object], field_name: str
+) -> datetime:
+    value = str(policy.get(field_name) or "").strip()
+    if not value:
+        raise ValueError(f"canary {field_name} is required")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"canary {field_name} must be timezone-aware")
+    return _as_utc(parsed)
+
+
+def _canary_trade_result(
+    trade: TradeRecord,
+    partials: list[PartialFillRecord],
+    *,
+    stop_loss_pct: object,
+) -> dict[str, object]:
+    """Return complete realized R or an explicit fail-closed evidence state."""
+
+    del stop_loss_pct
+    if trade.entry_price is None or trade.entry_price <= 0:
+        return {"status": "missing", "reason": "entry_price_missing"}
+    frozen_risk = trade.frozen_entry_risk_usd
+    if frozen_risk is None or frozen_risk <= 0:
+        return {"status": "missing", "reason": "frozen_entry_risk_missing"}
+    frozen_cost = trade.frozen_round_trip_cost_usd
+    if frozen_cost is None or frozen_cost < 0:
+        return {"status": "missing", "reason": "frozen_cost_missing"}
+    if trade.exit_order_status and trade.exit_order_status.upper() != "FILLED":
+        return {"status": "failed_exit"}
+
+    partial_pnl = 0.0
+    banked_quantity = 0
+    for partial in partials:
+        if partial.abandoned_reason:
+            return {"status": "missing", "reason": "partial_fill_abandoned"}
+        if not str(partial.exit_rule or "").strip():
+            return {"status": "missing", "reason": "partial_exit_attribution_missing"}
+        quantity = partial.fill_quantity or partial.closed_quantity
+        if partial.fill_price is None or quantity <= 0 or partial.filled_at is None:
+            return {"status": "missing", "reason": "partial_fill_truth_missing"}
+        partial_pnl += (
+            (partial.fill_price - trade.entry_price) * quantity * 100
+        )
+        banked_quantity += quantity
+
+    final_quantity = (
+        trade.exit_filled_quantity
+        if trade.exit_filled_quantity is not None
+        else trade.quantity
+    )
+    if final_quantity < 0:
+        return {"status": "missing", "reason": "final_quantity_invalid"}
+    final_pnl = 0.0
+    if final_quantity > 0:
+        if (
+            trade.exit_order_id is None
+            or trade.exit_price is None
+            or trade.exit_filled_at is None
+            or str(trade.exit_order_status or "").upper() != "FILLED"
+        ):
+            return {
+                "status": "missing",
+                "reason": "confirmed_final_exit_truth_missing",
+            }
+        if not str(trade.exit_rule or "").strip():
+            return {"status": "missing", "reason": "final_exit_attribution_missing"}
+        final_pnl = (
+            (trade.exit_price - trade.entry_price) * final_quantity * 100
+        )
+    original_quantity = final_quantity + banked_quantity
+    if original_quantity <= 0:
+        return {"status": "missing", "reason": "original_quantity_missing"}
+    after_cost_pnl = final_pnl + partial_pnl - frozen_cost
+    return {
+        "status": "complete",
+        "gross_realized_pnl_usd": round(final_pnl + partial_pnl, 2),
+        "frozen_round_trip_cost_usd": round(frozen_cost, 2),
+        "realized_pnl_usd": round(after_cost_pnl, 2),
+        "frozen_risk_usd": round(frozen_risk, 2),
+        "r_multiple": after_cost_pnl / frozen_risk,
+    }
+
+
 @dataclass(slots=True, frozen=True)
 class RailAStatus:
     active: bool
@@ -319,6 +426,12 @@ class RiskManager:
         trade_state_repository: TradeStateRepository,
         event_repository: EventRepository,
         demotion_store: DemotionStore | None = None,
+        canary_inhibition_store: CanaryInhibitionStore | None = None,
+        canary_policies: dict[str, dict[str, object]] | None = None,
+        canary_zero_fill_evidence_provider: CanaryZeroFillEvidenceProvider
+        | None = None,
+        canary_protection_evidence_provider: CanaryProtectionEvidenceProvider
+        | None = None,
         alert_mode: AlertMode = "live",
         alert_profile: str | None = None,
         now_fn=None,
@@ -329,6 +442,19 @@ class RiskManager:
         self.trade_state_repository = trade_state_repository
         self.event_repository = event_repository
         self.demotion_store = demotion_store or DemotionStore()
+        self.canary_inhibition_store = (
+            canary_inhibition_store or CanaryInhibitionStore()
+        )
+        self.canary_policies = {
+            str(deployment_id): dict(policy)
+            for deployment_id, policy in (canary_policies or {}).items()
+        }
+        self._canary_zero_fill_evidence_provider = (
+            canary_zero_fill_evidence_provider
+        )
+        self._canary_protection_evidence_provider = (
+            canary_protection_evidence_provider
+        )
         self.alert_mode = alert_mode
         self.alert_profile = alert_profile
         self._now_fn = now_fn or (lambda: datetime.now(UTC))
@@ -925,6 +1051,11 @@ class RiskManager:
             await self._emit_entry_decision(deployment_id, decision)
             return decision
 
+        decision = await self._canary_entry_decision(deployment_id)
+        if decision is not None:
+            await self._emit_entry_decision(deployment_id, decision)
+            return decision
+
         rail_b = await self._evaluate_rail_b(deployment_id)
         if rail_b.demoted:
             decision = EntryDecision(
@@ -944,6 +1075,213 @@ class RiskManager:
         await self._emit_entry_decision(deployment_id, decision)
         return decision
 
+    async def _canary_entry_decision(
+        self, deployment_id: str
+    ) -> EntryDecision | None:
+        automatic_canary_block = await self._evaluate_live_triage_canary(
+            deployment_id
+        )
+        if automatic_canary_block is not None:
+            return automatic_canary_block
+        try:
+            canary_inhibitions = self.canary_inhibition_store.matching(
+                deployment_id
+            )
+        except CanaryInhibitionStoreError as exc:
+            return EntryDecision(
+                allowed=False,
+                reason=CANARY_INHIBITION_STATE_UNAVAILABLE_REASON,
+                rail="CANARY",
+                details={"error": str(exc)},
+            )
+        if not canary_inhibitions:
+            return None
+        return EntryDecision(
+            allowed=False,
+            reason=CANARY_INHIBITED_REASON,
+            rail="CANARY",
+            details={
+                "canary_ids": [record.canary_id for record in canary_inhibitions],
+                "latched_at": [record.latched_at for record in canary_inhibitions],
+                "inhibition_reasons": [
+                    record.reason for record in canary_inhibitions
+                ],
+            },
+        )
+
+    async def _evaluate_live_triage_canary(
+        self, deployment_id: str
+    ) -> EntryDecision | None:
+        """Create durable stop latches before another canary entry is allowed."""
+
+        policy = self.canary_policies.get(deployment_id)
+        if policy is None:
+            return None
+        canary_id = str(policy.get("canary_id") or "").strip()
+        if not canary_id:
+            return EntryDecision(
+                allowed=False,
+                reason=CANARY_INHIBITION_STATE_UNAVAILABLE_REASON,
+                rail="CANARY",
+                details={"error": "canary_id_missing"},
+            )
+        try:
+            start = _canary_policy_time(policy, "start_at")
+            expires = _canary_policy_time(policy, "expires_at")
+            now = _as_utc(self._now_fn())
+            if now < start or now > expires:
+                return self._latch_canary_stop(
+                    deployment_id=deployment_id,
+                    canary_id=canary_id,
+                    reason="authorization_window_inactive",
+                    evidence={
+                        "evaluated_at": now.isoformat(),
+                        "start_at": start.isoformat(),
+                        "expires_at": expires.isoformat(),
+                    },
+                )
+            open_trades = await self.trade_state_repository.get_open_trades()
+            for trade in open_trades:
+                if (
+                    trade.deployment_id == deployment_id
+                    and _is_live_trade(trade)
+                    and trade.status not in {"pending_entry", "entry_reconciliation_hold"}
+                    and (trade.entry_price or 0) > 0
+                    and trade.quantity > 0
+                ):
+                    protection_proved = False
+                    if self._canary_protection_evidence_provider is not None:
+                        protection_proved = bool(
+                            await self._canary_protection_evidence_provider(trade)
+                        )
+                    if not protection_proved:
+                        return self._latch_canary_stop(
+                            deployment_id=deployment_id,
+                            canary_id=canary_id,
+                            reason="unprotected_position",
+                            evidence={
+                                "trade_id": trade.trade_id,
+                                "status": trade.status,
+                                "stop_order_id": trade.stop_order_id,
+                                "protection_proof": "broker_working_status_missing",
+                            },
+                        )
+
+            recent = await self.trade_state_repository.get_recent_trades(
+                limit=1000
+            )
+            closed = [
+                trade
+                for trade in recent
+                if trade.deployment_id == deployment_id
+                and _is_live_trade(trade)
+                and _is_closed_trade(trade)
+                and _trade_is_in_canary_window(trade, policy)
+            ]
+            partials_by_trade = (
+                await self.trade_state_repository.get_partial_fills_for_trades(
+                    [trade.trade_id for trade in closed]
+                )
+                if closed
+                else {}
+            )
+            cumulative_r = 0.0
+            contributing_trade_ids: list[str] = []
+            for trade in reversed(closed):
+                if await self._is_confirmed_zero_fill(trade.trade_id):
+                    continue
+                result = _canary_trade_result(
+                    trade,
+                    partials_by_trade.get(trade.trade_id, []),
+                    stop_loss_pct=policy.get("stop_loss_pct"),
+                )
+                if result["status"] == "missing":
+                    return self._latch_canary_stop(
+                        deployment_id=deployment_id,
+                        canary_id=canary_id,
+                        reason="missing_trade_or_exit_attribution",
+                        evidence={
+                            "trade_id": trade.trade_id,
+                            "missing_reason": result.get("reason"),
+                        },
+                    )
+                if result["status"] == "failed_exit":
+                    return self._latch_canary_stop(
+                        deployment_id=deployment_id,
+                        canary_id=canary_id,
+                        reason="failed_exit_receipt",
+                        evidence={
+                            "trade_id": trade.trade_id,
+                            "exit_order_status": trade.exit_order_status,
+                        },
+                    )
+                cumulative_r += float(result["r_multiple"])
+                contributing_trade_ids.append(trade.trade_id)
+
+            loss_floor = float(policy.get("max_cumulative_loss_r", -2.0))
+            if cumulative_r <= loss_floor:
+                return self._latch_canary_stop(
+                    deployment_id=deployment_id,
+                    canary_id=canary_id,
+                    reason="cumulative_loss_r",
+                    evidence={
+                        "cumulative_r": round(cumulative_r, 6),
+                        "loss_floor_r": loss_floor,
+                        "trade_ids": contributing_trade_ids,
+                        "r_definition": (
+                            "sum(realized_total_pnl_usd / "
+                            "frozen_entry_premium_stop_risk_usd)"
+                        ),
+                    },
+                )
+        except CanaryInhibitionStoreError as exc:
+            return EntryDecision(
+                allowed=False,
+                reason=CANARY_INHIBITION_STATE_UNAVAILABLE_REASON,
+                rail="CANARY",
+                details={"error": str(exc)},
+            )
+        except Exception as exc:
+            return EntryDecision(
+                allowed=False,
+                reason=CANARY_INHIBITION_STATE_UNAVAILABLE_REASON,
+                rail="CANARY",
+                details={"error": f"canary_evidence_evaluation_failed:{exc}"},
+            )
+        return None
+
+    async def _is_confirmed_zero_fill(self, trade_id: str) -> bool:
+        if self._canary_zero_fill_evidence_provider is None:
+            return False
+        return bool(await self._canary_zero_fill_evidence_provider(trade_id))
+
+    def _latch_canary_stop(
+        self,
+        *,
+        deployment_id: str,
+        canary_id: str,
+        reason: str,
+        evidence: dict[str, object],
+    ) -> EntryDecision:
+        record = self.canary_inhibition_store.record_inhibition(
+            deployment_id=deployment_id,
+            canary_id=canary_id,
+            reason=reason,
+            evidence=evidence,
+            now=self._now_fn(),
+        )
+        return EntryDecision(
+            allowed=False,
+            reason=CANARY_INHIBITED_REASON,
+            rail="CANARY",
+            details={
+                "canary_ids": [record.canary_id],
+                "latched_at": [record.latched_at],
+                "inhibition_reasons": [record.reason],
+                "evidence": record.evidence,
+            },
+        )
+
     async def reserve_sized_entry(
         self,
         *,
@@ -961,6 +1299,16 @@ class RiskManager:
         losses already realized today, would exceed that same halt budget.
         """
         async with self._sized_entry_lock:
+            # This is the final pre-submission lock used by the planner.  The
+            # canary window, evidence-based stop conditions, and durable latch
+            # must be re-read here—not only in the earlier planning consult—so
+            # expiry or a concurrent stop cannot race an order submission.
+            canary_decision = await self._canary_entry_decision(deployment_id)
+            if canary_decision is not None:
+                await self._emit_sized_entry_decision(
+                    deployment_id, trade_id, canary_decision
+                )
+                return canary_decision
             proposed_loss = planned_stop_loss_usd(
                 entry_price=entry_price,
                 quantity=quantity,

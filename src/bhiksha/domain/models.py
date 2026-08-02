@@ -180,6 +180,24 @@ class TradeRecord:
     # recover this. None only for rows written before this migration.
     # Metadata/reporting-only; never read by order-management logic.
     can_ladder: bool | None = None
+    # Immutable research/canary lineage frozen when the trade is first
+    # persisted.  These fields are reporting and audit identity only; they
+    # never authorize an order.  Additive nullable columns preserve rows from
+    # sessions predating the evidence-identity contract.
+    active_plan_id: str | None = None
+    research_run_id: str | None = None
+    evidence_packet_id: str | None = None
+    evidence_artifact_sha256: str | None = None
+    evidence_artifact_uri: str | None = None
+    canary_id: str | None = None
+    canary_authorization_sha256: str | None = None
+    canary_start_at: str | None = None
+    canary_expires_at: str | None = None
+    plan_revision_id: str | None = None
+    session_id: str | None = None
+    fact_receipt_id: str | None = None
+    frozen_entry_risk_usd: float | None = None
+    frozen_round_trip_cost_usd: float | None = None
 
 
 @dataclass(slots=True, frozen=True)

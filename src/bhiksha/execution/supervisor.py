@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import UTC
+import hashlib
 import math
 import os
 import uuid
@@ -196,6 +197,7 @@ class ExecutionSupervisor:
         exit_state_repository: ExitStateRepository | None = None,
         active_plan_id: str | None = None,
         startup_config_id: str | None = None,
+        deployment_evidence_identity: dict[str, dict[str, object]] | None = None,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
@@ -211,6 +213,10 @@ class ExecutionSupervisor:
         )
         self.active_plan_id = active_plan_id
         self.startup_config_id = startup_config_id
+        self.deployment_evidence_identity = {
+            str(deployment_id): dict(identity)
+            for deployment_id, identity in (deployment_evidence_identity or {}).items()
+        }
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._disabled_entry_deployments: set[str] = set()
@@ -2371,37 +2377,6 @@ class ExecutionSupervisor:
         cash_guard_details: dict[str, object] = {}
         sized_risk_details: dict[str, object] = {}
         risk_manager = getattr(self.planner, "risk_manager", None)
-        if risk_manager is not None:
-            stop_loss_pct, stop_loss_source = resolve_planned_stop_loss_pct(deployment)
-            sized_risk = await risk_manager.reserve_sized_entry(
-                trade_id=plan.trade_id,
-                deployment_id=plan.deployment_id,
-                symbol=plan.symbol,
-                entry_price=final_limit_price,
-                quantity=plan.quantity,
-                stop_loss_pct=stop_loss_pct,
-            )
-            sized_risk_details = {
-                "sized_entry_risk": dict(sized_risk.details),
-                "planned_stop_loss_pct": stop_loss_pct,
-                "planned_stop_loss_source": stop_loss_source,
-            }
-            if not sized_risk.allowed:
-                await self.event_repository.append(
-                    "entry_reprice_sized_risk_blocked",
-                    {
-                        "deployment_id": plan.deployment_id,
-                        "trade_id": plan.trade_id,
-                        "attempt": attempt,
-                        "reason": sized_risk.reason,
-                        **sized_risk_details,
-                    },
-                )
-                return _EntryRepriceResult(
-                    plan=plan,
-                    error=sized_risk.reason or "entry_reprice_sized_risk_blocked",
-                    cancelled_without_fill=True,
-                )
         if getattr(self.planner, "cash_guard", None) is not None:
             await self.planner.cash_guard.release_entry(plan.trade_id)
             cash_result = await self.planner.cash_guard.reserve_entry(
@@ -2411,6 +2386,11 @@ class ExecutionSupervisor:
             )
             cash_guard_details = dict(cash_result.details)
             if cash_result.blocked:
+                # The original order has already been confirmed cancelled. A
+                # risk reservation from that order must not survive a failed
+                # replacement cash reservation.
+                if risk_manager is not None:
+                    await risk_manager.release_sized_entry(plan.trade_id)
                 await self.event_repository.append(
                     "entry_reprice_cash_guard_blocked",
                     {
@@ -2425,6 +2405,64 @@ class ExecutionSupervisor:
                 return _EntryRepriceResult(
                     plan=plan,
                     error=cash_result.reason or "entry_reprice_cash_guard_blocked",
+                    cancelled_without_fill=True,
+                )
+
+        # The cash guard above can await account state.  Re-evaluate and
+        # reserve sized risk only after it returns so canary expiry/latch state
+        # is fresh at the replacement-order boundary.  There is deliberately
+        # no await between an allowed result and place_entry_order below.
+        if risk_manager is not None:
+            stop_loss_pct, stop_loss_source = resolve_planned_stop_loss_pct(deployment)
+            try:
+                sized_risk = await risk_manager.reserve_sized_entry(
+                    trade_id=plan.trade_id,
+                    deployment_id=plan.deployment_id,
+                    symbol=plan.symbol,
+                    entry_price=final_limit_price,
+                    quantity=plan.quantity,
+                    stop_loss_pct=stop_loss_pct,
+                )
+            except Exception as exc:
+                if getattr(self.planner, "cash_guard", None) is not None:
+                    await self.planner.cash_guard.release_entry(plan.trade_id)
+                await risk_manager.release_sized_entry(plan.trade_id)
+                await self.event_repository.append(
+                    "entry_reprice_sized_risk_check_failed",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "trade_id": plan.trade_id,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    },
+                )
+                return _EntryRepriceResult(
+                    plan=plan,
+                    error=f"entry_reprice_sized_risk_check_failed:{exc}",
+                    cancelled_without_fill=True,
+                )
+            sized_risk_details = {
+                "sized_entry_risk": dict(sized_risk.details),
+                "planned_stop_loss_pct": stop_loss_pct,
+                "planned_stop_loss_source": stop_loss_source,
+            }
+            if not sized_risk.allowed:
+                if getattr(self.planner, "cash_guard", None) is not None:
+                    await self.planner.cash_guard.release_entry(plan.trade_id)
+                await risk_manager.release_sized_entry(plan.trade_id)
+                await self.event_repository.append(
+                    "entry_reprice_sized_risk_blocked",
+                    {
+                        "deployment_id": plan.deployment_id,
+                        "trade_id": plan.trade_id,
+                        "attempt": attempt,
+                        "reason": sized_risk.reason,
+                        **sized_risk_details,
+                    },
+                )
+                return _EntryRepriceResult(
+                    plan=plan,
+                    error=sized_risk.reason or "entry_reprice_sized_risk_blocked",
                     cancelled_without_fill=True,
                 )
 
@@ -7904,6 +7942,93 @@ class ExecutionSupervisor:
         )
 
     async def _upsert_trade_record(self, record: TradeRecord) -> None:
+        identity = self.deployment_evidence_identity.get(record.deployment_id)
+        if identity is not None:
+            frozen_entry_risk_usd = record.frozen_entry_risk_usd
+            frozen_round_trip_cost_usd = record.frozen_round_trip_cost_usd
+            if (
+                frozen_entry_risk_usd is None
+                and record.entry_price is not None
+                and record.entry_price > 0
+                and record.quantity > 0
+            ):
+                stop_loss_pct = _maybe_float(identity.get("stop_loss_pct"))
+                if (
+                    stop_loss_pct is not None
+                    and 0 < stop_loss_pct <= 1
+                ):
+                    frozen_entry_risk_usd = round(
+                        record.entry_price
+                        * record.quantity
+                        * 100
+                        * stop_loss_pct,
+                        2,
+                    )
+                cost_per_contract = _maybe_float(
+                    identity.get("round_trip_cost_per_contract_usd")
+                )
+                if cost_per_contract is not None and cost_per_contract >= 0:
+                    frozen_round_trip_cost_usd = round(
+                        record.quantity * cost_per_contract,
+                        2,
+                    )
+            plan_revision_id = record.plan_revision_id or _optional_text(
+                identity.get("plan_revision_id")
+            )
+            session_id = record.session_id or _optional_text(
+                identity.get("session_id")
+            )
+            evidence_packet_id = (
+                record.evidence_packet_id
+                or _optional_text(identity.get("evidence_packet_id"))
+            )
+            canary_authorization_sha256 = (
+                record.canary_authorization_sha256
+                or _optional_text(identity.get("canary_authorization_sha256"))
+            )
+            fact_receipt_id = record.fact_receipt_id
+            if fact_receipt_id is None and plan_revision_id and session_id:
+                receipt_payload = "|".join(
+                    [
+                        plan_revision_id,
+                        session_id,
+                        record.trade_id,
+                        evidence_packet_id or "",
+                        canary_authorization_sha256 or "",
+                    ]
+                )
+                fact_receipt_id = "sha256:" + hashlib.sha256(
+                    receipt_payload.encode("utf-8")
+                ).hexdigest()
+            record = replace(
+                record,
+                active_plan_id=record.active_plan_id or self.active_plan_id,
+                research_run_id=record.research_run_id or identity.get("research_run_id"),
+                evidence_packet_id=evidence_packet_id,
+                evidence_artifact_sha256=(
+                    record.evidence_artifact_sha256
+                    or identity.get("evidence_artifact_sha256")
+                ),
+                evidence_artifact_uri=(
+                    record.evidence_artifact_uri
+                    or identity.get("evidence_artifact_uri")
+                ),
+                canary_id=record.canary_id or identity.get("canary_id"),
+                canary_authorization_sha256=(
+                    canary_authorization_sha256
+                ),
+                canary_start_at=(
+                    record.canary_start_at or identity.get("canary_start_at")
+                ),
+                canary_expires_at=(
+                    record.canary_expires_at or identity.get("canary_expires_at")
+                ),
+                plan_revision_id=plan_revision_id,
+                session_id=session_id,
+                fact_receipt_id=fact_receipt_id,
+                frozen_entry_risk_usd=frozen_entry_risk_usd,
+                frozen_round_trip_cost_usd=frozen_round_trip_cost_usd,
+            )
         await self.trade_state_repository.upsert_trade(record)
 
     async def _finalize_cash_guard_reservation(self, trade_id: str) -> None:
@@ -8271,6 +8396,13 @@ def _maybe_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _maybe_int(value) -> int | None:

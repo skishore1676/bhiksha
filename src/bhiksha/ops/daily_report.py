@@ -20,6 +20,14 @@ from bhiksha.ops.provider_reconciliation_health import (
     empty_provider_reconciliation,
     summarize_provider_reconciliation,
 )
+from bhiksha.ops.trade_observation import (
+    ENTRY_CANCELLED_UNFILLED,
+    MISSING,
+    NON_TRADE_OUTCOMES,
+    NO_FILL,
+    classify_trade_observation,
+    index_terminal_entry_observations,
+)
 
 if TYPE_CHECKING:
     from bhiksha.config.models import DeploymentManifest
@@ -91,17 +99,35 @@ def build_daily_report(
     event_counts = Counter(event["event_type"] for event in events)
     provider_events = _provider_events(events)
     lifecycle_events = _lifecycle_events(events)
-    trades = [_augment_trade(trade, partials_by_trade.get(str(trade.get("trade_id")), [])) for trade in trades]
+    terminal_entry_observations = index_terminal_entry_observations(events)
+    augmented_trades: list[dict[str, Any]] = []
+    observation_outcomes: list[dict[str, Any]] = []
+    for raw_trade in trades:
+        trade = _augment_trade(
+            raw_trade,
+            partials_by_trade.get(str(raw_trade.get("trade_id")), []),
+        )
+        observation = classify_trade_observation(
+            trade,
+            terminal_entry_observations,
+        )
+        if observation is not None:
+            trade["observation_outcome"] = observation["observation_outcome"]
+            trade["pnl_eligible"] = observation["pnl_eligible"]
+            observation_outcomes.append(observation)
+        augmented_trades.append(trade)
+    trades = augmented_trades
     entry_reconciliation = summarize_reconciliation_state(trades, events, now=now)
-    released_no_fill_ids = set(entry_reconciliation["released_no_fill_trade_ids"])
     # Entry attempts in reconciliation are not broker positions, and a
-    # released zero-fill attempt is not a trade. Keep both in the dedicated
-    # reconciliation account instead of contaminating position/P&L reporting.
+    # proved terminal zero-fill attempt is not a trade. Keep both in the
+    # reconciliation/observation accounts instead of contaminating position
+    # and P&L reporting. A generic release event alone is insufficient: the
+    # classifier above must also prove terminal zero/null fill truth.
     trades = [
         trade
         for trade in trades
         if not _is_entry_reconciliation_hold(trade)
-        and str(trade.get("trade_id") or "") not in released_no_fill_ids
+        and trade.get("observation_outcome") not in NON_TRADE_OUTCOMES
     ]
     live_trades = [trade for trade in trades if trade["lane"] == "live"]
     shadow_trades = [trade for trade in trades if trade["lane"] == "shadow"]
@@ -158,11 +184,27 @@ def build_daily_report(
             "live_missing_exit_truth_count": live_missing_exit_truth,
             "shadow_missing_exit_truth_count": shadow_missing_exit_truth,
             "total_missing_exit_truth_count": live_missing_exit_truth + shadow_missing_exit_truth,
+            "entry_cancelled_unfilled_count": sum(
+                1
+                for row in observation_outcomes
+                if row.get("observation_outcome") == ENTRY_CANCELLED_UNFILLED
+            ),
+            "no_fill_count": sum(
+                1
+                for row in observation_outcomes
+                if row.get("observation_outcome") == NO_FILL
+            ),
+            "missing_observation_count": sum(
+                1
+                for row in observation_outcomes
+                if row.get("observation_outcome") == MISSING
+            ),
         },
         "open_position_summary": open_position_summary,
         "open_positions": open_positions,
         "entry_reconciliation": entry_reconciliation,
         "trades": trades,
+        "observation_outcomes": observation_outcomes,
         "lifecycle": lifecycle_events,
         "data_quality_warnings": data_quality_warnings,
         "profile_exit_summary": profile_exit_summary,
@@ -195,6 +237,11 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"- live realized P&L: `{_summary_pnl_text(summary, 'live')}`",
         f"- shadow realized P&L: `{_summary_pnl_text(summary, 'shadow')}`",
         f"- total realized P&L: `{_summary_pnl_text(summary, 'total')}`",
+        (
+            "- non-trade entry outcomes: "
+            f"`cancelled unfilled {summary.get('entry_cancelled_unfilled_count', 0)}, "
+            f"other no-fill {summary.get('no_fill_count', 0)}`"
+        ),
         f"- provider reconciliation state: `{provider.get('state', 'healthy')}`",
         (
             "- active provider reconciliation: "
@@ -692,6 +739,9 @@ def _empty_report(day: date) -> dict[str, Any]:
             "live_open_count": 0,
             "shadow_open_count": 0,
             "total_open_count": 0,
+            "entry_cancelled_unfilled_count": 0,
+            "no_fill_count": 0,
+            "missing_observation_count": 0,
         },
         "open_position_summary": _open_position_summary([]),
         "open_positions": [],
@@ -707,6 +757,7 @@ def _empty_report(day: date) -> dict[str, Any]:
             "released_no_fill_trade_ids": [],
         },
         "trades": [],
+        "observation_outcomes": [],
         "lifecycle": {},
         "data_quality_warnings": [],
         "profile_exit_summary": {"count": 0, "rule_counts": {}},
@@ -724,13 +775,20 @@ def _load_day_events(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
     start = f"{day.isoformat()}T00:00:00"
     end = f"{day.isoformat()}T99:99:99"
     rows = conn.execute(
-        "SELECT created_at, event_type, payload FROM events WHERE created_at >= ? AND created_at <= ? ORDER BY id",
+        "SELECT id, created_at, event_type, payload FROM events WHERE created_at >= ? AND created_at <= ? ORDER BY id",
         (start, end),
     ).fetchall()
     events: list[dict[str, Any]] = []
     for row in rows:
         payload = _safe_json(row["payload"])
-        events.append({"created_at": row["created_at"], "event_type": row["event_type"], "payload": payload})
+        events.append(
+            {
+                "event_id": row["id"],
+                "created_at": row["created_at"],
+                "event_type": row["event_type"],
+                "payload": payload,
+            }
+        )
     return events
 
 
@@ -911,6 +969,20 @@ def _load_day_trades(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]
         "exit_mode",
         "exit_rule",
         "can_ladder",
+        "active_plan_id",
+        "research_run_id",
+        "evidence_packet_id",
+        "evidence_artifact_sha256",
+        "evidence_artifact_uri",
+        "canary_id",
+        "canary_authorization_sha256",
+        "canary_start_at",
+        "canary_expires_at",
+        "plan_revision_id",
+        "session_id",
+        "fact_receipt_id",
+        "frozen_entry_risk_usd",
+        "frozen_round_trip_cost_usd",
         "updated_at",
     ]
     selected = [column for column in desired if column in columns]
@@ -1002,7 +1074,8 @@ def _missing_exit_truth_count(trades: list[dict[str, Any]]) -> int:
     return sum(
         1
         for trade in trades
-        if not _is_open_trade(trade)
+        if trade.get("observation_outcome") not in NON_TRADE_OUTCOMES
+        and not _is_open_trade(trade)
         and _maybe_float(trade.get("entry_price")) is not None
         and (_maybe_int(trade.get("quantity")) or 0) > 0
         and _maybe_float(trade.get("realized_pnl_usd")) is None
@@ -1199,6 +1272,8 @@ def _entry_selector_empty_by_deployment(
 def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
     for trade in trades:
+        if trade.get("observation_outcome") in NON_TRADE_OUTCOMES:
+            continue
         if (
             trade.get("lane") == "live"
             and not _is_open_trade(trade)

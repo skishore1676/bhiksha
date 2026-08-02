@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
+import hashlib
 from typing import Any
 
 from bhiksha.domain.models import (
@@ -27,6 +28,66 @@ class NullEventRepository(EventRepository):
 
     async def append(self, event_type: str, payload: dict[str, Any]) -> None:
         return None
+
+
+class EvidenceIdentityEventRepository(EventRepository):
+    """Decorate deployment-scoped events with immutable evidence lineage."""
+
+    def __init__(
+        self,
+        delegate: EventRepository,
+        deployment_identity: dict[str, dict[str, object]],
+    ) -> None:
+        self.delegate = delegate
+        self.deployment_identity = {
+            str(deployment_id): dict(identity)
+            for deployment_id, identity in deployment_identity.items()
+        }
+
+    async def append(self, event_type: str, payload: dict[str, Any]) -> None:
+        deployment_id = str(payload.get("deployment_id") or "")
+        identity = self.deployment_identity.get(deployment_id)
+        if identity is None:
+            await self.delegate.append(event_type, payload)
+            return
+        evidence_identity = {
+            key: identity.get(key)
+            for key in (
+                "active_plan_id",
+                "plan_revision_id",
+                "session_id",
+                "research_run_id",
+                "evidence_packet_id",
+                "evidence_artifact_sha256",
+                "evidence_artifact_uri",
+                "canary_id",
+                "canary_authorization_sha256",
+            )
+        }
+        trade_id = str(payload.get("trade_id") or "")
+        if trade_id:
+            receipt_payload = "|".join(
+                [
+                    str(evidence_identity.get("plan_revision_id") or ""),
+                    str(evidence_identity.get("session_id") or ""),
+                    trade_id,
+                    str(evidence_identity.get("evidence_packet_id") or ""),
+                    str(
+                        evidence_identity.get(
+                            "canary_authorization_sha256"
+                        )
+                        or ""
+                    ),
+                ]
+            )
+            evidence_identity["fact_receipt_id"] = (
+                "sha256:"
+                + hashlib.sha256(receipt_payload.encode("utf-8")).hexdigest()
+            )
+        await self.delegate.append(
+            event_type,
+            {**payload, "evidence_identity": evidence_identity},
+        )
 
 
 class TradeStateRepository(ABC):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import hashlib
+import json
 from typing import Any, ClassVar, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
@@ -699,6 +701,7 @@ class ActivePlan(BaseModel):
     active_plan_id: str
     trading_date: str | None = None
     generated_at: str | None = None
+    plan_revision_id: str | None = None
     risk_envelope_authorization_fingerprint: str | None = None
     source: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
@@ -721,6 +724,28 @@ class ActivePlan(BaseModel):
             raise ValueError(
                 "active plan may arm at most one risk-envelope canary: "
                 + ", ".join(sorted(armed))
+            )
+        live_entry_canaries = [
+            deployment.deployment_id
+            for deployment in self.deployments
+            if deployment.enabled
+            and not deployment.execution.shadow_only
+            and str(
+                deployment.source.metadata.get("strategy_id") or ""
+            ).startswith("triage-")
+            and str(
+                deployment.source.metadata.get("authorization_mode") or ""
+            ).lower()
+            == "live"
+        ]
+        experimental_authorities = sorted(
+            set(armed) | set(live_entry_canaries)
+        )
+        if len(experimental_authorities) > 1:
+            raise ValueError(
+                "active plan may arm at most one experimental live authority "
+                "across entry and exit-envelope canaries: "
+                + ", ".join(experimental_authorities)
             )
         for deployment in self.deployments:
             if (
@@ -753,6 +778,33 @@ class ActivePlan(BaseModel):
     # harmless if absent: defaults to ``{}`` for any plan compiled before
     # this field existed. See ``bhiksha.risk.plan_operator_defaults_source``.
     operator_defaults: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_plan_revision_id(self) -> "ActivePlan":
+        payload = {
+            "contract_name": self.contract_name,
+            "schema_version": self.schema_version,
+            "active_plan_id": self.active_plan_id,
+            "trading_date": self.trading_date,
+            "deployments": [
+                deployment.model_dump(mode="json")
+                for deployment in self.deployments
+            ],
+            "operator_defaults": self.operator_defaults,
+            "suppressed": self.suppressed,
+        }
+        computed = "sha256:" + hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.plan_revision_id is not None and self.plan_revision_id != computed:
+            raise ValueError("plan_revision_id does not match active plan")
+        self.plan_revision_id = computed
+        return self
 
 
 class StrategyCatalogEntry(BaseModel):

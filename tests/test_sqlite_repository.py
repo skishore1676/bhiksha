@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import closing
+import json
 import os
 import sqlite3
 from datetime import UTC, datetime
@@ -8,6 +9,7 @@ import pytest
 
 from bhiksha.domain.models import TradeRecord
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteEventRepository, SQLiteTradeStateRepository
+from bhiksha.persistence.repository import EvidenceIdentityEventRepository
 
 
 def test_sqlite_event_repository_appends_rows(tmp_path) -> None:
@@ -20,6 +22,41 @@ def test_sqlite_event_repository_appends_rows(tmp_path) -> None:
         row = conn.execute("SELECT event_type, payload FROM events").fetchone()
     assert row[0] == "test_event"
     assert "hello" in row[1]
+
+
+def test_deployment_events_carry_complete_evidence_identity(tmp_path) -> None:
+    db_path = tmp_path / "events.db"
+    base = SQLiteEventRepository(str(db_path))
+    repo = EvidenceIdentityEventRepository(
+        base,
+        {
+            "pdd_live": {
+                "active_plan_id": "plan-pdd",
+                "plan_revision_id": "sha256:plan",
+                "session_id": "plan-pdd:session",
+                "research_run_id": "run-pdd",
+                "evidence_packet_id": "a" * 64,
+                "evidence_artifact_sha256": "b" * 64,
+                "evidence_artifact_uri": "mala-evidence://pdd",
+                "canary_id": "pdd-v1",
+                "canary_authorization_sha256": "c" * 64,
+            }
+        },
+    )
+
+    asyncio.run(
+        repo.append(
+            "entry_filled",
+            {"deployment_id": "pdd_live", "trade_id": "PDD-1"},
+        )
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        raw = conn.execute("SELECT payload FROM events").fetchone()[0]
+    identity = json.loads(raw)["evidence_identity"]
+    assert identity["plan_revision_id"] == "sha256:plan"
+    assert identity["evidence_packet_id"] == "a" * 64
+    assert identity["fact_receipt_id"].startswith("sha256:")
 
 
 def test_sqlite_backend_enables_wal_and_busy_timeout(tmp_path) -> None:
@@ -173,6 +210,52 @@ def test_trade_upsert_does_not_regress_pending_exit_to_stale_open_snapshot(tmp_p
     assert record.exit_order_id == "EXIT-NVDA-RACE"
     assert record.exit_limit_price == 2.07
     assert record.exit_submitted_at == submitted_at
+
+
+def test_trade_evidence_identity_is_persisted_and_immutable(tmp_path) -> None:
+    db_path = tmp_path / "runtime.db"
+    repo = SQLiteTradeStateRepository(str(db_path))
+    identity = {
+        "active_plan_id": "active_plan_2026-08-03_pdd_canary_v1",
+        "research_run_id": "triage-w1w2-20260710-pdd-long",
+        "evidence_packet_id": "a" * 64,
+        "evidence_artifact_sha256": "b" * 64,
+        "evidence_artifact_uri": "mala-evidence://sha256/packet/pdd.json",
+        "canary_id": "pdd-v1",
+        "canary_authorization_sha256": "c" * 64,
+        "canary_start_at": "2026-08-03T00:00:00-05:00",
+        "canary_expires_at": "2026-08-28T15:15:00-05:00",
+    }
+
+    async def run() -> TradeRecord:
+        await repo.upsert_trade(
+            TradeRecord(
+                trade_id="PDD-IDENTITY",
+                deployment_id="pdd_live_canary",
+                symbol="PDD",
+                quantity=1,
+                entry_price=1.0,
+                status="pending_entry",
+                **identity,
+            )
+        )
+        # A later lifecycle snapshot without lineage must not erase the
+        # frozen identity from the first persisted trade fact.
+        await repo.upsert_trade(
+            TradeRecord(
+                trade_id="PDD-IDENTITY",
+                deployment_id="pdd_live_canary",
+                symbol="PDD",
+                quantity=1,
+                entry_price=1.0,
+                status="open_protected",
+            )
+        )
+        return (await repo.get_recent_trades(limit=1))[0]
+
+    record = asyncio.run(run())
+    for key, value in identity.items():
+        assert getattr(record, key) == value
 
 
 def test_sqlite_event_repository_does_not_leak_file_descriptors(tmp_path) -> None:
