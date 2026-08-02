@@ -12,6 +12,8 @@ from typing import Any
 from bhiksha.trader_desk.consult_service import (
     BrokerInertConsultationService,
     ConsultServiceConfig,
+    ConsultationBusyError,
+    ConsultationUnavailableError,
 )
 
 
@@ -43,6 +45,12 @@ class ConsultationHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             result = self.service.consult(payload)
+        except ConsultationBusyError:
+            self._send_error(HTTPStatus.CONFLICT)
+            return
+        except ConsultationUnavailableError:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            return
         except (ValueError, json.JSONDecodeError):
             self._send_error(HTTPStatus.BAD_REQUEST)
             return

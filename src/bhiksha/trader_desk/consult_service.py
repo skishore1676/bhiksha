@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import threading
+import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,6 +23,42 @@ from mala_bhiksha_kernel import CapabilityManifest  # noqa: E402
 
 
 CENTRAL = ZoneInfo("America/Chicago")
+CONSULTATION_COMMAND_TIMEOUT_SECONDS = 240
+
+
+class ConsultationBusyError(RuntimeError):
+    """A broker-inert consultation is already using the research surface."""
+
+
+class ConsultationUnavailableError(RuntimeError):
+    """The broker-inert research query failed or exceeded its timebox."""
+
+
+class _DeadlineCommandRunner:
+    """Share one monotonic request budget across all bridge subprocesses."""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.expires_at = time.monotonic() + timeout_seconds
+
+    def __call__(
+        self,
+        cmd: list[str],
+        cwd: Path,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        remaining = self.expires_at - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, self.timeout_seconds)
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=remaining,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +79,7 @@ class BrokerInertConsultationService:
 
     def __init__(self, config: ConsultServiceConfig) -> None:
         self.config = config
+        self._consult_lock = threading.Lock()
         self._assert_packet_boundary()
 
     def preflight(self) -> dict[str, Any]:
@@ -112,19 +152,42 @@ class BrokerInertConsultationService:
             datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         else:
             timestamp = datetime.now(CENTRAL).isoformat()
-        result = consult_mala_playbook(
-            packet_path=self.config.packet,
-            symbol=symbol,
-            direction=direction,
-            timestamp=timestamp,
-            chart_read=chart_read,
-            mala_repo=self.config.mala_repo,
-            capability_manifest_path=self.config.capability_manifest,
-            legacy_retirement_report_path=self.config.legacy_retirement_report,
-            out_root=self.config.artifact_root / "consultations",
-            update_mala_log=False,
-        )
-        return asdict(result)
+        lock = getattr(self, "_consult_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._consult_lock = lock
+        if not lock.acquire(blocking=False):
+            raise ConsultationBusyError("consultation already in progress")
+        try:
+            runner = _DeadlineCommandRunner(
+                CONSULTATION_COMMAND_TIMEOUT_SECONDS
+            )
+            result = consult_mala_playbook(
+                packet_path=self.config.packet,
+                symbol=symbol,
+                direction=direction,
+                timestamp=timestamp,
+                chart_read=chart_read,
+                mala_repo=self.config.mala_repo,
+                capability_manifest_path=self.config.capability_manifest,
+                legacy_retirement_report_path=self.config.legacy_retirement_report,
+                out_root=self.config.artifact_root / "consultations",
+                update_mala_log=False,
+                runner=runner,
+            )
+            return asdict(result)
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            raise ConsultationUnavailableError(
+                "consultation research query unavailable"
+            ) from exc
+        finally:
+            lock.release()
 
     def _assert_packet_boundary(self) -> None:
         payload = self.preflight()
@@ -136,8 +199,6 @@ class BrokerInertConsultationService:
             raise ValueError(
                 "consultation service requires the eligible v1 shadow packet"
             )
-
-
 def _required_text(payload: dict[str, Any], key: str) -> str:
     value = str(payload.get(key) or "").strip()
     if not value:
