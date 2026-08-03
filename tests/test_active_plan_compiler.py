@@ -181,6 +181,36 @@ def _authorized_live_triage_canary_row(
     return row.model_copy(update={"source_metadata": metadata})
 
 
+def _authorized_v2_live_triage_canary_row(
+    catalog_root: Path,
+) -> ActivePlanSheetRow:
+    row = _live_triage_canary_row()
+    metadata = dict(row.source_metadata)
+    metadata["authorization_contract_version"] = "pdd-entry-canary.v2"
+    metadata["canary_id"] = "pdd-live-canary-v2"
+    policy = dict(metadata["canary_policy"])
+    policy["scale_fraction_of_baseline"] = 0.50
+    metadata["canary_policy"] = policy
+    row = row.model_copy(
+        update={
+            "max_trade_premium_usd": 1_000.0,
+            "max_contracts": 2,
+            "source_metadata": metadata,
+        }
+    )
+    catalog = load_strategy_catalog(catalog_root)
+    deployment = _compile_row(
+        row,
+        {entry.strategy_id: entry for entry in catalog},
+    )
+    metadata = dict(row.source_metadata)
+    metadata["authorization_sha256"] = compute_live_triage_authorization_sha256(
+        deployment,
+        active_plan_id="active_plan_2026-08-03",
+    )
+    return row.model_copy(update={"source_metadata": metadata})
+
+
 def test_live_triage_canary_requires_immutable_identity_and_bounded_policy(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
@@ -222,6 +252,177 @@ def test_live_triage_canary_carries_packet_and_stop_gates_into_plan(tmp_path: Pa
     assert deployment.risk.max_trade_premium_usd == 300
     assert deployment.source.metadata["evidence_packet_id"] == "a" * 64
     assert deployment.source.metadata["canary_policy"]["scale_min_clean_closes"] == 10
+
+
+def test_v2_live_triage_canary_authorizes_two_contract_1000_cap(
+    tmp_path: Path,
+) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "pdd.yaml",
+        strategy_id="triage-market_impulse-PDD__pdd_long",
+        symbol="PDD",
+    )
+
+    compiled = compile_active_plan_from_rows(
+        rows=[_authorized_v2_live_triage_canary_row(catalog_root)],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-08-03",
+        trading_date="2026-08-03",
+    )
+
+    assert compiled.plan.suppressed == []
+    deployment = compiled.plan.deployments[0]
+    assert deployment.risk.max_contracts == 2
+    assert deployment.risk.max_trade_premium_usd == 1_000.0
+    assert (
+        deployment.source.metadata["authorization_contract_version"]
+        == "pdd-entry-canary.v2"
+    )
+    assert (
+        deployment.source.metadata["canary_policy"][
+            "scale_fraction_of_baseline"
+        ]
+        == 0.50
+    )
+
+
+def test_v2_live_triage_canary_rejects_three_contracts(
+    tmp_path: Path,
+) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "pdd.yaml",
+        strategy_id="triage-market_impulse-PDD__pdd_long",
+        symbol="PDD",
+    )
+    row = _authorized_v2_live_triage_canary_row(catalog_root)
+    row = row.model_copy(update={"max_contracts": 3})
+
+    compiled = compile_active_plan_from_rows(
+        rows=[row],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-08-03",
+        trading_date="2026-08-03",
+    )
+
+    assert compiled.plan.deployments == []
+    assert "requires max_contracts=2" in compiled.plan.suppressed[0]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("baseline_cap", "canary_cap", "expected_reason"),
+    [
+        (4_000.0, 1_000.0, "baseline_max_trade_premium_usd=2000"),
+        (1_000.0, 500.0, "baseline_max_trade_premium_usd=2000"),
+        (2_000.0, 999.0, "max_trade_premium_usd=1000"),
+    ],
+)
+def test_v2_live_triage_canary_requires_exact_operator_authorized_size(
+    tmp_path: Path,
+    baseline_cap: float,
+    canary_cap: float,
+    expected_reason: str,
+) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "pdd.yaml",
+        strategy_id="triage-market_impulse-PDD__pdd_long",
+        symbol="PDD",
+    )
+    row = _authorized_v2_live_triage_canary_row(catalog_root)
+    metadata = dict(row.source_metadata)
+    metadata["baseline_max_trade_premium_usd"] = baseline_cap
+    row = row.model_copy(
+        update={
+            "max_trade_premium_usd": canary_cap,
+            "source_metadata": metadata,
+        }
+    )
+    compiled = compile_active_plan_from_rows(
+        rows=[row],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-08-03",
+        trading_date="2026-08-03",
+    )
+
+    assert compiled.plan.deployments == []
+    assert expected_reason in compiled.plan.suppressed[0]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("authorization_contract_version", "expected_reason"),
+    [
+        ("pdd-entry-canary.v3", "unsupported authorization_contract_version"),
+        (None, "requires max_contracts=1"),
+    ],
+)
+def test_v2_live_triage_canary_rejects_unknown_or_downgraded_contract(
+    tmp_path: Path,
+    authorization_contract_version: str | None,
+    expected_reason: str,
+) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "pdd.yaml",
+        strategy_id="triage-market_impulse-PDD__pdd_long",
+        symbol="PDD",
+    )
+    row = _authorized_v2_live_triage_canary_row(catalog_root)
+    metadata = dict(row.source_metadata)
+    if authorization_contract_version is None:
+        metadata.pop("authorization_contract_version", None)
+    else:
+        metadata["authorization_contract_version"] = (
+            authorization_contract_version
+        )
+    row = row.model_copy(update={"source_metadata": metadata})
+    compiled = compile_active_plan_from_rows(
+        rows=[row],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-08-03",
+        trading_date="2026-08-03",
+    )
+
+    assert compiled.plan.deployments == []
+    assert expected_reason in compiled.plan.suppressed[0]["reason"]
+
+
+def test_v2_live_triage_authorization_hash_binds_size_fields(
+    tmp_path: Path,
+) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "pdd.yaml",
+        strategy_id="triage-market_impulse-PDD__pdd_long",
+        symbol="PDD",
+    )
+    row = _authorized_v2_live_triage_canary_row(catalog_root)
+    catalog = load_strategy_catalog(catalog_root)
+    deployment = _compile_row(
+        row,
+        {entry.strategy_id: entry for entry in catalog},
+    )
+    tampered = deployment.model_copy(
+        update={
+            "risk": deployment.risk.model_copy(
+                update={"max_trade_premium_usd": 999.0}
+            )
+        }
+    )
+
+    assert compute_live_triage_authorization_sha256(
+        deployment,
+        active_plan_id="active_plan_2026-08-03",
+    ) != compute_live_triage_authorization_sha256(
+        tampered,
+        active_plan_id="active_plan_2026-08-03",
+    )
 
 
 def test_retained_pdd_release_candidate_recomputes_exact_authorization() -> None:

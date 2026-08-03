@@ -36,6 +36,8 @@ from bhiksha.time_utils import normalize_time_text, parse_time_text
 
 
 LIVE_TRIAGE_PROVIDER_OVERLAP_FLOOR = 0.90
+LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V1 = "pdd-entry-canary.v1"
+LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2 = "pdd-entry-canary.v2"
 
 
 class StrategyCatalogSheetRow(BaseModel):
@@ -1070,10 +1072,35 @@ def _validate_live_triage_canary(deployment: DeploymentManifest, *, strategy_id:
     expected_uri_prefix = f"mala-evidence://sha256/{packet_id}/"
     if not str(metadata["artifact_uri"]).startswith(expected_uri_prefix):
         raise ValueError(f"live triage canary {strategy_id!r} artifact_uri is not packet-bound")
-    if deployment.risk.max_contracts != 1:
-        raise ValueError(f"live triage canary {strategy_id!r} requires max_contracts=1")
-    if deployment.risk.max_trade_premium_usd > 300:
-        raise ValueError(f"live triage canary {strategy_id!r} requires max_trade_premium_usd<=300")
+    authorization_contract = str(
+        metadata.get("authorization_contract_version")
+        or LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V1
+    ).strip()
+    if authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V1:
+        required_max_contracts = 1
+        premium_ceiling = 300.0
+        authorized_fraction = 0.20
+    elif authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2:
+        required_max_contracts = 2
+        premium_ceiling = 1_000.0
+        authorized_fraction = 0.50
+    else:
+        raise ValueError(
+            f"live triage canary {strategy_id!r} has unsupported "
+            f"authorization_contract_version={authorization_contract!r}"
+        )
+    if deployment.risk.max_contracts != required_max_contracts:
+        raise ValueError(
+            f"live triage canary {strategy_id!r} contract "
+            f"{authorization_contract!r} requires "
+            f"max_contracts={required_max_contracts}"
+        )
+    if deployment.risk.max_trade_premium_usd > premium_ceiling:
+        raise ValueError(
+            f"live triage canary {strategy_id!r} contract "
+            f"{authorization_contract!r} requires "
+            f"max_trade_premium_usd<={premium_ceiling:g}"
+        )
     if deployment.execution.runtime_mode != "live_approval_gated":
         raise ValueError(f"live triage canary {strategy_id!r} requires runtime_mode=live_approval_gated")
     if deployment.exit.profile_exit_drives_live is not True:
@@ -1087,7 +1114,7 @@ def _validate_live_triage_canary(deployment: DeploymentManifest, *, strategy_id:
         "stop_on_failed_exit_receipt": True,
         "scale_min_clean_closes": 10,
         "r_definition": "sum_after_cost_trade_pnl_over_frozen_entry_stop_risk",
-        "scale_fraction_of_baseline": 0.20,
+        "scale_fraction_of_baseline": authorized_fraction,
         "round_trip_cost_per_contract_usd": 2.0,
     }
     if not isinstance(policy, dict):
@@ -1116,11 +1143,33 @@ def _validate_live_triage_canary(deployment: DeploymentManifest, *, strategy_id:
             f"live triage canary {strategy_id!r} requires "
             "baseline_max_trade_premium_usd"
         )
-    expected_cap = min(300.0, float(baseline_cap) * 0.20)
+    if (
+        authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2
+        and abs(float(baseline_cap) - 2_000.0) > 1e-9
+    ):
+        raise ValueError(
+            f"live triage canary {strategy_id!r} contract "
+            f"{authorization_contract!r} requires "
+            "baseline_max_trade_premium_usd=2000"
+        )
+    if (
+        authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2
+        and abs(deployment.risk.max_trade_premium_usd - 1_000.0) > 1e-9
+    ):
+        raise ValueError(
+            f"live triage canary {strategy_id!r} contract "
+            f"{authorization_contract!r} requires "
+            "max_trade_premium_usd=1000"
+        )
+    expected_cap = min(
+        premium_ceiling,
+        float(baseline_cap) * authorized_fraction,
+    )
     if abs(deployment.risk.max_trade_premium_usd - expected_cap) > 1e-9:
         raise ValueError(
             f"live triage canary {strategy_id!r} premium cap must equal "
-            "min(300, 20% of baseline_max_trade_premium_usd)"
+            f"min({premium_ceiling:g}, {authorized_fraction:.0%} of "
+            "baseline_max_trade_premium_usd)"
         )
 
 
