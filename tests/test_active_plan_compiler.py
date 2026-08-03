@@ -460,6 +460,48 @@ def test_retained_pdd_release_candidate_recomputes_exact_authorization() -> None
     assert receipt["projection_assertions"]["iwm_risk_envelope_mode"] == "off"
 
 
+def test_retained_pdd_v2_release_candidate_recomputes_exact_authorization() -> None:
+    receipt_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "release_candidates"
+        / "pdd_resize_20260802"
+        / "pdd_canary_candidate_v2.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    deployment = DeploymentManifest.model_validate(
+        receipt["authorization_payload"]["deployment"]
+    )
+
+    assert compute_live_triage_authorization_sha256(
+        deployment,
+        active_plan_id=receipt["authorization_payload"]["active_plan_id"],
+    ) == receipt["authorization_sha256"]
+    assert receipt["authorization_sha256"] == (
+        "4d8bb1d188190ee5d0e2c066fc960f99daa79b01a34dcefa9ff11cd4b9663539"
+    )
+    assert receipt["plan_revision_id"] == (
+        "sha256:fb7fa031bbc27b532ee99e6aa04470c540995c91483bac40958826a53cfab510"
+    )
+    active_plan_bytes = gzip.decompress(
+        base64.b64decode(receipt["active_plan_gzip_base64"])
+    )
+    assert hashlib.sha256(active_plan_bytes).hexdigest() == (
+        "9e80422e371f00d06e6117b13097550d7d95f39b675f2fd96f922e9694d000bf"
+    )
+    plan_payload = json.loads(active_plan_bytes)
+    claimed_revision = plan_payload.pop("plan_revision_id")
+    assert ActivePlan.model_validate(plan_payload).plan_revision_id == claimed_revision
+    assertions = receipt["projection_assertions"]
+    assert assertions["pdd_max_trade_premium_usd"] == 1_000.0
+    assert assertions["pdd_max_contracts"] == 2
+    assert assertions["pdd_profile_exit_id"] == "profile__trend_continuation"
+    assert assertions["pdd_target_1_quantity"] == 0.60
+    assert assertions["pdd_target_1_contracts"] == 1
+    assert assertions["pdd_runner_contracts"] == 1
+    assert assertions["pdd_risk_envelope_live_mode"] == "off"
+
+
 @pytest.mark.parametrize(
     ("baseline_cap", "canary_cap", "expected_reason"),
     [
