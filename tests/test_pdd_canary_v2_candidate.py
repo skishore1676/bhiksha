@@ -130,8 +130,8 @@ def test_pdd_projection_changes_only_four_authorized_cells() -> None:
     assert source == source_before
     assert observed == source_before[0]
     assert projected is not source
-    assert pdd_row["max_trade_premium_usd"] == 1_000.0
-    assert pdd_row["max_contracts"] == 2
+    assert pdd_row["max_trade_premium_usd"] == "1000"
+    assert pdd_row["max_contracts"] == "2"
     assert pdd_row["enabled"] is True
     assert pdd_row["authorization_mode"] == "live"
 

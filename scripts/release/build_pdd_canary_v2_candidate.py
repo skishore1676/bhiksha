@@ -246,8 +246,11 @@ def _project_pdd_v2(
     )
     pdd_row.update(
         {
-            "max_trade_premium_usd": 1_000.0,
-            "max_contracts": 2,
+            # Google returns these pre-existing control cells as strings.
+            # Preserve that physical representation so the retained Sheet
+            # postimage hash is exactly reproducible after USER_ENTERED write.
+            "max_trade_premium_usd": "1000",
+            "max_contracts": "2",
             "notes": (
                 "PDD entry canary v2 authorized 2026-08-02: maximum two "
                 "contracts, max $1,000 premium, TREND_CONTINUATION profile, "
@@ -648,9 +651,9 @@ def main() -> None:
         ),
         "proposed_cells": {
             "row_29": {
-                "E": 1_000.0,
+                "E": pdd_row["max_trade_premium_usd"],
                 "G": pdd_row["notes"],
-                "J": 2,
+                "J": pdd_row["max_contracts"],
                 "K": pdd_row["source_metadata"],
             }
         },
