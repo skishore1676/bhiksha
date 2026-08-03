@@ -259,10 +259,14 @@ def build_trading_decision_export(
     partials: dict[str, list[dict[str, Any]]] = {}
     terminal_events: list[dict[str, Any]] = []
     weekly_observation_events: list[dict[str, Any]] = []
+    option_snapshot_selected_matches: dict[str, bool | None] = {}
     if path.exists():
         with closing(sqlite3.connect(path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = _load_window_trades(conn, date(2000, 1, 1), through)
+            option_snapshot_selected_matches = (
+                _load_option_snapshot_selected_matches(conn, rows)
+            )
             partials = _load_partials(conn, [str(row["trade_id"]) for row in rows])
             terminal_events = _load_observation_events(
                 conn,
@@ -324,7 +328,14 @@ def build_trading_decision_export(
                 {"message": "missing_explicit_exit_attribution"},
                 *quality_warnings,
             ]
-        evidence_status, evidence_issues = _decision_evidence_status(row, trade)
+        option_snapshot_selected_match = option_snapshot_selected_matches.get(
+            str(row.get("trade_id") or "")
+        )
+        evidence_status, evidence_issues = _decision_evidence_status(
+            row,
+            trade,
+            option_snapshot_selected_match=option_snapshot_selected_match,
+        )
         facts.append(
             {
                 "trade_id": str(row.get("trade_id")),
@@ -384,6 +395,9 @@ def build_trading_decision_export(
                 ),
                 "option_selection_snapshot_persisted": row.get(
                     "option_selection_snapshot_persisted"
+                ),
+                "option_selection_snapshot_selected_match": (
+                    option_snapshot_selected_match
                 ),
                 "option_candidate_set_sha256": row.get(
                     "option_candidate_set_sha256"
@@ -836,7 +850,10 @@ def _coerce_day(value: date | str | None) -> date:
 
 
 def _decision_evidence_status(
-    row: dict[str, Any], trade: dict[str, Any]
+    row: dict[str, Any],
+    trade: dict[str, Any],
+    *,
+    option_snapshot_selected_match: bool | None = None,
 ) -> tuple[str, list[str]]:
     """Classify a closed trade without upgrading incomplete plumbing to evidence."""
 
@@ -859,15 +876,92 @@ def _decision_evidence_status(
     issues = [f"missing_{field}" for field in required if not row.get(field)]
     if row.get("option_selection_snapshot_persisted") not in (True, 1):
         issues.append("option_selection_snapshot_not_persisted")
+    elif option_snapshot_selected_match is False:
+        issues.append("option_selection_selected_contract_not_persisted")
+    elif option_snapshot_selected_match is None:
+        issues.append("option_selection_snapshot_consistency_unavailable")
     if not trade.get("exit_attribution"):
         issues.append("missing_explicit_exit_attribution")
-    if "option_selection_snapshot_not_persisted" in issues:
+    if {
+        "option_selection_snapshot_not_persisted",
+        "option_selection_selected_contract_not_persisted",
+    }.intersection(issues):
         return "plumbing_invalid", sorted(set(issues))
     if issues:
         return "incomplete", sorted(set(issues))
     if row.get("authorization_identity_status") == "compiled_observation_only":
         return "observation_only", []
     return "eligible", []
+
+
+def _load_option_snapshot_selected_matches(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+) -> dict[str, bool | None]:
+    """Prove that a persisted selection snapshot contains its claimed winner."""
+
+    tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if not {
+        "option_chain_snapshot_attempts",
+        "option_chain_snapshots",
+    }.issubset(tables):
+        return {
+            str(row["trade_id"]): None
+            for row in rows
+            if row["option_selection_snapshot_id"]
+        }
+
+    by_snapshot: dict[str, tuple[str | None, bool]] = {}
+    snapshot_ids = sorted(
+        {
+            str(row["option_selection_snapshot_id"])
+            for row in rows
+            if row["option_selection_snapshot_id"]
+        }
+    )
+    if snapshot_ids:
+        placeholders = ", ".join("?" for _ in snapshot_ids)
+        query = f"""
+            SELECT
+                attempt.snapshot_id,
+                attempt.selected_option_symbol,
+                MAX(
+                    CASE
+                        WHEN snapshot.is_selected = 1
+                         AND snapshot.option_symbol = attempt.selected_option_symbol
+                        THEN 1 ELSE 0
+                    END
+                ) AS selected_row_persisted
+            FROM option_chain_snapshot_attempts AS attempt
+            LEFT JOIN option_chain_snapshots AS snapshot
+              ON snapshot.snapshot_id = attempt.snapshot_id
+            WHERE attempt.snapshot_id IN ({placeholders})
+            GROUP BY attempt.snapshot_id, attempt.selected_option_symbol
+        """
+        for result in conn.execute(query, snapshot_ids).fetchall():
+            by_snapshot[str(result["snapshot_id"])] = (
+                result["selected_option_symbol"],
+                bool(result["selected_row_persisted"]),
+            )
+
+    matches: dict[str, bool | None] = {}
+    for row in rows:
+        snapshot_id = row["option_selection_snapshot_id"]
+        if not snapshot_id:
+            continue
+        recorded = by_snapshot.get(str(snapshot_id))
+        matches[str(row["trade_id"])] = bool(
+            recorded
+            and recorded[0]
+            and str(recorded[0]) == str(row["option_symbol"] or "")
+            and recorded[1]
+        )
+    return matches
 
 
 def _observation_window(row: dict[str, Any], trade: dict[str, Any]) -> str:

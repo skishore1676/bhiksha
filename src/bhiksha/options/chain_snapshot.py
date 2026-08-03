@@ -18,10 +18,11 @@ real selector alongside this module and asserts they agree on the winning
 contract, as a canary against the two cascades drifting apart.
 
 Volume is bounded deliberately (see ``_capture_candidates``): only contracts
-of the correct type (calls for long signals / puts for short) that are
-either inside the requested DTE window or sit at the single nearest-after-DTE
-expiry are captured. That keeps a ~1,122-contract SMH chain down to roughly
-~300 captured rows per attempt.
+of the correct type (calls for long signals / puts for short) that are inside
+the requested DTE window, sit at the single nearest-after-DTE expiry, or share
+the expiry actually selected by the fallback are captured. The last clause is
+important when the nearest expiry has no liquid contract and the selector
+continues to a later expiry; the persisted sidecar must contain its winner.
 """
 
 from __future__ import annotations
@@ -123,7 +124,14 @@ def build_chain_snapshot(
         if contract.underlying_symbol == request.symbol and contract.contract_type.upper() == allowed_type
     ]
     nearest_after_dte = _nearest_after_dte(desired, dte_max=dte_max)
-    capture_set = _capture_candidates(desired, dte_min=dte_min, dte_max=dte_max, nearest_after_dte=nearest_after_dte)
+    selected_dte = int(selection.dte) if selection is not None else None
+    capture_set = _capture_candidates(
+        desired,
+        dte_min=dte_min,
+        dte_max=dte_max,
+        nearest_after_dte=nearest_after_dte,
+        selected_dte=selected_dte,
+    )
 
     selected_option_symbol = selection.option_symbol if selection is not None else None
     candidate_rows = [
@@ -276,11 +284,14 @@ def _capture_candidates(
     dte_min: int,
     dte_max: int,
     nearest_after_dte: int | None,
+    selected_dte: int | None,
 ) -> list[OptionContractSnapshot]:
     return [
         contract
         for contract in desired
-        if (dte_min <= contract.dte <= dte_max) or (nearest_after_dte is not None and contract.dte == nearest_after_dte)
+        if (dte_min <= contract.dte <= dte_max)
+        or (nearest_after_dte is not None and contract.dte == nearest_after_dte)
+        or (selected_dte is not None and contract.dte == selected_dte)
     ]
 
 

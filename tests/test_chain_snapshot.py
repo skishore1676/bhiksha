@@ -187,6 +187,44 @@ def test_build_chain_snapshot_cross_check_against_real_selector_winner() -> None
     assert real_selection.option_symbol == "SMH260717P00610000"
 
 
+def test_build_chain_snapshot_persists_farther_fallback_winner() -> None:
+    request = _request(
+        dte_min=0,
+        dte_max=3,
+        dte_fallback_policy="allow_nearest_after",
+    )
+    contracts = [
+        _contract(
+            "SMH_NEAREST_ILLIQUID",
+            dte=4,
+            bid=1.00,
+            ask=2.00,
+        ),
+        _contract(
+            "SMH_FARTHER_LIQUID",
+            dte=11,
+            bid=3.00,
+            ask=3.10,
+        ),
+    ]
+
+    selection = SingleLegOptionSelector().select(request, contracts)
+    attempt = build_chain_snapshot(
+        request,
+        contracts,
+        lane="live",
+        snapshot_id="snap-farther-fallback",
+        selection=selection,
+    )
+
+    assert selection.option_symbol == "SMH_FARTHER_LIQUID"
+    assert attempt.nearest_after_dte == 4
+    assert {row.dte for row in attempt.rows} == {4, 11}
+    selected = [row for row in attempt.rows if row.is_selected]
+    assert len(selected) == 1
+    assert selected[0].option_symbol == selection.option_symbol
+
+
 def test_build_chain_snapshot_handles_empty_chain() -> None:
     request = _request()
     attempt = build_chain_snapshot(

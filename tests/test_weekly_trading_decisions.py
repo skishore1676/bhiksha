@@ -6,6 +6,8 @@ import sqlite3
 
 from bhiksha.domain.models import TradeRecord
 from bhiksha.ops.weekly_trading_decisions import (
+    _decision_evidence_status,
+    _load_option_snapshot_selected_matches,
     build_trading_decision_export,
     finalize_weekly_trading_decisions,
     render_weekly_trading_decisions_markdown,
@@ -50,6 +52,71 @@ def test_weekly_decision_renderer_names_outcome_and_human_gate() -> None:
     assert "workbook update: `ok`" in markdown
     assert "require Suman's explicit decision" in markdown
     json.dumps(report)
+
+
+def test_evidence_status_quarantines_snapshot_without_selected_contract() -> None:
+    row = {
+        "evidence_packet_id": "a" * 64,
+        "experiment_id": "experiment-v1",
+        "cohort_id": "cohort-v1",
+        "cohort_contract_sha256": "b" * 64,
+        "deployment_contract_sha256": "c" * 64,
+        "declared_option_selection_contract_sha256": "d" * 64,
+        "exit_policy_sha256": "e" * 64,
+        "plan_revision_id": "sha256:plan",
+        "session_id": "session-v1",
+        "fact_receipt_id": "sha256:fact",
+        "option_selection_snapshot_id": "snapshot-v1",
+        "option_selection_snapshot_persisted": 1,
+        "option_candidate_set_sha256": "f" * 64,
+        "actual_option_selection_sha256": "1" * 64,
+    }
+
+    status, issues = _decision_evidence_status(
+        row,
+        {"exit_attribution": "profile:no_progress"},
+        option_snapshot_selected_match=False,
+    )
+
+    assert status == "plumbing_invalid"
+    assert issues == ["option_selection_selected_contract_not_persisted"]
+
+
+def test_snapshot_consistency_requires_attempt_and_selected_row() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE option_chain_snapshot_attempts (
+            snapshot_id TEXT PRIMARY KEY,
+            selected_option_symbol TEXT
+        );
+        CREATE TABLE option_chain_snapshots (
+            snapshot_id TEXT,
+            option_symbol TEXT,
+            is_selected INTEGER
+        );
+        INSERT INTO option_chain_snapshot_attempts VALUES
+            ('good-snapshot', 'GOOD'),
+            ('missing-winner', 'FARTHER');
+        INSERT INTO option_chain_snapshots VALUES
+            ('good-snapshot', 'GOOD', 1),
+            ('missing-winner', 'NEAREST', 0);
+        CREATE TABLE trades (
+            trade_id TEXT,
+            option_symbol TEXT,
+            option_selection_snapshot_id TEXT
+        );
+        INSERT INTO trades VALUES
+            ('good-trade', 'GOOD', 'good-snapshot'),
+            ('bad-trade', 'FARTHER', 'missing-winner');
+        """
+    )
+    rows = conn.execute("SELECT * FROM trades ORDER BY trade_id").fetchall()
+
+    matches = _load_option_snapshot_selected_matches(conn, rows)
+
+    assert matches == {"bad-trade": False, "good-trade": True}
 
 
 def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
