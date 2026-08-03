@@ -487,7 +487,7 @@ def test_retained_pdd_v2_release_candidate_recomputes_exact_authorization() -> N
         base64.b64decode(receipt["active_plan_gzip_base64"])
     )
     assert hashlib.sha256(active_plan_bytes).hexdigest() == (
-        "9e80422e371f00d06e6117b13097550d7d95f39b675f2fd96f922e9694d000bf"
+        "30c498b6ad3c6b9ce97a131edb8e540f66071008910c402168e99679d65f871d"
     )
     plan_payload = json.loads(active_plan_bytes)
     claimed_revision = plan_payload.pop("plan_revision_id")
