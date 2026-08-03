@@ -19,6 +19,7 @@ import yaml
 from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
 from bhiksha.execution.pricing import resolve_entry_reprice_max_chase_pct
+from bhiksha.evidence.bindings import apply_evidence_binding, load_evidence_bindings
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 from bhiksha.risk.canary_inhibition_store import (
     CanaryInhibitionRecord,
@@ -354,6 +355,7 @@ def compile_active_plan_from_rows(
     suppressed: list[dict[str, Any]] | None = None,
     risk_demotion_store: DemotionStore | None = None,
     canary_inhibition_store: CanaryInhibitionStore | None = None,
+    evidence_bindings: dict[str, dict[str, Any]] | None = None,
 ) -> CompiledActivePlan:
     suppressed_rows = list(suppressed or [])
     if google_strategy_catalog is not None:
@@ -420,6 +422,25 @@ def compile_active_plan_from_rows(
         deployments,
         inhibition_store=canary_inhibition_store,
     )
+    bound_deployments: list[DeploymentManifest] = []
+    rows_by_id = {row.row_id: row for row in rows}
+    for deployment in deployments:
+        row = rows_by_id.get(deployment.deployment_id)
+        try:
+            if row is not None and row.strategy_id:
+                deployment = apply_evidence_binding(
+                    deployment,
+                    strategy_id=row.strategy_id,
+                    authorization_mode=row.authorization_mode,
+                    bindings=evidence_bindings or {},
+                )
+        except (ValidationError, ValueError) as exc:
+            if row is None:
+                raise
+            suppressed_rows.append(_suppressed_row(reason=str(exc), row=row))
+            continue
+        bound_deployments.append(deployment)
+    deployments = bound_deployments
 
     source = {
         "name": source_name,
@@ -444,6 +465,11 @@ def compile_active_plan_from_rows(
             "risk_demotion_warnings": demotion_warnings,
             "live_triage_provider_overlap_warnings": provider_overlap_warnings,
             "canary_inhibition_warnings": canary_inhibition_warnings,
+            "evidence_bound_deployment_count": sum(
+                1
+                for deployment in deployments
+                if deployment.source.metadata.get("evidence_binding_sha256")
+            ),
         },
         suppressed=suppressed_rows,
         deployments=deployments,
@@ -468,6 +494,7 @@ def compile_active_plan_from_google_sheets(
     manual_client: GoogleSheetTableClient | None = None,
     catalog_client: GoogleSheetTableClient | None = None,
     defaults_client: GoogleSheetTableClient | None = None,
+    evidence_bindings_path: str | Path | None = None,
 ) -> CompiledActivePlan:
     if catalog_client is None:
         catalog_client = GoogleSheetTableClient(
@@ -534,6 +561,11 @@ def compile_active_plan_from_google_sheets(
         google_strategy_catalog=catalog_validation.rows,
         operator_defaults=operator_defaults,
         suppressed=suppressed,
+        evidence_bindings=(
+            load_evidence_bindings(evidence_bindings_path)
+            if evidence_bindings_path is not None
+            else None
+        ),
     )
 
 

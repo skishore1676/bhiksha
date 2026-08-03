@@ -9,6 +9,7 @@ from pathlib import Path
 
 from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets, write_compiled_active_plan
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
+from bhiksha.evidence.bindings import DEFAULT_EVIDENCE_BINDINGS_PATH
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,6 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for approved strategy activations")
     parser.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual trade setups")
     parser.add_argument(
+        "--evidence-bindings",
+        default=str(DEFAULT_EVIDENCE_BINDINGS_PATH),
+        help="Immutable experiment-to-deployment binding registry",
+    )
+    parser.add_argument(
         "--out",
         default="artifacts/playbook/active_plan.json",
         help="Where to write the compiled active plan JSON",
@@ -62,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             active_plan_id=args.active_plan_id,
             trading_date=args.trading_date,
             source_name=args.source_name,
+            evidence_bindings_path=args.evidence_bindings,
         )
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(

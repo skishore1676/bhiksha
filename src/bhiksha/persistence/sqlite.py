@@ -281,6 +281,19 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     evidence_packet_id TEXT,
                     evidence_artifact_sha256 TEXT,
                     evidence_artifact_uri TEXT,
+                    experiment_id TEXT,
+                    cohort_id TEXT,
+                    cohort_contract_sha256 TEXT,
+                    deployment_contract_sha256 TEXT,
+                    declared_option_selection_contract_id TEXT,
+                    declared_option_selection_contract_sha256 TEXT,
+                    authorization_identity_status TEXT,
+                    exit_policy_id TEXT,
+                    exit_policy_sha256 TEXT,
+                    option_selection_snapshot_id TEXT,
+                    option_selection_snapshot_persisted INTEGER,
+                    option_candidate_set_sha256 TEXT,
+                    actual_option_selection_sha256 TEXT,
                     canary_id TEXT,
                     canary_authorization_sha256 TEXT,
                     canary_start_at TEXT,
@@ -330,6 +343,19 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 "evidence_packet_id": "TEXT",
                 "evidence_artifact_sha256": "TEXT",
                 "evidence_artifact_uri": "TEXT",
+                "experiment_id": "TEXT",
+                "cohort_id": "TEXT",
+                "cohort_contract_sha256": "TEXT",
+                "deployment_contract_sha256": "TEXT",
+                "declared_option_selection_contract_id": "TEXT",
+                "declared_option_selection_contract_sha256": "TEXT",
+                "authorization_identity_status": "TEXT",
+                "exit_policy_id": "TEXT",
+                "exit_policy_sha256": "TEXT",
+                "option_selection_snapshot_id": "TEXT",
+                "option_selection_snapshot_persisted": "INTEGER",
+                "option_candidate_set_sha256": "TEXT",
+                "actual_option_selection_sha256": "TEXT",
                 "canary_id": "TEXT",
                 "canary_authorization_sha256": "TEXT",
                 "canary_start_at": "TEXT",
@@ -514,12 +540,17 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
                     exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
                     active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
-                    evidence_artifact_uri, canary_id, canary_authorization_sha256,
+                    evidence_artifact_uri, experiment_id, cohort_id, cohort_contract_sha256,
+                    deployment_contract_sha256, declared_option_selection_contract_id,
+                    declared_option_selection_contract_sha256, authorization_identity_status,
+                    exit_policy_id, exit_policy_sha256, option_selection_snapshot_id,
+                    option_selection_snapshot_persisted, option_candidate_set_sha256,
+                    actual_option_selection_sha256, canary_id, canary_authorization_sha256,
                     canary_start_at, canary_expires_at,
                     plan_revision_id, session_id, fact_receipt_id,
                     frozen_entry_risk_usd, frozen_round_trip_cost_usd,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     deployment_id=excluded.deployment_id,
                     symbol=excluded.symbol,
@@ -591,6 +622,19 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     evidence_packet_id=COALESCE(trade_sessions.evidence_packet_id, excluded.evidence_packet_id),
                     evidence_artifact_sha256=COALESCE(trade_sessions.evidence_artifact_sha256, excluded.evidence_artifact_sha256),
                     evidence_artifact_uri=COALESCE(trade_sessions.evidence_artifact_uri, excluded.evidence_artifact_uri),
+                    experiment_id=COALESCE(trade_sessions.experiment_id, excluded.experiment_id),
+                    cohort_id=COALESCE(trade_sessions.cohort_id, excluded.cohort_id),
+                    cohort_contract_sha256=COALESCE(trade_sessions.cohort_contract_sha256, excluded.cohort_contract_sha256),
+                    deployment_contract_sha256=COALESCE(trade_sessions.deployment_contract_sha256, excluded.deployment_contract_sha256),
+                    declared_option_selection_contract_id=COALESCE(trade_sessions.declared_option_selection_contract_id, excluded.declared_option_selection_contract_id),
+                    declared_option_selection_contract_sha256=COALESCE(trade_sessions.declared_option_selection_contract_sha256, excluded.declared_option_selection_contract_sha256),
+                    authorization_identity_status=COALESCE(trade_sessions.authorization_identity_status, excluded.authorization_identity_status),
+                    exit_policy_id=COALESCE(trade_sessions.exit_policy_id, excluded.exit_policy_id),
+                    exit_policy_sha256=COALESCE(trade_sessions.exit_policy_sha256, excluded.exit_policy_sha256),
+                    option_selection_snapshot_id=COALESCE(trade_sessions.option_selection_snapshot_id, excluded.option_selection_snapshot_id),
+                    option_selection_snapshot_persisted=COALESCE(trade_sessions.option_selection_snapshot_persisted, excluded.option_selection_snapshot_persisted),
+                    option_candidate_set_sha256=COALESCE(trade_sessions.option_candidate_set_sha256, excluded.option_candidate_set_sha256),
+                    actual_option_selection_sha256=COALESCE(trade_sessions.actual_option_selection_sha256, excluded.actual_option_selection_sha256),
                     canary_id=COALESCE(trade_sessions.canary_id, excluded.canary_id),
                     canary_authorization_sha256=COALESCE(trade_sessions.canary_authorization_sha256, excluded.canary_authorization_sha256),
                     canary_start_at=COALESCE(trade_sessions.canary_start_at, excluded.canary_start_at),
@@ -634,6 +678,19 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                     record.evidence_packet_id,
                     record.evidence_artifact_sha256,
                     record.evidence_artifact_uri,
+                    record.experiment_id,
+                    record.cohort_id,
+                    record.cohort_contract_sha256,
+                    record.deployment_contract_sha256,
+                    record.declared_option_selection_contract_id,
+                    record.declared_option_selection_contract_sha256,
+                    record.authorization_identity_status,
+                    record.exit_policy_id,
+                    record.exit_policy_sha256,
+                    record.option_selection_snapshot_id,
+                    None if record.option_selection_snapshot_persisted is None else int(record.option_selection_snapshot_persisted),
+                    record.option_candidate_set_sha256,
+                    record.actual_option_selection_sha256,
                     record.canary_id,
                     record.canary_authorization_sha256,
                     record.canary_start_at,
@@ -701,7 +758,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
                        exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
                        active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
-                       evidence_artifact_uri, canary_id, canary_authorization_sha256,
+                       evidence_artifact_uri, experiment_id, cohort_id, cohort_contract_sha256,
+                       deployment_contract_sha256, declared_option_selection_contract_id,
+                       declared_option_selection_contract_sha256, authorization_identity_status,
+                       exit_policy_id, exit_policy_sha256, option_selection_snapshot_id,
+                       option_selection_snapshot_persisted, option_candidate_set_sha256,
+                       actual_option_selection_sha256, canary_id, canary_authorization_sha256,
                        canary_start_at, canary_expires_at, plan_revision_id,
                        session_id, fact_receipt_id, frozen_entry_risk_usd,
                        frozen_round_trip_cost_usd
@@ -721,7 +783,12 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                        exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
                        exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
                        active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
-                       evidence_artifact_uri, canary_id, canary_authorization_sha256,
+                       evidence_artifact_uri, experiment_id, cohort_id, cohort_contract_sha256,
+                       deployment_contract_sha256, declared_option_selection_contract_id,
+                       declared_option_selection_contract_sha256, authorization_identity_status,
+                       exit_policy_id, exit_policy_sha256, option_selection_snapshot_id,
+                       option_selection_snapshot_persisted, option_candidate_set_sha256,
+                       actual_option_selection_sha256, canary_id, canary_authorization_sha256,
                        canary_start_at, canary_expires_at, plan_revision_id,
                        session_id, fact_receipt_id, frozen_entry_risk_usd,
                        frozen_round_trip_cost_usd
@@ -1149,10 +1216,26 @@ class SQLiteChainSnapshotRepository(ChainSnapshotRepository):
                     total_candidates INTEGER NOT NULL,
                     captured_candidates INTEGER NOT NULL,
                     selector_empty INTEGER NOT NULL,
-                    selected_option_symbol TEXT
+                    selected_option_symbol TEXT,
+                    option_candidate_set_sha256 TEXT,
+                    actual_option_selection_sha256 TEXT
                 )
                 """
             )
+            attempt_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(option_chain_snapshot_attempts)"
+                ).fetchall()
+            }
+            for column_name in (
+                "option_candidate_set_sha256",
+                "actual_option_selection_sha256",
+            ):
+                if column_name not in attempt_columns:
+                    conn.execute(
+                        f"ALTER TABLE option_chain_snapshot_attempts ADD COLUMN {column_name} TEXT"
+                    )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_option_chain_snapshot_attempts_created_at "
                 "ON option_chain_snapshot_attempts(created_at)"
@@ -1217,7 +1300,8 @@ class SQLiteChainSnapshotRepository(ChainSnapshotRepository):
                     dte_min, dte_max, min_open_interest, target_abs_delta_min, target_abs_delta_max,
                     max_bid_ask_spread_pct, dte_fallback_policy, nearest_after_dte, total_candidates,
                     captured_candidates, selector_empty, selected_option_symbol
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    , option_candidate_set_sha256, actual_option_selection_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attempt.snapshot_id,
@@ -1239,6 +1323,8 @@ class SQLiteChainSnapshotRepository(ChainSnapshotRepository):
                     attempt.captured_candidates,
                     int(attempt.selector_empty),
                     attempt.selected_option_symbol,
+                    attempt.option_candidate_set_sha256,
+                    attempt.actual_option_selection_sha256,
                 ),
             )
             if attempt.rows:
@@ -1331,15 +1417,30 @@ def _trade_record_from_row(row) -> TradeRecord:
         evidence_packet_id=row[28] if len(row) > 28 else None,
         evidence_artifact_sha256=row[29] if len(row) > 29 else None,
         evidence_artifact_uri=row[30] if len(row) > 30 else None,
-        canary_id=row[31] if len(row) > 31 else None,
-        canary_authorization_sha256=row[32] if len(row) > 32 else None,
-        canary_start_at=row[33] if len(row) > 33 else None,
-        canary_expires_at=row[34] if len(row) > 34 else None,
-        plan_revision_id=row[35] if len(row) > 35 else None,
-        session_id=row[36] if len(row) > 36 else None,
-        fact_receipt_id=row[37] if len(row) > 37 else None,
-        frozen_entry_risk_usd=row[38] if len(row) > 38 else None,
-        frozen_round_trip_cost_usd=row[39] if len(row) > 39 else None,
+        experiment_id=row[31] if len(row) > 31 else None,
+        cohort_id=row[32] if len(row) > 32 else None,
+        cohort_contract_sha256=row[33] if len(row) > 33 else None,
+        deployment_contract_sha256=row[34] if len(row) > 34 else None,
+        declared_option_selection_contract_id=row[35] if len(row) > 35 else None,
+        declared_option_selection_contract_sha256=row[36] if len(row) > 36 else None,
+        authorization_identity_status=row[37] if len(row) > 37 else None,
+        exit_policy_id=row[38] if len(row) > 38 else None,
+        exit_policy_sha256=row[39] if len(row) > 39 else None,
+        option_selection_snapshot_id=row[40] if len(row) > 40 else None,
+        option_selection_snapshot_persisted=(
+            bool(row[41]) if len(row) > 41 and row[41] is not None else None
+        ),
+        option_candidate_set_sha256=row[42] if len(row) > 42 else None,
+        actual_option_selection_sha256=row[43] if len(row) > 43 else None,
+        canary_id=row[44] if len(row) > 44 else None,
+        canary_authorization_sha256=row[45] if len(row) > 45 else None,
+        canary_start_at=row[46] if len(row) > 46 else None,
+        canary_expires_at=row[47] if len(row) > 47 else None,
+        plan_revision_id=row[48] if len(row) > 48 else None,
+        session_id=row[49] if len(row) > 49 else None,
+        fact_receipt_id=row[50] if len(row) > 50 else None,
+        frozen_entry_risk_usd=row[51] if len(row) > 51 else None,
+        frozen_round_trip_cost_usd=row[52] if len(row) > 52 else None,
     )
 
 

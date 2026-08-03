@@ -237,6 +237,37 @@ class ExecutionSupervisor:
             self.exit_edge_recorder.close()
         await self.planner.close()
 
+    def due_exit_edge_continuation_options(
+        self, *, held_option_symbols: set[str], now: datetime
+    ) -> tuple[str, ...]:
+        if self.exit_edge_recorder is None:
+            return ()
+        return self.exit_edge_recorder.continuation_option_symbols(
+            held_option_symbols=held_option_symbols,
+            now=now,
+        )
+
+    async def continue_exit_edge_quotes(
+        self, option_symbols: tuple[str, ...]
+    ) -> None:
+        """Read-only quote continuation after the real position has exited."""
+
+        if self.exit_edge_recorder is None:
+            return
+        for option_symbol in option_symbols:
+            try:
+                # OrderManager's existing observer sends this exact quote into
+                # the counterfactual tape. No order or position method is used.
+                await self.planner.order_manager.get_option_quote(option_symbol)
+                self.exit_edge_recorder.record_continuation_quote_result(
+                    option_symbol
+                )
+            except Exception as exc:
+                self.exit_edge_recorder.record_continuation_quote_result(
+                    option_symbol,
+                    error=f"continuation_quote:{type(exc).__name__}:{exc}",
+                )
+
     # ------------------------------------------------------------------ #
     # H3: profile-exit ladder-state lifecycle (per-position, supervisor-owned)
     # ------------------------------------------------------------------ #
@@ -1754,6 +1785,7 @@ class ExecutionSupervisor:
                             status="pending_entry",
                             entry_order_id=plan.order_id,
                             can_ladder=plan.quantity >= 2,
+                            **_selection_trade_record_kwargs(plan),
                         )
                     )
                     transition = self.lifecycle_store.begin_entry(
@@ -1795,6 +1827,7 @@ class ExecutionSupervisor:
                             status="open_unprotected",
                             entry_order_id="SHADOW_ENTRY",
                             can_ladder=plan.quantity >= 2,
+                            **_selection_trade_record_kwargs(plan),
                         )
                     )
                     transition = self.lifecycle_store.mark_open(
@@ -8013,6 +8046,32 @@ class ExecutionSupervisor:
                     record.evidence_artifact_uri
                     or identity.get("evidence_artifact_uri")
                 ),
+                experiment_id=record.experiment_id or identity.get("experiment_id"),
+                cohort_id=record.cohort_id or identity.get("cohort_id"),
+                cohort_contract_sha256=(
+                    record.cohort_contract_sha256
+                    or identity.get("cohort_contract_sha256")
+                ),
+                deployment_contract_sha256=(
+                    record.deployment_contract_sha256
+                    or identity.get("deployment_contract_sha256")
+                ),
+                declared_option_selection_contract_id=(
+                    record.declared_option_selection_contract_id
+                    or identity.get("declared_option_selection_contract_id")
+                ),
+                declared_option_selection_contract_sha256=(
+                    record.declared_option_selection_contract_sha256
+                    or identity.get("declared_option_selection_contract_sha256")
+                ),
+                authorization_identity_status=(
+                    record.authorization_identity_status
+                    or identity.get("authorization_identity_status")
+                ),
+                exit_policy_id=record.exit_policy_id or identity.get("exit_policy_id"),
+                exit_policy_sha256=(
+                    record.exit_policy_sha256 or identity.get("exit_policy_sha256")
+                ),
                 canary_id=record.canary_id or identity.get("canary_id"),
                 canary_authorization_sha256=(
                     canary_authorization_sha256
@@ -8521,6 +8580,22 @@ def _underlying_entry_price(decision: SignalDecision) -> float | None:
 
 def _entry_plan_approved(plan: TradePlan) -> bool:
     return plan.risk_reasons == ["approved"]
+
+
+def _selection_trade_record_kwargs(plan: TradePlan) -> dict[str, object]:
+    """Freeze the exact selector attempt on the trade's first durable row."""
+
+    details = plan.risk_details
+    return {
+        "option_selection_snapshot_id": details.get("option_selection_snapshot_id"),
+        "option_selection_snapshot_persisted": details.get(
+            "option_selection_snapshot_persisted"
+        ),
+        "option_candidate_set_sha256": details.get("option_candidate_set_sha256"),
+        "actual_option_selection_sha256": details.get(
+            "actual_option_selection_sha256"
+        ),
+    }
 
 
 def _target_handoff_activation_floor(

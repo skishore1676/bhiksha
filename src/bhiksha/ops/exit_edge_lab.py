@@ -913,7 +913,7 @@ def analyze_prospective_repository(
     except (OSError, json.JSONDecodeError):
         blockers.append("live_health_readback_missing")
     if health is not None:
-        if int(health.get("schema_version") or 0) != 1:
+        if int(health.get("schema_version") or 0) not in {1, 2}:
             blockers.append("live_health_schema_invalid")
         if health.get("enabled") is not True:
             blockers.append("live_health_disabled")

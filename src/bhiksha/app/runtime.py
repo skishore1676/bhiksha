@@ -413,14 +413,42 @@ class BhikshaRuntime:
                 "active_plan_id": active_plan_id,
                 "research_run_id": _optional_identity_text(metadata.get("run_id")),
                 "evidence_packet_id": _optional_identity_text(
-                    metadata.get("evidence_packet_id")
+                    metadata.get("observation_evidence_packet_id")
+                    or metadata.get("evidence_packet_id")
                 ),
                 "evidence_artifact_sha256": _optional_identity_text(
-                    metadata.get("artifact_sha256")
+                    metadata.get("observation_evidence_artifact_sha256")
+                    or metadata.get("artifact_sha256")
                 ),
                 "evidence_artifact_uri": _optional_identity_text(
-                    metadata.get("artifact_uri")
+                    metadata.get("observation_evidence_artifact_uri")
+                    or metadata.get("artifact_uri")
                 ),
+                "experiment_id": _optional_identity_text(metadata.get("experiment_id")),
+                "cohort_id": _optional_identity_text(metadata.get("cohort_id")),
+                "cohort_contract_sha256": _optional_identity_text(
+                    metadata.get("cohort_contract_sha256")
+                ),
+                "deployment_contract_sha256": _optional_identity_text(
+                    metadata.get("deployment_contract_sha256")
+                ),
+                "declared_option_selection_contract_id": _optional_identity_text(
+                    metadata.get("declared_option_selection_contract_id")
+                ),
+                "declared_option_selection_contract_sha256": _optional_identity_text(
+                    metadata.get("declared_option_selection_contract_sha256")
+                ),
+                "authorization_identity_status": _optional_identity_text(
+                    metadata.get("authorization_identity_status")
+                ),
+                "exit_policy_id": deployment.exit.profile,
+                "exit_policy_sha256": hashlib.sha256(
+                    json.dumps(
+                        deployment.exit.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
                 "canary_id": _optional_identity_text(metadata.get("canary_id")),
                 "canary_authorization_sha256": _optional_identity_text(
                     metadata.get("authorization_sha256")
@@ -1079,6 +1107,28 @@ class BhikshaRuntime:
                 for position in tracker_positions
             )
             output(f"SYNC positions={joined}")
+
+        continuation_options = supervisor.due_exit_edge_continuation_options(
+            held_option_symbols={
+                str(position.option_symbol)
+                for position in tracker_positions
+                if position.option_symbol
+            },
+            now=bar.timestamp,
+        )
+        if continuation_options:
+            continuation_enqueued = execution_dispatcher.submit(
+                bar.symbol,
+                key=f"exit_edge_continuation:{bar.symbol}",
+                runner=lambda options=continuation_options: (
+                    supervisor.continue_exit_edge_quotes(options)
+                ),
+            )
+            if continuation_enqueued:
+                output(
+                    "EXIT_EDGE_CONTINUATION_ENQUEUED "
+                    f"options={','.join(continuation_options)}"
+                )
 
         if effective_halt_and_flatten:
             emergency_enqueued = execution_dispatcher.submit(

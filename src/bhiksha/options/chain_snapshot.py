@@ -27,6 +27,8 @@ expiry are captured. That keeps a ~1,122-contract SMH chain down to roughly
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
 from typing import TYPE_CHECKING
 
 from bhiksha.domain.models import OptionContractSnapshot, OptionSelectionRequest
@@ -78,6 +80,8 @@ class ChainSnapshotAttempt:
     captured_candidates: int
     selector_empty: bool
     selected_option_symbol: str | None
+    option_candidate_set_sha256: str = ""
+    actual_option_selection_sha256: str = ""
     rows: list[ContractSnapshotRow] = field(default_factory=list)
 
 
@@ -122,6 +126,19 @@ def build_chain_snapshot(
     capture_set = _capture_candidates(desired, dte_min=dte_min, dte_max=dte_max, nearest_after_dte=nearest_after_dte)
 
     selected_option_symbol = selection.option_symbol if selection is not None else None
+    candidate_rows = [
+        _row_for_contract(
+            contract,
+            dte_min=dte_min,
+            dte_max=dte_max,
+            delta_min=delta_min,
+            delta_max=delta_max,
+            min_open_interest=min_open_interest,
+            max_spread_pct=max_spread_pct,
+            selected_option_symbol=selected_option_symbol,
+        )
+        for contract in desired
+    ]
     rows = [
         _row_for_contract(
             contract,
@@ -135,6 +152,39 @@ def build_chain_snapshot(
         )
         for contract in capture_set
     ]
+
+    candidate_set_sha256 = _canonical_sha256(
+        {
+            "schema_version": "bhiksha.option_candidate_set.v1",
+            "candidates": [
+                _canonical_row_payload(row)
+                for row in sorted(candidate_rows, key=lambda item: (item.option_symbol, item.expiration_date, item.strike))
+            ],
+        }
+    )
+    selection_sha256 = _canonical_sha256(
+        {
+            "schema_version": "bhiksha.actual_option_selection.v1",
+            "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+            "selector_version": "1",
+            "request": {
+                "deployment_id": request.deployment_id,
+                "symbol": request.symbol,
+                "direction": request.direction.value,
+                "allowed_contract_type": allowed_type,
+                "dte_min": dte_min,
+                "dte_max": dte_max,
+                "min_open_interest": min_open_interest,
+                "target_abs_delta_min": delta_min,
+                "target_abs_delta_max": delta_max,
+                "max_bid_ask_spread_pct": max_spread_pct,
+                "dte_fallback_policy": fallback_policy,
+            },
+            "option_candidate_set_sha256": candidate_set_sha256,
+            "selected_option_symbol": selected_option_symbol,
+            "selector_empty": selector_error is not None,
+        }
+    )
 
     return ChainSnapshotAttempt(
         snapshot_id=snapshot_id,
@@ -155,8 +205,40 @@ def build_chain_snapshot(
         captured_candidates=len(rows),
         selector_empty=selector_error is not None,
         selected_option_symbol=selected_option_symbol,
+        option_candidate_set_sha256=candidate_set_sha256,
+        actual_option_selection_sha256=selection_sha256,
         rows=rows,
     )
+
+
+def _canonical_sha256(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_row_payload(row: ContractSnapshotRow) -> dict[str, object]:
+    return {
+        "option_symbol": row.option_symbol,
+        "expiration_date": row.expiration_date,
+        "dte": row.dte,
+        "strike": row.strike,
+        "contract_type": row.contract_type,
+        "open_interest": row.open_interest,
+        "delta": row.delta,
+        "bid": row.bid,
+        "ask": row.ask,
+        "spread_pct": row.spread_pct,
+        "dte_in_window": row.dte_in_window,
+        "verdict": row.verdict,
+        "fallback_verdict": row.fallback_verdict,
+        "is_selected": row.is_selected,
+    }
 
 
 def _thresholds(

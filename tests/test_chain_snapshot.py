@@ -80,11 +80,23 @@ def test_build_chain_snapshot_labels_accepted_and_selected_contract() -> None:
     assert attempt.captured_candidates == 1
     assert attempt.selector_empty is False
     assert attempt.selected_option_symbol == "SMH260708P00250000"
+    assert len(attempt.option_candidate_set_sha256) == 64
+    assert len(attempt.actual_option_selection_sha256) == 64
     row = attempt.rows[0]
     assert row.verdict == VERDICT_ACCEPTED
     assert row.is_selected is True
     assert row.dte_in_window is True
     assert row.fallback_verdict is None
+
+    repeated = build_chain_snapshot(
+        request,
+        contracts,
+        lane="live",
+        snapshot_id="different-attempt-id",
+        selection=SingleLegOptionSelector().select(request, contracts),
+    )
+    assert repeated.option_candidate_set_sha256 == attempt.option_candidate_set_sha256
+    assert repeated.actual_option_selection_sha256 == attempt.actual_option_selection_sha256
 
 
 def test_build_chain_snapshot_labels_each_filter_rejection() -> None:

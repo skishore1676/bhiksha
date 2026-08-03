@@ -2,15 +2,17 @@
 
 The recorder is an observational sidecar.  The runtime thread only performs
 ``Queue.put_nowait`` plus tiny in-memory bookkeeping; SQLite and report writes
-run on a daemon worker.  Quotes arrive exclusively from the existing
-``OrderManager.get_option_quote`` result observer, so enabling this module does
-not create a quote poller or consume additional broker quota.
+run on a daemon worker. Quotes arrive through the existing
+``OrderManager.get_option_quote`` result observer. While a paired arm remains
+open after the real position exits, the runtime may request one bounded,
+read-only public quote per option every configured continuation interval; it
+never calls an order or position endpoint.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -68,6 +70,7 @@ class ExitEdgeLiveRecorder:
         fill_latency_ms: int = 0,
         max_freshness_ms: int = 2_000,
         max_sequence_gap: int = 1,
+        continuation_min_interval_seconds: float = 30.0,
         repository_factory: Callable[[str | Path], ProspectiveQuoteTapeRepository]
         | None = None,
     ) -> None:
@@ -76,6 +79,9 @@ class ExitEdgeLiveRecorder:
         self.fill_latency_ms = int(fill_latency_ms)
         self.max_freshness_ms = int(max_freshness_ms)
         self.max_sequence_gap = int(max_sequence_gap)
+        self.continuation_min_interval_seconds = max(
+            float(continuation_min_interval_seconds), 1.0
+        )
         self._queue: Queue[_Register | _ObservedQuote] = Queue(
             maxsize=max(int(queue_capacity), 1)
         )
@@ -85,6 +91,7 @@ class ExitEdgeLiveRecorder:
         self._active_by_option: dict[str, set[str]] = {}
         self._pending_censors: dict[str, str] = {}
         self._pending_registration_attempts: dict[str, dict[str, Any]] = {}
+        self._last_continuation_request: dict[str, datetime] = {}
         self._health: dict[str, Any] = {
             "schema_version": 2,
             "enabled": True,
@@ -94,9 +101,10 @@ class ExitEdgeLiveRecorder:
             "inference_eligible": False,
             "inference_blockers": ["guarded_repository_report_required"],
             "broker_calls_added": 0,
-            "post_exit_quote_continuation": (
-                "not_enabled_protection_priority_unproved"
-            ),
+            "post_exit_quote_continuation": "enabled_bounded_public_quote_v1",
+            "continuation_min_interval_seconds": self.continuation_min_interval_seconds,
+            "continuation_quote_calls_added": 0,
+            "continuation_quote_failures": 0,
             "quote_source": QUOTE_SOURCE,
             "quote_feed": QUOTE_FEED,
             "observed_quote_timestamp_fields": {},
@@ -199,6 +207,38 @@ class ExitEdgeLiveRecorder:
             self._record_drop(option_symbol, "quote_queue_full")
         except Exception as exc:
             self._record_drop(option_symbol, f"quote_observer_error:{type(exc).__name__}")
+
+    def continuation_option_symbols(
+        self,
+        *,
+        held_option_symbols: set[str],
+        now: datetime,
+    ) -> tuple[str, ...]:
+        """Reserve due post-exit quote reads without touching order authority."""
+
+        observed_at = _aware_utc(now)
+        held = {_normalize_option_symbol(value) for value in held_option_symbols}
+        with self._lock:
+            due: list[str] = []
+            for option_symbol, cohort_ids in sorted(self._active_by_option.items()):
+                if not cohort_ids or option_symbol in held:
+                    continue
+                previous = self._last_continuation_request.get(option_symbol)
+                if previous is not None and (
+                    observed_at - previous
+                ) < timedelta(seconds=self.continuation_min_interval_seconds):
+                    continue
+                self._last_continuation_request[option_symbol] = observed_at
+                due.append(option_symbol)
+            return tuple(due)
+
+    def record_continuation_quote_result(
+        self, option_symbol: str, *, error: str | None = None
+    ) -> None:
+        del option_symbol
+        self._increment_health("continuation_quote_calls_added")
+        if error is not None:
+            self._increment_health("continuation_quote_failures", error=error)
 
     def close(self, *, join_timeout_seconds: float = 1.0) -> None:
         """Drain queued facts and censor unfinished cohorts at session shutdown."""
@@ -461,6 +501,7 @@ class ExitEdgeLiveRecorder:
                 values.discard(cohort_id)
                 if not values:
                     self._active_by_option.pop(normalized, None)
+                    self._last_continuation_request.pop(normalized, None)
             self._health["active_cohorts"] = sum(
                 len(active) for active in self._active_by_option.values()
             )

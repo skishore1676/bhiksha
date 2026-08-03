@@ -23,6 +23,7 @@ from bhiksha.active_plan.compiler import (
 from bhiksha.config.loader import load_active_plan, load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest
 from bhiksha.execution.exit_policy import canonical_policy_hash
+from bhiksha.evidence.bindings import build_registry_payload, canonical_sha256
 from bhiksha.tools.compile_active_plan import main as compile_active_plan_main
 
 
@@ -500,6 +501,78 @@ def test_retained_pdd_v2_release_candidate_recomputes_exact_authorization() -> N
     assert assertions["pdd_target_1_contracts"] == 1
     assert assertions["pdd_runner_contracts"] == 1
     assert assertions["pdd_risk_envelope_live_mode"] == "off"
+
+
+def test_pdd_v2_authorization_validates_before_observation_binding(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "pdd.yaml",
+        strategy_id="triage-market_impulse-PDD__pdd_long",
+        symbol="PDD",
+    )
+    row = _authorized_v2_live_triage_canary_row(catalog_root)
+    baseline = compile_active_plan_from_rows(
+        rows=[row],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-08-03",
+        trading_date="2026-08-03",
+    ).plan.deployments[0]
+    option = {
+        "schema_version": "mala.option_selection_contract.v1",
+        "contract_id": "pdd-observation-v2",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1",
+        "parameters": {
+            "dte_min": baseline.execution.dte_min,
+            "dte_max": baseline.execution.dte_max,
+            "dte_fallback_policy": baseline.execution.dte_fallback_policy,
+            "target_abs_delta_min": baseline.execution.target_abs_delta_min,
+            "target_abs_delta_max": baseline.execution.target_abs_delta_max,
+            "min_open_interest": baseline.execution.min_open_interest,
+            "max_bid_ask_spread_pct": baseline.execution.max_bid_ask_spread_pct,
+            "long_signal_contract_type": baseline.execution.option_mapping["long_signal"],
+            "short_signal_contract_type": baseline.execution.option_mapping["short_signal"],
+        },
+    }
+    option["contract_sha256"] = canonical_sha256(option)
+    registry = build_registry_payload(
+        [
+            {
+                "strategy_id": "triage-market_impulse-PDD__pdd_long",
+                "symbol": "PDD",
+                "direction": baseline.strategy.params["direction"],
+                "allowed_authorization_modes": ["live"],
+                "run_id": "triage-w1w2-20260710-pdd-long",
+                "evidence_packet_id": "9" * 64,
+                "artifact_sha256": "8" * 64,
+                "artifact_uri": "mala-evidence://sha256/" + "9" * 64 + "/observation.json",
+                "experiment_id": "pdd-prospective-v2",
+                "cohort_id": "pdd-next20-v2",
+                "cohort_contract_sha256": "7" * 64,
+                "declared_option_selection_contract": option,
+            }
+        ]
+    )
+
+    compiled = compile_active_plan_from_rows(
+        rows=[row],
+        strategy_catalog_path=catalog_root,
+        active_plan_id="active_plan_2026-08-03",
+        trading_date="2026-08-03",
+        evidence_bindings={
+            "triage-market_impulse-PDD__pdd_long": registry["bindings"][0]
+        },
+    )
+
+    assert len(compiled.plan.deployments) == 1
+    deployment = compiled.plan.deployments[0]
+    assert deployment.risk.max_trade_premium_usd == 1_000.0
+    assert deployment.risk.max_contracts == 2
+    assert deployment.source.metadata["evidence_packet_id"] == "a" * 64
+    assert deployment.source.metadata["observation_evidence_packet_id"] == "9" * 64
+    assert deployment.source.metadata["authorization_identity_status"] == "compiled_observation_only"
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,26 @@
+{
+  "schema_version": "bhiksha.evidence_binding_targets.v1",
+  "targets": [
+    {
+      "packet_dir": "meta_market_impulse_short_v1",
+      "strategy_id": "market-impulse-all-basket-discovery__meta_short",
+      "symbol": "META",
+      "direction": "short",
+      "allowed_authorization_modes": ["shadow"]
+    },
+    {
+      "packet_dir": "nvda_opening_drive_short_v1",
+      "strategy_id": "opening-drive-current-basket-discovery__nvda_short",
+      "symbol": "NVDA",
+      "direction": "short",
+      "allowed_authorization_modes": ["live"]
+    },
+    {
+      "packet_dir": "pdd_market_impulse_long_observation_v2",
+      "strategy_id": "triage-market_impulse-PDD__pdd_long",
+      "symbol": "PDD",
+      "direction": "long",
+      "allowed_authorization_modes": ["live"]
+    }
+  ]
+}

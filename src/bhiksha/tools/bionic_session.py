@@ -22,6 +22,7 @@ from bhiksha.bionic.session_ops import (
     write_feedback_bundle,
 )
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
+from bhiksha.evidence.bindings import DEFAULT_EVIDENCE_BINDINGS_PATH
 from bhiksha.loop.observation import write_observation_reports
 from bhiksha.ops.summary import build_session_summary
 from bhiksha.tools.healthcheck import _run as run_healthcheck
@@ -117,6 +118,7 @@ def _prepare(args: argparse.Namespace) -> int:
                 active_plan_id=args.active_plan_id,
                 trading_date=args.trading_date,
                 source_name=args.source_name,
+                evidence_bindings_path=repo_root / DEFAULT_EVIDENCE_BINDINGS_PATH,
             )
             active_plan_path.parent.mkdir(parents=True, exist_ok=True)
             active_plan_path.write_text(

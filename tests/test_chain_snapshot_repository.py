@@ -71,6 +71,8 @@ def _attempt(
         captured_candidates=len(rows),
         selector_empty=selector_empty,
         selected_option_symbol=selected_option_symbol,
+        option_candidate_set_sha256="a" * 64,
+        actual_option_selection_sha256="b" * 64,
         rows=rows,
     )
 
@@ -83,7 +85,8 @@ def test_record_attempt_writes_summary_and_per_contract_rows(tmp_path) -> None:
 
     with closing(sqlite3.connect(str(db_path))) as conn:
         attempt_row = conn.execute(
-            "SELECT deployment_id, symbol, lane, selector_empty, selected_option_symbol, captured_candidates "
+            "SELECT deployment_id, symbol, lane, selector_empty, selected_option_symbol, captured_candidates, "
+            "option_candidate_set_sha256, actual_option_selection_sha256 "
             "FROM option_chain_snapshot_attempts WHERE snapshot_id = ?",
             ("snap-1",),
         ).fetchone()
@@ -93,7 +96,16 @@ def test_record_attempt_writes_summary_and_per_contract_rows(tmp_path) -> None:
             ("snap-1",),
         ).fetchall()
 
-    assert attempt_row == ("smh_short_lane", "SMH", "live", 0, "SMH260708P00250000", 2)
+    assert attempt_row == (
+        "smh_short_lane",
+        "SMH",
+        "live",
+        0,
+        "SMH260708P00250000",
+        2,
+        "a" * 64,
+        "b" * 64,
+    )
     assert len(contract_rows) == 2
     accepted_row = next(row for row in contract_rows if row[0] == "SMH260708P00250000")
     assert accepted_row[1] == "accepted"

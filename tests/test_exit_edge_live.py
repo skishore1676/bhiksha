@@ -158,6 +158,46 @@ def test_live_recorder_pairs_from_reused_quotes_and_stops_observing(tmp_path: Pa
     )
 
 
+def test_post_exit_continuation_keeps_same_cohort_until_all_arms_terminal(
+    tmp_path: Path,
+) -> None:
+    recorder = _recorder(tmp_path, continuation_min_interval_seconds=30)
+    recorder.start()
+    assert recorder.try_register_entry(
+        deployment=_deployment(),
+        trade_id="T-CONTINUE",
+        option_symbol=OPTION,
+        entry_timestamp=ENTRY,
+        entry_premium=2.0,
+        quantity=10,
+    )
+    _wait_until(lambda: recorder.snapshot()["active_cohorts"] == 1)
+
+    assert recorder.continuation_option_symbols(
+        held_option_symbols={OPTION}, now=ENTRY + timedelta(seconds=15)
+    ) == ()
+    due = recorder.continuation_option_symbols(
+        held_option_symbols=set(), now=ENTRY + timedelta(seconds=45)
+    )
+    assert due == (OPTION,)
+    assert recorder.continuation_option_symbols(
+        held_option_symbols=set(), now=ENTRY + timedelta(seconds=50)
+    ) == ()
+
+    for sequence, bid in enumerate([2.10, 2.70, 2.75, 3.40, 3.35], start=1):
+        quote_at = ENTRY + timedelta(seconds=15 * sequence)
+        recorder.observe_quote(
+            OPTION, _quote(quote_at, bid), quote_at + timedelta(milliseconds=100)
+        )
+    recorder.record_continuation_quote_result(OPTION)
+    _wait_until(lambda: recorder.snapshot()["paired_cohorts"] == 1)
+    health = recorder.snapshot()
+    assert health["post_exit_quote_continuation"] == "enabled_bounded_public_quote_v1"
+    assert health["continuation_quote_calls_added"] == 1
+    assert health["active_cohorts"] == 0
+    recorder.close()
+
+
 def test_full_queue_and_slow_storage_never_block_quote_observer(tmp_path: Path) -> None:
     class SlowRepository(ProspectiveQuoteTapeRepository):
         def try_register_cohort(self, payload):

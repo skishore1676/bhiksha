@@ -20,6 +20,7 @@ from bhiksha.execution.pricing import (
     resolve_entry_reprice_max_chase_pct,
     resolve_initial_spread_fraction,
 )
+from bhiksha.evidence.bindings import DEFAULT_EVIDENCE_BINDINGS_PATH
 from bhiksha.strategy.capabilities import CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST_PATH
 from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
 
@@ -219,6 +220,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for active strategies")
     parser.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual entries")
     parser.add_argument("--strategy-catalog", default=default_strategy_catalog_path, help="Local Bhiksha strategy catalog path")
+    parser.add_argument(
+        "--evidence-bindings",
+        default=os.getenv("BHIKSHA_EVIDENCE_BINDINGS_PATH", str(DEFAULT_EVIDENCE_BINDINGS_PATH)),
+        help="Immutable experiment-to-deployment binding registry",
+    )
     parser.add_argument("--out", default=default_output_path, help="Where to write the active plan JSON")
     parser.add_argument("--log-dir", default=default_log_dir, help="Directory for dated active-plan sync logs")
     parser.add_argument(
@@ -276,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=output_path,
                 log_dir=log_dir,
                 runtime_capabilities_path=None if args.skip_runtime_capability_refresh else args.runtime_capabilities,
+                evidence_bindings_path=args.evidence_bindings,
                 active_plan_id=args.active_plan_id,
                 trading_date=args.trading_date,
                 source_name=args.source_name,
@@ -350,6 +357,7 @@ def sync_active_plan_once(
     output_path: str | Path,
     log_dir: str | Path,
     runtime_capabilities_path: str | Path | None = None,
+    evidence_bindings_path: str | Path | None = DEFAULT_EVIDENCE_BINDINGS_PATH,
     active_plan_id: str | None = None,
     trading_date: str | None = None,
     source_name: str = "google_sheet_integration",
@@ -380,6 +388,11 @@ def sync_active_plan_once(
             active_plan_id=active_plan_id,
             trading_date=trading_date,
             source_name=source_name,
+            evidence_bindings_path=(
+                evidence_bindings_path
+                if evidence_bindings_path is not None and Path(evidence_bindings_path).exists()
+                else None
+            ),
         )
     plan_payload = compiled.plan.model_dump(mode="json")
     previous_lane_config = _read_previous_lane_config(resolved_output)

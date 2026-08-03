@@ -324,6 +324,7 @@ def build_trading_decision_export(
                 {"message": "missing_explicit_exit_attribution"},
                 *quality_warnings,
             ]
+        evidence_status, evidence_issues = _decision_evidence_status(row, trade)
         facts.append(
             {
                 "trade_id": str(row.get("trade_id")),
@@ -363,6 +364,36 @@ def build_trading_decision_export(
                     "evidence_artifact_sha256"
                 ),
                 "evidence_artifact_uri": row.get("evidence_artifact_uri"),
+                "experiment_id": row.get("experiment_id"),
+                "cohort_id": row.get("cohort_id"),
+                "cohort_contract_sha256": row.get("cohort_contract_sha256"),
+                "deployment_contract_sha256": row.get("deployment_contract_sha256"),
+                "declared_option_selection_contract_id": row.get(
+                    "declared_option_selection_contract_id"
+                ),
+                "declared_option_selection_contract_sha256": row.get(
+                    "declared_option_selection_contract_sha256"
+                ),
+                "authorization_identity_status": row.get(
+                    "authorization_identity_status"
+                ),
+                "exit_policy_id": row.get("exit_policy_id"),
+                "exit_policy_sha256": row.get("exit_policy_sha256"),
+                "option_selection_snapshot_id": row.get(
+                    "option_selection_snapshot_id"
+                ),
+                "option_selection_snapshot_persisted": row.get(
+                    "option_selection_snapshot_persisted"
+                ),
+                "option_candidate_set_sha256": row.get(
+                    "option_candidate_set_sha256"
+                ),
+                "actual_option_selection_sha256": row.get(
+                    "actual_option_selection_sha256"
+                ),
+                "observation_window": _observation_window(row, trade),
+                "decision_evidence_status": evidence_status,
+                "decision_evidence_issues": evidence_issues,
                 "canary_id": row.get("canary_id"),
                 "canary_authorization_sha256": row.get(
                     "canary_authorization_sha256"
@@ -802,6 +833,52 @@ def _coerce_day(value: date | str | None) -> date:
         return date.fromisoformat(str(value))
     now = datetime.now(UTC).date()
     return now - timedelta(days=(now.weekday() - 4) % 7)
+
+
+def _decision_evidence_status(
+    row: dict[str, Any], trade: dict[str, Any]
+) -> tuple[str, list[str]]:
+    """Classify a closed trade without upgrading incomplete plumbing to evidence."""
+
+    if not row.get("evidence_packet_id"):
+        return "legacy_unbound", ["missing_evidence_packet_id"]
+    required = (
+        "experiment_id",
+        "cohort_id",
+        "cohort_contract_sha256",
+        "deployment_contract_sha256",
+        "declared_option_selection_contract_sha256",
+        "exit_policy_sha256",
+        "plan_revision_id",
+        "session_id",
+        "fact_receipt_id",
+        "option_selection_snapshot_id",
+        "option_candidate_set_sha256",
+        "actual_option_selection_sha256",
+    )
+    issues = [f"missing_{field}" for field in required if not row.get(field)]
+    if row.get("option_selection_snapshot_persisted") not in (True, 1):
+        issues.append("option_selection_snapshot_not_persisted")
+    if not trade.get("exit_attribution"):
+        issues.append("missing_explicit_exit_attribution")
+    if "option_selection_snapshot_not_persisted" in issues:
+        return "plumbing_invalid", sorted(set(issues))
+    if issues:
+        return "incomplete", sorted(set(issues))
+    if row.get("authorization_identity_status") == "compiled_observation_only":
+        return "observation_only", []
+    return "eligible", []
+
+
+def _observation_window(row: dict[str, Any], trade: dict[str, Any]) -> str:
+    status = row.get("authorization_identity_status")
+    if status == "compiled_observation_only":
+        return "live_approval_gated"
+    if status == "shadow_observation" and trade.get("lane") == "shadow":
+        return "current_shadow"
+    if row.get("experiment_id"):
+        return "current_other"
+    return "older_shadow_or_legacy"
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:

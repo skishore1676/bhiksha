@@ -124,7 +124,7 @@ class ExecutionPlanner:
                 selector_error=exc,
             )
             raise
-        await self._capture_chain_snapshot(
+        snapshot_attempt, snapshot_persisted = await self._capture_chain_snapshot(
             snapshot_id,
             selection_request,
             contracts,
@@ -132,7 +132,10 @@ class ExecutionPlanner:
             selection=selection,
             selector_error=None,
         )
-        selection_details = _selection_details(selection)
+        selection_details = {
+            **_selection_details(selection),
+            **_selection_snapshot_details(snapshot_attempt, persisted=snapshot_persisted),
+        }
         conflicting_positions = [
             position
             for position in self.position_tracker.find_by_option_symbol(selection.option_symbol)
@@ -607,7 +610,7 @@ class ExecutionPlanner:
         lane: str,
         selection,
         selector_error,
-    ) -> None:
+    ) -> tuple[object | None, bool]:
         """Persist the candidate chain for one selection attempt.
 
         Telemetry only -- must never raise into ``plan_entry``. The candidate
@@ -629,11 +632,15 @@ class ExecutionPlanner:
                 selection=selection,
                 selector_error=selector_error,
             )
-            await self.chain_snapshot_repository.record_attempt(attempt)
         except Exception:
             # A snapshot failure must never break (or even flag) the entry
             # path -- the trade matters more than the telemetry.
-            return
+            return None, False
+        try:
+            await self.chain_snapshot_repository.record_attempt(attempt)
+        except Exception:
+            return attempt, False
+        return attempt, True
 
 
 def _entry_window_allows(deployment: DeploymentManifest, timestamp) -> bool:
@@ -694,6 +701,22 @@ def _selection_details(selection) -> dict:
             }
         )
     return details
+
+
+def _selection_snapshot_details(attempt, *, persisted: bool) -> dict:
+    if attempt is None:
+        return {
+            "option_selection_snapshot_id": None,
+            "option_selection_snapshot_persisted": False,
+            "option_candidate_set_sha256": None,
+            "actual_option_selection_sha256": None,
+        }
+    return {
+        "option_selection_snapshot_id": attempt.snapshot_id,
+        "option_selection_snapshot_persisted": persisted,
+        "option_candidate_set_sha256": attempt.option_candidate_set_sha256,
+        "actual_option_selection_sha256": attempt.actual_option_selection_sha256,
+    }
 
 
 def _underlying_entry_price(decision: SignalDecision) -> float | None:

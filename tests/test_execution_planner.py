@@ -895,6 +895,10 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
         "selected_bid": 3.0,
         "selected_ask": 2.9,
         "selected_spread_pct": pytest.approx(0.03389830508474579),
+        "option_selection_snapshot_id": plan.risk_details["option_selection_snapshot_id"],
+        "option_selection_snapshot_persisted": True,
+        "option_candidate_set_sha256": plan.risk_details["option_candidate_set_sha256"],
+        "actual_option_selection_sha256": plan.risk_details["actual_option_selection_sha256"],
     }
     assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 9.1
 
@@ -946,6 +950,10 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
         "selected_bid": 3.0,
         "selected_ask": 2.9,
         "selected_spread_pct": pytest.approx(0.03389830508474579),
+        "option_selection_snapshot_id": plan.risk_details["option_selection_snapshot_id"],
+        "option_selection_snapshot_persisted": True,
+        "option_candidate_set_sha256": plan.risk_details["option_candidate_set_sha256"],
+        "actual_option_selection_sha256": plan.risk_details["actual_option_selection_sha256"],
     }
     assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.85
     assert order_manager.place_entry_order_calls == 0

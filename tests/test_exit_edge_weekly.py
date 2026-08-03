@@ -26,7 +26,7 @@ WEEK_END = date(2026, 7, 24)
 
 def _health(*, updated_at: str = "2026-07-24T20:10:00+00:00") -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "enabled": True,
         "mode": "observational_shadow_only",
         "enforcement_authority": False,
