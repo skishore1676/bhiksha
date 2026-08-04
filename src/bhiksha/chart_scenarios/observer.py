@@ -10,7 +10,6 @@ from typing import Any
 from mala_bhiksha_kernel import (
     ChartScenarioSpec,
     ExitProfile,
-    ManagementPolicySpec,
     ShadowEventType,
     canonical_sha256,
 )
@@ -23,9 +22,14 @@ from .quotes import (
     ensure_read_only_quote_source,
     select_snapshot,
 )
-from .repository import EventWrite, ScenarioEventRepository, TerminalScenarioError
+from .repository import (
+    EventWrite,
+    ScenarioEventRepository,
+    TerminalScenarioError,
+    canonical_observation_slot_id,
+)
 from .triggers import evaluate_condition, normalize_bars
-from .validation import TRIGGER_VERSION
+from .validation import TRIGGER_VERSION, ShadowPlan, validate_bundle
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,30 +66,46 @@ class BrokerInertScenarioObserver:
         self,
         repository: ScenarioEventRepository,
         *,
+        plan: ShadowPlan,
         quote_source: ReadOnlyOptionSnapshotSource | None = None,
-        exit_policy_registry: Mapping[ExitProfile | str, ManagementPolicySpec],
-        cost_model: CostModel,
-        quote_eligibility_policy: QuoteEligibilityPolicy,
-        plan_hash: str,
         trigger_version: str = TRIGGER_VERSION,
     ) -> None:
         if trigger_version != TRIGGER_VERSION:
             raise ValueError(f"unsupported trigger version: {trigger_version!r}")
         self.repository = repository
+        sealed_plan = validate_bundle(plan.model_dump(mode="json"))
         sealed_source = ensure_read_only_quote_source(quote_source)
         self.quote_snapshots = (
             tuple(sealed_source.snapshots) if sealed_source is not None else ()
         )
-        self.exit_policy_registry = {
-            profile
-            if isinstance(profile, ExitProfile)
-            else ExitProfile(profile): policy
-            for profile, policy in exit_policy_registry.items()
+        self.exit_policy_registry = dict(sealed_plan.exit_policy_registry)
+        self.plan_hash = sealed_plan.plan_hash
+        self.run_manifest_hash = sealed_plan.run_manifest_hash.removeprefix("sha256:")
+        self.treatment_manifest_hash = sealed_plan.treatment_manifest_hash.removeprefix(
+            "sha256:"
+        )
+        self.run_input_hashes_hash = canonical_sha256(
+            sealed_plan.run_manifest["input_hashes"]
+        )
+        self.cartographer_receipt_hash = (
+            sealed_plan.cartographer_receipt_hash.removeprefix("sha256:")
+        )
+        self.cartographer_export_hash = (
+            sealed_plan.cartographer_export_hash.removeprefix("sha256:")
+        )
+        self.observation_window_hash = (
+            sealed_plan.target_session_window_hash.removeprefix("sha256:")
+        )
+        self.run_id = str(sealed_plan.run_manifest["run_id"])
+        self.installed_scenario_hashes = {
+            (item.arm_id.value, item.scenario_id): item.scenario_hash
+            for item in sealed_plan.scenarios
         }
-        normalized_plan_hash = str(plan_hash).removeprefix("sha256:")
-        if len(normalized_plan_hash) != 64:
-            raise ValueError("plan_hash must be a sha256 identity")
-        self.plan_hash = normalized_plan_hash
+        self.expected_arms_by_candidate: dict[str, tuple[str, ...]] = {}
+        for item in sealed_plan.scenarios:
+            arms = set(self.expected_arms_by_candidate.get(item.candidate_id, ()))
+            arms.add(item.arm_id.value)
+            self.expected_arms_by_candidate[item.candidate_id] = tuple(sorted(arms))
         self.policy_registry_hash = canonical_sha256(
             {
                 profile.value: policy.model_dump(mode="json")
@@ -94,9 +114,11 @@ class BrokerInertScenarioObserver:
                 )
             }
         )
-        self.cost_model = CostModel.model_validate(cost_model.model_dump(mode="json"))
+        self.cost_model = CostModel.model_validate(
+            sealed_plan.cost_model.model_dump(mode="json")
+        )
         self.quote_eligibility_policy = QuoteEligibilityPolicy.model_validate(
-            quote_eligibility_policy.model_dump(mode="json")
+            sealed_plan.quote_eligibility_policy.model_dump(mode="json")
         )
         self.treatment_hash = canonical_sha256(
             {
@@ -106,6 +128,7 @@ class BrokerInertScenarioObserver:
             }
         )
         self.trigger_version = trigger_version
+        self.market_fact_proof: dict[str, Any] | None = None
 
     def observe_one(
         self,
@@ -116,14 +139,19 @@ class BrokerInertScenarioObserver:
         quote_path: Sequence[OptionQuoteSnapshot | Mapping[str, Any]] = (),
         evaluated_at: datetime | str | None = None,
         market_observation_id: str | None = None,
+        observation_slot_ordinal: int = 1,
     ) -> ObservationResult:
         """Replay one read-only cycle from supplied bars/quotes.
 
         ``quote_path`` is a supplied, immutable tape.  If an entry is made in
         this call, its first quote is used for the synthetic entry and later
         quotes are evaluated as the exit path.  A replay of the same cycle uses
-        event identities and state rather than re-arming the scenario.
+        event identities and state rather than re-arming the scenario.  The
+        legacy caller label is deliberately ignored; the installed run and
+        ``observation_slot_ordinal`` own the canonical observation identity.
         """
+
+        del market_observation_id
 
         if any(not isinstance(bar, Mapping) for bar in bars):
             raise TypeError("observer bars require exact raw mappings")
@@ -147,11 +175,6 @@ class BrokerInertScenarioObserver:
                 max(timestamps) if timestamps else scenario.observation_window.start_at
             )
         )
-        if not market_observation_id or not market_observation_id.strip():
-            raise ValueError(
-                "market_observation_id is required for cross-arm fact binding"
-            )
-        observation_id = market_observation_id
         facts_payload = {
             "bars": [bar.to_dict() for bar in normalized_bars],
             "option_quote": single_quote.to_dict()
@@ -162,14 +185,54 @@ class BrokerInertScenarioObserver:
         }
         self.market_facts_hash = canonical_sha256(facts_payload)
         new_events: list[Any] = []
+        observation_id = canonical_observation_slot_id(
+            run_manifest_hash=self.run_manifest_hash,
+            ordinal=observation_slot_ordinal,
+        )
 
         try:
+            if scenario.run_id != self.run_id:
+                raise ValueError("scenario run_id differs from installed plan run")
+            if (
+                self.installed_scenario_hashes.get(
+                    (scenario.arm_id.value, scenario.scenario_id)
+                )
+                != scenario.scenario_hash
+            ):
+                raise ValueError("scenario is not an exact installed plan artifact")
             self._validate_scenario_policies(scenario)
-            self.repository.bind_market_facts(
-                scenario,
-                observation_key=timestamp_json(now),
-                facts_hash=self.market_facts_hash,
+            expected_arms = self.expected_arms_by_candidate.get(scenario.candidate_id)
+            if expected_arms is None or scenario.arm_id.value not in expected_arms:
+                raise ValueError("scenario is not installed in the observer plan")
+            preexisting_state = self.repository.get_state(
+                scenario, self.trigger_version
             )
+            if preexisting_state is not None:
+                if preexisting_state["terminal"]:
+                    return self._result(scenario, preexisting_state, new_events)
+                if self._recover_latched_primary_exit(
+                    new_events, scenario, preexisting_state
+                ):
+                    recovered_state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or preexisting_state
+                    )
+                    return self._result(scenario, recovered_state, new_events)
+            self.market_fact_proof = self.repository.bind_market_facts(
+                scenario,
+                observation_slot_ordinal=observation_slot_ordinal,
+                run_manifest_hash=self.run_manifest_hash,
+                plan_hash=self.plan_hash,
+                treatment_manifest_hash=self.treatment_manifest_hash,
+                run_input_hashes_hash=self.run_input_hashes_hash,
+                cartographer_receipt_hash=self.cartographer_receipt_hash,
+                cartographer_export_hash=self.cartographer_export_hash,
+                observation_window_hash=self.observation_window_hash,
+                expected_arm_ids=expected_arms,
+                facts_hash=self.market_facts_hash,
+                evaluated_at=timestamp_json(now),
+            )
+            observation_id = str(self.market_fact_proof["slot_id"])
             is_new = self.repository.register_scenario(
                 scenario,
                 self.trigger_version,
@@ -196,6 +259,12 @@ class BrokerInertScenarioObserver:
             if state is None:
                 raise RuntimeError("scenario state disappeared after registration")
             if state["terminal"]:
+                return self._result(scenario, state, new_events)
+
+            if self._recover_latched_primary_exit(new_events, scenario, state):
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
                 return self._result(scenario, state, new_events)
 
             if now < scenario.observation_window.start_at:
@@ -529,22 +598,7 @@ class BrokerInertScenarioObserver:
                 profile_states = dict(state.get("profile_states") or {})
                 primary_prior = profile_states.get(scenario.exit_profile.value) or {}
                 if primary_prior.get("terminal"):
-                    self._record_terminal(
-                        new_events,
-                        scenario,
-                        ShadowEventType.SYNTHETIC_EXIT,
-                        primary_prior.get("terminal_at", quote.quote_time),
-                        observation_id,
-                        role="synthetic-exit",
-                        reason="recovered_latched_primary_exit",
-                        details={
-                            "profile": scenario.exit_profile.value,
-                            "rule": primary_prior.get("terminal_rule"),
-                            "observation": primary_prior.get("terminal_observation"),
-                            "mark_not_fill": True,
-                        },
-                        status="synthetic_exit",
-                    )
+                    self._recover_latched_primary_exit(new_events, scenario, state)
                     state = (
                         self.repository.get_state(scenario, self.trigger_version)
                         or state
@@ -574,6 +628,10 @@ class BrokerInertScenarioObserver:
                             quote.quote_time
                         )
                         next_profile_state["terminal_observation"] = result.to_dict()
+                        next_profile_state["terminal_quote_hash"] = quote.snapshot_hash
+                        next_profile_state["market_fact_proof"] = dict(
+                            self.market_fact_proof or {}
+                        )
                     profile_states[profile.value] = next_profile_state
                     observations.append((profile, result))
                 for profile, result in observations:
@@ -772,6 +830,94 @@ class BrokerInertScenarioObserver:
             terminal=True,
         )
 
+    def _recover_latched_primary_exit(
+        self,
+        events: list[Any],
+        scenario: ChartScenarioSpec,
+        state: Mapping[str, Any],
+    ) -> bool:
+        """Materialize a primary exit already latched before a process death."""
+
+        profile_states = state.get("profile_states")
+        if not isinstance(profile_states, Mapping):
+            return False
+        primary = profile_states.get(scenario.exit_profile.value)
+        if not isinstance(primary, Mapping) or not primary.get("terminal"):
+            return False
+        observation = primary.get("terminal_observation")
+        if not isinstance(observation, Mapping):
+            raise TypeError("latched primary exit is missing terminal observation")
+        gross_r = observation.get("gross_r")
+        net_r = observation.get("net_r")
+        quote_hash = primary.get("terminal_quote_hash")
+        if (
+            isinstance(gross_r, bool)
+            or not isinstance(gross_r, (int, float))
+            or isinstance(net_r, bool)
+            or not isinstance(net_r, (int, float))
+            or not isinstance(quote_hash, str)
+            or len(quote_hash.removeprefix("sha256:")) != 64
+        ):
+            raise ValueError("latched primary exit lacks canonical terminal fields")
+        terminal_at = as_utc(primary.get("terminal_at"))
+        prior_proof = primary.get("market_fact_proof")
+        if not isinstance(prior_proof, Mapping):
+            raise TypeError("latched primary exit lacks its observation-slot proof")
+        slot_ordinal = prior_proof.get("slot_ordinal")
+        persisted_slot_id = prior_proof.get("slot_id")
+        if (
+            isinstance(slot_ordinal, bool)
+            or not isinstance(slot_ordinal, int)
+            or persisted_slot_id
+            != canonical_observation_slot_id(
+                run_manifest_hash=self.run_manifest_hash,
+                ordinal=slot_ordinal,
+            )
+            or str(prior_proof.get("plan_hash", "")).removeprefix("sha256:")
+            != self.plan_hash
+            or str(prior_proof.get("run_manifest_hash", "")).removeprefix("sha256:")
+            != self.run_manifest_hash
+            or str(prior_proof.get("treatment_manifest_hash", "")).removeprefix(
+                "sha256:"
+            )
+            != self.treatment_manifest_hash
+            or prior_proof.get("candidate_id") != scenario.candidate_id
+        ):
+            raise ValueError("latched primary exit observation-slot proof is invalid")
+        self.market_fact_proof = dict(prior_proof)
+        reason = str(observation.get("reason") or "recovered_latched_primary_exit")
+        self._record_terminal(
+            events,
+            scenario,
+            ShadowEventType.SYNTHETIC_EXIT,
+            terminal_at,
+            str(persisted_slot_id),
+            role="synthetic-exit",
+            reason=reason,
+            details={
+                "profile": scenario.exit_profile.value,
+                "primary": True,
+                "counterfactual": False,
+                "mark_not_fill": True,
+                "synthetic_exit_mark": observation.get("mark"),
+                "primary_gross_r": float(gross_r),
+                "primary_net_r": float(net_r),
+                "rule": primary.get("terminal_rule"),
+                "observation": dict(observation),
+                "recovered_after_restart": True,
+            },
+            status="synthetic_exit",
+            state_updates={
+                "terminal_profile": scenario.exit_profile.value,
+                "terminal_quote_hash": quote_hash.removeprefix("sha256:"),
+                "primary_gross_r": float(gross_r),
+                "primary_net_r": float(net_r),
+                "terminal_reason": reason,
+                "profile_states": dict(profile_states),
+            },
+        )
+        return True
+
     def _expire_if_open(
         self,
         events: list[Any],
@@ -895,10 +1041,17 @@ class BrokerInertScenarioObserver:
             },
             "trigger_version": TRIGGER_VERSION,
             "plan_hash": self.plan_hash,
+            "run_manifest_hash": self.run_manifest_hash,
+            "treatment_manifest_hash": self.treatment_manifest_hash,
+            "run_input_hashes_hash": self.run_input_hashes_hash,
+            "cartographer_receipt_hash": self.cartographer_receipt_hash,
+            "cartographer_export_hash": self.cartographer_export_hash,
+            "observation_window_hash": self.observation_window_hash,
             "policy_registry_hash": self.policy_registry_hash,
             "cost_model_hash": self.cost_model.content_hash,
             "quote_eligibility_policy_hash": self.quote_eligibility_policy.content_hash,
             "market_facts_hash": self.market_facts_hash,
+            "market_fact_proof": dict(self.market_fact_proof or {}),
             "scenario_hash": scenario.scenario_hash,
             "component_manifest_hash": scenario.component_manifest_hash,
             "candidate_pool_hash": scenario.candidate_pool_hash,

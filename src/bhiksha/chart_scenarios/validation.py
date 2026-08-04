@@ -35,7 +35,7 @@ DEFAULT_SHADOW_RECEIPT_PATH = Path(
 )
 DEFAULT_SHADOW_DB_PATH = Path("artifacts/chart_scenarios/shadow_events.sqlite3")
 SHADOW_PLAN_SCHEMA_VERSION = "bhiksha.chart-scenario-shadow-plan.v1"
-INSTALL_RECEIPT_SCHEMA_VERSION = "bhiksha.chart-scenario-install-receipt.v1"
+INSTALL_RECEIPT_SCHEMA_VERSION = "bhiksha.chart-scenario-install-receipt.v2"
 TRIGGER_VERSION = "market-context-trigger.v1"
 
 
@@ -93,6 +93,14 @@ class ShadowPlan(BaseModel):
     campaign_manifest_hash: str
     run_manifest: dict[str, Any]
     run_manifest_hash: str
+    treatment_manifest: dict[str, Any]
+    treatment_manifest_hash: str
+    cartographer_receipt: dict[str, Any]
+    cartographer_receipt_hash: str
+    cartographer_export_manifest: dict[str, Any]
+    cartographer_export_hash: str
+    target_session_date: str
+    target_session_window_hash: str
     component_manifest: ComponentManifest
     component_manifest_hash: str = Field(min_length=64, max_length=64)
     chart_evidence: list[ChartEvidencePacket] = Field(min_length=1)
@@ -119,6 +127,14 @@ class ShadowPlan(BaseModel):
             "campaign_manifest_hash",
             "run_manifest",
             "run_manifest_hash",
+            "treatment_manifest",
+            "treatment_manifest_hash",
+            "cartographer_receipt",
+            "cartographer_receipt_hash",
+            "cartographer_export_manifest",
+            "cartographer_export_hash",
+            "target_session_date",
+            "target_session_window_hash",
             "component_manifest",
             "component_manifest_hash",
             "chart_evidence",
@@ -232,8 +248,8 @@ class ShadowPlan(BaseModel):
             "ends_on",
             "authorization_mode",
             "expected_arms",
-            "component_manifest",
-            "component_manifest_hash",
+            "treatment_manifest",
+            "treatment_manifest_hash",
             "universe_hash",
             "status",
             "content_hash",
@@ -246,11 +262,15 @@ class ShadowPlan(BaseModel):
             "campaign_id",
             "run_id",
             "trading_date",
+            "target_session_date",
             "as_of",
             "authorization_mode",
             "expected_arms",
             "input_hashes",
-            "component_manifest_hash",
+            "treatment_manifest_hash",
+            "cartographer_receipt_hash",
+            "cartographer_export_hash",
+            "observation_window_hash",
             "status",
             "content_hash",
         }
@@ -259,7 +279,7 @@ class ShadowPlan(BaseModel):
             or set(self.run_manifest) != run_fields
         ):
             raise BundleValidationError(
-                "campaign and run manifests must be exact registered artifacts"
+                "campaign and run manifests must be exact registered v2 artifacts"
             )
         campaign_hash = "sha256:" + canonical_sha256(
             {
@@ -286,6 +306,12 @@ class ShadowPlan(BaseModel):
         ):
             raise BundleValidationError("run manifest hash mismatch")
         expected_arms = ["chart_deterministic", "chart_agentic_rerank"]
+        if (
+            self.campaign_manifest.get("schema")
+            != "tradelab.market_context_campaign.v2"
+            or self.run_manifest.get("schema") != "tradelab.market_context_run.v2"
+        ):
+            raise BundleValidationError("shadow plan requires campaign.v2 and run.v2")
         for manifest, status in (
             (self.campaign_manifest, "authorized"),
             (self.run_manifest, "created"),
@@ -334,20 +360,157 @@ class ShadowPlan(BaseModel):
             <= self.campaign_manifest.get("ends_on")
         ):
             raise BundleValidationError("run date is outside campaign authorization")
-        component_material = self.component_manifest.model_dump(mode="json")
-        component_hash = "sha256:" + canonical_sha256(component_material)
-        if self.campaign_manifest.get("component_manifest") != component_material:
-            raise BundleValidationError("campaign treatment manifest differs from plan")
+        treatment_body = {
+            key: value
+            for key, value in self.treatment_manifest.items()
+            if key != "content_hash"
+        }
+        treatment_hash = "sha256:" + canonical_sha256(treatment_body)
         if (
-            self.campaign_manifest.get("component_manifest_hash") != component_hash
-            or self.run_manifest.get("component_manifest_hash") != component_hash
+            self.treatment_manifest.get("schema")
+            != "tradelab.market_context_treatment.v1"
+            or self.treatment_manifest.get("content_hash") != treatment_hash
+            or self.treatment_manifest_hash != treatment_hash
+            or self.campaign_manifest.get("treatment_manifest")
+            != self.treatment_manifest
+            or self.campaign_manifest.get("treatment_manifest_hash") != treatment_hash
+            or self.run_manifest.get("treatment_manifest_hash") != treatment_hash
         ):
-            raise BundleValidationError("campaign/run treatment manifest hash mismatch")
+            raise BundleValidationError("campaign/run treatment manifest mismatch")
+        frozen_behavior = self.treatment_manifest.get("frozen_behavior")
+        required_frozen = {
+            "exit_policy_registry",
+            "cost_model",
+            "quote_eligibility_policy",
+            "selected_profile_by_thesis",
+        }
+        if (
+            not isinstance(frozen_behavior, Mapping)
+            or set(frozen_behavior) != required_frozen
+        ):
+            raise BundleValidationError(
+                "treatment must freeze four exact policy/economics mappings"
+            )
+        frozen_material: dict[str, Mapping[str, Any]] = {}
+        for name in sorted(required_frozen):
+            item = frozen_behavior[name]
+            if not isinstance(item, Mapping) or set(item) != {
+                "material",
+                "content_hash",
+            }:
+                raise BundleValidationError(
+                    f"treatment frozen_behavior.{name} is invalid"
+                )
+            material = item.get("material")
+            if not isinstance(material, Mapping):
+                raise BundleValidationError(
+                    f"treatment frozen_behavior.{name}.material must be an object"
+                )
+            material_hash = "sha256:" + canonical_sha256(material)
+            if item.get("content_hash") != material_hash:
+                raise BundleValidationError(
+                    f"treatment frozen_behavior.{name} hash mismatch"
+                )
+            frozen_material[name] = material
+        registry_material = {
+            profile.value: policy.model_dump(mode="json")
+            for profile, policy in sorted(
+                self.exit_policy_registry.items(), key=lambda item: item[0].value
+            )
+        }
+        if (
+            dict(frozen_material["exit_policy_registry"]) != registry_material
+            or dict(frozen_material["cost_model"])
+            != self.cost_model.model_dump(mode="json")
+            or dict(frozen_material["quote_eligibility_policy"])
+            != self.quote_eligibility_policy.model_dump(mode="json")
+        ):
+            raise BundleValidationError(
+                "plan policy/economics material differs from frozen treatment"
+            )
+        selected_profile_map = frozen_material["selected_profile_by_thesis"]
+        if any(
+            selected_profile_map.get(scenario.thesis_class.value)
+            != scenario.exit_profile.value
+            for scenario in self.scenarios
+        ):
+            raise BundleValidationError(
+                "scenario exit profile differs from frozen treatment mapping"
+            )
         if (
             str(self.campaign_manifest.get("universe_hash", "")).removeprefix("sha256:")
             != self.candidate_pool.universe_manifest_hash
         ):
             raise BundleValidationError("campaign universe differs from candidate pool")
+
+        export_body = {
+            key: value
+            for key, value in self.cartographer_export_manifest.items()
+            if key not in {"export_id", "export_hash"}
+        }
+        export_hash = canonical_sha256(export_body)
+        target_window = self.cartographer_export_manifest.get("target_session_window")
+        if (
+            self.cartographer_export_manifest.get("schema")
+            != "market_cartographer.market_context_export.v2"
+            or self.cartographer_export_manifest.get("export_hash") != export_hash
+            or self.cartographer_export_manifest.get("export_id")
+            != f"export:{export_hash[:16]}"
+            or self.cartographer_export_hash.removeprefix("sha256:") != export_hash
+            or not isinstance(target_window, Mapping)
+        ):
+            raise BundleValidationError("Cartographer export manifest mismatch")
+        window_hash = canonical_sha256(target_window)
+        receipt_body = {
+            key: value
+            for key, value in self.cartographer_receipt.items()
+            if key != "receipt_hash"
+        }
+        receipt_hash = canonical_sha256(receipt_body)
+        if (
+            self.cartographer_receipt.get("schema")
+            != "market_cartographer.market_context_receipt.v2"
+            or self.cartographer_receipt.get("status") != "succeeded"
+            or self.cartographer_receipt.get("receipt_hash") != receipt_hash
+            or self.cartographer_receipt_hash.removeprefix("sha256:") != receipt_hash
+            or self.cartographer_receipt.get("run_id") != self.candidate_pool.run_id
+            or self.cartographer_receipt.get("export_hash") != export_hash
+            or str(
+                self.cartographer_receipt.get("candidate_pool_hash", "")
+            ).removeprefix("sha256:")
+            != self.candidate_pool.pool_hash
+            or self.cartographer_receipt.get("target_session_window") != target_window
+            or str(
+                self.cartographer_receipt.get("target_session_window_hash", "")
+            ).removeprefix("sha256:")
+            != window_hash
+        ):
+            raise BundleValidationError("Cartographer receipt mismatch")
+        if (
+            self.target_session_date
+            != self.cartographer_export_manifest.get("target_session_date")
+            or self.run_manifest.get("target_session_date") != self.target_session_date
+            or self.run_manifest.get("trading_date") != self.target_session_date
+            or self.target_session_window_hash.removeprefix("sha256:") != window_hash
+            or str(self.run_manifest.get("observation_window_hash", "")).removeprefix(
+                "sha256:"
+            )
+            != window_hash
+            or str(self.run_manifest.get("cartographer_receipt_hash", "")).removeprefix(
+                "sha256:"
+            )
+            != receipt_hash
+            or str(self.run_manifest.get("cartographer_export_hash", "")).removeprefix(
+                "sha256:"
+            )
+            != export_hash
+            or any(
+                candidate.observation_window.model_dump(mode="json")
+                != dict(target_window)
+                for candidate in self.candidate_pool.candidates
+            )
+        ):
+            raise BundleValidationError("registered run window/input identity mismatch")
 
         evidence_by_id = {item.evidence_id: item for item in self.chart_evidence}
         if len(evidence_by_id) != len(self.chart_evidence):
@@ -678,7 +841,7 @@ def _failure_receipt(
     error: Exception,
     input_sha256: str | None,
 ) -> dict[str, Any]:
-    return {
+    body = {
         "receipt_schema_version": INSTALL_RECEIPT_SCHEMA_VERSION,
         "receipt_id": "install-failure-" + (input_sha256 or "unknown")[:16],
         "status": "failed",
@@ -690,6 +853,7 @@ def _failure_receipt(
         "error": str(error),
         "broker_effect_count": 0,
     }
+    return {**body, "receipt_hash": canonical_sha256(body)}
 
 
 def install_shadow_plan(
@@ -718,7 +882,7 @@ def install_shadow_plan(
         input_digest = hashlib.sha256(encoded).hexdigest()
         plan = validate_bundle(payload)
         _write_atomic_json(output, plan.to_payload())
-        receipt_payload = {
+        receipt_body = {
             "receipt_schema_version": INSTALL_RECEIPT_SCHEMA_VERSION,
             "receipt_id": "install-" + plan.plan_hash[:32],
             "status": "installed",
@@ -728,6 +892,12 @@ def install_shadow_plan(
             "input_sha256": input_digest,
             "plan_id": plan.plan_id,
             "plan_hash": plan.plan_hash,
+            "run_manifest_hash": plan.run_manifest_hash,
+            "treatment_manifest_hash": plan.treatment_manifest_hash,
+            "cartographer_receipt_hash": plan.cartographer_receipt_hash,
+            "cartographer_export_hash": plan.cartographer_export_hash,
+            "target_session_date": plan.target_session_date,
+            "target_session_window_hash": plan.target_session_window_hash,
             "scenario_count": len(plan.scenarios),
             "scenario_hashes": [scenario.scenario_hash for scenario in plan.scenarios],
             "identities": [
@@ -757,6 +927,10 @@ def install_shadow_plan(
             "component_manifest_hash": plan.component_manifest_hash,
             "candidate_pool_hash": plan.candidate_pool.pool_hash,
             "broker_effect_count": 0,
+        }
+        receipt_payload = {
+            **receipt_body,
+            "receipt_hash": canonical_sha256(receipt_body),
         }
         _write_atomic_json(receipt, receipt_payload)
         return receipt_payload

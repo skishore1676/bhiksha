@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import pytest
@@ -37,9 +37,16 @@ from bhiksha.chart_scenarios import (
     evaluate_condition,
     evaluate_exit_profile,
     install_shadow_plan,
+    run_observation_cycle,
     validate_bundle,
 )
 from bhiksha.chart_scenarios.policies import CostModel, QuoteEligibilityPolicy
+from bhiksha.execution.profile_exit import (
+    ProfileExitFields,
+    ProfileExitState,
+    ProfileMarketView,
+    evaluate_profile_exit,
+)
 
 
 def _policy(profile: ExitProfile) -> ManagementPolicySpec:
@@ -100,45 +107,10 @@ def _bundle_payload() -> dict:
         update={"arm_id": ArmId.CHART_DETERMINISTIC, "selector_manifest_hash": "c" * 64}
     )
     scenario = ChartScenarioSpec.model_validate(vectors["chart_scenario"])
-    selected_policy = _registry()[scenario.exit_profile]
+    registry = _registry()
+    selected_policy = registry[scenario.exit_profile]
     cost_model = _cost_model()
     quote_policy = _quote_policy()
-    component_material = manifest.model_dump(mode="json")
-    treatment_hash = "sha256:" + canonical_sha256(component_material)
-    trading_date = pool.as_of.date().isoformat()
-    campaign = {
-        "schema": "tradelab.market_context_campaign.v1",
-        "program_id": pool.program_id,
-        "experiment_family_id": pool.experiment_family_id,
-        "experiment_version": pool.experiment_version,
-        "campaign_id": pool.campaign_id,
-        "created_at": pool.as_of.isoformat().replace("+00:00", "Z"),
-        "starts_on": trading_date,
-        "ends_on": trading_date,
-        "authorization_mode": "shadow",
-        "expected_arms": ["chart_deterministic", "chart_agentic_rerank"],
-        "component_manifest": component_material,
-        "component_manifest_hash": treatment_hash,
-        "universe_hash": "sha256:" + pool.universe_manifest_hash,
-        "status": "authorized",
-    }
-    campaign["content_hash"] = "sha256:" + canonical_sha256(campaign)
-    run = {
-        "schema": "tradelab.market_context_run.v1",
-        "program_id": pool.program_id,
-        "experiment_family_id": pool.experiment_family_id,
-        "experiment_version": pool.experiment_version,
-        "campaign_id": pool.campaign_id,
-        "run_id": pool.run_id,
-        "trading_date": trading_date,
-        "as_of": pool.as_of.isoformat().replace("+00:00", "Z"),
-        "authorization_mode": "shadow",
-        "expected_arms": ["chart_deterministic", "chart_agentic_rerank"],
-        "input_hashes": {"candidate_pool": pool.pool_hash},
-        "component_manifest_hash": treatment_hash,
-        "status": "created",
-    }
-    run["content_hash"] = "sha256:" + canonical_sha256(run)
     scenario = scenario.model_copy(
         update={
             "management_policy": selected_policy,
@@ -156,6 +128,120 @@ def _bundle_payload() -> dict:
             "selection_packet_hash": deterministic_selection.selection_hash,
         }
     )
+    registry_material = {
+        profile.value: policy.model_dump(mode="json")
+        for profile, policy in registry.items()
+    }
+    frozen_material = {
+        "exit_policy_registry": registry_material,
+        "cost_model": cost_model.model_dump(mode="json"),
+        "quote_eligibility_policy": quote_policy.model_dump(mode="json"),
+        "selected_profile_by_thesis": {
+            scenario.thesis_class.value: scenario.exit_profile.value
+        },
+    }
+    frozen_behavior = {
+        name: {
+            "material": material,
+            "content_hash": "sha256:" + canonical_sha256(material),
+        }
+        for name, material in frozen_material.items()
+    }
+    treatment_body = {
+        "schema": "tradelab.market_context_treatment.v1",
+        "program_id": pool.program_id,
+        "experiment_family_id": pool.experiment_family_id,
+        "experiment_version": pool.experiment_version,
+        "treatment_version": "fixture-v1",
+        "component_commits": {
+            name: "a" * 40 for name in ("kernel", "cartographer", "tradelab", "bhiksha")
+        },
+        "ranker": {
+            "provider_id": "fixture",
+            "model_id": "fixture",
+            "prompt_contract_path": "fixture",
+            "prompt_contract_sha256": "a" * 64,
+        },
+        "frozen_behavior": frozen_behavior,
+        "narrative": {
+            "mode": "observational_sidecar",
+            "selection_influence": False,
+            "included_in_treatment": False,
+        },
+        "daily_cartographer_inputs_or_outputs": "excluded",
+    }
+    treatment = {
+        **treatment_body,
+        "content_hash": "sha256:" + canonical_sha256(treatment_body),
+    }
+    treatment_hash = treatment["content_hash"]
+    trading_date = pool.as_of.date().isoformat()
+    campaign = {
+        "schema": "tradelab.market_context_campaign.v2",
+        "program_id": pool.program_id,
+        "experiment_family_id": pool.experiment_family_id,
+        "experiment_version": pool.experiment_version,
+        "campaign_id": pool.campaign_id,
+        "created_at": pool.as_of.isoformat().replace("+00:00", "Z"),
+        "starts_on": trading_date,
+        "ends_on": trading_date,
+        "authorization_mode": "shadow",
+        "expected_arms": ["chart_deterministic", "chart_agentic_rerank"],
+        "treatment_manifest": treatment,
+        "treatment_manifest_hash": treatment_hash,
+        "universe_hash": "sha256:" + pool.universe_manifest_hash,
+        "status": "authorized",
+    }
+    campaign["content_hash"] = "sha256:" + canonical_sha256(campaign)
+    target_window = pool.candidates[0].observation_window.model_dump(mode="json")
+    window_hash = canonical_sha256(target_window)
+    export_body = {
+        "schema": "market_cartographer.market_context_export.v2",
+        "campaign_id": pool.campaign_id,
+        "run_id": pool.run_id,
+        "target_session_date": trading_date,
+        "target_session_window": target_window,
+        "target_session_window_hash": window_hash,
+        "candidate_pool_hash": pool.pool_hash,
+    }
+    export_hash = canonical_sha256(export_body)
+    export_manifest = {
+        **export_body,
+        "export_id": f"export:{export_hash[:16]}",
+        "export_hash": export_hash,
+    }
+    receipt_body = {
+        "schema": "market_cartographer.market_context_receipt.v2",
+        "status": "succeeded",
+        "run_id": pool.run_id,
+        "export_hash": export_hash,
+        "target_session_date": trading_date,
+        "target_session_window": target_window,
+        "target_session_window_hash": window_hash,
+        "candidate_pool_hash": pool.pool_hash,
+    }
+    receipt_hash = canonical_sha256(receipt_body)
+    receipt = {**receipt_body, "receipt_hash": receipt_hash}
+    run = {
+        "schema": "tradelab.market_context_run.v2",
+        "program_id": pool.program_id,
+        "experiment_family_id": pool.experiment_family_id,
+        "experiment_version": pool.experiment_version,
+        "campaign_id": pool.campaign_id,
+        "run_id": pool.run_id,
+        "trading_date": trading_date,
+        "target_session_date": trading_date,
+        "as_of": pool.as_of.isoformat().replace("+00:00", "Z"),
+        "authorization_mode": "shadow",
+        "expected_arms": ["chart_deterministic", "chart_agentic_rerank"],
+        "input_hashes": {"candidate_pool": "sha256:" + pool.pool_hash},
+        "treatment_manifest_hash": treatment_hash,
+        "cartographer_receipt_hash": receipt_hash,
+        "cartographer_export_hash": export_hash,
+        "observation_window_hash": window_hash,
+        "status": "created",
+    }
+    run["content_hash"] = "sha256:" + canonical_sha256(run)
     return {
         "schema_version": "bhiksha.chart-scenario-shadow-plan.v1",
         "plan_id": "fixture-plan",
@@ -166,6 +252,14 @@ def _bundle_payload() -> dict:
         "campaign_manifest_hash": campaign["content_hash"],
         "run_manifest": run,
         "run_manifest_hash": run["content_hash"],
+        "treatment_manifest": treatment,
+        "treatment_manifest_hash": treatment_hash,
+        "cartographer_receipt": receipt,
+        "cartographer_receipt_hash": receipt_hash,
+        "cartographer_export_manifest": export_manifest,
+        "cartographer_export_hash": export_hash,
+        "target_session_date": trading_date,
+        "target_session_window_hash": window_hash,
         "component_manifest": manifest.model_dump(mode="json"),
         "component_manifest_hash": manifest.manifest_hash,
         "chart_evidence": [chart.model_dump(mode="json")],
@@ -176,7 +270,7 @@ def _bundle_payload() -> dict:
         ],
         "exit_policy_registry": {
             profile.value: policy.model_dump(mode="json")
-            for profile, policy in _registry().items()
+            for profile, policy in registry.items()
         },
         "cost_model": cost_model.model_dump(mode="json"),
         "quote_eligibility_policy": quote_policy.model_dump(mode="json"),
@@ -195,6 +289,34 @@ def _plan():
     return validate_bundle(_bundle_payload())
 
 
+def _cycle_input(plan=None, *, slot: int = 1) -> dict:
+    active_plan = plan or _plan()
+    candidates = []
+    seen: set[str] = set()
+    for scenario in active_plan.scenarios:
+        if scenario.candidate_id in seen:
+            continue
+        seen.add(scenario.candidate_id)
+        candidates.append(
+            {
+                "candidate_id": scenario.candidate_id,
+                "symbol": scenario.symbol,
+                "bars": _bars(),
+                "quotes": [],
+            }
+        )
+    body = {
+        "schema_version": "bhiksha.chart-scenario-cycle-input.v1",
+        "plan_hash": active_plan.plan_hash,
+        "run_manifest_hash": active_plan.run_manifest_hash,
+        "treatment_manifest_hash": active_plan.treatment_manifest_hash,
+        "observation_slot_ordinal": slot,
+        "evaluated_at": "2026-08-04T11:18:00Z",
+        "candidates": candidates,
+    }
+    return {**body, "content_hash": canonical_sha256(body)}
+
+
 def _observer(
     repository: ScenarioEventRepository,
     *,
@@ -203,11 +325,8 @@ def _observer(
     plan = _plan()
     return BrokerInertScenarioObserver(
         repository,
+        plan=plan,
         quote_source=quote_source,
-        exit_policy_registry=plan.exit_policy_registry,
-        cost_model=plan.cost_model,
-        quote_eligibility_policy=plan.quote_eligibility_policy,
-        plan_hash=plan.plan_hash,
     )
 
 
@@ -283,6 +402,13 @@ def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(
     installed = install_shadow_plan(payload, output_path=output, receipt_path=receipt)
 
     assert installed["status"] == "installed"
+    assert (
+        installed["receipt_schema_version"]
+        == "bhiksha.chart-scenario-install-receipt.v2"
+    )
+    assert installed["receipt_hash"] == canonical_sha256(
+        {key: value for key, value in installed.items() if key != "receipt_hash"}
+    )
     assert installed["broker_effect_count"] == 0
     assert installed["identities"][0]["candidate_id"] == "candidate-1"
     assert (
@@ -305,6 +431,9 @@ def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(
     failure = json.loads(receipt.read_text(encoding="utf-8"))
     assert failure["status"] == "failed"
     assert failure["broker_effect_count"] == 0
+    assert failure["receipt_hash"] == canonical_sha256(
+        {key: value for key, value in failure.items() if key != "receipt_hash"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -345,7 +474,10 @@ def test_bundle_rejects_missing_hash_and_unknown_kernel_fields() -> None:
 def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
     missing = _bundle_payload()
     missing["exit_policy_registry"].pop(ExitProfile.RANGE_EXPANSION.value)
-    with pytest.raises(BundleValidationError, match="missing compatible profiles"):
+    with pytest.raises(
+        BundleValidationError,
+        match="missing compatible profiles|policy/economics material",
+    ):
         validate_bundle(missing)
 
     mismatched = _bundle_payload()
@@ -353,7 +485,8 @@ def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
         ExitProfile.RANGE_EXPANSION
     ).model_dump(mode="json")
     with pytest.raises(
-        BundleValidationError, match="unsupported exit_family|selected policy differs"
+        BundleValidationError,
+        match="unsupported exit_family|selected policy differs|policy/economics material",
     ):
         validate_bundle(mismatched)
 
@@ -398,7 +531,8 @@ def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
         }
     )
     with pytest.raises(
-        BundleValidationError, match="unsupported risk-envelope semantics"
+        BundleValidationError,
+        match="unsupported risk-envelope semantics|policy/economics material",
     ):
         validate_bundle(unsupported)
 
@@ -406,8 +540,35 @@ def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
     unsupported_family["exit_policy_registry"][ExitProfile.FLASH_REVERSAL.value][
         "stop_family"
     ] = "underlying_atr"
-    with pytest.raises(BundleValidationError, match="unsupported stop_family"):
+    with pytest.raises(
+        BundleValidationError,
+        match="unsupported stop_family|policy/economics material",
+    ):
         validate_bundle(unsupported_family)
+
+
+def test_bundle_rejects_obsolete_self_signed_v1_registry_manifests() -> None:
+    legacy = _bundle_payload()
+    legacy["campaign_manifest"]["schema"] = "tradelab.market_context_campaign.v1"
+    legacy["campaign_manifest"]["content_hash"] = "sha256:" + canonical_sha256(
+        {
+            key: value
+            for key, value in legacy["campaign_manifest"].items()
+            if key != "content_hash"
+        }
+    )
+    legacy["campaign_manifest_hash"] = legacy["campaign_manifest"]["content_hash"]
+    legacy["run_manifest"]["schema"] = "tradelab.market_context_run.v1"
+    legacy["run_manifest"]["content_hash"] = "sha256:" + canonical_sha256(
+        {
+            key: value
+            for key, value in legacy["run_manifest"].items()
+            if key != "content_hash"
+        }
+    )
+    legacy["run_manifest_hash"] = legacy["run_manifest"]["content_hash"]
+    with pytest.raises(BundleValidationError, match="v2"):
+        validate_bundle(legacy)
 
 
 def test_bundle_refuses_live_active_plan_paths_without_reading_them(
@@ -491,21 +652,17 @@ def test_stale_single_quote_and_treatment_drift_fail_closed(tmp_path: Path) -> N
         update={"exit_fee_per_contract_usd": 2.0, "content_hash": None}
     )
     changed_cost = CostModel.model_validate(changed_cost.model_dump(mode="json"))
-    drifted = BrokerInertScenarioObserver(
-        ScenarioEventRepository(
-            tmp_path / "artifacts" / "chart_scenarios" / "drift.sqlite3"
-        ),
-        exit_policy_registry=plan.exit_policy_registry,
-        cost_model=changed_cost,
-        quote_eligibility_policy=plan.quote_eligibility_policy,
-        plan_hash=plan.plan_hash,
-    ).observe_one(
-        scenario,
-        bars=_bars(),
-        market_observation_id="caller-label-b",
-    )
-    assert drifted.error is not None
-    assert "cost model differs" in drifted.error
+    drifted_plan = plan.model_copy(update={"cost_model": changed_cost})
+    with pytest.raises(
+        BundleValidationError,
+        match="cost model hash mismatch|policy/economics material",
+    ):
+        BrokerInertScenarioObserver(
+            ScenarioEventRepository(
+                tmp_path / "artifacts" / "chart_scenarios" / "drift.sqlite3"
+            ),
+            plan=drifted_plan,
+        )
 
 
 def test_typed_trigger_primitives_require_completed_bars_and_respect_expiry() -> None:
@@ -710,7 +867,7 @@ def test_no_progress_exit_uses_explicit_favorable_floor() -> None:
         _quote("q-entry", 1.0, "2026-08-04T14:00:00Z")
     )
     stalled = OptionQuoteSnapshot.from_mapping(
-        _quote("q-stalled", 1.04, "2026-08-04T14:06:00Z")
+        _quote("q-stalled", 1.20, "2026-08-04T15:15:00Z")
     )
     result = evaluate_exit_profile(
         ExitProfile.EXHAUSTION_REVERSAL,
@@ -724,6 +881,58 @@ def test_no_progress_exit_uses_explicit_favorable_floor() -> None:
     )
     assert result.rule == "no_progress"
     assert result.is_terminal
+    canonical = evaluate_profile_exit(
+        fields=ProfileExitFields.from_management_spec(policy),
+        entry_premium=1.0,
+        quantity=1,
+        market=ProfileMarketView(current_premium=1.20, bar_time_et=time(11, 15)),
+        entry_time=entry.quote_time,
+        now=stalled.quote_time,
+        state=ProfileExitState.new(1.0, 1),
+        require_bar_time_for_eod=True,
+    )
+    assert canonical.rule.value == "no_progress"
+
+
+def test_eod_hard_flat_precedes_staged_target_like_canonical_bhiksha() -> None:
+    policy = _policy(ExitProfile.TREND_CONTINUATION).model_copy(
+        update={
+            "target_1_r": 1.0,
+            "target_2_r": 2.0,
+            "target_1_quantity": 0.6,
+            "initial_stop_pct": 0.4,
+        }
+    )
+    entry = OptionQuoteSnapshot.from_mapping(
+        _quote("q-eod-entry", 2.0, "2026-08-04T18:00:00Z")
+    )
+    target_at_close = OptionQuoteSnapshot.from_mapping(
+        _quote("q-eod-target", 2.8, "2026-08-04T20:00:00Z")
+    )
+    shadow = evaluate_exit_profile(
+        ExitProfile.TREND_CONTINUATION,
+        entry,
+        target_at_close,
+        entry_time=entry.quote_time,
+        evaluated_at=target_at_close.quote_time,
+        management_policy=policy,
+        cost_model=_cost_model(contracts=10),
+        quote_eligibility_policy=_quote_policy(),
+    )
+    canonical = evaluate_profile_exit(
+        fields=ProfileExitFields.from_management_spec(policy),
+        entry_premium=2.0,
+        quantity=10,
+        market=ProfileMarketView(current_premium=2.8, bar_time_et=time(16, 0)),
+        entry_time=entry.quote_time,
+        now=target_at_close.quote_time,
+        state=ProfileExitState.new(2.0, 10),
+        require_bar_time_for_eod=True,
+    )
+    assert shadow.rule == "eod_flat"
+    assert shadow.status == "exit"
+    assert canonical.rule.value == "eod_flat"
+    assert canonical.exit_quantity == 10
 
 
 def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_marks(
@@ -810,7 +1019,14 @@ def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(
     assert not first.terminal
     assert "quote_unavailable" in [event.event_type.value for event in first.events]
     trigger_count = sum(
-        event.event_type.value == "entry_triggered" for event in repository.events()
+        event.event_type.value == "entry_triggered"
+        and event.scenario_id == scenario.scenario_id
+        for event in repository.events()
+    )
+    observer.observe_one(
+        _plan().scenarios[1],
+        bars=_bars(),
+        observation_slot_ordinal=1,
     )
     second = observer.observe_one(
         scenario,
@@ -820,11 +1036,14 @@ def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(
             _quote("q-exit", 2.05, "2026-08-04T11:40:00Z"),
         ],
         market_observation_id="quote-recovered",
+        observation_slot_ordinal=2,
     )
     assert second.error is None
     assert (
         sum(
-            event.event_type.value == "entry_triggered" for event in repository.events()
+            event.event_type.value == "entry_triggered"
+            and event.scenario_id == scenario.scenario_id
+            for event in repository.events()
         )
         == trigger_count
     )
@@ -868,11 +1087,8 @@ def test_read_only_quote_source_rejects_order_capability(tmp_path: Path) -> None
             ScenarioEventRepository(
                 tmp_path / "artifacts" / "chart_scenarios" / "events.sqlite3"
             ),
+            plan=_plan(),
             quote_source=NotActuallyReadOnly(),
-            exit_policy_registry=_registry(),
-            cost_model=_cost_model(),
-            quote_eligibility_policy=_quote_policy(),
-            plan_hash=_plan().plan_hash,
         )
 
     hidden_effects: list[str] = []
@@ -903,19 +1119,11 @@ def test_restart_rejects_counterfactual_policy_or_plan_drift(tmp_path: Path) -> 
     )
 
     changed_payload = _bundle_payload()
-    changed_policy = _policy(ExitProfile.RANGE_EXPANSION).model_copy(
-        update={"target_r": 1.75}
-    )
-    changed_payload["exit_policy_registry"][ExitProfile.RANGE_EXPANSION.value] = (
-        changed_policy.model_dump(mode="json")
-    )
+    changed_payload["plan_id"] = "different-valid-plan"
     changed_plan = validate_bundle(changed_payload)
     changed_observer = BrokerInertScenarioObserver(
         repository,
-        exit_policy_registry=changed_plan.exit_policy_registry,
-        cost_model=changed_plan.cost_model,
-        quote_eligibility_policy=changed_plan.quote_eligibility_policy,
-        plan_hash=changed_plan.plan_hash,
+        plan=changed_plan,
     )
     changed_result = changed_observer.observe_one(
         changed_plan.scenarios[0],
@@ -936,16 +1144,44 @@ def test_shared_candidate_arms_require_identical_market_facts(tmp_path: Path) ->
         plan.scenarios[0],
         bars=_bars(),
         market_observation_id="paired-arm-observation",
+        evaluated_at="2026-08-04T11:18:00Z",
+        observation_slot_ordinal=1,
     )
+    skipped_pair = observer.observe_one(
+        plan.scenarios[0],
+        bars=_bars(),
+        evaluated_at="2026-08-04T11:18:01Z",
+        observation_slot_ordinal=2,
+    )
+    assert skipped_pair.error is not None
+    assert "before every expected arm is paired" in skipped_pair.error
     changed_bars = deepcopy(_bars())
     changed_bars[-1]["close"] = 101.5
     changed_result = observer.observe_one(
         plan.scenarios[1],
         bars=changed_bars,
         market_observation_id="different-caller-label",
+        evaluated_at="2026-08-04T11:18:01Z",
+        observation_slot_ordinal=1,
     )
     assert changed_result.error is not None
     assert "different market facts" in changed_result.error
+    paired = observer.observe_one(
+        plan.scenarios[1],
+        bars=_bars(),
+        market_observation_id="another-ignored-label",
+        evaluated_at="2026-08-04T11:18:00Z",
+        observation_slot_ordinal=1,
+    )
+    assert paired.error is None
+    proofs = repository.paired_market_fact_proofs()
+    assert len(proofs) == 1
+    assert proofs[0]["paired"] is True
+    assert proofs[0]["observed_arm_ids"] == [
+        "chart_agentic_rerank",
+        "chart_deterministic",
+    ]
+    assert len(proofs[0]["proof_hash"]) == 64
 
 
 def test_restart_recovers_latched_primary_terminal_after_crash(tmp_path: Path) -> None:
@@ -980,13 +1216,68 @@ def test_restart_recovers_latched_primary_terminal_after_crash(tmp_path: Path) -
 
     recovered = _observer(repository).observe_one(
         scenario,
-        bars=_bars(),
-        quote_path=quotes,
+        bars=[],
+        quote_path=[],
+        evaluated_at="2026-08-04T16:00:00Z",
         market_observation_id="renamed-crash-cycle",
+        observation_slot_ordinal=2,
     )
     assert recovered.error is None
     assert recovered.terminal
     assert recovered.status == "synthetic_exit"
+    recovered_state = repository.get_state(scenario, observer.trigger_version)
+    assert recovered_state is not None
+    latched = recovered_state["profile_states"][scenario.exit_profile.value]
+    terminal_observation = latched["terminal_observation"]
+    assert recovered_state["primary_net_r"] == terminal_observation["net_r"]
+    assert recovered_state["primary_gross_r"] == terminal_observation["gross_r"]
+    assert recovered_state["terminal_profile"] == scenario.exit_profile.value
+    assert recovered_state["terminal_quote_hash"] == latched["terminal_quote_hash"]
+    assert (
+        recovered.events[-1].market_observation_id
+        == latched["market_fact_proof"]["slot_id"]
+    )
+
+
+def test_observe_cycle_pairs_every_installed_arm_and_writes_zero_effect_receipt(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "cycle.sqlite3"
+    )
+    receipt_path = tmp_path / "artifacts" / "chart_scenarios" / "cycle-receipt.json"
+    receipt = run_observation_cycle(
+        plan,
+        _cycle_input(plan),
+        repository=repository,
+        receipt_path=receipt_path,
+    )
+    assert receipt["status"] == "succeeded"
+    assert receipt["scenario_count"] == len(plan.scenarios)
+    assert receipt["paired_fact_proof_count"] == 1
+    assert receipt["broker_effect_count"] == 0
+    assert not any(receipt["effects"].values())
+    proof = receipt["paired_fact_proofs"][0]
+    assert proof[
+        "treatment_manifest_hash"
+    ] == plan.treatment_manifest_hash.removeprefix("sha256:")
+    assert proof["cartographer_export_hash"] == plan.cartographer_export_hash
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
+
+    drifted = deepcopy(_cycle_input(plan))
+    drifted["evaluated_at"] = "2026-08-04T11:18:01Z"
+    drifted["content_hash"] = canonical_sha256(
+        {key: value for key, value in drifted.items() if key != "content_hash"}
+    )
+    failed = run_observation_cycle(
+        plan,
+        drifted,
+        repository=repository,
+        receipt_path=receipt_path,
+    )
+    assert failed["status"] == "failed"
+    assert all("different market facts" in error for error in failed["errors"])
 
 
 def test_new_package_import_graph_has_no_money_path_imports() -> None:
@@ -1078,8 +1369,8 @@ def test_cli_install_observe_and_status_are_read_only_fixture_commands(
             str(fixture_path),
             "--db-path",
             str(db_path),
-            "--observation-id",
-            "cli-fixture-observation",
+            "--observation-slot",
+            "1",
             "--scenario-id",
             "scenario-deterministic-1",
         ],

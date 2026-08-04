@@ -69,7 +69,8 @@ PYTHONPATH=/Users/suman/code/worktrees/bhiksha-market-context/src:/Users/suman/c
 
 Validation runs before the destination is replaced. Installation writes a
 temporary file in the destination directory, fsyncs it, and uses atomic replace;
-the receipt is replaced atomically afterward. A failed validation or write
+the authenticated v2 receipt is replaced atomically afterward. Its
+`receipt_hash` is the canonical hash of every field except itself. A failed validation or write
 produces a failed receipt and leaves the prior plan artifact untouched. Missing
 or unknown identity/schema/trigger/policy/source/hash data, a hash mismatch,
 an incompatible exit profile, a future observation, or a non-shadow packet
@@ -88,18 +89,47 @@ is retained in observation state.
 PYTHONPATH=/Users/suman/code/worktrees/bhiksha-market-context/src:/Users/suman/code/worktrees/kernel-market-context/src \
   /Users/suman/code/bhiksha/.venv/bin/python -m bhiksha.chart_scenarios observe-one \
   --fixture /path/to/chart_scenario_fixture.json \
-  --db-path artifacts/chart_scenarios/shadow_events.sqlite3
+  --db-path artifacts/chart_scenarios/shadow_events.sqlite3 \
+  --observation-slot 1
 ```
 
 The cycle is restart-safe. Repository state is bound to the installed plan hash
 and the complete exit-policy registry hash, so a restart cannot silently change
 the counterfactual policies. The event identity includes
 `(campaign_id, run_id, arm_id, scenario_id, trigger_version)` and the event
-role/observation ID. Replaying an observation does not duplicate a trigger,
-synthetic entry, or terminal event; a terminal scenario cannot be re-armed.
-For the same campaign/run/candidate/observation ID, both arms must present the
-same canonical market-facts hash. A divergent bar or quote snapshot fails
-closed instead of manufacturing paired evidence.
+role/run-owned observation-slot ID. Replaying an observation does not duplicate
+a trigger, synthetic entry, or terminal event; a terminal scenario cannot be
+re-armed.
+The slot ID is derived from the installed run-manifest hash and a monotonic
+ordinal. A candidate cannot advance to the next slot until every installed arm
+has bound the current slot. Both arms must present the same evaluated time and
+canonical market-facts hash; caller labels are ignored. Once every expected arm
+agrees, SQLite persists a content-addressed paired-fact proof for downstream
+evaluation. A divergent timestamp, bar, or quote snapshot fails closed instead
+of manufacturing paired evidence.
+
+For an operational cycle, the runtime's read-only market-data/option-selection
+adapter exports one candidate-keyed JSON snapshot. Bars come from the canonical
+completed-bar seam and quotes are the canonical selector's already-chosen
+snapshot rows; the chart-scenario lane neither owns a client credential nor
+calls an order manager. One command fans those immutable facts across every
+installed scenario, pairs shared candidates by the run-owned slot, and writes a
+zero-effect receipt:
+
+```bash
+PYTHONPATH=/Users/suman/code/worktrees/bhiksha-market-context/src:/Users/suman/code/worktrees/kernel-market-context/src \
+  /Users/suman/code/bhiksha/.venv/bin/python -m bhiksha.chart_scenarios observe-cycle \
+  --plan artifacts/chart_scenarios/active_shadow_plan.json \
+  --cycle-input /path/to/read-only-cycle-snapshot.json \
+  --db-path artifacts/chart_scenarios/shadow_events.sqlite3 \
+  --receipt artifacts/chart_scenarios/cycle-receipt.json
+```
+
+The cycle snapshot is bound to the installed plan, registered run, frozen
+treatment, one positive slot ordinal, one evaluated time, and exactly one fact
+record per installed candidate. Its content hash is verified before any event
+write. Live snapshot capture and scheduling stay in the supervisor-owned
+read-only adapter; this command has no broker-submit capability.
 
 ## Status and readback
 

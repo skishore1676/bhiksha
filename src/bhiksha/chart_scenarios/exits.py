@@ -119,8 +119,11 @@ def evaluate_exit_profile(
         entry_mark * stop_pct * cost_model.contract_multiplier * cost_model.contracts
     )
     cost_r = cost_model.total_round_trip_cost_usd / risk_dollars
-    peak_r = max(float(state.get("peak_r", r)), r)
-    state["peak_r"] = peak_r
+    # Match Bhiksha's canonical ladder: favorable excursion is the high-water
+    # mark from PRIOR ticks.  The current tick may update it only after no rung
+    # fires, so one quote cannot both establish progress and defeat a time stop.
+    prior_peak_r = float(state.get("peak_r", 0.0))
+    state["peak_r"] = prior_peak_r
     state["exit_policy_id"] = policy_identity["policy_id"]
     state["exit_policy_schema_version"] = policy_identity["policy_schema_version"]
     state["exit_policy_hash"] = policy_identity["policy_hash"]
@@ -131,6 +134,23 @@ def evaluate_exit_profile(
     state.setdefault("realized_r_contracts", 0.0)
     state.setdefault("remaining_contracts", cost_model.contracts)
     elapsed = (now - entry_at).total_seconds()
+
+    # Canonical Bhiksha gives the session hard-flat precedence over every price
+    # rung.  A target touch at/after hard flat is therefore an EOD exit, not a
+    # staged target.
+    if management_policy.eod_flat:
+        hard_flat = _time_from_policy(management_policy.hard_flat_time_et)
+        if now.astimezone(ZoneInfo("America/New_York")).time() >= hard_flat:
+            return _result(
+                selected,
+                "exit",
+                "eod_flat",
+                current_mark,
+                r,
+                elapsed,
+                state,
+                "profile_eod_flat",
+            )
 
     disaster_pct = management_policy.premium_disaster_stop_pct
     if disaster_pct is not None and current_mark <= entry_mark * (1.0 - disaster_pct):
@@ -226,9 +246,9 @@ def evaluate_exit_profile(
     if (
         giveback_fraction is not None
         and giveback_arm is not None
-        and peak_r >= giveback_arm
+        and prior_peak_r >= giveback_arm
     ):
-        floor = peak_r * (1.0 - min(giveback_fraction, 1.0))
+        floor = prior_peak_r * (1.0 - min(giveback_fraction, 1.0))
         if r <= floor:
             return _result(
                 selected,
@@ -260,7 +280,7 @@ def evaluate_exit_profile(
 
     if management_policy.no_progress_seconds is not None:
         floor = float(management_policy.parameters["no_progress_favorable_floor_r"])
-        if elapsed >= management_policy.no_progress_seconds and peak_r < floor:
+        if elapsed >= management_policy.no_progress_seconds and prior_peak_r < floor:
             return _result(
                 selected,
                 "exit",
@@ -272,20 +292,7 @@ def evaluate_exit_profile(
                 "profile_no_progress",
             )
 
-    if management_policy.eod_flat:
-        hard_flat = _time_from_policy(management_policy.hard_flat_time_et)
-        if now.astimezone(ZoneInfo("America/New_York")).time() >= hard_flat:
-            return _result(
-                selected,
-                "exit",
-                "eod_flat",
-                current_mark,
-                r,
-                elapsed,
-                state,
-                "profile_eod_flat",
-            )
-
+    state["peak_r"] = max(prior_peak_r, r)
     return _result(
         selected, "hold", "hold", current_mark, r, elapsed, state, "profile_hold"
     )

@@ -1,5 +1,11 @@
 """Broker-inert chart-scenario shadow observation lane."""
 
+from .cycle import (
+    CYCLE_INPUT_SCHEMA,
+    CYCLE_RECEIPT_SCHEMA,
+    run_observation_cycle,
+    validate_cycle_input,
+)
 from .exits import ExitObservation, evaluate_exit_profile
 from .models import CompletedBar, OptionQuoteSnapshot, as_utc, timestamp_json
 from .observer import (
@@ -16,12 +22,14 @@ from .quotes import (
     ensure_read_only_quote_source,
 )
 from .repository import (
+    OBSERVATION_SLOT_SCHEMA,
     EventChainReport,
     EventWrite,
     IdempotencyConflict,
     ScenarioEventRepository,
     SQLiteScenarioRepository,
     TerminalScenarioError,
+    canonical_observation_slot_id,
     scenario_identity_key,
 )
 from .triggers import (
@@ -48,9 +56,12 @@ from .validation import (
 )
 
 __all__ = [
+    "CYCLE_INPUT_SCHEMA",
+    "CYCLE_RECEIPT_SCHEMA",
     "DEFAULT_SHADOW_DB_PATH",
     "DEFAULT_SHADOW_PLAN_PATH",
     "DEFAULT_SHADOW_RECEIPT_PATH",
+    "OBSERVATION_SLOT_SCHEMA",
     "SHADOW_PLAN_SCHEMA_VERSION",
     "TRIGGER_VERSION",
     "AtomicShadowPlanInstaller",
@@ -78,6 +89,7 @@ __all__ = [
     "TerminalScenarioError",
     "TriggerEvaluation",
     "as_utc",
+    "canonical_observation_slot_id",
     "ensure_read_only_quote_source",
     "evaluate_condition",
     "evaluate_exit_profile",
@@ -86,7 +98,9 @@ __all__ = [
     "load_bundle",
     "normalize_bars",
     "read_installed_plan",
+    "run_observation_cycle",
     "scenario_identity_key",
     "timestamp_json",
     "validate_bundle",
+    "validate_cycle_input",
 ]

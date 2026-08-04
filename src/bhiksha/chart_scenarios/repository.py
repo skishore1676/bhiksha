@@ -31,6 +31,27 @@ class TerminalScenarioError(RuntimeError):
     """A caller attempted to arm a scenario after its terminal event."""
 
 
+OBSERVATION_SLOT_SCHEMA = "market-context-observation-slot.v1"
+
+
+def canonical_observation_slot_id(*, run_manifest_hash: str, ordinal: int) -> str:
+    """Return the run-owned identity for one market-observation cycle."""
+
+    if ordinal < 1:
+        raise ValueError("observation slot ordinal must be positive")
+    normalized = str(run_manifest_hash).removeprefix("sha256:")
+    if len(normalized) != 64:
+        raise ValueError("run_manifest_hash must be a sha256 identity")
+    digest = canonical_sha256(
+        {
+            "schema": OBSERVATION_SLOT_SCHEMA,
+            "run_manifest_hash": normalized,
+            "ordinal": ordinal,
+        }
+    )
+    return "observation-slot-" + digest[:32]
+
+
 @dataclass(frozen=True, slots=True)
 class EventWrite:
     event: ScenarioShadowEvent
@@ -162,6 +183,32 @@ class ScenarioEventRepository:
                             campaign_id, run_id, candidate_id, observation_key
                         )
                     );
+                    CREATE TABLE IF NOT EXISTS chart_scenario_observation_slots (
+                        campaign_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        candidate_id TEXT NOT NULL,
+                        slot_ordinal INTEGER NOT NULL,
+                        slot_id TEXT NOT NULL,
+                        plan_hash TEXT NOT NULL,
+                        run_manifest_hash TEXT NOT NULL,
+                        treatment_manifest_hash TEXT NOT NULL,
+                        run_input_hashes_hash TEXT NOT NULL,
+                        cartographer_receipt_hash TEXT NOT NULL,
+                        cartographer_export_hash TEXT NOT NULL,
+                        observation_window_hash TEXT NOT NULL,
+                        facts_hash TEXT NOT NULL,
+                        evaluated_at TEXT NOT NULL,
+                        observed_arm_ids_json TEXT NOT NULL,
+                        expected_arm_ids_json TEXT NOT NULL,
+                        paired INTEGER NOT NULL DEFAULT 0,
+                        proof_hash TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (
+                            campaign_id, run_id, candidate_id, slot_ordinal
+                        ),
+                        UNIQUE (campaign_id, run_id, candidate_id, slot_id)
+                    );
                     """
                 )
             self._schema_ready = True
@@ -170,48 +217,205 @@ class ScenarioEventRepository:
         self,
         scenario: ChartScenarioSpec,
         *,
-        observation_key: str,
+        observation_slot_ordinal: int,
+        run_manifest_hash: str,
+        plan_hash: str,
+        treatment_manifest_hash: str,
+        run_input_hashes_hash: str,
+        cartographer_receipt_hash: str,
+        cartographer_export_hash: str,
+        observation_window_hash: str,
+        expected_arm_ids: tuple[str, ...],
         facts_hash: str,
-    ) -> None:
-        """Bind both arms for one candidate/observation to identical raw facts."""
+        evaluated_at: str,
+    ) -> dict[str, Any]:
+        """Bind one run-owned slot and persist a proof when all arms agree."""
 
         self.ensure_schema()
+        normalized_run_hash = str(run_manifest_hash).removeprefix("sha256:")
+        normalized_plan_hash = str(plan_hash).removeprefix("sha256:")
+        durable_bindings = {
+            "treatment_manifest_hash": str(treatment_manifest_hash).removeprefix(
+                "sha256:"
+            ),
+            "run_input_hashes_hash": str(run_input_hashes_hash).removeprefix("sha256:"),
+            "cartographer_receipt_hash": str(cartographer_receipt_hash).removeprefix(
+                "sha256:"
+            ),
+            "cartographer_export_hash": str(cartographer_export_hash).removeprefix(
+                "sha256:"
+            ),
+            "observation_window_hash": str(observation_window_hash).removeprefix(
+                "sha256:"
+            ),
+        }
+        if any(len(value) != 64 for value in durable_bindings.values()):
+            raise ValueError("observation slot bindings must be sha256 identities")
+        expected = tuple(sorted(set(expected_arm_ids)))
+        if scenario.arm_id.value not in expected:
+            raise ValueError("scenario arm is not authorized for this plan candidate")
+        if not expected:
+            raise ValueError("observation slot requires at least one expected arm")
+        slot_id = canonical_observation_slot_id(
+            run_manifest_hash=normalized_run_hash,
+            ordinal=observation_slot_ordinal,
+        )
+        now = timestamp_json(datetime.now(UTC))
         with self._connect(write=True) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute(
+                """
+                SELECT slot_ordinal, paired FROM chart_scenario_observation_slots
+                WHERE campaign_id=? AND run_id=? AND candidate_id=?
+                ORDER BY slot_ordinal DESC LIMIT 1
+                """,
+                (scenario.campaign_id, scenario.run_id, scenario.candidate_id),
+            ).fetchone()
+            if latest is None and observation_slot_ordinal != 1:
+                raise IdempotencyConflict("first observation slot must have ordinal 1")
+            if latest is not None:
+                latest_ordinal = int(latest["slot_ordinal"])
+                if observation_slot_ordinal > latest_ordinal + 1:
+                    raise IdempotencyConflict("observation slot ordinal skipped ahead")
+                if observation_slot_ordinal > latest_ordinal and not bool(
+                    latest["paired"]
+                ):
+                    raise IdempotencyConflict(
+                        "cannot advance observation slot before every expected arm is paired"
+                    )
             row = conn.execute(
                 """
-                SELECT facts_hash FROM chart_scenario_market_facts
-                WHERE campaign_id=? AND run_id=? AND candidate_id=?
-                  AND observation_key=?
+                SELECT * FROM chart_scenario_observation_slots
+                WHERE campaign_id=? AND run_id=? AND candidate_id=? AND slot_ordinal=?
                 """,
                 (
                     scenario.campaign_id,
                     scenario.run_id,
                     scenario.candidate_id,
-                    observation_key,
+                    observation_slot_ordinal,
                 ),
             ).fetchone()
             if row is not None:
-                if row["facts_hash"] != facts_hash:
+                if row["plan_hash"] != normalized_plan_hash:
+                    raise IdempotencyConflict(
+                        "observation slot was reused with a different shadow plan hash"
+                    )
+                if row["run_manifest_hash"] != normalized_run_hash:
+                    raise IdempotencyConflict(
+                        "observation slot was reused with a different run manifest hash"
+                    )
+                if (
+                    row["slot_id"] != slot_id
+                    or row["evaluated_at"] != evaluated_at
+                    or row["facts_hash"] != facts_hash
+                    or any(row[key] != value for key, value in durable_bindings.items())
+                    or tuple(json.loads(row["expected_arm_ids_json"])) != expected
+                ):
                     raise IdempotencyConflict(
                         "shared candidate observation was reused with different market facts"
                     )
-                return
+                observed = set(json.loads(row["observed_arm_ids_json"]))
+                created_at = str(row["created_at"])
+            else:
+                observed = set()
+                created_at = now
+            observed.add(scenario.arm_id.value)
+            paired = observed == set(expected)
+            proof_material = {
+                "schema": OBSERVATION_SLOT_SCHEMA,
+                "campaign_id": scenario.campaign_id,
+                "run_id": scenario.run_id,
+                "candidate_id": scenario.candidate_id,
+                "slot_ordinal": observation_slot_ordinal,
+                "slot_id": slot_id,
+                "plan_hash": normalized_plan_hash,
+                "run_manifest_hash": normalized_run_hash,
+                **durable_bindings,
+                "facts_hash": facts_hash,
+                "evaluated_at": evaluated_at,
+                "observed_arm_ids": sorted(observed),
+                "expected_arm_ids": list(expected),
+                "paired": paired,
+            }
+            proof_hash = canonical_sha256(proof_material) if paired else None
             conn.execute(
                 """
-                INSERT INTO chart_scenario_market_facts
-                (campaign_id, run_id, candidate_id, observation_key, facts_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO chart_scenario_observation_slots
+                (campaign_id, run_id, candidate_id, slot_ordinal, slot_id,
+                 plan_hash, run_manifest_hash, treatment_manifest_hash,
+                 run_input_hashes_hash, cartographer_receipt_hash,
+                 cartographer_export_hash, observation_window_hash,
+                 facts_hash, evaluated_at,
+                 observed_arm_ids_json, expected_arm_ids_json, paired, proof_hash,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, run_id, candidate_id, slot_ordinal)
+                DO UPDATE SET observed_arm_ids_json=excluded.observed_arm_ids_json,
+                              paired=excluded.paired,
+                              proof_hash=excluded.proof_hash,
+                              updated_at=excluded.updated_at
                 """,
                 (
                     scenario.campaign_id,
                     scenario.run_id,
                     scenario.candidate_id,
-                    observation_key,
+                    observation_slot_ordinal,
+                    slot_id,
+                    normalized_plan_hash,
+                    normalized_run_hash,
+                    durable_bindings["treatment_manifest_hash"],
+                    durable_bindings["run_input_hashes_hash"],
+                    durable_bindings["cartographer_receipt_hash"],
+                    durable_bindings["cartographer_export_hash"],
+                    durable_bindings["observation_window_hash"],
                     facts_hash,
-                    timestamp_json(datetime.now(UTC)),
+                    evaluated_at,
+                    json.dumps(sorted(observed), separators=(",", ":")),
+                    json.dumps(list(expected), separators=(",", ":")),
+                    int(paired),
+                    proof_hash,
+                    created_at,
+                    now,
                 ),
             )
+        return {**proof_material, "proof_hash": proof_hash}
+
+    def paired_market_fact_proofs(self) -> list[dict[str, Any]]:
+        """Return durable paired-fact proofs for evaluation adapters."""
+
+        if not self.db_path.exists() or not self._observation_slots_exist_readonly():
+            return []
+        with self._connect(write=False) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM chart_scenario_observation_slots
+                WHERE paired=1 ORDER BY run_id, candidate_id, slot_ordinal
+                """
+            ).fetchall()
+        return [
+            {
+                "schema": OBSERVATION_SLOT_SCHEMA,
+                "campaign_id": row["campaign_id"],
+                "run_id": row["run_id"],
+                "candidate_id": row["candidate_id"],
+                "slot_ordinal": row["slot_ordinal"],
+                "slot_id": row["slot_id"],
+                "plan_hash": row["plan_hash"],
+                "run_manifest_hash": row["run_manifest_hash"],
+                "treatment_manifest_hash": row["treatment_manifest_hash"],
+                "run_input_hashes_hash": row["run_input_hashes_hash"],
+                "cartographer_receipt_hash": row["cartographer_receipt_hash"],
+                "cartographer_export_hash": row["cartographer_export_hash"],
+                "observation_window_hash": row["observation_window_hash"],
+                "facts_hash": row["facts_hash"],
+                "evaluated_at": row["evaluated_at"],
+                "observed_arm_ids": json.loads(row["observed_arm_ids_json"]),
+                "expected_arm_ids": json.loads(row["expected_arm_ids_json"]),
+                "paired": True,
+                "proof_hash": row["proof_hash"],
+            }
+            for row in rows
+        ]
 
     def register_scenario(
         self,
@@ -539,6 +743,7 @@ class ScenarioEventRepository:
                 "scenario_count": 0,
                 "terminal_scenario_count": 0,
                 "event_count": 0,
+                "paired_market_fact_proof_count": 0,
                 "broker_effect_count": 0,
                 "event_chain_valid": True,
             }
@@ -557,6 +762,15 @@ class ScenarioEventRepository:
             last = conn.execute(
                 "SELECT event_hash FROM chart_scenario_events ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
+            paired_fact_count = (
+                int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM chart_scenario_observation_slots WHERE paired=1"
+                    ).fetchone()[0]
+                )
+                if self._observation_slots_exist_readonly()
+                else 0
+            )
         chain = self.verify_event_chain()
         return {
             "db_path": str(self.db_path),
@@ -566,6 +780,7 @@ class ScenarioEventRepository:
             "last_event_hash": last["event_hash"] if last is not None else None,
             "event_chain_valid": chain.valid,
             "event_chain_errors": list(chain.errors),
+            "paired_market_fact_proof_count": paired_fact_count,
             "broker_effect_count": 0,
         }
 
@@ -581,14 +796,28 @@ class ScenarioEventRepository:
             }
         return {"chart_scenario_states", "chart_scenario_events"}.issubset(names)
 
+    def _observation_slots_exist_readonly(self) -> bool:
+        if not self.db_path.exists():
+            return False
+        with self._connect(write=False) as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='chart_scenario_observation_slots'
+                """
+            ).fetchone()
+        return row is not None
+
 
 __all__ = [
+    "OBSERVATION_SLOT_SCHEMA",
     "EventChainReport",
     "EventWrite",
     "IdempotencyConflict",
     "SQLiteScenarioRepository",
     "ScenarioEventRepository",
     "TerminalScenarioError",
+    "canonical_observation_slot_id",
     "scenario_identity_key",
 ]
 

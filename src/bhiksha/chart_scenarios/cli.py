@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .cycle import run_observation_cycle
 from .observer import BrokerInertScenarioObserver
 from .quotes import PersistedOptionSnapshotSource
 from .repository import ScenarioEventRepository
@@ -88,18 +89,15 @@ def _observe_one(args: argparse.Namespace) -> int:
     quote_source = PersistedOptionSnapshotSource(quotes) if quotes else None
     observer = BrokerInertScenarioObserver(
         repository,
+        plan=plan,
         quote_source=quote_source,
-        exit_policy_registry=plan.exit_policy_registry,
-        cost_model=plan.cost_model,
-        quote_eligibility_policy=plan.quote_eligibility_policy,
-        plan_hash=plan.plan_hash,
     )
     result = observer.observe_one(
         scenario,
         bars=bars,
         quote_path=quotes,
         evaluated_at=evaluated_at,
-        market_observation_id=args.observation_id,
+        observation_slot_ordinal=args.observation_slot,
     )
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     return 0 if result.error is None else 2
@@ -116,6 +114,21 @@ def _status(args: argparse.Namespace) -> int:
         status["plan_component_manifest_hash"] = plan.component_manifest_hash
     print(json.dumps(status, indent=2, sort_keys=True))
     return 0 if status.get("event_chain_valid", False) else 2
+
+
+def _observe_cycle(args: argparse.Namespace) -> int:
+    plan = load_bundle(args.plan)
+    cycle_input = _read_json(args.cycle_input)
+    if not isinstance(cycle_input, Mapping):
+        raise TypeError("cycle input must be an object")
+    receipt = run_observation_cycle(
+        plan,
+        cycle_input,
+        repository=ScenarioEventRepository(args.db_path),
+        receipt_path=args.receipt,
+    )
+    print(json.dumps(receipt, indent=2, sort_keys=True))
+    return 0 if receipt["status"] == "succeeded" else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -148,8 +161,23 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument(
         "--at", default=None, help="explicit RFC 3339 observation time"
     )
-    observe.add_argument("--observation-id", required=True)
+    observe.add_argument(
+        "--observation-slot",
+        required=True,
+        type=int,
+        help="positive run-owned observation cycle ordinal",
+    )
     observe.set_defaults(handler=_observe_one)
+
+    cycle = subparsers.add_parser(
+        "observe-cycle",
+        help="observe every installed scenario from one canonical read-only snapshot",
+    )
+    cycle.add_argument("--plan", default=str(DEFAULT_SHADOW_PLAN_PATH))
+    cycle.add_argument("--cycle-input", required=True)
+    cycle.add_argument("--db-path", default=str(DEFAULT_SHADOW_DB_PATH))
+    cycle.add_argument("--receipt", required=True)
+    cycle.set_defaults(handler=_observe_cycle)
 
     status = subparsers.add_parser(
         "status", help="read experiment state and verify the event chain"
