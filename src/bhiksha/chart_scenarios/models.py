@@ -8,10 +8,11 @@ method or a reference to Bhiksha's execution stack.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import math
-from typing import Any, Mapping
+from typing import Any
 
 from mala_bhiksha_kernel import canonical_sha256
 
@@ -22,7 +23,7 @@ def as_utc(value: datetime | str) -> datetime:
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str) and value.strip():
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     else:
         raise TypeError("timestamp must be an RFC 3339 string or aware datetime")
     if parsed.tzinfo is None or parsed.utcoffset() is None:
@@ -65,12 +66,16 @@ class CompletedBar:
         if self.volume is not None:
             object.__setattr__(self, "volume", finite_float(self.volume, "volume"))
         if not self.completed:
-            raise ValueError("only completed bars may enter the chart-scenario observer")
-        if self.high < max(self.open, self.close) or self.low > min(self.open, self.close):
+            raise ValueError(
+                "only completed bars may enter the chart-scenario observer"
+            )
+        if self.high < max(self.open, self.close) or self.low > min(
+            self.open, self.close
+        ):
             raise ValueError("bar high/low do not contain open and close")
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "CompletedBar":
+    def from_mapping(cls, value: Mapping[str, Any]) -> CompletedBar:
         if not isinstance(value, Mapping):
             raise TypeError("bar observation must be an object")
         timestamp = value.get("timestamp", value.get("bar_time", value.get("at")))
@@ -150,7 +155,10 @@ class OptionQuoteSnapshot:
             if value is not None:
                 object.__setattr__(self, field, finite_float(value, field))
         if self.open_interest is not None:
-            if isinstance(self.open_interest, bool) or int(self.open_interest) != self.open_interest:
+            if (
+                isinstance(self.open_interest, bool)
+                or int(self.open_interest) != self.open_interest
+            ):
                 raise TypeError("open_interest must be an integer")
             if self.open_interest < 0:
                 raise ValueError("open_interest must be non-negative")
@@ -163,7 +171,7 @@ class OptionQuoteSnapshot:
         object.__setattr__(self, "snapshot_hash", computed)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "OptionQuoteSnapshot":
+    def from_mapping(cls, value: Mapping[str, Any]) -> OptionQuoteSnapshot:
         if not isinstance(value, Mapping):
             raise TypeError("option quote must be an object")
         quote_time = value.get("quote_time", value.get("timestamp", value.get("at")))
@@ -172,15 +180,23 @@ class OptionQuoteSnapshot:
         option_symbol = value.get("option_symbol", value.get("contract_symbol"))
         underlying = value.get("underlying_symbol", value.get("symbol"))
         if not option_symbol or not underlying:
-            raise ValueError("option quote requires option_symbol and underlying_symbol")
+            raise ValueError(
+                "option quote requires option_symbol and underlying_symbol"
+            )
         return cls(
             snapshot_id=str(value.get("snapshot_id", value.get("quote_id", "quote"))),
             option_symbol=str(option_symbol),
             underlying_symbol=str(underlying),
-            contract_type=str(value.get("contract_type", value.get("option_type", "unknown"))),
-            expiration_date=str(value.get("expiration_date", value.get("expiration", "unknown"))),
+            contract_type=str(
+                value.get("contract_type", value.get("option_type", "unknown"))
+            ),
+            expiration_date=str(
+                value.get("expiration_date", value.get("expiration", "unknown"))
+            ),
             quote_time=as_utc(quote_time),
-            source_id=str(value.get("source_id", value.get("source", "caller_snapshot"))),
+            source_id=str(
+                value.get("source_id", value.get("source", "caller_snapshot"))
+            ),
             bid=value.get("bid"),
             ask=value.get("ask"),
             last=value.get("last", value.get("mark")),
@@ -228,9 +244,9 @@ class OptionQuoteSnapshot:
             return False
         if self.ask is not None and self.ask < 0:
             return False
-        if self.bid is not None and self.ask is not None and self.ask < self.bid:
-            return False
-        return True
+        return not (
+            self.bid is not None and self.ask is not None and self.ask < self.bid
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._hash_payload()

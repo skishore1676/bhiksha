@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Any, Mapping, Sequence
+from datetime import datetime
+from typing import Any
 
 from mala_bhiksha_kernel import (
     ChartScenarioSpec,
     ExitProfile,
     ManagementPolicySpec,
     ShadowEventType,
+    canonical_sha256,
 )
 
 from .exits import ExitObservation, evaluate_exit_profile
 from .models import CompletedBar, OptionQuoteSnapshot, as_utc, timestamp_json
+from .policies import CostModel, QuoteEligibilityPolicy
 from .quotes import ReadOnlyOptionSnapshotSource, ensure_read_only_quote_source
 from .repository import EventWrite, ScenarioEventRepository, TerminalScenarioError
-from .triggers import TriggerEvaluation, evaluate_condition, normalize_bars
+from .triggers import evaluate_condition, normalize_bars
 from .validation import TRIGGER_VERSION
 
 
@@ -57,6 +60,9 @@ class BrokerInertScenarioObserver:
         *,
         quote_source: ReadOnlyOptionSnapshotSource | None = None,
         exit_policy_registry: Mapping[ExitProfile | str, ManagementPolicySpec],
+        cost_model: CostModel,
+        quote_eligibility_policy: QuoteEligibilityPolicy,
+        plan_hash: str,
         trigger_version: str = TRIGGER_VERSION,
     ) -> None:
         if trigger_version != TRIGGER_VERSION:
@@ -64,9 +70,25 @@ class BrokerInertScenarioObserver:
         self.repository = repository
         self.quote_source = ensure_read_only_quote_source(quote_source)
         self.exit_policy_registry = {
-            profile if isinstance(profile, ExitProfile) else ExitProfile(profile): policy
+            profile
+            if isinstance(profile, ExitProfile)
+            else ExitProfile(profile): policy
             for profile, policy in exit_policy_registry.items()
         }
+        normalized_plan_hash = str(plan_hash).removeprefix("sha256:")
+        if len(normalized_plan_hash) != 64:
+            raise ValueError("plan_hash must be a sha256 identity")
+        self.plan_hash = normalized_plan_hash
+        self.policy_registry_hash = canonical_sha256(
+            {
+                profile.value: policy.model_dump(mode="json")
+                for profile, policy in sorted(
+                    self.exit_policy_registry.items(), key=lambda item: item[0].value
+                )
+            }
+        )
+        self.cost_model = cost_model
+        self.quote_eligibility_policy = quote_eligibility_policy
         self.trigger_version = trigger_version
 
     def observe_one(
@@ -88,20 +110,50 @@ class BrokerInertScenarioObserver:
         """
 
         normalized_bars = normalize_bars(bars)
-        single_quote = self._coerce_quote(option_quote) if option_quote is not None else None
+        single_quote = (
+            self._coerce_quote(option_quote) if option_quote is not None else None
+        )
         normalized_path = [self._coerce_quote(quote) for quote in quote_path]
         timestamps = [bar.timestamp for bar in normalized_bars]
         timestamps.extend(quote.quote_time for quote in normalized_path)
         if single_quote is not None:
             timestamps.append(single_quote.quote_time)
-        now = as_utc(evaluated_at) if evaluated_at is not None else (
-            max(timestamps) if timestamps else scenario.observation_window.start_at
+        now = (
+            as_utc(evaluated_at)
+            if evaluated_at is not None
+            else (
+                max(timestamps) if timestamps else scenario.observation_window.start_at
+            )
         )
-        observation_id = market_observation_id or "obs-" + timestamp_json(now)
+        if not market_observation_id or not market_observation_id.strip():
+            raise ValueError(
+                "market_observation_id is required for cross-arm fact binding"
+            )
+        observation_id = market_observation_id
+        facts_payload = {
+            "bars": [bar.to_dict() for bar in normalized_bars],
+            "option_quote": single_quote.to_dict()
+            if single_quote is not None
+            else None,
+            "quote_path": [quote.to_dict() for quote in normalized_path],
+            "evaluated_at": timestamp_json(now),
+        }
+        self.market_facts_hash = canonical_sha256(facts_payload)
         new_events: list[Any] = []
 
         try:
-            is_new = self.repository.register_scenario(scenario, self.trigger_version)
+            self._validate_scenario_policies(scenario)
+            self.repository.bind_market_facts(
+                scenario,
+                market_observation_id=observation_id,
+                facts_hash=self.market_facts_hash,
+            )
+            is_new = self.repository.register_scenario(
+                scenario,
+                self.trigger_version,
+                plan_hash=self.plan_hash,
+                policy_registry_hash=self.policy_registry_hash,
+            )
             if is_new:
                 self._record(
                     new_events,
@@ -139,18 +191,33 @@ class BrokerInertScenarioObserver:
                         {
                             "status": "watching",
                             "observation_window": {
-                                "start_at": timestamp_json(scenario.observation_window.start_at),
-                                "end_at": timestamp_json(scenario.observation_window.end_at),
+                                "start_at": timestamp_json(
+                                    scenario.observation_window.start_at
+                                ),
+                                "end_at": timestamp_json(
+                                    scenario.observation_window.end_at
+                                ),
                             },
                         },
                     ),
                     state_updates={"status": "watching", "watching": True},
                 )
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
 
             if now > scenario.observation_window.end_at:
-                self._expire_if_open(new_events, scenario, state, now, observation_id, reason="window_expired")
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                self._expire_if_open(
+                    new_events,
+                    scenario,
+                    state,
+                    now,
+                    observation_id,
+                    reason="window_expired",
+                )
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
                 return self._result(scenario, state, new_events)
 
             invalidation = evaluate_condition(
@@ -171,7 +238,9 @@ class BrokerInertScenarioObserver:
                     details={"condition": invalidation.to_dict()},
                     status="invalidated",
                 )
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
                 return self._result(scenario, state, new_events)
 
             triggered = bool(state.get("triggered"))
@@ -193,10 +262,23 @@ class BrokerInertScenarioObserver:
                         details=self._details(scenario, {"condition": entry.to_dict()}),
                         state_updates={"status": "watching"},
                     )
-                    state = self.repository.get_state(scenario, self.trigger_version) or state
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
                     if now >= scenario.observation_window.end_at:
-                        self._expire_if_open(new_events, scenario, state, now, observation_id, reason="entry_not_triggered")
-                        state = self.repository.get_state(scenario, self.trigger_version) or state
+                        self._expire_if_open(
+                            new_events,
+                            scenario,
+                            state,
+                            now,
+                            observation_id,
+                            reason="entry_not_triggered",
+                        )
+                        state = (
+                            self.repository.get_state(scenario, self.trigger_version)
+                            or state
+                        )
                     return self._result(scenario, state, new_events)
                 self._record(
                     new_events,
@@ -208,7 +290,9 @@ class BrokerInertScenarioObserver:
                     details=self._details(scenario, {"condition": entry.to_dict()}),
                     state_updates={"status": "triggered", "triggered": True},
                 )
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
 
             if not state.get("validated"):
                 validation = evaluate_condition(
@@ -218,10 +302,23 @@ class BrokerInertScenarioObserver:
                     evaluated_at=now,
                 )
                 if not validation.triggered:
-                    state = self.repository.get_state(scenario, self.trigger_version) or state
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
                     if now >= scenario.observation_window.end_at:
-                        self._expire_if_open(new_events, scenario, state, now, observation_id, reason="validation_not_passed")
-                        state = self.repository.get_state(scenario, self.trigger_version) or state
+                        self._expire_if_open(
+                            new_events,
+                            scenario,
+                            state,
+                            now,
+                            observation_id,
+                            reason="validation_not_passed",
+                        )
+                        state = (
+                            self.repository.get_state(scenario, self.trigger_version)
+                            or state
+                        )
                     return self._result(scenario, state, new_events)
                 self._record(
                     new_events,
@@ -230,17 +327,25 @@ class BrokerInertScenarioObserver:
                     event_time=now,
                     market_observation_id=observation_id,
                     role="validation-passed",
-                    details=self._details(scenario, {"condition": validation.to_dict()}),
+                    details=self._details(
+                        scenario, {"condition": validation.to_dict()}
+                    ),
                     state_updates={"status": "validated", "validated": True},
                 )
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
 
             entry_quote = self._entry_quote_from_state(state)
             entry_created = entry_quote is None
             if entry_quote is None:
-                entry_quote = single_quote or (normalized_path[0] if normalized_path else None)
+                entry_quote = single_quote or (
+                    normalized_path[0] if normalized_path else None
+                )
                 entry_quote = entry_quote or self._quote_from_source(scenario, now)
-                if entry_quote is None or not self._quote_matches_scenario(entry_quote, scenario, now=now):
+                if entry_quote is None or not self._quote_matches_scenario(
+                    entry_quote, scenario, now=now
+                ):
                     self._record(
                         new_events,
                         scenario,
@@ -252,14 +357,32 @@ class BrokerInertScenarioObserver:
                             scenario,
                             {"reason": "quote_unavailable_or_contract_mismatch"},
                         ),
-                        state_updates={"status": "validated", "quote_status": "unavailable"},
+                        state_updates={
+                            "status": "validated",
+                            "quote_status": "unavailable",
+                        },
                     )
-                    state = self.repository.get_state(scenario, self.trigger_version) or state
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
                     if now >= scenario.observation_window.end_at:
-                        self._expire_if_open(new_events, scenario, state, now, observation_id, reason="quote_unavailable_at_expiry")
-                        state = self.repository.get_state(scenario, self.trigger_version) or state
+                        self._expire_if_open(
+                            new_events,
+                            scenario,
+                            state,
+                            now,
+                            observation_id,
+                            reason="quote_unavailable_at_expiry",
+                        )
+                        state = (
+                            self.repository.get_state(scenario, self.trigger_version)
+                            or state
+                        )
                     return self._result(scenario, state, new_events)
-                if not entry_quote.eligible:
+                if not self.quote_eligibility_policy.eligible(
+                    entry_quote, evaluated_at=entry_quote.quote_time
+                ):
                     self._record(
                         new_events,
                         scenario,
@@ -267,10 +390,22 @@ class BrokerInertScenarioObserver:
                         event_time=now,
                         market_observation_id=observation_id,
                         role="quote-unavailable:" + observation_id,
-                        details=self._details(scenario, {"reason": "quote_not_eligible", "quote": entry_quote.quote_provenance()}),
-                        state_updates={"status": "validated", "quote_status": "ineligible"},
+                        details=self._details(
+                            scenario,
+                            {
+                                "reason": "quote_not_eligible",
+                                "quote": entry_quote.quote_provenance(),
+                            },
+                        ),
+                        state_updates={
+                            "status": "validated",
+                            "quote_status": "ineligible",
+                        },
                     )
-                    state = self.repository.get_state(scenario, self.trigger_version) or state
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
                     return self._result(scenario, state, new_events)
                 self._record(
                     new_events,
@@ -279,8 +414,17 @@ class BrokerInertScenarioObserver:
                     event_time=now,
                     market_observation_id=observation_id,
                     role="option-selected",
-                    details=self._details(scenario, {"quote": entry_quote.quote_provenance(), "selected_contract": entry_quote.option_symbol}),
-                    state_updates={"status": "option_selected", "selected_option_symbol": entry_quote.option_symbol},
+                    details=self._details(
+                        scenario,
+                        {
+                            "quote": entry_quote.quote_provenance(),
+                            "selected_contract": entry_quote.option_symbol,
+                        },
+                    ),
+                    state_updates={
+                        "status": "option_selected",
+                        "selected_option_symbol": entry_quote.option_symbol,
+                    },
                 )
                 self._record(
                     new_events,
@@ -308,18 +452,25 @@ class BrokerInertScenarioObserver:
                         "synthetic_entry": True,
                     },
                 )
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
 
             exit_quotes = list(normalized_path)
             if entry_created and exit_quotes:
                 entry_ids = {entry_quote.snapshot_id}
-                exit_quotes = [quote for quote in exit_quotes if quote.snapshot_id not in entry_ids]
+                exit_quotes = [
+                    quote for quote in exit_quotes if quote.snapshot_id not in entry_ids
+                ]
             if not exit_quotes and not entry_created and single_quote is not None:
                 exit_quotes = [single_quote]
             for quote in exit_quotes:
                 if quote.quote_time < entry_quote.quote_time:
                     continue
-                if quote.snapshot_id == entry_quote.snapshot_id and quote.quote_time == entry_quote.quote_time:
+                if (
+                    quote.snapshot_id == entry_quote.snapshot_id
+                    and quote.quote_time == entry_quote.quote_time
+                ):
                     continue
                 if quote.option_symbol != entry_quote.option_symbol:
                     self._record(
@@ -328,16 +479,32 @@ class BrokerInertScenarioObserver:
                         ShadowEventType.QUOTE_UNAVAILABLE,
                         event_time=quote.quote_time,
                         market_observation_id=observation_id,
-                        role="quote-unavailable:" + observation_id + ":" + quote.snapshot_id,
-                        details=self._details(scenario, {"reason": "selected_contract_changed", "quote": quote.quote_provenance()}),
-                        state_updates={"status": "synthetic_entry", "quote_status": "contract_mismatch"},
+                        role="quote-unavailable:"
+                        + observation_id
+                        + ":"
+                        + quote.snapshot_id,
+                        details=self._details(
+                            scenario,
+                            {
+                                "reason": "selected_contract_changed",
+                                "quote": quote.quote_provenance(),
+                            },
+                        ),
+                        state_updates={
+                            "status": "synthetic_entry",
+                            "quote_status": "contract_mismatch",
+                        },
                     )
                     continue
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
                 profile_states = dict(state.get("profile_states") or {})
                 observations: list[tuple[ExitProfile, ExitObservation]] = []
                 for profile in scenario.compatible_exit_profiles:
                     prior = profile_states.get(profile.value) or {}
+                    if prior.get("terminal"):
+                        continue
                     result = evaluate_exit_profile(
                         profile,
                         entry_quote,
@@ -345,9 +512,18 @@ class BrokerInertScenarioObserver:
                         entry_time=entry_quote.quote_time,
                         evaluated_at=quote.quote_time,
                         management_policy=self.exit_policy_registry[profile],
+                        cost_model=self.cost_model,
+                        quote_eligibility_policy=self.quote_eligibility_policy,
                         prior_state=prior,
                     )
-                    profile_states[profile.value] = result.state
+                    next_profile_state = dict(result.state)
+                    if result.is_terminal:
+                        next_profile_state["terminal"] = True
+                        next_profile_state["terminal_rule"] = result.rule
+                        next_profile_state["terminal_at"] = timestamp_json(
+                            quote.quote_time
+                        )
+                    profile_states[profile.value] = next_profile_state
                     observations.append((profile, result))
                 for profile, result in observations:
                     primary = profile is scenario.exit_profile
@@ -365,18 +541,29 @@ class BrokerInertScenarioObserver:
                                 "primary": primary,
                                 "counterfactual": not primary,
                                 "mark_not_fill": True,
-                                "evaluated_exit_policy_id": result.state["exit_policy_id"],
+                                "evaluated_exit_policy_id": result.state[
+                                    "exit_policy_id"
+                                ],
                                 "evaluated_exit_policy_schema_version": result.state[
                                     "exit_policy_schema_version"
                                 ],
-                                "evaluated_exit_policy_hash": result.state["exit_policy_hash"],
+                                "evaluated_exit_policy_hash": result.state[
+                                    "exit_policy_hash"
+                                ],
                                 "quote": quote.quote_provenance(),
                                 "observation": result.to_dict(),
                             },
                         ),
-                        state_updates={"status": "exit_observing", "profile_states": profile_states},
+                        state_updates={
+                            "status": "exit_observing",
+                            "profile_states": profile_states,
+                        },
                     )
-                primary_result = next(result for profile, result in observations if profile is scenario.exit_profile)
+                primary_result = next(
+                    result
+                    for profile, result in observations
+                    if profile is scenario.exit_profile
+                )
                 if primary_result.is_terminal:
                     self._record_terminal(
                         new_events,
@@ -392,7 +579,8 @@ class BrokerInertScenarioObserver:
                             "counterfactual": False,
                             "mark_not_fill": True,
                             "synthetic_exit_mark": primary_result.mark,
-                            "primary_net_r": primary_result.r,
+                            "primary_gross_r": primary_result.gross_r,
+                            "primary_net_r": primary_result.net_r,
                             "rule": primary_result.rule,
                             "quote": quote.quote_provenance(),
                         },
@@ -400,20 +588,35 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "terminal_profile": scenario.exit_profile.value,
                             "terminal_quote_hash": quote.snapshot_hash,
-                            "primary_net_r": primary_result.r,
+                            "primary_gross_r": primary_result.gross_r,
+                            "primary_net_r": primary_result.net_r,
                             "terminal_reason": primary_result.reason,
                             "profile_states": profile_states,
                         },
                     )
-                    state = self.repository.get_state(scenario, self.trigger_version) or state
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
                     break
             else:
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
 
             state = self.repository.get_state(scenario, self.trigger_version) or state
             if now >= scenario.observation_window.end_at and not state["terminal"]:
-                self._expire_if_open(new_events, scenario, state, now, observation_id, reason="primary_profile_not_terminal")
-                state = self.repository.get_state(scenario, self.trigger_version) or state
+                self._expire_if_open(
+                    new_events,
+                    scenario,
+                    state,
+                    now,
+                    observation_id,
+                    reason="primary_profile_not_terminal",
+                )
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
             return self._result(scenario, state, new_events)
         except TerminalScenarioError:
             state = self.repository.get_state(scenario, self.trigger_version) or {
@@ -421,7 +624,7 @@ class BrokerInertScenarioObserver:
                 "terminal": True,
             }
             return self._result(scenario, state, new_events)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - fail closed and persist a terminal receipt
             state = self.repository.get_state(scenario, self.trigger_version)
             if state is not None and not state["terminal"]:
                 try:
@@ -436,8 +639,11 @@ class BrokerInertScenarioObserver:
                         details={"error_type": type(exc).__name__, "error": str(exc)},
                         status="runtime_error",
                     )
-                    state = self.repository.get_state(scenario, self.trigger_version) or state
-                except Exception:
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
+                except Exception:  # noqa: BLE001,S110 - preserve the original observer failure
                     pass
             return ObservationResult(
                 scenario_id=scenario.scenario_id,
@@ -500,7 +706,9 @@ class BrokerInertScenarioObserver:
             event_time=event_time,
             market_observation_id=market_observation_id,
             role=role,
-            details=self._details(scenario, {"reason": reason, **details, "terminal": True}),
+            details=self._details(
+                scenario, {"reason": reason, **details, "terminal": True}
+            ),
             state_updates=updates,
             terminal=True,
         )
@@ -524,15 +732,27 @@ class BrokerInertScenarioObserver:
                 observation_id,
                 role="expired",
                 reason=reason,
-                details={"observation_window_end": timestamp_json(scenario.observation_window.end_at)},
+                details={
+                    "observation_window_end": timestamp_json(
+                        scenario.observation_window.end_at
+                    )
+                },
                 status="expired",
             )
 
     @staticmethod
-    def _coerce_quote(value: OptionQuoteSnapshot | Mapping[str, Any]) -> OptionQuoteSnapshot:
-        return value if isinstance(value, OptionQuoteSnapshot) else OptionQuoteSnapshot.from_mapping(value)
+    def _coerce_quote(
+        value: OptionQuoteSnapshot | Mapping[str, Any],
+    ) -> OptionQuoteSnapshot:
+        return (
+            value
+            if isinstance(value, OptionQuoteSnapshot)
+            else OptionQuoteSnapshot.from_mapping(value)
+        )
 
-    def _quote_from_source(self, scenario: ChartScenarioSpec, at: datetime) -> OptionQuoteSnapshot | None:
+    def _quote_from_source(
+        self, scenario: ChartScenarioSpec, at: datetime
+    ) -> OptionQuoteSnapshot | None:
         if self.quote_source is None:
             return None
         value = self.quote_source.get_snapshot(scenario=scenario, at=at)
@@ -551,9 +771,7 @@ class BrokerInertScenarioObserver:
             return False
         if quote.quote_time < scenario.observation_window.start_at:
             return False
-        if now is not None and quote.quote_time > now:
-            return False
-        return True
+        return not (now is not None and quote.quote_time > now)
 
     @staticmethod
     def _entry_quote_from_state(state: Mapping[str, Any]) -> OptionQuoteSnapshot | None:
@@ -562,11 +780,36 @@ class BrokerInertScenarioObserver:
             return None
         try:
             return OptionQuoteSnapshot.from_mapping(raw)
-        except Exception:
+        except Exception:  # noqa: BLE001 - malformed persisted state is treated as absent
             return None
 
-    @staticmethod
-    def _details(scenario: ChartScenarioSpec, details: Mapping[str, Any]) -> dict[str, Any]:
+    def _validate_scenario_policies(self, scenario: ChartScenarioSpec) -> None:
+        missing = set(scenario.compatible_exit_profiles) - set(
+            self.exit_policy_registry
+        )
+        if missing:
+            raise ValueError(
+                "observer exit policy registry is missing profiles: "
+                + ", ".join(sorted(profile.value for profile in missing))
+            )
+        selected = self.exit_policy_registry[scenario.exit_profile]
+        if scenario.management_policy is None:
+            raise ValueError("scenario selected management_policy is missing")
+        if (
+            selected.canonical_policy_json
+            != scenario.management_policy.canonical_policy_json
+        ):
+            raise ValueError(
+                "observer selected policy differs from scenario management_policy"
+            )
+        if selected.policy_hash != scenario.exit_policy_hash:
+            raise ValueError(
+                "observer selected policy hash differs from scenario exit_policy_hash"
+            )
+
+    def _details(
+        self, scenario: ChartScenarioSpec, details: Mapping[str, Any]
+    ) -> dict[str, Any]:
         payload = {
             "broker_effect_count": 0,
             "identity": {
@@ -585,12 +828,19 @@ class BrokerInertScenarioObserver:
                 "thesis_class": scenario.thesis_class.value,
             },
             "trigger_version": TRIGGER_VERSION,
+            "plan_hash": self.plan_hash,
+            "policy_registry_hash": self.policy_registry_hash,
+            "cost_model_hash": self.cost_model.content_hash,
+            "quote_eligibility_policy_hash": self.quote_eligibility_policy.content_hash,
+            "market_facts_hash": self.market_facts_hash,
             "scenario_hash": scenario.scenario_hash,
             "component_manifest_hash": scenario.component_manifest_hash,
             "candidate_pool_hash": scenario.candidate_pool_hash,
             "selection_packet_hash": scenario.selection_packet_hash,
             "candidate_hash": scenario.candidate_hash,
-            "chart_evidence_hashes": [item.evidence_hash for item in scenario.chart_evidence_refs],
+            "chart_evidence_hashes": [
+                item.evidence_hash for item in scenario.chart_evidence_refs
+            ],
             "exit_policy_hash": scenario.exit_policy_hash,
             "component_hashes": {
                 "component_manifest": scenario.component_manifest_hash,
@@ -598,7 +848,9 @@ class BrokerInertScenarioObserver:
                 "selection_packet": scenario.selection_packet_hash,
                 "scenario": scenario.scenario_hash,
                 "exit_policy": scenario.exit_policy_hash,
-                "chart_evidence": [item.evidence_hash for item in scenario.chart_evidence_refs],
+                "chart_evidence": [
+                    item.evidence_hash for item in scenario.chart_evidence_refs
+                ],
             },
             "authorization_mode": scenario.authorization_mode.value,
             "source_type": scenario.source_type.value,

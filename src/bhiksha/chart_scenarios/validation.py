@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
-from typing import Any, Literal, Mapping
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
 
 from mala_bhiksha_kernel import (
     ArmSelection,
@@ -25,9 +24,15 @@ from mala_bhiksha_kernel import (
     canonical_sha256,
     validate_shadow_only,
 )
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .paths import require_experiment_path
+from .policies import CostModel, QuoteEligibilityPolicy
 
 DEFAULT_SHADOW_PLAN_PATH = Path("artifacts/chart_scenarios/active_shadow_plan.json")
-DEFAULT_SHADOW_RECEIPT_PATH = Path("artifacts/chart_scenarios/active_shadow_plan.receipt.json")
+DEFAULT_SHADOW_RECEIPT_PATH = Path(
+    "artifacts/chart_scenarios/active_shadow_plan.receipt.json"
+)
 DEFAULT_SHADOW_DB_PATH = Path("artifacts/chart_scenarios/shadow_events.sqlite3")
 SHADOW_PLAN_SCHEMA_VERSION = "bhiksha.chart-scenario-shadow-plan.v1"
 INSTALL_RECEIPT_SCHEMA_VERSION = "bhiksha.chart-scenario-install-receipt.v1"
@@ -90,6 +95,8 @@ class ShadowPlan(BaseModel):
     candidate_pool: ScenarioCandidatePool
     arm_selections: list[ArmSelection] = Field(min_length=1)
     exit_policy_registry: dict[ExitProfile, ManagementPolicySpec] = Field(min_length=1)
+    cost_model: CostModel
+    quote_eligibility_policy: QuoteEligibilityPolicy
     scenarios: list[ChartScenarioSpec] = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -110,11 +117,15 @@ class ShadowPlan(BaseModel):
             "candidate_pool",
             "arm_selections",
             "exit_policy_registry",
+            "cost_model",
+            "quote_eligibility_policy",
             "scenarios",
         )
         missing = [key for key in required if key not in payload]
         if missing:
-            raise BundleValidationError("bundle is missing required fields: " + ", ".join(missing))
+            raise BundleValidationError(
+                "bundle is missing required fields: " + ", ".join(missing)
+            )
         _require_declared_hash(
             payload["component_manifest"],
             ("content_hash", "manifest_hash", "component_manifest_hash"),
@@ -145,6 +156,39 @@ class ShadowPlan(BaseModel):
                 ("content_hash", "selection_hash", "arm_selection_hash"),
                 f"arm_selections[{index}]",
             )
+        registry = payload["exit_policy_registry"]
+        if not isinstance(registry, Mapping):
+            raise BundleValidationError("exit_policy_registry must be an object")
+        for profile, policy in registry.items():
+            expected_policy_fields = set(ManagementPolicySpec.model_fields) - {
+                "protective_floor_mode"
+            }
+            if (
+                isinstance(policy, Mapping)
+                and policy.get("policy_schema_version") == "exit-policy.v2"
+            ):
+                expected_policy_fields.add("protective_floor_mode")
+            if not isinstance(policy, Mapping) or set(policy) != expected_policy_fields:
+                missing = (
+                    expected_policy_fields - set(policy)
+                    if isinstance(policy, Mapping)
+                    else expected_policy_fields
+                )
+                extra = (
+                    set(policy) - expected_policy_fields
+                    if isinstance(policy, Mapping)
+                    else set()
+                )
+                raise BundleValidationError(
+                    f"exit_policy_registry[{profile}] must explicitly declare every policy field; "
+                    f"missing={sorted(missing)}, extra={sorted(extra)}"
+                )
+        _require_declared_hash(payload["cost_model"], ("content_hash",), "cost_model")
+        _require_declared_hash(
+            payload["quote_eligibility_policy"],
+            ("content_hash",),
+            "quote_eligibility_policy",
+        )
         for index, item in enumerate(payload["scenarios"]):
             _require_declared_hash(
                 item,
@@ -154,7 +198,7 @@ class ShadowPlan(BaseModel):
         return payload
 
     @model_validator(mode="after")
-    def validate_plan(self) -> "ShadowPlan":
+    def validate_plan(self) -> ShadowPlan:
         validate_shadow_only(
             type(
                 "PlanAuthorization",
@@ -166,7 +210,9 @@ class ShadowPlan(BaseModel):
             )()
         )
         if self.component_manifest_hash != self.component_manifest.manifest_hash:
-            raise BundleValidationError("component_manifest_hash does not match component_manifest")
+            raise BundleValidationError(
+                "component_manifest_hash does not match component_manifest"
+            )
 
         evidence_by_id = {item.evidence_id: item for item in self.chart_evidence}
         if len(evidence_by_id) != len(self.chart_evidence):
@@ -184,7 +230,10 @@ class ShadowPlan(BaseModel):
         )
         for reference in self.candidate_pool.chart_evidence_refs:
             evidence = evidence_by_id.get(reference.evidence_id)
-            if evidence is None or evidence.chart_evidence_hash != reference.evidence_hash:
+            if (
+                evidence is None
+                or evidence.chart_evidence_hash != reference.evidence_hash
+            ):
                 raise BundleValidationError(
                     f"candidate pool evidence hash mismatch for {reference.evidence_id}"
                 )
@@ -196,9 +245,13 @@ class ShadowPlan(BaseModel):
                 packet.campaign_id,
                 packet.run_id,
             ) != run_identity:
-                raise BundleValidationError("chart evidence identity does not match candidate pool")
+                raise BundleValidationError(
+                    "chart evidence identity does not match candidate pool"
+                )
             if packet.as_of > self.candidate_pool.as_of:
-                raise BundleValidationError("chart evidence as_of is later than candidate pool as_of")
+                raise BundleValidationError(
+                    "chart evidence as_of is later than candidate pool as_of"
+                )
 
         selections_by_arm: dict[str, ArmSelection] = {}
         for selection in self.arm_selections:
@@ -210,12 +263,20 @@ class ShadowPlan(BaseModel):
                 selection.campaign_id,
                 selection.run_id,
             ) != run_identity:
-                raise BundleValidationError("arm selection identity does not match candidate pool")
+                raise BundleValidationError(
+                    "arm selection identity does not match candidate pool"
+                )
             arm_key = selection.arm_id.value
             if arm_key in selections_by_arm:
                 raise BundleValidationError(f"duplicate arm selection for {arm_key}")
             selection.validate_against_pool(self.candidate_pool)
             selections_by_arm[arm_key] = selection
+        expected_arms = {"chart_deterministic", "chart_agentic_rerank"}
+        if set(selections_by_arm) != expected_arms:
+            raise BundleValidationError(
+                "shadow plan requires both experiment arms; missing="
+                + ", ".join(sorted(expected_arms - set(selections_by_arm)))
+            )
 
         scenario_keys: set[tuple[str, str, str, str, str]] = set()
         required_profiles = {
@@ -236,6 +297,25 @@ class ShadowPlan(BaseModel):
                 raise BundleValidationError(
                     f"exit_policy_registry[{profile.value}] is not canonically resolved: {exc}"
                 ) from exc
+            if policy.risk_envelope_enabled or policy.protective_floor_mode is not None:
+                raise BundleValidationError(
+                    f"exit_policy_registry[{profile.value}] uses unsupported risk-envelope semantics"
+                )
+            if (
+                policy.initial_stop_pct is not None
+                and policy.premium_disaster_stop_pct is not None
+                and policy.premium_disaster_stop_pct < policy.initial_stop_pct
+            ):
+                raise BundleValidationError(
+                    f"exit_policy_registry[{profile.value}] disaster stop is tighter than initial stop"
+                )
+            if policy.no_progress_seconds is not None:
+                floor = policy.parameters.get("no_progress_favorable_floor_r")
+                if isinstance(floor, bool) or not isinstance(floor, (int, float)):
+                    raise BundleValidationError(
+                        f"exit_policy_registry[{profile.value}] requires explicit "
+                        "parameters.no_progress_favorable_floor_r"
+                    )
         for scenario in self.scenarios:
             self._check_identity(scenario, "scenario")
             if (
@@ -245,12 +325,27 @@ class ShadowPlan(BaseModel):
                 scenario.campaign_id,
                 scenario.run_id,
             ) != run_identity:
-                raise BundleValidationError("scenario identity does not match candidate pool")
+                raise BundleValidationError(
+                    "scenario identity does not match candidate pool"
+                )
             if scenario.observation_window.start_at < self.candidate_pool.as_of:
-                raise BundleValidationError("scenario observation window starts before candidate pool as_of")
+                raise BundleValidationError(
+                    "scenario observation window starts before candidate pool as_of"
+                )
             if scenario.component_manifest_hash != self.component_manifest_hash:
                 raise BundleValidationError(
                     f"scenario {scenario.scenario_id} has a different component manifest hash"
+                )
+            if scenario.cost_model_hash != self.cost_model.content_hash:
+                raise BundleValidationError(
+                    f"scenario {scenario.scenario_id} cost model hash mismatch"
+                )
+            if (
+                scenario.quote_eligibility_policy_hash
+                != self.quote_eligibility_policy.content_hash
+            ):
+                raise BundleValidationError(
+                    f"scenario {scenario.scenario_id} quote policy hash mismatch"
                 )
             selection = selections_by_arm.get(scenario.arm_id.value)
             if selection is None:
@@ -270,7 +365,10 @@ class ShadowPlan(BaseModel):
                 raise BundleValidationError(
                     f"scenario {scenario.scenario_id} is missing selected management_policy"
                 )
-            if scenario.management_policy.canonical_policy_json != selected_policy.canonical_policy_json:
+            if (
+                scenario.management_policy.canonical_policy_json
+                != selected_policy.canonical_policy_json
+            ):
                 raise BundleValidationError(
                     f"scenario {scenario.scenario_id} selected policy differs from exit_policy_registry"
                 )
@@ -295,7 +393,10 @@ class ShadowPlan(BaseModel):
             scenario_keys.add(key)
             for reference in scenario.chart_evidence_refs:
                 evidence = evidence_by_id.get(reference.evidence_id)
-                if evidence is None or evidence.chart_evidence_hash != reference.evidence_hash:
+                if (
+                    evidence is None
+                    or evidence.chart_evidence_hash != reference.evidence_hash
+                ):
                     raise BundleValidationError(
                         f"scenario {scenario.scenario_id} evidence hash mismatch for {reference.evidence_id}"
                     )
@@ -347,11 +448,19 @@ def load_bundle(path: str | Path) -> ShadowPlan:
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except Exception as exc:
-        raise BundleValidationError(f"cannot read chart-scenario bundle: {exc}") from exc
+        raise BundleValidationError(
+            f"cannot read chart-scenario bundle: {exc}"
+        ) from exc
     return validate_bundle(payload)
 
 
 def _guard_experiment_path(path: Path, *, role: str) -> None:
+    if role in {"output", "receipt", "database"}:
+        try:
+            require_experiment_path(path, role=role)
+        except ValueError as exc:
+            raise BundleValidationError(str(exc)) from exc
+        return
     resolved = path.expanduser().resolve()
     if resolved.name == "active_plan.json" or "playbook" in resolved.parts:
         raise BundleValidationError(
@@ -365,7 +474,9 @@ def _default_receipt_path(output: Path) -> Path:
 
 def _write_atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
     temporary_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -394,9 +505,16 @@ def _write_atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
                 pass
 
 
-def _input_bytes(source: str | Path | Mapping[str, Any]) -> tuple[bytes, Mapping[str, Any]]:
+def _input_bytes(
+    source: str | Path | Mapping[str, Any],
+) -> tuple[bytes, Mapping[str, Any]]:
     if isinstance(source, Mapping):
-        encoded = (json.dumps(source, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+        encoded = (
+            json.dumps(
+                source, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            + "\n"
+        ).encode("utf-8")
         return encoded, source
     source_path = Path(source)
     _guard_experiment_path(source_path, role="input")
@@ -434,7 +552,13 @@ def install_shadow_plan(
     """Validate then atomically replace the experiment-only shadow plan."""
 
     output = Path(output_path)
-    receipt = Path(receipt_path) if receipt_path is not None else _default_receipt_path(output)
+    receipt = (
+        Path(receipt_path)
+        if receipt_path is not None
+        else _default_receipt_path(output)
+    )
+    _guard_experiment_path(output, role="output")
+    _guard_experiment_path(receipt, role="receipt")
     _guard_experiment_path(output, role="write")
     _guard_experiment_path(receipt, role="write")
     input_digest: str | None = None
@@ -472,7 +596,9 @@ def install_shadow_plan(
                     "candidate_pool_hash": scenario.candidate_pool_hash,
                     "selection_packet_hash": scenario.selection_packet_hash,
                     "component_manifest_hash": scenario.component_manifest_hash,
-                    "chart_evidence_hashes": [item.evidence_hash for item in scenario.chart_evidence_refs],
+                    "chart_evidence_hashes": [
+                        item.evidence_hash for item in scenario.chart_evidence_refs
+                    ],
                     "exit_policy_hash": scenario.exit_policy_hash,
                 }
                 for scenario in plan.scenarios
@@ -492,7 +618,7 @@ def install_shadow_plan(
         )
         try:
             _write_atomic_json(receipt, failure)
-        except Exception:
+        except Exception:  # noqa: BLE001,S110 - preserve the original install failure
             # The original validation/write error is the useful failure.  The
             # caller still sees it if filesystem metadata is read-only.
             pass
@@ -528,13 +654,13 @@ __all__ = [
     "DEFAULT_SHADOW_DB_PATH",
     "DEFAULT_SHADOW_PLAN_PATH",
     "DEFAULT_SHADOW_RECEIPT_PATH",
+    "SHADOW_PLAN_SCHEMA_VERSION",
+    "TRIGGER_VERSION",
     "AtomicShadowPlanInstaller",
     "BundleValidationError",
     "ChartScenarioBundleValidator",
     "InstallError",
     "ShadowPlan",
-    "TRIGGER_VERSION",
-    "SHADOW_PLAN_SCHEMA_VERSION",
     "install_shadow_plan",
     "load_bundle",
     "read_installed_plan",

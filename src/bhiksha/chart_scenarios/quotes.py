@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .models import OptionQuoteSnapshot, as_utc
 
@@ -13,7 +14,9 @@ from .models import OptionQuoteSnapshot, as_utc
 class ReadOnlyOptionSnapshotSource(Protocol):
     """The only quote capability the observer consumes."""
 
-    def get_snapshot(self, *, scenario: Any, at: datetime) -> OptionQuoteSnapshot | None:
+    def get_snapshot(
+        self, *, scenario: Any, at: datetime
+    ) -> OptionQuoteSnapshot | None:
         """Return a persisted/read-only snapshot, or ``None`` if unavailable."""
 
 
@@ -32,11 +35,11 @@ _ORDER_METHODS = frozenset(
 
 
 def ensure_read_only_quote_source(source: Any) -> ReadOnlyOptionSnapshotSource:
-    """Reject a caller object that exposes an order-shaped capability.
+    """Accept only the package's sealed, data-only snapshot containers.
 
-    A structural ``Protocol`` cannot stop a broad adapter object from carrying
-    extra methods.  This small runtime guard makes the boundary auditable while
-    retaining a convenient adapter seam for persisted fixtures.
+    An arbitrary callback can hide effects inside ``get_snapshot`` even when it
+    exposes no order-named method.  Exact-type acceptance keeps executable
+    adapters outside the observer process.
     """
 
     if source is None:
@@ -46,6 +49,11 @@ def ensure_read_only_quote_source(source: Any) -> ReadOnlyOptionSnapshotSource:
         raise TypeError(
             "option snapshot source exposes prohibited order capability: "
             + ", ".join(sorted(exposed))
+        )
+    if type(source) not in {StaticOptionSnapshotSource, PersistedOptionSnapshotSource}:
+        raise TypeError(
+            "option snapshot source must be a sealed data-only StaticOptionSnapshotSource "
+            "or PersistedOptionSnapshotSource"
         )
     getter = getattr(source, "get_snapshot", None)
     if not callable(getter):
@@ -68,22 +76,31 @@ class StaticOptionSnapshotSource:
             iterable = snapshots
         for value in iterable:
             values.append(
-                value if isinstance(value, OptionQuoteSnapshot) else OptionQuoteSnapshot.from_mapping(value)
+                value
+                if isinstance(value, OptionQuoteSnapshot)
+                else OptionQuoteSnapshot.from_mapping(value)
             )
         self._snapshots = tuple(values)
 
-    def get_snapshot(self, *, scenario: Any, at: datetime) -> OptionQuoteSnapshot | None:
+    def get_snapshot(
+        self, *, scenario: Any, at: datetime
+    ) -> OptionQuoteSnapshot | None:
         scenario_id = str(getattr(scenario, "scenario_id", ""))
         symbol = str(getattr(scenario, "symbol", ""))
         candidates = [
             quote
             for quote in self._snapshots
             if quote.quote_time <= as_utc(at)
-            and (quote.scenario_id == scenario_id or (quote.scenario_id is None and quote.underlying_symbol == symbol))
+            and (
+                quote.scenario_id == scenario_id
+                or (quote.scenario_id is None and quote.underlying_symbol == symbol)
+            )
         ]
         if not candidates:
             return None
-        candidates.sort(key=lambda quote: (quote.is_selected, quote.quote_time, quote.snapshot_id))
+        candidates.sort(
+            key=lambda quote: (quote.is_selected, quote.quote_time, quote.snapshot_id)
+        )
         return candidates[-1]
 
 
@@ -91,16 +108,18 @@ class PersistedOptionSnapshotSource(StaticOptionSnapshotSource):
     """Read snapshots from an immutable JSON export without network access."""
 
     @classmethod
-    def from_json(cls, path: str | Path) -> "PersistedOptionSnapshotSource":
+    def from_json(cls, path: str | Path) -> PersistedOptionSnapshotSource:
         import json
 
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if isinstance(payload, Mapping):
-            raw = payload.get("snapshots", payload.get("quotes", payload.get("option_snapshots")))
+            raw = payload.get(
+                "snapshots", payload.get("quotes", payload.get("option_snapshots"))
+            )
         else:
             raw = payload
         if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
-            raise ValueError("quote snapshot file must contain a snapshots array")
+            raise TypeError("quote snapshot file must contain a snapshots array")
         return cls(raw)
 
 
@@ -108,11 +127,13 @@ def quote_source_from_payload(payload: Any) -> PersistedOptionSnapshotSource:
     """Build the same read-only adapter from a fixture object."""
 
     if isinstance(payload, Mapping):
-        raw = payload.get("snapshots", payload.get("quotes", payload.get("option_snapshots")))
+        raw = payload.get(
+            "snapshots", payload.get("quotes", payload.get("option_snapshots"))
+        )
     else:
         raw = payload
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
-        raise ValueError("quote fixture must contain a snapshots array")
+        raise TypeError("quote fixture must contain a snapshots array")
     return PersistedOptionSnapshotSource(raw)
 
 

@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import ast
-from copy import deepcopy
-from datetime import UTC, datetime
 import json
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from copy import deepcopy
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
-
 from mala_bhiksha_kernel import (
+    ArmId,
     ArmSelection,
     ChartEvidencePacket,
     ChartScenarioSpec,
@@ -25,6 +24,7 @@ from mala_bhiksha_kernel import (
     ScenarioCandidatePool,
     load_market_context_conformance_vectors,
 )
+from pydantic import ValidationError
 
 from bhiksha.chart_scenarios import (
     BrokerInertScenarioObserver,
@@ -32,11 +32,12 @@ from bhiksha.chart_scenarios import (
     CompletedBar,
     OptionQuoteSnapshot,
     ScenarioEventRepository,
-    StaticOptionSnapshotSource,
     evaluate_condition,
+    evaluate_exit_profile,
     install_shadow_plan,
     validate_bundle,
 )
+from bhiksha.chart_scenarios.policies import CostModel, QuoteEligibilityPolicy
 
 
 def _policy(profile: ExitProfile) -> ManagementPolicySpec:
@@ -64,20 +65,57 @@ def _registry() -> dict[ExitProfile, ManagementPolicySpec]:
     return {profile: _policy(profile) for profile in ExitProfile}
 
 
+def _cost_model() -> CostModel:
+    return CostModel(
+        schema_version="market-context-cost-model.v1",
+        contract_multiplier=100,
+        contracts=1,
+        entry_fee_per_contract_usd=1.0,
+        exit_fee_per_contract_usd=1.0,
+        entry_slippage_per_contract_usd=0.0,
+        exit_slippage_per_contract_usd=0.0,
+    )
+
+
+def _quote_policy() -> QuoteEligibilityPolicy:
+    return QuoteEligibilityPolicy(
+        schema_version="market-context-quote-eligibility.v1",
+        require_bid_ask=True,
+        allow_last_fallback=False,
+        max_spread_pct=0.15,
+        max_quote_age_seconds=0,
+        require_positive_mark=True,
+    )
+
+
 def _bundle_payload() -> dict:
     vectors = load_market_context_conformance_vectors()
     manifest = ComponentManifest.model_validate(vectors["component_manifest"])
     chart = ChartEvidencePacket.model_validate(vectors["chart_evidence"])
     pool = ScenarioCandidatePool.model_validate(vectors["candidate_pool"])
     selection = ArmSelection.model_validate(vectors["arm_selection"])
+    deterministic_selection = selection.model_copy(
+        update={"arm_id": ArmId.CHART_DETERMINISTIC, "selector_manifest_hash": "c" * 64}
+    )
     scenario = ChartScenarioSpec.model_validate(vectors["chart_scenario"])
     selected_policy = _registry()[scenario.exit_profile]
+    cost_model = _cost_model()
+    quote_policy = _quote_policy()
     scenario = scenario.model_copy(
         update={
             "management_policy": selected_policy,
             "exit_policy_id": selected_policy.policy_id,
             "exit_policy_schema_version": selected_policy.policy_schema_version,
             "exit_policy_hash": selected_policy.policy_hash,
+            "cost_model_hash": cost_model.content_hash,
+            "quote_eligibility_policy_hash": quote_policy.content_hash,
+        }
+    )
+    deterministic_scenario = scenario.model_copy(
+        update={
+            "arm_id": deterministic_selection.arm_id,
+            "scenario_id": "scenario-deterministic-1",
+            "selection_packet_hash": deterministic_selection.selection_hash,
         }
     )
     return {
@@ -90,17 +128,45 @@ def _bundle_payload() -> dict:
         "component_manifest_hash": manifest.manifest_hash,
         "chart_evidence": [chart.model_dump(mode="json")],
         "candidate_pool": pool.model_dump(mode="json"),
-        "arm_selections": [selection.model_dump(mode="json")],
+        "arm_selections": [
+            deterministic_selection.model_dump(mode="json"),
+            selection.model_dump(mode="json"),
+        ],
         "exit_policy_registry": {
             profile.value: policy.model_dump(mode="json")
             for profile, policy in _registry().items()
         },
-        "scenarios": [scenario.model_dump(mode="json")],
+        "cost_model": cost_model.model_dump(mode="json"),
+        "quote_eligibility_policy": quote_policy.model_dump(mode="json"),
+        "scenarios": [
+            deterministic_scenario.model_dump(mode="json"),
+            scenario.model_dump(mode="json"),
+        ],
     }
 
 
 def _scenario() -> ChartScenarioSpec:
-    return validate_bundle(_bundle_payload()).scenarios[0]
+    return _plan().scenarios[0]
+
+
+def _plan():
+    return validate_bundle(_bundle_payload())
+
+
+def _observer(
+    repository: ScenarioEventRepository,
+    *,
+    quote_source=None,
+) -> BrokerInertScenarioObserver:
+    plan = _plan()
+    return BrokerInertScenarioObserver(
+        repository,
+        quote_source=quote_source,
+        exit_policy_registry=plan.exit_policy_registry,
+        cost_model=plan.cost_model,
+        quote_eligibility_policy=plan.quote_eligibility_policy,
+        plan_hash=plan.plan_hash,
+    )
 
 
 def _bars() -> list[dict[str, object]]:
@@ -144,10 +210,14 @@ def _quote(snapshot_id: str, mark: float, at: str) -> dict[str, object]:
     }
 
 
-def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(tmp_path: Path) -> None:
+def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(
+    tmp_path: Path,
+) -> None:
     payload = _bundle_payload()
     output = tmp_path / "artifacts" / "chart_scenarios" / "active_shadow_plan.json"
-    receipt = tmp_path / "artifacts" / "chart_scenarios" / "active_shadow_plan.receipt.json"
+    receipt = (
+        tmp_path / "artifacts" / "chart_scenarios" / "active_shadow_plan.receipt.json"
+    )
     live_plan = tmp_path / "artifacts" / "playbook" / "active_plan.json"
     live_plan.parent.mkdir(parents=True)
     live_plan.write_text("live-plan-sentinel\n", encoding="utf-8")
@@ -157,9 +227,15 @@ def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(tmp_path: Pa
     assert installed["status"] == "installed"
     assert installed["broker_effect_count"] == 0
     assert installed["identities"][0]["candidate_id"] == "candidate-1"
-    assert installed["identities"][0]["component_manifest_hash"] == installed["component_manifest_hash"]
+    assert (
+        installed["identities"][0]["component_manifest_hash"]
+        == installed["component_manifest_hash"]
+    )
     installed_bytes = output.read_bytes()
-    assert json.loads(installed_bytes)["schema_version"] == "bhiksha.chart-scenario-shadow-plan.v1"
+    assert (
+        json.loads(installed_bytes)["schema_version"]
+        == "bhiksha.chart-scenario-shadow-plan.v1"
+    )
     assert live_plan.read_text(encoding="utf-8") == "live-plan-sentinel\n"
     assert not list(output.parent.glob(".active_shadow_plan.json.*.tmp"))
 
@@ -181,7 +257,9 @@ def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(tmp_path: Pa
         ("trigger_version", "unknown-trigger.v99"),
     ],
 )
-def test_bundle_rejects_non_shadow_source_or_unknown_trigger(field: str, value: str) -> None:
+def test_bundle_rejects_non_shadow_source_or_unknown_trigger(
+    field: str, value: str
+) -> None:
     payload = _bundle_payload()
     payload[field] = value
     with pytest.raises(BundleValidationError):
@@ -220,22 +298,75 @@ def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
         validate_bundle(mismatched)
 
     absent_selected_material = _bundle_payload()
-    absent_selected_material["scenarios"] = [
-        ChartScenarioSpec.model_validate(
-            load_market_context_conformance_vectors()["chart_scenario"]
-        ).model_dump(mode="json")
-    ]
-    with pytest.raises(BundleValidationError, match="missing selected management_policy"):
+    raw_scenario = ChartScenarioSpec.model_validate(
+        load_market_context_conformance_vectors()["chart_scenario"]
+    ).model_copy(
+        update={
+            "cost_model_hash": _cost_model().content_hash,
+            "quote_eligibility_policy_hash": _quote_policy().content_hash,
+        }
+    )
+    absent_selected_material["scenarios"] = [raw_scenario.model_dump(mode="json")]
+    with pytest.raises(
+        BundleValidationError, match="missing selected management_policy"
+    ):
         validate_bundle(absent_selected_material)
 
+    omitted_default = _bundle_payload()
+    omitted_default["exit_policy_registry"][ExitProfile.FLASH_REVERSAL.value].pop(
+        "max_hold_seconds"
+    )
+    with pytest.raises(
+        BundleValidationError, match="explicitly declare every policy field"
+    ):
+        validate_bundle(omitted_default)
 
-def test_bundle_refuses_live_active_plan_paths_without_reading_them(tmp_path: Path) -> None:
+    unsupported = _bundle_payload()
+    unsupported["exit_policy_registry"][ExitProfile.FLASH_REVERSAL.value][
+        "risk_envelope_enabled"
+    ] = True
+    unsupported["exit_policy_registry"][ExitProfile.FLASH_REVERSAL.value].update(
+        {
+            "risk_envelope_activation_r": 0.25,
+            "risk_envelope_initial_floor_r": -1.0,
+            "risk_envelope_curvature": 1.5,
+            "risk_envelope_floor_at_t1_r": 0.0,
+            "risk_envelope_ratchet_step_r": 0.1,
+            "target_1_r": 1.0,
+            "target_2_r": 2.0,
+            "target_1_quantity": 0.75,
+        }
+    )
+    with pytest.raises(
+        BundleValidationError, match="unsupported risk-envelope semantics"
+    ):
+        validate_bundle(unsupported)
+
+
+def test_bundle_refuses_live_active_plan_paths_without_reading_them(
+    tmp_path: Path,
+) -> None:
     live = tmp_path / "artifacts" / "playbook" / "active_plan.json"
     live.parent.mkdir(parents=True)
     live.write_text('{"secret": "sentinel"}\n', encoding="utf-8")
     with pytest.raises(BundleValidationError, match="live active-plan path"):
-        install_shadow_plan(live, output_path=tmp_path / "shadow.json")
+        install_shadow_plan(
+            live,
+            output_path=tmp_path / "artifacts" / "chart_scenarios" / "shadow.json",
+        )
     assert live.read_text(encoding="utf-8") == '{"secret": "sentinel"}\n'
+
+    arbitrary = tmp_path / "config" / "runtime.json"
+    arbitrary.parent.mkdir(parents=True)
+    arbitrary.write_text("runtime-sentinel\n", encoding="utf-8")
+    with pytest.raises(BundleValidationError, match="artifacts/chart_scenarios"):
+        install_shadow_plan(_bundle_payload(), output_path=arbitrary)
+    assert arbitrary.read_text(encoding="utf-8") == "runtime-sentinel\n"
+
+    with pytest.raises(ValueError, match="artifacts/chart_scenarios"):
+        ScenarioEventRepository(
+            tmp_path / "artifacts" / "playbook" / "active_plan.json"
+        )
 
 
 def test_typed_trigger_primitives_require_completed_bars_and_respect_expiry() -> None:
@@ -253,14 +384,26 @@ def test_typed_trigger_primitives_require_completed_bars_and_respect_expiry() ->
     def condition(kind: ConditionType, **kwargs: object) -> EntryCondition:
         return EntryCondition(condition_type=kind, timeframe="39m", **kwargs)
 
-    cross = evaluate_condition(condition(ConditionType.CROSS_ABOVE, level=100, level_ref="chart#level"), bars, window)
+    cross = evaluate_condition(
+        condition(ConditionType.CROSS_ABOVE, level=100, level_ref="chart#level"),
+        bars,
+        window,
+    )
     assert cross.triggered
-    hold = evaluate_condition(condition(ConditionType.HOLD_ABOVE, level=100, level_ref="chart#level", bars=2), bars, window)
+    hold = evaluate_condition(
+        condition(ConditionType.HOLD_ABOVE, level=100, level_ref="chart#level", bars=2),
+        bars,
+        window,
+    )
     assert hold.triggered
     bars_below = bars + [
         CompletedBar(datetime(2026, 8, 4, 11, 57, tzinfo=UTC), 101, 102, 98, 99),
     ]
-    below = evaluate_condition(condition(ConditionType.CROSS_BELOW, level=100, level_ref="chart#level"), bars_below, window)
+    below = evaluate_condition(
+        condition(ConditionType.CROSS_BELOW, level=100, level_ref="chart#level"),
+        bars_below,
+        window,
+    )
     assert below.triggered
     hold_below = evaluate_condition(
         condition(ConditionType.HOLD_BELOW, level=105, level_ref="chart#level", bars=2),
@@ -269,13 +412,23 @@ def test_typed_trigger_primitives_require_completed_bars_and_respect_expiry() ->
     )
     assert hold_below.triggered
     reclaim = evaluate_condition(
-        condition(ConditionType.RECLAIM, level=100, level_ref="chart#level", window_seconds=3600),
+        condition(
+            ConditionType.RECLAIM,
+            level=100,
+            level_ref="chart#level",
+            window_seconds=3600,
+        ),
         bars,
         window,
     )
     assert reclaim.triggered
     reject = evaluate_condition(
-        condition(ConditionType.REJECT, level=100, level_ref="chart#level", window_seconds=3600),
+        condition(
+            ConditionType.REJECT,
+            level=100,
+            level_ref="chart#level",
+            window_seconds=3600,
+        ),
         bars,
         window,
     )
@@ -324,10 +477,110 @@ def test_typed_trigger_primitives_require_completed_bars_and_respect_expiry() ->
         )
 
 
-def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_marks(tmp_path: Path) -> None:
+def test_staged_exit_reports_weighted_gross_and_after_cost_r() -> None:
+    policy = _policy(ExitProfile.TREND_CONTINUATION).model_copy(
+        update={
+            "target_1_r": 1.0,
+            "target_2_r": 2.0,
+            "target_1_quantity": 0.5,
+            "breakeven_after_t1": True,
+        }
+    )
+    entry = OptionQuoteSnapshot.from_mapping(
+        _quote("q-entry", 1.0, "2026-08-04T14:00:00Z")
+    )
+    first_target = OptionQuoteSnapshot.from_mapping(
+        _quote("q-target-1", 1.4, "2026-08-04T14:10:00Z")
+    )
+    partial = evaluate_exit_profile(
+        ExitProfile.TREND_CONTINUATION,
+        entry,
+        first_target,
+        entry_time=entry.quote_time,
+        evaluated_at=first_target.quote_time,
+        management_policy=policy,
+        cost_model=_cost_model(),
+        quote_eligibility_policy=_quote_policy(),
+    )
+    assert partial.status == "partial"
+    assert partial.gross_r == pytest.approx(1.0)
+    assert partial.net_r == pytest.approx(0.95)
+    assert partial.state["realized_gross_r"] == pytest.approx(0.5)
+    assert partial.state["remaining_fraction"] == pytest.approx(0.5)
+
+    final_quote = OptionQuoteSnapshot.from_mapping(
+        _quote("q-target-2", 1.8, "2026-08-04T14:20:00Z")
+    )
+    final = evaluate_exit_profile(
+        ExitProfile.TREND_CONTINUATION,
+        entry,
+        final_quote,
+        entry_time=entry.quote_time,
+        evaluated_at=final_quote.quote_time,
+        management_policy=policy,
+        cost_model=_cost_model(),
+        quote_eligibility_policy=_quote_policy(),
+        prior_state=partial.state,
+    )
+    assert final.rule == "target_2"
+    assert final.r == pytest.approx(2.0)
+    assert final.gross_r == pytest.approx(1.5)
+    assert final.net_r == pytest.approx(1.45)
+
+    breakeven_quote = OptionQuoteSnapshot.from_mapping(
+        _quote("q-breakeven", 1.0, "2026-08-04T14:15:00Z")
+    )
+    breakeven = evaluate_exit_profile(
+        ExitProfile.TREND_CONTINUATION,
+        entry,
+        breakeven_quote,
+        entry_time=entry.quote_time,
+        evaluated_at=breakeven_quote.quote_time,
+        management_policy=policy,
+        cost_model=_cost_model(),
+        quote_eligibility_policy=_quote_policy(),
+        prior_state=partial.state,
+    )
+    assert breakeven.rule == "breakeven_after_target_1"
+    assert breakeven.gross_r == pytest.approx(0.5)
+    assert breakeven.net_r == pytest.approx(0.45)
+
+
+def test_no_progress_exit_uses_explicit_favorable_floor() -> None:
+    policy = _policy(ExitProfile.EXHAUSTION_REVERSAL).model_copy(
+        update={
+            "no_progress_seconds": 300,
+            "parameters": {"no_progress_favorable_floor_r": 0.25},
+        }
+    )
+    entry = OptionQuoteSnapshot.from_mapping(
+        _quote("q-entry", 1.0, "2026-08-04T14:00:00Z")
+    )
+    stalled = OptionQuoteSnapshot.from_mapping(
+        _quote("q-stalled", 1.04, "2026-08-04T14:06:00Z")
+    )
+    result = evaluate_exit_profile(
+        ExitProfile.EXHAUSTION_REVERSAL,
+        entry,
+        stalled,
+        entry_time=entry.quote_time,
+        evaluated_at=stalled.quote_time,
+        management_policy=policy,
+        cost_model=_cost_model(),
+        quote_eligibility_policy=_quote_policy(),
+    )
+    assert result.rule == "no_progress"
+    assert result.is_terminal
+
+
+def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_marks(
+    tmp_path: Path,
+) -> None:
     scenario = _scenario()
-    repository = ScenarioEventRepository(tmp_path / "events.sqlite3")
-    observer = BrokerInertScenarioObserver(repository, exit_policy_registry=_registry())
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "events.sqlite3"
+    )
+    observer = _observer(repository)
     quotes = [
         _quote("q-entry", 1.05, "2026-08-04T11:20:00Z"),
         _quote("q-range", 1.85, "2026-08-04T11:40:00Z"),
@@ -348,11 +601,23 @@ def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_
     event_types = [event.event_type.value for event in repository.events()]
     assert "synthetic_entry" in event_types
     assert "synthetic_exit" in event_types
-    exit_events = [event for event in repository.events() if event.event_type.value == "exit_observation"]
-    assert {event.details["profile"] for event in exit_events} == {"TREND_CONTINUATION", "RANGE_EXPANSION"}
+    exit_events = [
+        event
+        for event in repository.events()
+        if event.event_type.value == "exit_observation"
+    ]
+    assert {event.details["profile"] for event in exit_events} == {
+        "TREND_CONTINUATION",
+        "RANGE_EXPANSION",
+    }
+    assert (
+        sum(event.details["profile"] == "RANGE_EXPANSION" for event in exit_events) == 1
+    )
     assert any(event.details["counterfactual"] for event in exit_events)
     assert all(event.details["evaluated_exit_policy_hash"] for event in exit_events)
-    assert len({event.details["evaluated_exit_policy_hash"] for event in exit_events}) == 2
+    assert (
+        len({event.details["evaluated_exit_policy_hash"] for event in exit_events}) == 2
+    )
     assert all(event.broker_effect_count == 0 for event in repository.events())
     assert all(event.details["mark_not_fill"] for event in exit_events)
     assert repository.verify_event_chain().valid
@@ -378,14 +643,22 @@ def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_
     assert repository.event_count() == count
 
 
-def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(tmp_path: Path) -> None:
+def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(
+    tmp_path: Path,
+) -> None:
     scenario = _scenario()
-    repository = ScenarioEventRepository(tmp_path / "events.sqlite3")
-    observer = BrokerInertScenarioObserver(repository, exit_policy_registry=_registry())
-    first = observer.observe_one(scenario, bars=_bars(), market_observation_id="missing-quote")
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "events.sqlite3"
+    )
+    observer = _observer(repository)
+    first = observer.observe_one(
+        scenario, bars=_bars(), market_observation_id="missing-quote"
+    )
     assert not first.terminal
     assert "quote_unavailable" in [event.event_type.value for event in first.events]
-    trigger_count = sum(event.event_type.value == "entry_triggered" for event in repository.events())
+    trigger_count = sum(
+        event.event_type.value == "entry_triggered" for event in repository.events()
+    )
     second = observer.observe_one(
         scenario,
         bars=_bars(),
@@ -396,29 +669,40 @@ def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(tmp_path: Pa
         market_observation_id="quote-recovered",
     )
     assert second.error is None
-    assert sum(event.event_type.value == "entry_triggered" for event in repository.events()) == trigger_count
-    assert any(event.event_type.value == "synthetic_entry" for event in repository.events())
+    assert (
+        sum(
+            event.event_type.value == "entry_triggered" for event in repository.events()
+        )
+        == trigger_count
+    )
+    assert any(
+        event.event_type.value == "synthetic_entry" for event in repository.events()
+    )
     assert repository.verify_event_chain().valid
 
 
 def test_repository_detects_event_chain_tampering(tmp_path: Path) -> None:
     scenario = _scenario()
-    repository = ScenarioEventRepository(tmp_path / "events.sqlite3")
-    BrokerInertScenarioObserver(repository, exit_policy_registry=_registry()).observe_one(
+    db_path = tmp_path / "artifacts" / "chart_scenarios" / "events.sqlite3"
+    repository = ScenarioEventRepository(db_path)
+    _observer(repository).observe_one(
         scenario,
         bars=_bars(),
         quote_path=[_quote("q-entry", 1.05, "2026-08-04T11:20:00Z")],
         market_observation_id="chain-observation",
     )
-    with sqlite3.connect(tmp_path / "events.sqlite3") as conn:
-        conn.execute("UPDATE chart_scenario_events SET event_hash=? WHERE sequence=2", ("0" * 64,))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE chart_scenario_events SET event_hash=? WHERE sequence=2",
+            ("0" * 64,),
+        )
         conn.commit()
     report = repository.verify_event_chain()
     assert not report.valid
     assert report.errors
 
 
-def test_read_only_quote_source_rejects_order_capability() -> None:
+def test_read_only_quote_source_rejects_order_capability(tmp_path: Path) -> None:
     class NotActuallyReadOnly:
         def get_snapshot(self, *, scenario: object, at: datetime) -> None:
             return None
@@ -428,10 +712,87 @@ def test_read_only_quote_source_rejects_order_capability() -> None:
 
     with pytest.raises(TypeError, match="prohibited order capability"):
         BrokerInertScenarioObserver(
-            ScenarioEventRepository(":memory:"),
+            ScenarioEventRepository(
+                tmp_path / "artifacts" / "chart_scenarios" / "events.sqlite3"
+            ),
             quote_source=NotActuallyReadOnly(),
             exit_policy_registry=_registry(),
+            cost_model=_cost_model(),
+            quote_eligibility_policy=_quote_policy(),
+            plan_hash=_plan().plan_hash,
         )
+
+    hidden_effects: list[str] = []
+
+    class HiddenCallback:
+        def get_snapshot(self, *, scenario: object, at: datetime) -> None:
+            hidden_effects.append("effect")
+
+    with pytest.raises(TypeError, match="sealed data-only"):
+        _observer(
+            ScenarioEventRepository(
+                tmp_path / "artifacts" / "chart_scenarios" / "hidden.sqlite3"
+            ),
+            quote_source=HiddenCallback(),
+        )
+    assert hidden_effects == []
+
+
+def test_restart_rejects_counterfactual_policy_or_plan_drift(tmp_path: Path) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "events.sqlite3"
+    )
+    _observer(repository).observe_one(
+        plan.scenarios[0],
+        bars=_bars(),
+        market_observation_id="first-plan-observation",
+    )
+
+    changed_payload = _bundle_payload()
+    changed_policy = _policy(ExitProfile.RANGE_EXPANSION).model_copy(
+        update={"target_r": 1.75}
+    )
+    changed_payload["exit_policy_registry"][ExitProfile.RANGE_EXPANSION.value] = (
+        changed_policy.model_dump(mode="json")
+    )
+    changed_plan = validate_bundle(changed_payload)
+    changed_observer = BrokerInertScenarioObserver(
+        repository,
+        exit_policy_registry=changed_plan.exit_policy_registry,
+        cost_model=changed_plan.cost_model,
+        quote_eligibility_policy=changed_plan.quote_eligibility_policy,
+        plan_hash=changed_plan.plan_hash,
+    )
+    changed_result = changed_observer.observe_one(
+        changed_plan.scenarios[0],
+        bars=_bars(),
+        market_observation_id="second-plan-observation",
+    )
+    assert changed_result.error is not None
+    assert "different shadow plan hash" in changed_result.error
+
+
+def test_shared_candidate_arms_require_identical_market_facts(tmp_path: Path) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "events.sqlite3"
+    )
+    observer = _observer(repository)
+    observer.observe_one(
+        plan.scenarios[0],
+        bars=_bars(),
+        market_observation_id="paired-arm-observation",
+    )
+    changed_bars = deepcopy(_bars())
+    changed_bars[-1]["close"] = 101.5
+    changed_result = observer.observe_one(
+        plan.scenarios[1],
+        bars=changed_bars,
+        market_observation_id="paired-arm-observation",
+    )
+    assert changed_result.error is not None
+    assert "different market facts" in changed_result.error
 
 
 def test_new_package_import_graph_has_no_money_path_imports() -> None:
@@ -460,12 +821,18 @@ def test_new_package_import_graph_has_no_money_path_imports() -> None:
                 names = [node.module or ""]
             else:
                 names = []
-            assert not any(name == prefix or name.startswith(prefix + ".") for name in names for prefix in prohibited_prefixes), path
+            assert not any(
+                name == prefix or name.startswith(prefix + ".")
+                for name in names
+                for prefix in prohibited_prefixes
+            ), path
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 assert node.name not in prohibited_functions, (path, node.name)
 
 
-def test_cli_install_observe_and_status_are_read_only_fixture_commands(tmp_path: Path) -> None:
+def test_cli_install_observe_and_status_are_read_only_fixture_commands(
+    tmp_path: Path,
+) -> None:
     root = Path(__file__).parents[1]
     kernel = root.parent / "kernel-market-context"
     env = {
@@ -498,7 +865,13 @@ def test_cli_install_observe_and_status_are_read_only_fixture_commands(tmp_path:
     assert install.returncode == 0, install.stderr + install.stdout
     fixture_path = tmp_path / "fixture.json"
     fixture_path.write_text(
-        json.dumps({"plan": _bundle_payload(), "bars": _bars(), "quotes": [_quote("q1", 1.05, "2026-08-04T11:20:00Z")] }),
+        json.dumps(
+            {
+                "plan": _bundle_payload(),
+                "bars": _bars(),
+                "quotes": [_quote("q1", 1.05, "2026-08-04T11:20:00Z")],
+            }
+        ),
         encoding="utf-8",
     )
     observe = subprocess.run(
@@ -511,6 +884,10 @@ def test_cli_install_observe_and_status_are_read_only_fixture_commands(tmp_path:
             str(fixture_path),
             "--db-path",
             str(db_path),
+            "--observation-id",
+            "cli-fixture-observation",
+            "--scenario-id",
+            "scenario-deterministic-1",
         ],
         env=env,
         text=True,

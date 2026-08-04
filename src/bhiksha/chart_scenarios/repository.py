@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
 import hashlib
 import json
-from pathlib import Path
 import sqlite3
 import threading
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
-from mala_bhiksha_kernel import ChartScenarioSpec, ScenarioShadowEvent, ShadowEventType, canonical_sha256
+from mala_bhiksha_kernel import (
+    ChartScenarioSpec,
+    ScenarioShadowEvent,
+    ShadowEventType,
+    canonical_sha256,
+)
 
 from .models import as_utc, timestamp_json
+from .paths import require_experiment_path
 
 
 class IdempotencyConflict(RuntimeError):
@@ -42,7 +49,9 @@ class EventChainReport:
         return self.valid
 
 
-def scenario_identity_key(scenario: ChartScenarioSpec, trigger_version: str) -> tuple[str, str, str, str, str]:
+def scenario_identity_key(
+    scenario: ChartScenarioSpec, trigger_version: str
+) -> tuple[str, str, str, str, str]:
     return (
         scenario.campaign_id,
         scenario.run_id,
@@ -52,7 +61,9 @@ def scenario_identity_key(scenario: ChartScenarioSpec, trigger_version: str) -> 
     )
 
 
-def _event_role_key(scenario: ChartScenarioSpec, trigger_version: str, role: str) -> str:
+def _event_role_key(
+    scenario: ChartScenarioSpec, trigger_version: str, role: str
+) -> str:
     fields = scenario_identity_key(scenario, trigger_version)
     if not role.strip():
         raise ValueError("event idempotency role must be non-empty")
@@ -74,7 +85,7 @@ class ScenarioEventRepository:
         write_busy_timeout_ms: int = 1,
         read_busy_timeout_ms: int = 250,
     ) -> None:
-        self.db_path = Path(db_path)
+        self.db_path = require_experiment_path(db_path, role="database")
         self.write_busy_timeout_ms = int(write_busy_timeout_ms)
         self.read_busy_timeout_ms = int(read_busy_timeout_ms)
         if self.write_busy_timeout_ms < 1 or self.read_busy_timeout_ms < 1:
@@ -83,10 +94,14 @@ class ScenarioEventRepository:
         self._schema_ready = False
 
     def _connect(self, *, write: bool) -> sqlite3.Connection:
-        timeout = (self.write_busy_timeout_ms if write else self.read_busy_timeout_ms) / 1000.0
+        timeout = (
+            self.write_busy_timeout_ms if write else self.read_busy_timeout_ms
+        ) / 1000.0
         conn = sqlite3.connect(self.db_path, timeout=timeout)
         conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout={self.write_busy_timeout_ms if write else self.read_busy_timeout_ms}")
+        conn.execute(
+            f"PRAGMA busy_timeout={self.write_busy_timeout_ms if write else self.read_busy_timeout_ms}"
+        )
         if write:
             conn.execute("PRAGMA journal_mode=WAL")
         return conn
@@ -108,6 +123,8 @@ class ScenarioEventRepository:
                         scenario_id TEXT NOT NULL,
                         trigger_version TEXT NOT NULL,
                         scenario_hash TEXT NOT NULL,
+                        plan_hash TEXT NOT NULL,
+                        policy_registry_hash TEXT NOT NULL,
                         status TEXT NOT NULL,
                         terminal INTEGER NOT NULL DEFAULT 0,
                         metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -133,36 +150,116 @@ class ScenarioEventRepository:
                     );
                     CREATE INDEX IF NOT EXISTS chart_scenario_events_identity_idx
                         ON chart_scenario_events (campaign_id, run_id, arm_id, scenario_id, trigger_version);
+                    CREATE TABLE IF NOT EXISTS chart_scenario_market_facts (
+                        campaign_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        candidate_id TEXT NOT NULL,
+                        market_observation_id TEXT NOT NULL,
+                        facts_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (
+                            campaign_id, run_id, candidate_id, market_observation_id
+                        )
+                    );
                     """
                 )
             self._schema_ready = True
 
-    def register_scenario(self, scenario: ChartScenarioSpec, trigger_version: str) -> bool:
-        """Register a scenario identity; return ``True`` only on first insert."""
+    def bind_market_facts(
+        self,
+        scenario: ChartScenarioSpec,
+        *,
+        market_observation_id: str,
+        facts_hash: str,
+    ) -> None:
+        """Bind both arms for one candidate/observation to identical raw facts."""
 
         self.ensure_schema()
-        campaign_id, run_id, arm_id, scenario_id, version = scenario_identity_key(scenario, trigger_version)
-        now = timestamp_json(datetime.now(UTC))
-        scenario_json = json.dumps(scenario.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         with self._connect(write=True) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT scenario_hash FROM chart_scenario_states
+                SELECT facts_hash FROM chart_scenario_market_facts
+                WHERE campaign_id=? AND run_id=? AND candidate_id=?
+                  AND market_observation_id=?
+                """,
+                (
+                    scenario.campaign_id,
+                    scenario.run_id,
+                    scenario.candidate_id,
+                    market_observation_id,
+                ),
+            ).fetchone()
+            if row is not None:
+                if row["facts_hash"] != facts_hash:
+                    raise IdempotencyConflict(
+                        "shared candidate observation was reused with different market facts"
+                    )
+                return
+            conn.execute(
+                """
+                INSERT INTO chart_scenario_market_facts
+                (campaign_id, run_id, candidate_id, market_observation_id, facts_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scenario.campaign_id,
+                    scenario.run_id,
+                    scenario.candidate_id,
+                    market_observation_id,
+                    facts_hash,
+                    timestamp_json(datetime.now(UTC)),
+                ),
+            )
+
+    def register_scenario(
+        self,
+        scenario: ChartScenarioSpec,
+        trigger_version: str,
+        *,
+        plan_hash: str,
+        policy_registry_hash: str,
+    ) -> bool:
+        """Register a scenario identity; return ``True`` only on first insert."""
+
+        self.ensure_schema()
+        campaign_id, run_id, arm_id, scenario_id, version = scenario_identity_key(
+            scenario, trigger_version
+        )
+        now = timestamp_json(datetime.now(UTC))
+        scenario_json = json.dumps(
+            scenario.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        )
+        with self._connect(write=True) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT scenario_hash, plan_hash, policy_registry_hash
+                FROM chart_scenario_states
                 WHERE campaign_id=? AND run_id=? AND arm_id=? AND scenario_id=? AND trigger_version=?
                 """,
                 (campaign_id, run_id, arm_id, scenario_id, version),
             ).fetchone()
             if row is not None:
                 if row["scenario_hash"] != scenario.scenario_hash:
-                    raise ValueError("scenario identity was reused with a different scenario hash")
+                    raise ValueError(
+                        "scenario identity was reused with a different scenario hash"
+                    )
+                if row["plan_hash"] != plan_hash:
+                    raise ValueError(
+                        "scenario identity was reused with a different shadow plan hash"
+                    )
+                if row["policy_registry_hash"] != policy_registry_hash:
+                    raise ValueError(
+                        "scenario identity was reused with a different policy registry hash"
+                    )
                 return False
             conn.execute(
                 """
                 INSERT INTO chart_scenario_states
                 (campaign_id, run_id, arm_id, scenario_id, trigger_version, scenario_hash,
-                 status, terminal, metadata_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'installed', 0, ?, ?)
+                 plan_hash, policy_registry_hash, status, terminal, metadata_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'installed', 0, ?, ?)
                 """,
                 (
                     campaign_id,
@@ -171,7 +268,17 @@ class ScenarioEventRepository:
                     scenario_id,
                     version,
                     scenario.scenario_hash,
-                    json.dumps({"scenario": json.loads(scenario_json)}, sort_keys=True, separators=(",", ":")),
+                    plan_hash,
+                    policy_registry_hash,
+                    json.dumps(
+                        {
+                            "scenario": json.loads(scenario_json),
+                            "plan_hash": plan_hash,
+                            "policy_registry_hash": policy_registry_hash,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                     now,
                 ),
             )
@@ -229,7 +336,11 @@ class ScenarioEventRepository:
 
         self.ensure_schema()
         try:
-            kind = event_type if isinstance(event_type, ShadowEventType) else ShadowEventType(event_type)
+            kind = (
+                event_type
+                if isinstance(event_type, ShadowEventType)
+                else ShadowEventType(event_type)
+            )
         except ValueError as exc:
             raise ValueError(f"unknown shadow event type: {event_type!r}") from exc
         if not market_observation_id.strip():
@@ -255,9 +366,15 @@ class ScenarioEventRepository:
             ).fetchone()
             if existing is not None:
                 if existing["payload_fingerprint"] != fingerprint:
-                    raise IdempotencyConflict("event identity was replayed with different facts")
-                event = ScenarioShadowEvent.model_validate(json.loads(existing["event_json"]))
-                return EventWrite(event=event, created=False, idempotency_key=idempotency_key)
+                    raise IdempotencyConflict(
+                        "event identity was replayed with different facts"
+                    )
+                event = ScenarioShadowEvent.model_validate(
+                    json.loads(existing["event_json"])
+                )
+                return EventWrite(
+                    event=event, created=False, idempotency_key=idempotency_key
+                )
 
             state_row = conn.execute(
                 """
@@ -269,13 +386,20 @@ class ScenarioEventRepository:
             if state_row is None:
                 raise ValueError("scenario must be registered before appending events")
             if bool(state_row["terminal"]):
-                raise TerminalScenarioError("terminal scenario cannot accept a new event")
+                raise TerminalScenarioError(
+                    "terminal scenario cannot accept a new event"
+                )
 
             previous_row = conn.execute(
                 "SELECT event_hash FROM chart_scenario_events ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
-            preceding_hash = previous_row["event_hash"] if previous_row is not None else None
-            event_id = "event-" + hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:48]
+            preceding_hash = (
+                previous_row["event_hash"] if previous_row is not None else None
+            )
+            event_id = (
+                "event-"
+                + hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:48]
+            )
             event = ScenarioShadowEvent.model_validate(
                 {
                     "schema_version": "market-context-shadow-event.v1",
@@ -299,7 +423,9 @@ class ScenarioEventRepository:
                     "source_type": scenario.source_type.value,
                 }
             )
-            event_json = json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+            event_json = json.dumps(
+                event.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+            )
             conn.execute(
                 """
                 INSERT INTO chart_scenario_events
@@ -325,7 +451,11 @@ class ScenarioEventRepository:
             prior_metadata["last_event_type"] = kind.value
             prior_metadata["last_event_observation_id"] = market_observation_id
             status = str(updates.get("status", state_row["status"]))
-            terminal_value = bool(state_row["terminal"]) or terminal or bool(updates.get("terminal", False))
+            terminal_value = (
+                bool(state_row["terminal"])
+                or terminal
+                or bool(updates.get("terminal", False))
+            )
             conn.execute(
                 """
                 UPDATE chart_scenario_states
@@ -347,14 +477,21 @@ class ScenarioEventRepository:
         if not self.db_path.exists() or not self._tables_exist_readonly():
             return []
         with self._connect(write=False) as conn:
-            rows = conn.execute("SELECT event_json FROM chart_scenario_events ORDER BY sequence").fetchall()
-        return [ScenarioShadowEvent.model_validate(json.loads(row["event_json"])) for row in rows]
+            rows = conn.execute(
+                "SELECT event_json FROM chart_scenario_events ORDER BY sequence"
+            ).fetchall()
+        return [
+            ScenarioShadowEvent.model_validate(json.loads(row["event_json"]))
+            for row in rows
+        ]
 
     def event_count(self) -> int:
         if not self.db_path.exists() or not self._tables_exist_readonly():
             return 0
         with self._connect(write=False) as conn:
-            return int(conn.execute("SELECT COUNT(*) FROM chart_scenario_events").fetchone()[0])
+            return int(
+                conn.execute("SELECT COUNT(*) FROM chart_scenario_events").fetchone()[0]
+            )
 
     def verify_event_chain(self) -> EventChainReport:
         if not self.db_path.exists() or not self._tables_exist_readonly():
@@ -367,13 +504,17 @@ class ScenarioEventRepository:
         previous: str | None = None
         for row in rows:
             try:
-                event = ScenarioShadowEvent.model_validate(json.loads(row["event_json"]))
+                event = ScenarioShadowEvent.model_validate(
+                    json.loads(row["event_json"])
+                )
                 if event.event_hash != row["event_hash"]:
-                    errors.append(f"sequence {row['sequence']} stored event hash mismatch")
+                    errors.append(
+                        f"sequence {row['sequence']} stored event hash mismatch"
+                    )
                 if event.preceding_event_hash != previous:
                     errors.append(f"sequence {row['sequence']} predecessor mismatch")
                 previous = event.event_hash
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - report every corrupt ledger row
                 errors.append(f"sequence {row['sequence']} invalid event: {exc}")
                 previous = row["event_hash"]
         return EventChainReport(
@@ -394,10 +535,20 @@ class ScenarioEventRepository:
                 "event_chain_valid": True,
             }
         with self._connect(write=False) as conn:
-            scenario_count = int(conn.execute("SELECT COUNT(*) FROM chart_scenario_states").fetchone()[0])
-            terminal_count = int(conn.execute("SELECT COUNT(*) FROM chart_scenario_states WHERE terminal=1").fetchone()[0])
-            event_count = int(conn.execute("SELECT COUNT(*) FROM chart_scenario_events").fetchone()[0])
-            last = conn.execute("SELECT event_hash FROM chart_scenario_events ORDER BY sequence DESC LIMIT 1").fetchone()
+            scenario_count = int(
+                conn.execute("SELECT COUNT(*) FROM chart_scenario_states").fetchone()[0]
+            )
+            terminal_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM chart_scenario_states WHERE terminal=1"
+                ).fetchone()[0]
+            )
+            event_count = int(
+                conn.execute("SELECT COUNT(*) FROM chart_scenario_events").fetchone()[0]
+            )
+            last = conn.execute(
+                "SELECT event_hash FROM chart_scenario_events ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
         chain = self.verify_event_chain()
         return {
             "db_path": str(self.db_path),
@@ -416,7 +567,9 @@ class ScenarioEventRepository:
         with self._connect(write=False) as conn:
             names = {
                 str(row["name"])
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
             }
         return {"chart_scenario_states", "chart_scenario_events"}.issubset(names)
 
@@ -425,8 +578,8 @@ __all__ = [
     "EventChainReport",
     "EventWrite",
     "IdempotencyConflict",
-    "ScenarioEventRepository",
     "SQLiteScenarioRepository",
+    "ScenarioEventRepository",
     "TerminalScenarioError",
     "scenario_identity_key",
 ]

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from mala_bhiksha_kernel import (
     ConditionType,
@@ -39,7 +40,9 @@ class TriggerEvaluation:
         }
 
 
-def normalize_bars(bars: Sequence[CompletedBar | Mapping[str, Any]]) -> list[CompletedBar]:
+def normalize_bars(
+    bars: Sequence[CompletedBar | Mapping[str, Any]],
+) -> list[CompletedBar]:
     """Convert, sort, and validate one completed-bar observation sequence."""
 
     normalized = [
@@ -109,17 +112,25 @@ def evaluate_condition(
     else:
         now = as_utc(evaluated_at)
     if now < observation_window.start_at:
-        return _false(condition, now=now, reason="before_observation_window", bars=normalized)
+        return _false(
+            condition, now=now, reason="before_observation_window", bars=normalized
+        )
     if now > observation_window.end_at:
-        return _false(condition, now=now, reason="observation_window_expired", bars=normalized)
+        return _false(
+            condition, now=now, reason="observation_window_expired", bars=normalized
+        )
 
     start, end = _window_bounds(condition, observation_window, now)
     if end < start or now < start:
-        return _false(condition, now=now, reason="condition_window_closed", bars=normalized)
+        return _false(
+            condition, now=now, reason="condition_window_closed", bars=normalized
+        )
     usable = [bar for bar in normalized if bar.timestamp <= now]
     current = [bar for bar in usable if start <= bar.timestamp <= min(end, now)]
     if not current:
-        return _false(condition, now=now, reason="no_completed_bar_in_window", bars=usable)
+        return _false(
+            condition, now=now, reason="no_completed_bar_in_window", bars=usable
+        )
 
     kind = condition.condition_type
     level = condition.level
