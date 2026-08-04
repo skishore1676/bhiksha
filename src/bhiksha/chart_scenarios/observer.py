@@ -365,6 +365,11 @@ class BrokerInertScenarioObserver:
                                 "primary": primary,
                                 "counterfactual": not primary,
                                 "mark_not_fill": True,
+                                "evaluated_exit_policy_id": result.state["exit_policy_id"],
+                                "evaluated_exit_policy_schema_version": result.state[
+                                    "exit_policy_schema_version"
+                                ],
+                                "evaluated_exit_policy_hash": result.state["exit_policy_hash"],
                                 "quote": quote.quote_provenance(),
                                 "observation": result.to_dict(),
                             },

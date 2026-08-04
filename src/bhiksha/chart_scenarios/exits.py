@@ -49,6 +49,12 @@ def _time_from_policy(value: str) -> time:
         raise ValueError(f"invalid hard_flat_time_et in management policy: {value!r}") from None
 
 
+def _meets_r(value: float, threshold: float) -> bool:
+    """Compare R thresholds without losing exact hits to binary float noise."""
+
+    return value >= threshold or abs(value - threshold) <= 1e-12
+
+
 def evaluate_exit_profile(
     profile: ExitProfile | str,
     entry_quote: OptionQuoteSnapshot,
@@ -113,14 +119,14 @@ def evaluate_exit_profile(
     if target_2 is None:
         target_2 = management_policy.target_r
     target_1_quantity = management_policy.target_1_quantity
-    if target_1 is not None and not state.get("target_1_hit") and r >= target_1:
+    if target_1 is not None and not state.get("target_1_hit") and _meets_r(r, target_1):
         state["target_1_hit"] = True
         if target_2 is None or target_1_quantity >= 1.0:
             return _result(selected, "exit", "target_1", current_mark, r, elapsed, state, "primary_target_1")
         return _result(selected, "partial", "target_1_partial", current_mark, r, elapsed, state, "counterfactual_target_1_partial")
-    if target_2 is not None and state.get("target_1_hit") and r >= target_2:
+    if target_2 is not None and state.get("target_1_hit") and _meets_r(r, target_2):
         return _result(selected, "exit", "target_2", current_mark, r, elapsed, state, "primary_target_2")
-    if target_1 is None and target_2 is not None and r >= target_2:
+    if target_1 is None and target_2 is not None and _meets_r(r, target_2):
         return _result(selected, "exit", "target", current_mark, r, elapsed, state, "profile_target")
 
     giveback_fraction = management_policy.giveback_retrace_fraction

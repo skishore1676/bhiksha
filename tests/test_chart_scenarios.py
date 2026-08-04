@@ -331,7 +331,9 @@ def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_
     quotes = [
         _quote("q-entry", 1.05, "2026-08-04T11:20:00Z"),
         _quote("q-range", 1.85, "2026-08-04T11:40:00Z"),
-        _quote("q-trend", 2.05, "2026-08-04T11:50:00Z"),
+        # Exactly 2R under the selected 40% stop must not miss on binary
+        # floating-point representation.
+        _quote("q-trend", 1.89, "2026-08-04T11:50:00Z"),
     ]
 
     first = observer.observe_one(
@@ -349,6 +351,8 @@ def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_
     exit_events = [event for event in repository.events() if event.event_type.value == "exit_observation"]
     assert {event.details["profile"] for event in exit_events} == {"TREND_CONTINUATION", "RANGE_EXPANSION"}
     assert any(event.details["counterfactual"] for event in exit_events)
+    assert all(event.details["evaluated_exit_policy_hash"] for event in exit_events)
+    assert len({event.details["evaluated_exit_policy_hash"] for event in exit_events}) == 2
     assert all(event.broker_effect_count == 0 for event in repository.events())
     assert all(event.details["mark_not_fill"] for event in exit_events)
     assert repository.verify_event_chain().valid
