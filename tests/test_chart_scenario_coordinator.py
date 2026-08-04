@@ -702,8 +702,8 @@ def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
     inputs = source / "cycle-inputs"
     cycles.mkdir(parents=True)
     inputs.mkdir(parents=True)
-    plan_path = source / "plan.json"
-    install = source / "install.json"
+    plan_path = source / "active_shadow_plan.json"
+    install = source / "install.receipt.json"
     events = source / "events.json"
     install_shadow_plan(_bundle_payload(), output_path=plan_path, receipt_path=install)
     database = source / "events.sqlite3"
@@ -793,9 +793,7 @@ def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
 
     outside_generation = tmp_path / "outside-generation"
     outside_generation.mkdir()
-    escaped_generation = (
-        tmp_path / "artifacts/chart_scenarios/escaped-generation"
-    )
+    escaped_generation = tmp_path / "artifacts/chart_scenarios/escaped-generation"
     escaped_generation.symlink_to(outside_generation)
     with pytest.raises(ValueError, match="not an immutable directory"):
         _validate_existing_staging_generation(escaped_generation, expected={})

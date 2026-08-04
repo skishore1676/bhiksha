@@ -1314,6 +1314,7 @@ def _validate_tradelab_paths(contract: Mapping[str, Any]) -> None:
 
 
 def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
+    _validate_staging_source_paths(paths)
     plan = read_installed_plan(paths.plan)
     if (
         plan.run_manifest.get("campaign_id") != contract["campaign_id"]
@@ -1366,9 +1367,9 @@ def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
     }
     for ordinal, (cycle, receipt, _input, _receipt) in enumerate(cycles, 1):
         expected_generation[f"cycle-inputs/cycle-{ordinal:04d}.json"] = cycle
-        expected_generation[
-            f"cycle-receipts/cycle-{ordinal:04d}.receipt.json"
-        ] = receipt
+        expected_generation[f"cycle-receipts/cycle-{ordinal:04d}.receipt.json"] = (
+            receipt
+        )
     if final_generation.is_symlink():
         raise ValueError("TradeLab staging generation cannot be a symlink")
     if final_generation.exists():
@@ -1402,6 +1403,23 @@ def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
         link.unlink(missing_ok=True)
 
 
+def _validate_staging_source_paths(paths: Any) -> None:
+    root = require_experiment_path(paths.root, role="Bhiksha staging source run")
+    expected = {
+        "plan": root / "active_shadow_plan.json",
+        "install_receipt": root / "install.receipt.json",
+        "cycle_inputs": root / "cycle-inputs",
+        "cycle_receipts": root / "cycles",
+        "events_export": root / "events.json",
+    }
+    for field, exact in expected.items():
+        supplied = Path(getattr(paths, field)).expanduser().resolve()
+        if supplied != exact.resolve():
+            raise ValueError(
+                f"Bhiksha staging {field} is not the exact run artifact path"
+            )
+
+
 def _validate_existing_staging_generation(
     generation: Path, *, expected: Mapping[str, Mapping[str, Any]]
 ) -> None:
@@ -1415,7 +1433,17 @@ def _validate_existing_staging_generation(
         for member in members
         if member.is_file()
     }
-    if set(files) != set(expected):
+    expected_directories = {
+        str(Path(relative).parent)
+        for relative in expected
+        if str(Path(relative).parent) != "."
+    }
+    directories = {
+        member.relative_to(generation).as_posix()
+        for member in members
+        if member.is_dir()
+    }
+    if set(files) != set(expected) or directories != expected_directories:
         raise ValueError("TradeLab staging generation members are not exact")
     for relative, payload in expected.items():
         if json.loads(files[relative].read_text(encoding="utf-8")) != dict(payload):
