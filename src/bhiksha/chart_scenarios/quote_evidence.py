@@ -33,20 +33,22 @@ def normalize_option_symbol(value: str) -> str:
 def selected_raw_quote(
     payload: Mapping[str, Any], *, option_symbol: str
 ) -> dict[str, Any]:
-    """Extract only the selected provider quote object and make it exact JSON."""
+    """Seal one selected provider response with its authenticated OCC key."""
 
     normalized = normalize_option_symbol(option_symbol)
     matches = [
-        value
+        (key, value)
         for key, value in payload.items()
         if normalize_option_symbol(str(key)) == normalized
         and isinstance(value, Mapping)
     ]
     if len(matches) != 1:
         raise ValueError("Schwab quote response omitted the exact selected contract")
-    raw = json.loads(json.dumps(dict(matches[0]), allow_nan=False))
-    _reject_sensitive_keys(raw)
-    return raw
+    _key, value = matches[0]
+    inner = json.loads(json.dumps(dict(value), allow_nan=False))
+    envelope = {normalized: inner}
+    _reject_sensitive_keys(envelope)
+    return envelope
 
 
 def build_live_quote(
@@ -66,6 +68,12 @@ def build_live_quote(
     selected_symbol = normalize_option_symbol(selected_contract.option_symbol)
     if normalized_symbol != selected_symbol:
         raise ValueError("selected quote symbol differs from chain snapshot")
+    if (
+        set(raw) != {normalized_symbol}
+        or not isinstance(raw.get(normalized_symbol), Mapping)
+    ):
+        raise ValueError("raw quote response must retain the exact selected OCC key")
+    selected_raw = raw[normalized_symbol]
     parsed_type, parsed_expiration, parsed_strike, parsed_root = occ_contract(
         normalized_symbol
     )
@@ -82,9 +90,15 @@ def build_live_quote(
     ):
         raise ValueError("selected chain snapshot conflicts with parsed OCC identity")
 
-    quote = raw.get("quote") if isinstance(raw.get("quote"), Mapping) else raw
+    quote = (
+        selected_raw.get("quote")
+        if isinstance(selected_raw.get("quote"), Mapping)
+        else selected_raw
+    )
     reference = (
-        raw.get("reference") if isinstance(raw.get("reference"), Mapping) else {}
+        selected_raw.get("reference")
+        if isinstance(selected_raw.get("reference"), Mapping)
+        else {}
     )
     provider_underlying = (
         str(reference["underlyingSymbol"]).strip().upper()

@@ -657,7 +657,7 @@ def _quote(
         },
     }
     return build_live_quote(
-        raw,
+        {contract.option_symbol: raw},
         option_symbol=contract.option_symbol,
         selected_contract=contract,
         acquired_at=datetime.fromisoformat(acquired_at or at),
@@ -670,7 +670,8 @@ def _reseal_quote(
     payload: dict[str, object], *, selection_mode: str | None = None
 ) -> dict[str, object]:
     raw = deepcopy(payload["raw_source"])
-    raw["quote"].update(
+    inner = raw[str(payload["option_symbol"])]
+    inner["quote"].update(
         {
             "bidPrice": payload["bid"],
             "askPrice": payload["ask"],
@@ -1351,8 +1352,9 @@ def test_bundle_refuses_live_active_plan_paths_without_reading_them(
 def test_raw_observations_are_exact_and_deeply_immutable() -> None:
     quote = _quote("q-exact", 1.0, "2026-08-04T11:20:00Z")
     snapshot = OptionQuoteSnapshot.from_mapping(quote)
-    quote["raw_source"]["reference"]["underlyingSymbol"] = "IWM"  # type: ignore[index]
-    assert snapshot.to_dict()["raw_source"]["reference"]["underlyingSymbol"] == "SPY"
+    symbol = str(quote["option_symbol"])
+    quote["raw_source"][symbol]["reference"]["underlyingSymbol"] = "IWM"  # type: ignore[index]
+    assert snapshot.to_dict()["raw_source"][symbol]["reference"]["underlyingSymbol"] == "SPY"
 
     missing_quote = _quote("q-missing", 1.0, "2026-08-04T11:20:00Z")
     missing_quote.pop("source_id")
@@ -1415,7 +1417,7 @@ def test_raw_quote_rejects_secrets_and_static_occ_join_attacks() -> None:
         open_interest=100,
     )
     raw_with_secret = deepcopy(quote["raw_source"])
-    raw_with_secret["access_token"] = "must-not-cross-wire"
+    raw_with_secret[contract.option_symbol]["access_token"] = "must-not-cross-wire"
     with pytest.raises(ValueError, match="forbidden sensitive key"):
         build_live_quote(
             raw_with_secret,
@@ -1427,7 +1429,9 @@ def test_raw_quote_rejects_secrets_and_static_occ_join_attacks() -> None:
         )
 
     raw_with_wrong_strike = deepcopy(quote["raw_source"])
-    raw_with_wrong_strike["reference"]["strikePrice"] = "101.000"
+    raw_with_wrong_strike[contract.option_symbol]["reference"]["strikePrice"] = (
+        "101.000"
+    )
     with pytest.raises(ValueError, match="static identity"):
         build_live_quote(
             raw_with_wrong_strike,
@@ -1439,7 +1443,7 @@ def test_raw_quote_rejects_secrets_and_static_occ_join_attacks() -> None:
         )
 
     raw_without_reference = deepcopy(quote["raw_source"])
-    raw_without_reference["reference"] = {}
+    raw_without_reference[contract.option_symbol]["reference"] = {}
     without_optional_reference = build_live_quote(
         raw_without_reference,
         option_symbol=contract.option_symbol,
@@ -1452,7 +1456,7 @@ def test_raw_quote_rejects_secrets_and_static_occ_join_attacks() -> None:
 
     wrong_symbol_payload = {
         "IWM260807C00200000": {
-            **raw_without_reference,
+            **raw_without_reference[contract.option_symbol],
             "reference": {},
         }
     }
@@ -1461,7 +1465,9 @@ def test_raw_quote_rejects_secrets_and_static_occ_join_attacks() -> None:
             wrong_symbol_payload,
             option_symbol=contract.option_symbol,
         )
-    exact_symbol_payload = {contract.option_symbol: raw_without_reference}
+    exact_symbol_payload = {
+        contract.option_symbol: raw_without_reference[contract.option_symbol]
+    }
     assert (
         selected_raw_quote(
             exact_symbol_payload,
