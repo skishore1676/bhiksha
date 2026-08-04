@@ -18,7 +18,11 @@ from mala_bhiksha_kernel import (
 from .exits import ExitObservation, evaluate_exit_profile
 from .models import CompletedBar, OptionQuoteSnapshot, as_utc, timestamp_json
 from .policies import CostModel, QuoteEligibilityPolicy
-from .quotes import ReadOnlyOptionSnapshotSource, ensure_read_only_quote_source
+from .quotes import (
+    ReadOnlyOptionSnapshotSource,
+    ensure_read_only_quote_source,
+    select_snapshot,
+)
 from .repository import EventWrite, ScenarioEventRepository, TerminalScenarioError
 from .triggers import evaluate_condition, normalize_bars
 from .validation import TRIGGER_VERSION
@@ -68,7 +72,10 @@ class BrokerInertScenarioObserver:
         if trigger_version != TRIGGER_VERSION:
             raise ValueError(f"unsupported trigger version: {trigger_version!r}")
         self.repository = repository
-        self.quote_source = ensure_read_only_quote_source(quote_source)
+        sealed_source = ensure_read_only_quote_source(quote_source)
+        self.quote_snapshots = (
+            tuple(sealed_source.snapshots) if sealed_source is not None else ()
+        )
         self.exit_policy_registry = {
             profile
             if isinstance(profile, ExitProfile)
@@ -87,8 +94,17 @@ class BrokerInertScenarioObserver:
                 )
             }
         )
-        self.cost_model = cost_model
-        self.quote_eligibility_policy = quote_eligibility_policy
+        self.cost_model = CostModel.model_validate(cost_model.model_dump(mode="json"))
+        self.quote_eligibility_policy = QuoteEligibilityPolicy.model_validate(
+            quote_eligibility_policy.model_dump(mode="json")
+        )
+        self.treatment_hash = canonical_sha256(
+            {
+                "policy_registry_hash": self.policy_registry_hash,
+                "cost_model_hash": self.cost_model.content_hash,
+                "quote_eligibility_policy_hash": self.quote_eligibility_policy.content_hash,
+            }
+        )
         self.trigger_version = trigger_version
 
     def observe_one(
@@ -109,6 +125,12 @@ class BrokerInertScenarioObserver:
         event identities and state rather than re-arming the scenario.
         """
 
+        if any(not isinstance(bar, Mapping) for bar in bars):
+            raise TypeError("observer bars require exact raw mappings")
+        if option_quote is not None and not isinstance(option_quote, Mapping):
+            raise TypeError("observer option_quote requires an exact raw mapping")
+        if any(not isinstance(quote, Mapping) for quote in quote_path):
+            raise TypeError("observer quote_path requires exact raw mappings")
         normalized_bars = normalize_bars(bars)
         single_quote = (
             self._coerce_quote(option_quote) if option_quote is not None else None
@@ -145,7 +167,7 @@ class BrokerInertScenarioObserver:
             self._validate_scenario_policies(scenario)
             self.repository.bind_market_facts(
                 scenario,
-                market_observation_id=observation_id,
+                observation_key=timestamp_json(now),
                 facts_hash=self.market_facts_hash,
             )
             is_new = self.repository.register_scenario(
@@ -153,6 +175,7 @@ class BrokerInertScenarioObserver:
                 self.trigger_version,
                 plan_hash=self.plan_hash,
                 policy_registry_hash=self.policy_registry_hash,
+                treatment_hash=self.treatment_hash,
             )
             if is_new:
                 self._record(
@@ -380,8 +403,12 @@ class BrokerInertScenarioObserver:
                             or state
                         )
                     return self._result(scenario, state, new_events)
-                if not self.quote_eligibility_policy.eligible(
-                    entry_quote, evaluated_at=entry_quote.quote_time
+                entry_observed_at = entry_quote.quote_time if normalized_path else now
+                if (
+                    not self.quote_eligibility_policy.eligible(
+                        entry_quote, evaluated_at=entry_observed_at
+                    )
+                    or not entry_quote.is_selected
                 ):
                     self._record(
                         new_events,
@@ -393,7 +420,7 @@ class BrokerInertScenarioObserver:
                         details=self._details(
                             scenario,
                             {
-                                "reason": "quote_not_eligible",
+                                "reason": "quote_not_eligible_or_not_preselected",
                                 "quote": entry_quote.quote_provenance(),
                             },
                         ),
@@ -500,6 +527,29 @@ class BrokerInertScenarioObserver:
                     self.repository.get_state(scenario, self.trigger_version) or state
                 )
                 profile_states = dict(state.get("profile_states") or {})
+                primary_prior = profile_states.get(scenario.exit_profile.value) or {}
+                if primary_prior.get("terminal"):
+                    self._record_terminal(
+                        new_events,
+                        scenario,
+                        ShadowEventType.SYNTHETIC_EXIT,
+                        primary_prior.get("terminal_at", quote.quote_time),
+                        observation_id,
+                        role="synthetic-exit",
+                        reason="recovered_latched_primary_exit",
+                        details={
+                            "profile": scenario.exit_profile.value,
+                            "rule": primary_prior.get("terminal_rule"),
+                            "observation": primary_prior.get("terminal_observation"),
+                            "mark_not_fill": True,
+                        },
+                        status="synthetic_exit",
+                    )
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
+                    break
                 observations: list[tuple[ExitProfile, ExitObservation]] = []
                 for profile in scenario.compatible_exit_profiles:
                     prior = profile_states.get(profile.value) or {}
@@ -523,6 +573,7 @@ class BrokerInertScenarioObserver:
                         next_profile_state["terminal_at"] = timestamp_json(
                             quote.quote_time
                         )
+                        next_profile_state["terminal_observation"] = result.to_dict()
                     profile_states[profile.value] = next_profile_state
                     observations.append((profile, result))
                 for profile, result in observations:
@@ -559,11 +610,19 @@ class BrokerInertScenarioObserver:
                             "profile_states": profile_states,
                         },
                     )
-                primary_result = next(
-                    result
-                    for profile, result in observations
-                    if profile is scenario.exit_profile
+                primary_result = (
+                    next(
+                        result
+                        for profile, result in observations
+                        if profile is scenario.exit_profile
+                    )
+                    if any(
+                        profile is scenario.exit_profile for profile, _ in observations
+                    )
+                    else None
                 )
+                if primary_result is None:
+                    continue
                 if primary_result.is_terminal:
                     self._record_terminal(
                         new_events,
@@ -741,24 +800,15 @@ class BrokerInertScenarioObserver:
             )
 
     @staticmethod
-    def _coerce_quote(
-        value: OptionQuoteSnapshot | Mapping[str, Any],
-    ) -> OptionQuoteSnapshot:
-        return (
-            value
-            if isinstance(value, OptionQuoteSnapshot)
-            else OptionQuoteSnapshot.from_mapping(value)
-        )
+    def _coerce_quote(value: Mapping[str, Any]) -> OptionQuoteSnapshot:
+        return OptionQuoteSnapshot.from_mapping(value)
 
     def _quote_from_source(
         self, scenario: ChartScenarioSpec, at: datetime
     ) -> OptionQuoteSnapshot | None:
-        if self.quote_source is None:
+        if not self.quote_snapshots:
             return None
-        value = self.quote_source.get_snapshot(scenario=scenario, at=at)
-        if value is None:
-            return None
-        return self._coerce_quote(value)
+        return select_snapshot(self.quote_snapshots, scenario=scenario, at=at)
 
     @staticmethod
     def _quote_matches_scenario(
@@ -768,6 +818,11 @@ class BrokerInertScenarioObserver:
         now: datetime | None = None,
     ) -> bool:
         if quote.underlying_symbol != scenario.symbol or not quote.option_symbol:
+            return False
+        expected_contract_type = "CALL" if scenario.direction.value == "long" else "PUT"
+        if quote.contract_type != expected_contract_type:
+            return False
+        if quote.scenario_id is not None and quote.scenario_id != scenario.scenario_id:
             return False
         if quote.quote_time < scenario.observation_window.start_at:
             return False
@@ -805,6 +860,17 @@ class BrokerInertScenarioObserver:
         if selected.policy_hash != scenario.exit_policy_hash:
             raise ValueError(
                 "observer selected policy hash differs from scenario exit_policy_hash"
+            )
+        if scenario.cost_model_hash != self.cost_model.content_hash:
+            raise ValueError(
+                "observer cost model differs from scenario cost_model_hash"
+            )
+        if (
+            scenario.quote_eligibility_policy_hash
+            != self.quote_eligibility_policy.content_hash
+        ):
+            raise ValueError(
+                "observer quote policy differs from scenario quote_eligibility_policy_hash"
             )
 
     def _details(

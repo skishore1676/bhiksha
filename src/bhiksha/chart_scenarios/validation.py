@@ -89,6 +89,10 @@ class ShadowPlan(BaseModel):
     trigger_version: Literal[TRIGGER_VERSION]
     authorization_mode: Literal["shadow"]
     source_type: Literal["chart_scenario_experiment"]
+    campaign_manifest: dict[str, Any]
+    campaign_manifest_hash: str
+    run_manifest: dict[str, Any]
+    run_manifest_hash: str
     component_manifest: ComponentManifest
     component_manifest_hash: str = Field(min_length=64, max_length=64)
     chart_evidence: list[ChartEvidencePacket] = Field(min_length=1)
@@ -111,6 +115,10 @@ class ShadowPlan(BaseModel):
             "trigger_version",
             "authorization_mode",
             "source_type",
+            "campaign_manifest",
+            "campaign_manifest_hash",
+            "run_manifest",
+            "run_manifest_hash",
             "component_manifest",
             "component_manifest_hash",
             "chart_evidence",
@@ -213,6 +221,133 @@ class ShadowPlan(BaseModel):
             raise BundleValidationError(
                 "component_manifest_hash does not match component_manifest"
             )
+        campaign_fields = {
+            "schema",
+            "program_id",
+            "experiment_family_id",
+            "experiment_version",
+            "campaign_id",
+            "created_at",
+            "starts_on",
+            "ends_on",
+            "authorization_mode",
+            "expected_arms",
+            "component_manifest",
+            "component_manifest_hash",
+            "universe_hash",
+            "status",
+            "content_hash",
+        }
+        run_fields = {
+            "schema",
+            "program_id",
+            "experiment_family_id",
+            "experiment_version",
+            "campaign_id",
+            "run_id",
+            "trading_date",
+            "as_of",
+            "authorization_mode",
+            "expected_arms",
+            "input_hashes",
+            "component_manifest_hash",
+            "status",
+            "content_hash",
+        }
+        if (
+            set(self.campaign_manifest) != campaign_fields
+            or set(self.run_manifest) != run_fields
+        ):
+            raise BundleValidationError(
+                "campaign and run manifests must be exact registered artifacts"
+            )
+        campaign_hash = "sha256:" + canonical_sha256(
+            {
+                key: value
+                for key, value in self.campaign_manifest.items()
+                if key != "content_hash"
+            }
+        )
+        run_hash = "sha256:" + canonical_sha256(
+            {
+                key: value
+                for key, value in self.run_manifest.items()
+                if key != "content_hash"
+            }
+        )
+        if (
+            self.campaign_manifest.get("content_hash") != campaign_hash
+            or self.campaign_manifest_hash != campaign_hash
+        ):
+            raise BundleValidationError("campaign manifest hash mismatch")
+        if (
+            self.run_manifest.get("content_hash") != run_hash
+            or self.run_manifest_hash != run_hash
+        ):
+            raise BundleValidationError("run manifest hash mismatch")
+        expected_arms = ["chart_deterministic", "chart_agentic_rerank"]
+        for manifest, status in (
+            (self.campaign_manifest, "authorized"),
+            (self.run_manifest, "created"),
+        ):
+            if (
+                manifest.get("authorization_mode") != "shadow"
+                or manifest.get("status") != status
+            ):
+                raise BundleValidationError(
+                    "campaign/run manifest is not shadow-authorized"
+                )
+            if manifest.get("expected_arms") != expected_arms:
+                raise BundleValidationError(
+                    "campaign/run manifest does not authorize both arms"
+                )
+        identity = {
+            "program_id": self.candidate_pool.program_id,
+            "experiment_family_id": self.candidate_pool.experiment_family_id,
+            "experiment_version": self.candidate_pool.experiment_version,
+            "campaign_id": self.candidate_pool.campaign_id,
+        }
+        if any(
+            self.campaign_manifest.get(key) != value
+            or self.run_manifest.get(key) != value
+            for key, value in identity.items()
+        ):
+            raise BundleValidationError(
+                "campaign/run identity does not match candidate pool"
+            )
+        if self.run_manifest.get("run_id") != self.candidate_pool.run_id:
+            raise BundleValidationError(
+                "run manifest does not authorize candidate pool run_id"
+            )
+        as_of = self.candidate_pool.as_of.isoformat().replace("+00:00", "Z")
+        if (
+            self.run_manifest.get("as_of") != as_of
+            or self.run_manifest.get("trading_date")
+            != self.candidate_pool.as_of.date().isoformat()
+        ):
+            raise BundleValidationError(
+                "run manifest date/as_of does not match candidate pool"
+            )
+        if (
+            not self.campaign_manifest.get("starts_on")
+            <= self.run_manifest.get("trading_date")
+            <= self.campaign_manifest.get("ends_on")
+        ):
+            raise BundleValidationError("run date is outside campaign authorization")
+        component_material = self.component_manifest.model_dump(mode="json")
+        component_hash = "sha256:" + canonical_sha256(component_material)
+        if self.campaign_manifest.get("component_manifest") != component_material:
+            raise BundleValidationError("campaign treatment manifest differs from plan")
+        if (
+            self.campaign_manifest.get("component_manifest_hash") != component_hash
+            or self.run_manifest.get("component_manifest_hash") != component_hash
+        ):
+            raise BundleValidationError("campaign/run treatment manifest hash mismatch")
+        if (
+            str(self.campaign_manifest.get("universe_hash", "")).removeprefix("sha256:")
+            != self.candidate_pool.universe_manifest_hash
+        ):
+            raise BundleValidationError("campaign universe differs from candidate pool")
 
         evidence_by_id = {item.evidence_id: item for item in self.chart_evidence}
         if len(evidence_by_id) != len(self.chart_evidence):
@@ -301,6 +436,20 @@ class ShadowPlan(BaseModel):
                 raise BundleValidationError(
                     f"exit_policy_registry[{profile.value}] uses unsupported risk-envelope semantics"
                 )
+            implemented = {
+                "policy_schema_version": "exit-policy.v1",
+                "stop_family": "premium_pct",
+                "stop_anchor": "filled_option_premium",
+                "target_model": "staged_r",
+                "target_order_mode": "virtual_or_broker",
+                "exit_family": profile.value.lower(),
+            }
+            for field, expected in implemented.items():
+                if getattr(policy, field) != expected:
+                    raise BundleValidationError(
+                        f"exit_policy_registry[{profile.value}] uses unsupported {field}; "
+                        f"expected {expected!r}"
+                    )
             if (
                 policy.initial_stop_pct is not None
                 and policy.premium_disaster_stop_pct is not None
@@ -559,6 +708,8 @@ def install_shadow_plan(
     )
     _guard_experiment_path(output, role="output")
     _guard_experiment_path(receipt, role="receipt")
+    if output.expanduser().resolve() == receipt.expanduser().resolve():
+        raise BundleValidationError("shadow plan and install receipt paths must differ")
     _guard_experiment_path(output, role="write")
     _guard_experiment_path(receipt, role="write")
     input_digest: str | None = None

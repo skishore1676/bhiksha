@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -61,13 +62,15 @@ def ensure_read_only_quote_source(source: Any) -> ReadOnlyOptionSnapshotSource:
     return source
 
 
+@dataclass(frozen=True, slots=True, init=False)
 class StaticOptionSnapshotSource:
     """A deterministic in-memory source for a caller-provided snapshot set."""
 
+    _snapshots: tuple[OptionQuoteSnapshot, ...] = field(init=False, repr=False)
+
     def __init__(
         self,
-        snapshots: Mapping[str, OptionQuoteSnapshot | Mapping[str, Any]]
-        | Sequence[OptionQuoteSnapshot | Mapping[str, Any]],
+        snapshots: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]],
     ) -> None:
         values: list[OptionQuoteSnapshot] = []
         if isinstance(snapshots, Mapping):
@@ -75,12 +78,14 @@ class StaticOptionSnapshotSource:
         else:
             iterable = snapshots
         for value in iterable:
-            values.append(
-                value
-                if isinstance(value, OptionQuoteSnapshot)
-                else OptionQuoteSnapshot.from_mapping(value)
-            )
-        self._snapshots = tuple(values)
+            if not isinstance(value, Mapping):
+                raise TypeError("snapshot sources require exact raw quote mappings")
+            values.append(OptionQuoteSnapshot.from_mapping(value))
+        object.__setattr__(self, "_snapshots", tuple(values))
+
+    @property
+    def snapshots(self) -> tuple[OptionQuoteSnapshot, ...]:
+        return self._snapshots
 
     def get_snapshot(
         self, *, scenario: Any, at: datetime
@@ -106,6 +111,8 @@ class StaticOptionSnapshotSource:
 
 class PersistedOptionSnapshotSource(StaticOptionSnapshotSource):
     """Read snapshots from an immutable JSON export without network access."""
+
+    __slots__ = ()
 
     @classmethod
     def from_json(cls, path: str | Path) -> PersistedOptionSnapshotSource:
@@ -137,10 +144,35 @@ def quote_source_from_payload(payload: Any) -> PersistedOptionSnapshotSource:
     return PersistedOptionSnapshotSource(raw)
 
 
+def select_snapshot(
+    snapshots: Sequence[OptionQuoteSnapshot], *, scenario: Any, at: datetime
+) -> OptionQuoteSnapshot | None:
+    """Pure selector used by the observer instead of invoking source methods."""
+
+    scenario_id = str(getattr(scenario, "scenario_id", ""))
+    symbol = str(getattr(scenario, "symbol", ""))
+    candidates = [
+        quote
+        for quote in snapshots
+        if quote.quote_time <= as_utc(at)
+        and (
+            quote.scenario_id == scenario_id
+            or (quote.scenario_id is None and quote.underlying_symbol == symbol)
+        )
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda quote: (quote.is_selected, quote.quote_time, quote.snapshot_id),
+    )
+
+
 __all__ = [
     "PersistedOptionSnapshotSource",
     "ReadOnlyOptionSnapshotSource",
     "StaticOptionSnapshotSource",
     "ensure_read_only_quote_source",
     "quote_source_from_payload",
+    "select_snapshot",
 ]

@@ -22,6 +22,7 @@ from mala_bhiksha_kernel import (
     ManagementPolicySpec,
     ObservationWindow,
     ScenarioCandidatePool,
+    canonical_sha256,
     load_market_context_conformance_vectors,
 )
 from pydantic import ValidationError
@@ -32,6 +33,7 @@ from bhiksha.chart_scenarios import (
     CompletedBar,
     OptionQuoteSnapshot,
     ScenarioEventRepository,
+    StaticOptionSnapshotSource,
     evaluate_condition,
     evaluate_exit_profile,
     install_shadow_plan,
@@ -50,10 +52,10 @@ def _policy(profile: ExitProfile) -> ManagementPolicySpec:
     return ManagementPolicySpec(
         policy_id=f"fixture-{profile.value.lower()}",
         policy_schema_version="exit-policy.v1",
-        stop_family="option_premium",
-        stop_anchor="entry_mark",
+        stop_family="premium_pct",
+        stop_anchor="filled_option_premium",
         exit_family=profile.value.lower(),
-        target_model="r_multiple",
+        target_model="staged_r",
         target_r=targets[profile],
         option_stop_fallback_pct=0.40,
         hard_flat_time_et="15:55",
@@ -65,11 +67,11 @@ def _registry() -> dict[ExitProfile, ManagementPolicySpec]:
     return {profile: _policy(profile) for profile in ExitProfile}
 
 
-def _cost_model() -> CostModel:
+def _cost_model(*, contracts: int = 1) -> CostModel:
     return CostModel(
         schema_version="market-context-cost-model.v1",
         contract_multiplier=100,
-        contracts=1,
+        contracts=contracts,
         entry_fee_per_contract_usd=1.0,
         exit_fee_per_contract_usd=1.0,
         entry_slippage_per_contract_usd=0.0,
@@ -101,6 +103,42 @@ def _bundle_payload() -> dict:
     selected_policy = _registry()[scenario.exit_profile]
     cost_model = _cost_model()
     quote_policy = _quote_policy()
+    component_material = manifest.model_dump(mode="json")
+    treatment_hash = "sha256:" + canonical_sha256(component_material)
+    trading_date = pool.as_of.date().isoformat()
+    campaign = {
+        "schema": "tradelab.market_context_campaign.v1",
+        "program_id": pool.program_id,
+        "experiment_family_id": pool.experiment_family_id,
+        "experiment_version": pool.experiment_version,
+        "campaign_id": pool.campaign_id,
+        "created_at": pool.as_of.isoformat().replace("+00:00", "Z"),
+        "starts_on": trading_date,
+        "ends_on": trading_date,
+        "authorization_mode": "shadow",
+        "expected_arms": ["chart_deterministic", "chart_agentic_rerank"],
+        "component_manifest": component_material,
+        "component_manifest_hash": treatment_hash,
+        "universe_hash": "sha256:" + pool.universe_manifest_hash,
+        "status": "authorized",
+    }
+    campaign["content_hash"] = "sha256:" + canonical_sha256(campaign)
+    run = {
+        "schema": "tradelab.market_context_run.v1",
+        "program_id": pool.program_id,
+        "experiment_family_id": pool.experiment_family_id,
+        "experiment_version": pool.experiment_version,
+        "campaign_id": pool.campaign_id,
+        "run_id": pool.run_id,
+        "trading_date": trading_date,
+        "as_of": pool.as_of.isoformat().replace("+00:00", "Z"),
+        "authorization_mode": "shadow",
+        "expected_arms": ["chart_deterministic", "chart_agentic_rerank"],
+        "input_hashes": {"candidate_pool": pool.pool_hash},
+        "component_manifest_hash": treatment_hash,
+        "status": "created",
+    }
+    run["content_hash"] = "sha256:" + canonical_sha256(run)
     scenario = scenario.model_copy(
         update={
             "management_policy": selected_policy,
@@ -124,6 +162,10 @@ def _bundle_payload() -> dict:
         "trigger_version": "market-context-trigger.v1",
         "authorization_mode": "shadow",
         "source_type": "chart_scenario_experiment",
+        "campaign_manifest": campaign,
+        "campaign_manifest_hash": campaign["content_hash"],
+        "run_manifest": run,
+        "run_manifest_hash": run["content_hash"],
         "component_manifest": manifest.model_dump(mode="json"),
         "component_manifest_hash": manifest.manifest_hash,
         "chart_evidence": [chart.model_dump(mode="json")],
@@ -177,6 +219,9 @@ def _bars() -> list[dict[str, object]]:
             "high": 99.0,
             "low": 97.0,
             "close": 99.0,
+            "volume": None,
+            "completed": True,
+            "bar_id": None,
         },
         {
             "timestamp": "2026-08-04T10:39:00Z",
@@ -184,6 +229,9 @@ def _bars() -> list[dict[str, object]]:
             "high": 102.0,
             "low": 99.0,
             "close": 101.0,
+            "volume": None,
+            "completed": True,
+            "bar_id": None,
         },
         {
             "timestamp": "2026-08-04T11:18:00Z",
@@ -191,6 +239,9 @@ def _bars() -> list[dict[str, object]]:
             "high": 103.0,
             "low": 100.0,
             "close": 102.0,
+            "volume": None,
+            "completed": True,
+            "bar_id": None,
         },
     ]
 
@@ -206,7 +257,14 @@ def _quote(snapshot_id: str, mark: float, at: str) -> dict[str, object]:
         "source_id": "fixture-read-only",
         "bid": mark - 0.05,
         "ask": mark + 0.05,
+        "last": None,
+        "strike": 100.0,
+        "delta": 0.5,
+        "open_interest": 100,
+        "scenario_id": None,
+        "is_selected": True,
         "provenance": {"fixture": "chart-scenario"},
+        "snapshot_hash": None,
     }
 
 
@@ -294,7 +352,9 @@ def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
     mismatched["exit_policy_registry"][ExitProfile.TREND_CONTINUATION.value] = _policy(
         ExitProfile.RANGE_EXPANSION
     ).model_dump(mode="json")
-    with pytest.raises(BundleValidationError, match="selected policy differs"):
+    with pytest.raises(
+        BundleValidationError, match="unsupported exit_family|selected policy differs"
+    ):
         validate_bundle(mismatched)
 
     absent_selected_material = _bundle_payload()
@@ -342,6 +402,13 @@ def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
     ):
         validate_bundle(unsupported)
 
+    unsupported_family = _bundle_payload()
+    unsupported_family["exit_policy_registry"][ExitProfile.FLASH_REVERSAL.value][
+        "stop_family"
+    ] = "underlying_atr"
+    with pytest.raises(BundleValidationError, match="unsupported stop_family"):
+        validate_bundle(unsupported_family)
+
 
 def test_bundle_refuses_live_active_plan_paths_without_reading_them(
     tmp_path: Path,
@@ -367,6 +434,78 @@ def test_bundle_refuses_live_active_plan_paths_without_reading_them(
         ScenarioEventRepository(
             tmp_path / "artifacts" / "playbook" / "active_plan.json"
         )
+
+    same = tmp_path / "artifacts" / "chart_scenarios" / "same.json"
+    with pytest.raises(BundleValidationError, match="paths must differ"):
+        install_shadow_plan(_bundle_payload(), output_path=same, receipt_path=same)
+
+
+def test_raw_observations_are_exact_and_deeply_immutable() -> None:
+    quote = _quote("q-exact", 1.0, "2026-08-04T11:20:00Z")
+    quote["provenance"] = {"nested": {"source": "fixture"}}
+    snapshot = OptionQuoteSnapshot.from_mapping(quote)
+    quote["provenance"]["nested"]["source"] = "mutated"  # type: ignore[index]
+    assert snapshot.to_dict()["provenance"]["nested"]["source"] == "fixture"
+
+    missing_quote = _quote("q-missing", 1.0, "2026-08-04T11:20:00Z")
+    missing_quote.pop("source_id")
+    with pytest.raises(ValueError, match="exact fields"):
+        OptionQuoteSnapshot.from_mapping(missing_quote)
+    missing_bar = _bars()[0]
+    missing_bar.pop("completed")
+    with pytest.raises(ValueError, match="exact fields"):
+        CompletedBar.from_mapping(missing_bar)
+    with pytest.raises(ValidationError, match="frozen"):
+        _cost_model().exit_fee_per_contract_usd = 99.0
+    with pytest.raises(ValidationError, match="frozen"):
+        _quote_policy().max_quote_age_seconds = 999
+
+
+def test_snapshot_source_is_data_only_and_cannot_be_monkeypatched() -> None:
+    source = StaticOptionSnapshotSource(
+        [_quote("q-source", 1.0, "2026-08-04T11:20:00Z")]
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        source.get_snapshot = lambda **_: None  # type: ignore[method-assign]
+
+
+def test_stale_single_quote_and_treatment_drift_fail_closed(tmp_path: Path) -> None:
+    plan = _plan()
+    scenario = plan.scenarios[0]
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "stale.sqlite3"
+    )
+    stale = _observer(repository).observe_one(
+        scenario,
+        bars=_bars(),
+        option_quote=_quote("q-stale", 1.0, "2026-08-04T11:20:00Z"),
+        evaluated_at="2026-08-04T11:30:00Z",
+        market_observation_id="caller-label-a",
+    )
+    assert not any(
+        event.event_type.value == "synthetic_entry" for event in stale.events
+    )
+    assert any(event.event_type.value == "quote_unavailable" for event in stale.events)
+
+    changed_cost = plan.cost_model.model_copy(
+        update={"exit_fee_per_contract_usd": 2.0, "content_hash": None}
+    )
+    changed_cost = CostModel.model_validate(changed_cost.model_dump(mode="json"))
+    drifted = BrokerInertScenarioObserver(
+        ScenarioEventRepository(
+            tmp_path / "artifacts" / "chart_scenarios" / "drift.sqlite3"
+        ),
+        exit_policy_registry=plan.exit_policy_registry,
+        cost_model=changed_cost,
+        quote_eligibility_policy=plan.quote_eligibility_policy,
+        plan_hash=plan.plan_hash,
+    ).observe_one(
+        scenario,
+        bars=_bars(),
+        market_observation_id="caller-label-b",
+    )
+    assert drifted.error is not None
+    assert "cost model differs" in drifted.error
 
 
 def test_typed_trigger_primitives_require_completed_bars_and_respect_expiry() -> None:
@@ -492,6 +631,7 @@ def test_staged_exit_reports_weighted_gross_and_after_cost_r() -> None:
     first_target = OptionQuoteSnapshot.from_mapping(
         _quote("q-target-1", 1.4, "2026-08-04T14:10:00Z")
     )
+    staged_cost_model = _cost_model(contracts=10)
     partial = evaluate_exit_profile(
         ExitProfile.TREND_CONTINUATION,
         entry,
@@ -499,14 +639,14 @@ def test_staged_exit_reports_weighted_gross_and_after_cost_r() -> None:
         entry_time=entry.quote_time,
         evaluated_at=first_target.quote_time,
         management_policy=policy,
-        cost_model=_cost_model(),
+        cost_model=staged_cost_model,
         quote_eligibility_policy=_quote_policy(),
     )
     assert partial.status == "partial"
     assert partial.gross_r == pytest.approx(1.0)
     assert partial.net_r == pytest.approx(0.95)
-    assert partial.state["realized_gross_r"] == pytest.approx(0.5)
-    assert partial.state["remaining_fraction"] == pytest.approx(0.5)
+    assert partial.state["realized_r_contracts"] == pytest.approx(5.0)
+    assert partial.state["remaining_contracts"] == 5
 
     final_quote = OptionQuoteSnapshot.from_mapping(
         _quote("q-target-2", 1.8, "2026-08-04T14:20:00Z")
@@ -518,7 +658,7 @@ def test_staged_exit_reports_weighted_gross_and_after_cost_r() -> None:
         entry_time=entry.quote_time,
         evaluated_at=final_quote.quote_time,
         management_policy=policy,
-        cost_model=_cost_model(),
+        cost_model=staged_cost_model,
         quote_eligibility_policy=_quote_policy(),
         prior_state=partial.state,
     )
@@ -537,13 +677,26 @@ def test_staged_exit_reports_weighted_gross_and_after_cost_r() -> None:
         entry_time=entry.quote_time,
         evaluated_at=breakeven_quote.quote_time,
         management_policy=policy,
-        cost_model=_cost_model(),
+        cost_model=staged_cost_model,
         quote_eligibility_policy=_quote_policy(),
         prior_state=partial.state,
     )
     assert breakeven.rule == "breakeven_after_target_1"
     assert breakeven.gross_r == pytest.approx(0.5)
     assert breakeven.net_r == pytest.approx(0.45)
+
+    one_contract = evaluate_exit_profile(
+        ExitProfile.TREND_CONTINUATION,
+        entry,
+        final_quote,
+        entry_time=entry.quote_time,
+        evaluated_at=final_quote.quote_time,
+        management_policy=policy,
+        cost_model=_cost_model(contracts=1),
+        quote_eligibility_policy=_quote_policy(),
+    )
+    assert one_contract.rule == "target_1"
+    assert one_contract.is_terminal
 
 
 def test_no_progress_exit_uses_explicit_favorable_floor() -> None:
@@ -789,10 +942,51 @@ def test_shared_candidate_arms_require_identical_market_facts(tmp_path: Path) ->
     changed_result = observer.observe_one(
         plan.scenarios[1],
         bars=changed_bars,
-        market_observation_id="paired-arm-observation",
+        market_observation_id="different-caller-label",
     )
     assert changed_result.error is not None
     assert "different market facts" in changed_result.error
+
+
+def test_restart_recovers_latched_primary_terminal_after_crash(tmp_path: Path) -> None:
+    scenario = _scenario()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "crash.sqlite3"
+    )
+    observer = _observer(repository)
+    original = observer._record_terminal
+
+    def crash_before_synthetic_exit(*args: object, **kwargs: object):
+        event_type = args[2]
+        if getattr(event_type, "value", event_type) == "synthetic_exit":
+            raise SystemExit("simulated process death")
+        return original(*args, **kwargs)
+
+    observer._record_terminal = crash_before_synthetic_exit  # type: ignore[method-assign]
+    quotes = [
+        _quote("q-entry", 1.0, "2026-08-04T11:20:00Z"),
+        _quote("q-exit", 2.0, "2026-08-04T11:40:00Z"),
+    ]
+    with pytest.raises(SystemExit, match="simulated process death"):
+        observer.observe_one(
+            scenario,
+            bars=_bars(),
+            quote_path=quotes,
+            market_observation_id="crash-cycle",
+        )
+    stranded = repository.get_state(scenario, observer.trigger_version)
+    assert stranded is not None and not stranded["terminal"]
+    assert stranded["profile_states"][scenario.exit_profile.value]["terminal"]
+
+    recovered = _observer(repository).observe_one(
+        scenario,
+        bars=_bars(),
+        quote_path=quotes,
+        market_observation_id="renamed-crash-cycle",
+    )
+    assert recovered.error is None
+    assert recovered.terminal
+    assert recovered.status == "synthetic_exit"
 
 
 def test_new_package_import_graph_has_no_money_path_imports() -> None:

@@ -12,9 +12,30 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any
 
 from mala_bhiksha_kernel import canonical_sha256
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_json(child) for key, child in value.items()}
+        )
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json(child) for child in value)
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    raise TypeError("provenance must contain only JSON-compatible values")
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(child) for child in value]
+    return value
 
 
 def as_utc(value: datetime | str) -> datetime:
@@ -65,6 +86,8 @@ class CompletedBar:
             object.__setattr__(self, field, finite_float(getattr(self, field), field))
         if self.volume is not None:
             object.__setattr__(self, "volume", finite_float(self.volume, "volume"))
+        if not isinstance(self.completed, bool):
+            raise TypeError("completed must be a boolean")
         if not self.completed:
             raise ValueError(
                 "only completed bars may enter the chart-scenario observer"
@@ -78,10 +101,23 @@ class CompletedBar:
     def from_mapping(cls, value: Mapping[str, Any]) -> CompletedBar:
         if not isinstance(value, Mapping):
             raise TypeError("bar observation must be an object")
-        timestamp = value.get("timestamp", value.get("bar_time", value.get("at")))
-        if timestamp is None:
-            raise ValueError("bar observation requires timestamp")
-        required = ("open", "high", "low", "close")
+        expected = {
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "completed",
+            "bar_id",
+        }
+        if set(value) != expected:
+            raise ValueError(
+                "bar observation must declare exact fields; "
+                f"missing={sorted(expected - set(value))}, extra={sorted(set(value) - expected)}"
+            )
+        timestamp = value["timestamp"]
+        required = ("open", "high", "low", "close", "completed")
         missing = [field for field in required if field not in value]
         if missing:
             raise ValueError(f"bar observation missing {', '.join(missing)}")
@@ -91,8 +127,8 @@ class CompletedBar:
             high=value["high"],
             low=value["low"],
             close=value["close"],
-            volume=value.get("volume"),
-            completed=bool(value.get("completed", True)),
+            volume=value["volume"],
+            completed=value["completed"],
             bar_id=str(value["bar_id"]) if value.get("bar_id") else None,
         )
 
@@ -150,6 +186,8 @@ class OptionQuoteSnapshot:
                 raise ValueError(f"{field} must be non-empty")
             object.__setattr__(self, field, value)
         object.__setattr__(self, "quote_time", as_utc(self.quote_time))
+        if not isinstance(self.is_selected, bool):
+            raise TypeError("is_selected must be a boolean")
         for field in ("bid", "ask", "last", "strike", "delta"):
             value = getattr(self, field)
             if value is not None:
@@ -163,6 +201,17 @@ class OptionQuoteSnapshot:
             if self.open_interest < 0:
                 raise ValueError("open_interest must be non-negative")
             object.__setattr__(self, "open_interest", int(self.open_interest))
+        if self.contract_type not in {"CALL", "PUT"}:
+            raise ValueError("contract_type must be CALL or PUT")
+        try:
+            expiration = datetime.fromisoformat(self.expiration_date).date()
+        except ValueError:
+            raise ValueError("expiration_date must use YYYY-MM-DD") from None
+        if expiration < self.quote_time.date():
+            raise ValueError("option quote expiration precedes quote_time")
+        if self.strike is None or self.strike <= 0:
+            raise ValueError("option quote requires a positive strike")
+        object.__setattr__(self, "provenance", _freeze_json(self.provenance or {}))
         computed = canonical_sha256(self._hash_payload())
         if self.snapshot_hash is not None:
             supplied = str(self.snapshot_hash).removeprefix("sha256:")
@@ -174,39 +223,48 @@ class OptionQuoteSnapshot:
     def from_mapping(cls, value: Mapping[str, Any]) -> OptionQuoteSnapshot:
         if not isinstance(value, Mapping):
             raise TypeError("option quote must be an object")
-        quote_time = value.get("quote_time", value.get("timestamp", value.get("at")))
-        if quote_time is None:
-            raise ValueError("option quote requires quote_time")
-        option_symbol = value.get("option_symbol", value.get("contract_symbol"))
-        underlying = value.get("underlying_symbol", value.get("symbol"))
-        if not option_symbol or not underlying:
+        expected = {
+            "snapshot_id",
+            "option_symbol",
+            "underlying_symbol",
+            "contract_type",
+            "expiration_date",
+            "quote_time",
+            "source_id",
+            "bid",
+            "ask",
+            "last",
+            "strike",
+            "delta",
+            "open_interest",
+            "scenario_id",
+            "is_selected",
+            "provenance",
+            "snapshot_hash",
+        }
+        if set(value) != expected:
             raise ValueError(
-                "option quote requires option_symbol and underlying_symbol"
+                "option quote must declare exact fields; "
+                f"missing={sorted(expected - set(value))}, extra={sorted(set(value) - expected)}"
             )
         return cls(
-            snapshot_id=str(value.get("snapshot_id", value.get("quote_id", "quote"))),
-            option_symbol=str(option_symbol),
-            underlying_symbol=str(underlying),
-            contract_type=str(
-                value.get("contract_type", value.get("option_type", "unknown"))
-            ),
-            expiration_date=str(
-                value.get("expiration_date", value.get("expiration", "unknown"))
-            ),
-            quote_time=as_utc(quote_time),
-            source_id=str(
-                value.get("source_id", value.get("source", "caller_snapshot"))
-            ),
-            bid=value.get("bid"),
-            ask=value.get("ask"),
-            last=value.get("last", value.get("mark")),
-            strike=value.get("strike"),
-            delta=value.get("delta"),
-            open_interest=value.get("open_interest"),
-            scenario_id=str(value["scenario_id"]) if value.get("scenario_id") else None,
-            is_selected=bool(value.get("is_selected", value.get("selected", False))),
-            provenance=value.get("provenance"),
-            snapshot_hash=value.get("snapshot_hash"),
+            snapshot_id=str(value["snapshot_id"]),
+            option_symbol=str(value["option_symbol"]),
+            underlying_symbol=str(value["underlying_symbol"]),
+            contract_type=str(value["contract_type"]),
+            expiration_date=str(value["expiration_date"]),
+            quote_time=as_utc(value["quote_time"]),
+            source_id=str(value["source_id"]),
+            bid=value["bid"],
+            ask=value["ask"],
+            last=value["last"],
+            strike=value["strike"],
+            delta=value["delta"],
+            open_interest=value["open_interest"],
+            scenario_id=str(value["scenario_id"]) if value["scenario_id"] else None,
+            is_selected=value["is_selected"],
+            provenance=value["provenance"],
+            snapshot_hash=value["snapshot_hash"],
         )
 
     def _hash_payload(self) -> dict[str, Any]:
@@ -226,7 +284,7 @@ class OptionQuoteSnapshot:
             "open_interest": self.open_interest,
             "scenario_id": self.scenario_id,
             "is_selected": self.is_selected,
-            "provenance": dict(self.provenance or {}),
+            "provenance": _thaw_json(self.provenance or {}),
         }
 
     @property

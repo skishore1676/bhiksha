@@ -125,6 +125,7 @@ class ScenarioEventRepository:
                         scenario_hash TEXT NOT NULL,
                         plan_hash TEXT NOT NULL,
                         policy_registry_hash TEXT NOT NULL,
+                        treatment_hash TEXT NOT NULL,
                         status TEXT NOT NULL,
                         terminal INTEGER NOT NULL DEFAULT 0,
                         metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -154,11 +155,11 @@ class ScenarioEventRepository:
                         campaign_id TEXT NOT NULL,
                         run_id TEXT NOT NULL,
                         candidate_id TEXT NOT NULL,
-                        market_observation_id TEXT NOT NULL,
+                        observation_key TEXT NOT NULL,
                         facts_hash TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         PRIMARY KEY (
-                            campaign_id, run_id, candidate_id, market_observation_id
+                            campaign_id, run_id, candidate_id, observation_key
                         )
                     );
                     """
@@ -169,7 +170,7 @@ class ScenarioEventRepository:
         self,
         scenario: ChartScenarioSpec,
         *,
-        market_observation_id: str,
+        observation_key: str,
         facts_hash: str,
     ) -> None:
         """Bind both arms for one candidate/observation to identical raw facts."""
@@ -181,13 +182,13 @@ class ScenarioEventRepository:
                 """
                 SELECT facts_hash FROM chart_scenario_market_facts
                 WHERE campaign_id=? AND run_id=? AND candidate_id=?
-                  AND market_observation_id=?
+                  AND observation_key=?
                 """,
                 (
                     scenario.campaign_id,
                     scenario.run_id,
                     scenario.candidate_id,
-                    market_observation_id,
+                    observation_key,
                 ),
             ).fetchone()
             if row is not None:
@@ -199,14 +200,14 @@ class ScenarioEventRepository:
             conn.execute(
                 """
                 INSERT INTO chart_scenario_market_facts
-                (campaign_id, run_id, candidate_id, market_observation_id, facts_hash, created_at)
+                (campaign_id, run_id, candidate_id, observation_key, facts_hash, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     scenario.campaign_id,
                     scenario.run_id,
                     scenario.candidate_id,
-                    market_observation_id,
+                    observation_key,
                     facts_hash,
                     timestamp_json(datetime.now(UTC)),
                 ),
@@ -219,6 +220,7 @@ class ScenarioEventRepository:
         *,
         plan_hash: str,
         policy_registry_hash: str,
+        treatment_hash: str,
     ) -> bool:
         """Register a scenario identity; return ``True`` only on first insert."""
 
@@ -234,7 +236,7 @@ class ScenarioEventRepository:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT scenario_hash, plan_hash, policy_registry_hash
+                SELECT scenario_hash, plan_hash, policy_registry_hash, treatment_hash
                 FROM chart_scenario_states
                 WHERE campaign_id=? AND run_id=? AND arm_id=? AND scenario_id=? AND trigger_version=?
                 """,
@@ -253,13 +255,17 @@ class ScenarioEventRepository:
                     raise ValueError(
                         "scenario identity was reused with a different policy registry hash"
                     )
+                if row["treatment_hash"] != treatment_hash:
+                    raise ValueError(
+                        "scenario identity was reused with different executable treatment"
+                    )
                 return False
             conn.execute(
                 """
                 INSERT INTO chart_scenario_states
                 (campaign_id, run_id, arm_id, scenario_id, trigger_version, scenario_hash,
-                 plan_hash, policy_registry_hash, status, terminal, metadata_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'installed', 0, ?, ?)
+                 plan_hash, policy_registry_hash, treatment_hash, status, terminal, metadata_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'installed', 0, ?, ?)
                 """,
                 (
                     campaign_id,
@@ -270,11 +276,13 @@ class ScenarioEventRepository:
                     scenario.scenario_hash,
                     plan_hash,
                     policy_registry_hash,
+                    treatment_hash,
                     json.dumps(
                         {
                             "scenario": json.loads(scenario_json),
                             "plan_hash": plan_hash,
                             "policy_registry_hash": policy_registry_hash,
+                            "treatment_hash": treatment_hash,
                         },
                         sort_keys=True,
                         separators=(",", ":"),

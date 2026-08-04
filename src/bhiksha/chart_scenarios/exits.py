@@ -86,16 +86,14 @@ def evaluate_exit_profile(
         selected = profile if isinstance(profile, ExitProfile) else ExitProfile(profile)
     except ValueError as exc:
         raise ValueError(f"unknown exit profile: {profile!r}") from exc
+    entry_at = as_utc(entry_time)
+    now = as_utc(evaluated_at)
     if not quote_eligibility_policy.eligible(
         entry_quote, evaluated_at=entry_quote.quote_time
-    ) or not quote_eligibility_policy.eligible(
-        current_quote, evaluated_at=current_quote.quote_time
-    ):
+    ) or not quote_eligibility_policy.eligible(current_quote, evaluated_at=now):
         raise ValueError("exit evaluation requires eligible option marks")
     if entry_quote.mark is None or current_quote.mark is None:
         raise ValueError("exit evaluation requires option marks")
-    entry_at = as_utc(entry_time)
-    now = as_utc(evaluated_at)
     if now < entry_at:
         raise ValueError("exit observation cannot precede synthetic entry")
 
@@ -129,8 +127,9 @@ def evaluate_exit_profile(
     state["cost_model_hash"] = cost_model.content_hash
     state["quote_eligibility_policy_hash"] = quote_eligibility_policy.content_hash
     state["cost_r"] = cost_r
-    state.setdefault("realized_gross_r", 0.0)
-    state.setdefault("remaining_fraction", 1.0)
+    state.setdefault("total_contracts", cost_model.contracts)
+    state.setdefault("realized_r_contracts", 0.0)
+    state.setdefault("remaining_contracts", cost_model.contracts)
     elapsed = (now - entry_at).total_seconds()
 
     disaster_pct = management_policy.premium_disaster_stop_pct
@@ -177,21 +176,16 @@ def evaluate_exit_profile(
     if target_2 is None:
         target_2 = management_policy.target_r
     target_1_quantity = management_policy.target_1_quantity
-    if target_2 is not None and _meets_r(r, target_2):
-        state["target_1_hit"] = bool(target_1 is not None and _meets_r(r, target_1))
-        return _result(
-            selected,
-            "exit",
-            "target_2",
-            current_mark,
-            r,
-            elapsed,
-            state,
-            "primary_target_2",
-        )
     if target_1 is not None and not state.get("target_1_hit") and _meets_r(r, target_1):
         state["target_1_hit"] = True
-        if target_2 is None or target_1_quantity >= 1.0:
+        banked_contracts = _partial_quantity(
+            cost_model.contracts, float(target_1_quantity)
+        )
+        state["realized_r_contracts"] = (
+            float(state["realized_r_contracts"]) + banked_contracts * r
+        )
+        state["remaining_contracts"] = cost_model.contracts - banked_contracts
+        if target_2 is None or banked_contracts >= cost_model.contracts:
             return _result(
                 selected,
                 "exit",
@@ -202,15 +196,6 @@ def evaluate_exit_profile(
                 state,
                 "primary_target_1",
             )
-        exited_fraction = min(
-            float(target_1_quantity), float(state["remaining_fraction"])
-        )
-        state["realized_gross_r"] = (
-            float(state["realized_gross_r"]) + exited_fraction * r
-        )
-        state["remaining_fraction"] = (
-            float(state["remaining_fraction"]) - exited_fraction
-        )
         return _result(
             selected,
             "partial",
@@ -220,6 +205,20 @@ def evaluate_exit_profile(
             elapsed,
             state,
             "counterfactual_target_1_partial",
+        )
+    runner_armed = (
+        state.get("target_1_hit") or target_1 is None or target_1_quantity <= 0
+    )
+    if runner_armed and target_2 is not None and _meets_r(r, target_2):
+        return _result(
+            selected,
+            "exit",
+            "target_2",
+            current_mark,
+            r,
+            elapsed,
+            state,
+            "primary_target_2",
         )
 
     giveback_fraction = management_policy.giveback_retrace_fraction
@@ -302,10 +301,11 @@ def _result(
     state: Mapping[str, Any],
     reason: str,
 ) -> ExitObservation:
+    total_contracts = int(state.get("total_contracts", 1))
     gross_r = (
-        float(state.get("realized_gross_r", 0.0))
-        + float(state.get("remaining_fraction", 1.0)) * r
-    )
+        float(state.get("realized_r_contracts", 0.0))
+        + state.get("remaining_contracts", total_contracts) * r
+    ) / total_contracts
     return ExitObservation(
         profile=profile,
         status=status,
@@ -318,6 +318,13 @@ def _result(
         state=dict(state),
         reason=reason,
     )
+
+
+def _partial_quantity(quantity: int, fraction: float) -> int:
+    if fraction >= 1.0:
+        return quantity
+    banked = round(quantity * fraction)
+    return max(1, min(banked, quantity - 1)) if quantity > 1 else quantity
 
 
 __all__ = ["ExitObservation", "evaluate_exit_profile"]

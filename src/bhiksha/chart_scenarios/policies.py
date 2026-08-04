@@ -12,11 +12,11 @@ from .models import OptionQuoteSnapshot, as_utc
 
 
 class CostModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     schema_version: Literal["market-context-cost-model.v1"]
     contract_multiplier: int = Field(gt=0)
-    contracts: Literal[1]
+    contracts: int = Field(gt=0, le=100)
     entry_fee_per_contract_usd: float = Field(ge=0, allow_inf_nan=False)
     exit_fee_per_contract_usd: float = Field(ge=0, allow_inf_nan=False)
     entry_slippage_per_contract_usd: float = Field(ge=0, allow_inf_nan=False)
@@ -46,7 +46,7 @@ class CostModel(BaseModel):
 
 
 class QuoteEligibilityPolicy(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     schema_version: Literal["market-context-quote-eligibility.v1"]
     require_bid_ask: bool
