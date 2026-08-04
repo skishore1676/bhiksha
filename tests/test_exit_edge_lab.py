@@ -482,7 +482,7 @@ def test_live_repository_missing_registration_blocks_subset_inference(tmp_path: 
 @pytest.mark.parametrize(
     "health_mutation,blocker",
     [
-        ({"schema_version": 3}, "live_health_schema_invalid"),
+        ({"schema_version": 4}, "live_health_schema_invalid"),
         ({"enabled": False}, "live_health_disabled"),
         ({"mode": "execution"}, "live_health_mode_invalid"),
         ({"enforcement_authority": True}, "live_health_enforcement_authority_invalid"),

@@ -155,20 +155,25 @@ two-sided `quoteTimestamp`, or **both** `bidTimestamp` and `askTimestamp`. For
 the side-specific form, the older side becomes the effective `quote_at`; this
 makes the freshness test cover both sides. A missing, malformed, or future
 side fails closed. Generic response timestamps, `lastTimestamp`, and trade
-timestamps do not prove the age of the bid/ask and censor the cohort. The
-recorder assigns a local sequence only after the observation enters its bounded
-queue; any active-cohort queue drop permanently censors the tape, so a
-synthetic contiguous sequence cannot hide missed observations. An unfinished
-cohort found after restart is censored as `restart_gap_unobserved_quotes`.
+timestamps do not prove the age of the bid/ask. Such observations are written
+to the append-only `exit_edge_quote_rejections` ledger and excluded from the
+admissible tape; the cohort remains active for a later fresh retry. The recorder
+assigns a local sequence only after an observation passes these checks. Any
+active-cohort queue drop still permanently censors the tape, so a synthetic
+contiguous sequence cannot hide missed observations. An unfinished cohort found
+after restart is censored as `restart_gap_unobserved_quotes`.
 
-This tee normally stops receiving marks when the actual position closes. It
-keeps the cohort open in case another existing request happens to fetch the
-same contract, but it does not add post-close calls. At session shutdown an
-unfinished case is explicitly censored as
+After the actual position closes, the runtime requests at most one bounded,
+read-only Public quote per option every configured continuation interval. It
+uses the existing quote observer and has no order, position, or enforcement
+authority. Retry continues until every virtual arm terminates or the session
+shuts down. A cohort with rejected observations but no admissible marks is then
+censored as `session_shutdown_without_admissible_quote_stream`; another
+unfinished case is censored as
 `no_post_exit_quote_source_session_shutdown_before_virtual_arms_terminal`.
-Therefore this integration is useful for opportunistic proof and health
-measurement; it is **not** guaranteed complete prospective collection. A
-separately budgeted low-priority quote source would require another approval.
+The retry-aware feed has its own frozen experiment identity,
+`order_manager_reused_quote_with_bounded_retry_v2`, so it is not pooled with
+older opportunistic collection.
 
 Enable persistently on oldmac only after syncing the reviewed commit, at a
 session boundary. The installer writes the flag into both the live-start and
@@ -195,8 +200,9 @@ readback to `artifacts/observations/exit_edge_live_status.json`. The status
 must say `mode=observational_shadow_only`, `enforcement_authority=false`, and
 `broker_calls_added=0`. Inspect `observed_quote_timestamp_fields`: at least one
 proved lineage (`quoteTimestamp` or `bidTimestamp+askTimestamp`) must be present.
-Any other field remains truthfully censored and cannot produce a useful paired
-case.
+Any other field remains truthfully rejected and cannot enter a useful paired
+case. Inspect `rejected_quotes` and `rejected_quote_reasons` to distinguish
+provider-data rejection from queue or storage loss.
 
 The 2026-07-27 day-one cohorts were censored because the normalizer discarded
 Public's side-specific timestamps before they reached the recorder. They remain

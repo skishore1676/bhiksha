@@ -15,6 +15,7 @@ from bhiksha.ops import exit_edge_live
 from bhiksha.ops.exit_edge_lab import (
     ProspectiveQuoteTapeRepository,
     SHADOW_CANDIDATE_IDS,
+    analyze_prospective_repository,
 )
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
 from bhiksha.execution.exit_policy import canonical_policy_hash
@@ -192,7 +193,7 @@ def test_post_exit_continuation_keeps_same_cohort_until_all_arms_terminal(
     recorder.record_continuation_quote_result(OPTION)
     _wait_until(lambda: recorder.snapshot()["paired_cohorts"] == 1)
     health = recorder.snapshot()
-    assert health["post_exit_quote_continuation"] == "enabled_bounded_public_quote_v1"
+    assert health["post_exit_quote_continuation"] == "enabled_bounded_public_quote_retry_v2"
     assert health["continuation_quote_calls_added"] == 1
     assert health["active_cohorts"] == 0
     recorder.close()
@@ -282,6 +283,29 @@ def test_registration_summary_waits_for_brief_schema_writer_lock(
 
     assert not writer.is_alive()
     assert summary["confirmed_fill_attempts"] == 0
+
+
+def test_existing_repository_adds_quote_rejection_ledger_on_initialize(
+    tmp_path: Path,
+) -> None:
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    repository.initialize()
+    with sqlite3.connect(repository.path) as conn:
+        conn.execute("DROP TABLE exit_edge_quote_rejections")
+
+    assert repository.quote_rejection_summary("unknown") == {
+        "count": 0,
+        "reasons": {},
+    }
+
+    repository.initialize()
+
+    with sqlite3.connect(repository.path) as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("exit_edge_quote_rejections",),
+        ).fetchone()
+    assert table == ("exit_edge_quote_rejections",)
 
 
 def test_restart_gap_censors_unfinished_persisted_cohort(tmp_path: Path) -> None:
@@ -448,7 +472,7 @@ def test_live_recorder_accepts_proved_public_side_timestamp_pair(
     }
 
 
-def test_live_recorder_censors_pair_with_future_side_timestamp(
+def test_live_recorder_rejects_bad_timestamp_then_pairs_from_fresh_retry(
     tmp_path: Path,
 ) -> None:
     recorder = _recorder(tmp_path)
@@ -472,13 +496,82 @@ def test_live_recorder_censors_pair_with_future_side_timestamp(
         ),
         received_at,
     )
-    _wait_until(lambda: recorder.snapshot()["censored_cohorts"] == 1)
+    _wait_until(lambda: recorder.snapshot()["rejected_quotes"] == 1)
+    assert recorder.snapshot()["active_cohorts"] == 1
+    assert recorder.snapshot()["censored_cohorts"] == 0
+
+    for sequence, bid in enumerate([2.10, 2.70, 2.75, 3.40, 3.35], start=2):
+        observed_at = ENTRY + timedelta(seconds=15 * sequence)
+        recorder.observe_quote(
+            OPTION,
+            _paired_quote(
+                observed_at - timedelta(milliseconds=150),
+                observed_at - timedelta(milliseconds=100),
+                bid,
+            ),
+            observed_at,
+        )
+    _wait_until(lambda: recorder.snapshot()["paired_cohorts"] == 1)
     recorder.close()
 
-    case = ProspectiveQuoteTapeRepository(tmp_path / "edge.db").load_case(
-        "exit-edge:T1"
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    case = repository.load_case("exit-edge:T1")
+    assert case.persisted_censor_reason is None
+    assert len(case.quotes) == 5
+    assert repository.quote_rejection_summary("exit-edge:T1") == {
+        "count": 1,
+        "reasons": {"missing_provider_quote_timestamp": 1},
+    }
+    report = analyze_prospective_repository(
+        repository,
+        health_path=tmp_path / "status.json",
     )
-    assert case.persisted_censor_reason == "missing_provider_quote_timestamp"
+    assert report["summary"]["rejected_quote_count"] == 1
+    assert report["summary"]["rejected_quote_reasons"] == {
+        "missing_provider_quote_timestamp": 1
+    }
+
+
+def test_live_recorder_retries_stale_quotes_and_censors_only_at_shutdown(
+    tmp_path: Path,
+) -> None:
+    recorder = _recorder(tmp_path, max_freshness_ms=2_000)
+    recorder.start()
+    assert recorder.try_register_entry(
+        deployment=_deployment(),
+        trade_id="T-STALE",
+        option_symbol=OPTION,
+        entry_timestamp=ENTRY,
+        entry_premium=2.0,
+        quantity=10,
+    )
+    _wait_until(lambda: recorder.snapshot()["active_cohorts"] == 1)
+    received_at = ENTRY + timedelta(seconds=30)
+    recorder.observe_quote(
+        OPTION,
+        _paired_quote(
+            received_at - timedelta(seconds=3),
+            received_at - timedelta(seconds=3),
+            2.10,
+        ),
+        received_at,
+    )
+    _wait_until(lambda: recorder.snapshot()["rejected_quotes"] == 1)
+    assert recorder.snapshot()["active_cohorts"] == 1
+    assert recorder.snapshot()["censored_cohorts"] == 0
+
+    recorder.close()
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    case = repository.load_case("exit-edge:T-STALE")
+    assert case.quotes == ()
+    assert (
+        case.persisted_censor_reason
+        == "session_shutdown_without_admissible_quote_stream"
+    )
+    assert repository.quote_rejection_summary("exit-edge:T-STALE") == {
+        "count": 1,
+        "reasons": {"stale_quote_gap": 1},
+    }
 
 
 def test_bounded_tee_stays_fast_with_many_same_contract_cohorts(tmp_path: Path) -> None:

@@ -38,7 +38,7 @@ from bhiksha.ops.exit_edge_lab import (
 
 ET = ZoneInfo("America/New_York")
 QUOTE_SOURCE = "public_api"
-QUOTE_FEED = "order_manager_reused_quote_v1"
+QUOTE_FEED = "order_manager_reused_quote_with_bounded_retry_v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +93,7 @@ class ExitEdgeLiveRecorder:
         self._pending_registration_attempts: dict[str, dict[str, Any]] = {}
         self._last_continuation_request: dict[str, datetime] = {}
         self._health: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "enabled": True,
             "mode": "observational_shadow_only",
             "enforcement_authority": False,
@@ -101,7 +101,7 @@ class ExitEdgeLiveRecorder:
             "inference_eligible": False,
             "inference_blockers": ["guarded_repository_report_required"],
             "broker_calls_added": 0,
-            "post_exit_quote_continuation": "enabled_bounded_public_quote_v1",
+            "post_exit_quote_continuation": "enabled_bounded_public_quote_retry_v2",
             "continuation_min_interval_seconds": self.continuation_min_interval_seconds,
             "continuation_quote_calls_added": 0,
             "continuation_quote_failures": 0,
@@ -119,6 +119,8 @@ class ExitEdgeLiveRecorder:
             "active_cohorts": 0,
             "paired_cohorts": 0,
             "censored_cohorts": 0,
+            "rejected_quotes": 0,
+            "rejected_quote_reasons": {},
             "dropped_observations": 0,
             "storage_failures": 0,
             "registration_failures": 0,
@@ -254,6 +256,9 @@ class ExitEdgeLiveRecorder:
             snapshot["observed_quote_timestamp_fields"] = dict(
                 self._health["observed_quote_timestamp_fields"]
             )
+            snapshot["rejected_quote_reasons"] = dict(
+                self._health["rejected_quote_reasons"]
+            )
             snapshot["inference_blockers"] = list(self._health["inference_blockers"])
             return snapshot
 
@@ -371,16 +376,32 @@ class ExitEdgeLiveRecorder:
                 observed.quote_timestamp_field
                 not in PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
             ):
-                self._censor(
+                self._reject_quote(
                     repository,
                     cohort_id,
+                    observed,
                     "unproven_bid_ask_quote_timestamp_lineage",
                 )
                 continue
             if observed.quote_at is None:
-                self._censor(repository, cohort_id, "missing_provider_quote_timestamp")
+                self._reject_quote(
+                    repository,
+                    cohort_id,
+                    observed,
+                    "missing_provider_quote_timestamp",
+                )
                 continue
             try:
+                case = repository.load_case(cohort_id)
+                rejection_reason = self._quote_rejection_reason(case, observed)
+                if rejection_reason is not None:
+                    self._reject_quote(
+                        repository,
+                        cohort_id,
+                        observed,
+                        rejection_reason,
+                    )
+                    continue
                 sequence = repository.latest_sequence(cohort_id) + 1
                 mark = QuoteTapeMark(
                     sequence=sequence,
@@ -419,6 +440,68 @@ class ExitEdgeLiveRecorder:
                 self._censor(repository, cohort_id, "quote_processing_failure")
         self._write_status_best_effort()
 
+    def _quote_rejection_reason(
+        self, case: Any, observed: _ObservedQuote
+    ) -> str | None:
+        """Validate one provider observation before it enters the paired tape."""
+
+        assert observed.quote_at is not None
+        if (
+            observed.quote_at < case.entry_timestamp
+            or observed.received_at < case.entry_timestamp
+        ):
+            return "quote_precedes_entry"
+        freshness_ms = (
+            observed.received_at - observed.quote_at
+        ).total_seconds() * 1000
+        if freshness_ms < 0:
+            return "quote_received_before_provider_timestamp"
+        if freshness_ms > self.max_freshness_ms:
+            return "stale_quote_gap"
+        if observed.bid is None or observed.bid <= 0:
+            return "missing_executable_bid"
+        if observed.ask is None or observed.ask <= 0:
+            return "missing_ask"
+        if observed.ask < observed.bid:
+            return "crossed_quote"
+        if case.quotes:
+            previous = case.quotes[-1]
+            if (
+                observed.quote_at < previous.quote_at
+                or observed.received_at < previous.received_at
+            ):
+                return "out_of_order_timestamp"
+        return None
+
+    def _reject_quote(
+        self,
+        repository: ProspectiveQuoteTapeRepository,
+        cohort_id: str,
+        observed: _ObservedQuote,
+        reason: str,
+    ) -> None:
+        """Durably reject an invalid mark and leave its cohort active for retry."""
+
+        if repository.try_record_quote_rejection(
+            cohort_id,
+            source=QUOTE_SOURCE,
+            feed=QUOTE_FEED,
+            reason=reason,
+            quote_timestamp_field=observed.quote_timestamp_field,
+            quote_at=observed.quote_at,
+            received_at=observed.received_at,
+            bid=observed.bid,
+            ask=observed.ask,
+            last=observed.last,
+        ):
+            self._increment_rejected_quote(reason)
+            return
+        self._increment_health(
+            "storage_failures",
+            error=f"quote_rejection_persist_failed:{cohort_id}:{reason}",
+        )
+        self._censor(repository, cohort_id, "quote_rejection_persistence_failure")
+
     def _flush_pending_censors(self, repository: ProspectiveQuoteTapeRepository) -> None:
         with self._lock:
             pending = dict(self._pending_censors)
@@ -453,7 +536,18 @@ class ExitEdgeLiveRecorder:
                 for cohort_id in values
             }
         for cohort_id in cohort_ids:
-            self._censor(repository, cohort_id, reason)
+            shutdown_reason = reason
+            try:
+                case = repository.load_case(cohort_id)
+                rejected = repository.quote_rejection_summary(cohort_id)
+                if not case.quotes and int(rejected["count"]) > 0:
+                    shutdown_reason = "session_shutdown_without_admissible_quote_stream"
+            except Exception as exc:
+                self._increment_health(
+                    "storage_failures",
+                    error=f"shutdown_readback:{cohort_id}:{exc}",
+                )
+            self._censor(repository, cohort_id, shutdown_reason)
 
     def _censor(
         self, repository: ProspectiveQuoteTapeRepository, cohort_id: str, reason: str
@@ -516,6 +610,15 @@ class ExitEdgeLiveRecorder:
             self._health[key] = int(self._health.get(key, 0)) + 1
             if error is not None:
                 self._health["last_error"] = error
+            self._health["updated_at"] = datetime.now(UTC).isoformat()
+
+    def _increment_rejected_quote(self, reason: str) -> None:
+        with self._lock:
+            self._health["rejected_quotes"] = int(
+                self._health.get("rejected_quotes", 0)
+            ) + 1
+            reasons = self._health["rejected_quote_reasons"]
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
             self._health["updated_at"] = datetime.now(UTC).isoformat()
 
     def _set_health(self, **values: Any) -> None:
