@@ -16,7 +16,9 @@ from bhiksha.chart_scenarios.repository import ScenarioEventRepository
 from bhiksha.chart_scenarios.validation import read_installed_plan
 from bhiksha.config.environment import load_dotenv
 from bhiksha.integrations.schwab.chain import SchwabOptionChainService
-from bhiksha.integrations.schwab.client import SchwabApiClient
+from bhiksha.integrations.schwab.market_data_client import (
+    SchwabReadOnlyMarketDataClient,
+)
 from bhiksha.market_data.adapters.schwab import SchwabBarSource
 from bhiksha.ops.chart_scenario_live_export import export_live_cycle_input
 
@@ -27,8 +29,10 @@ async def _run(args: argparse.Namespace) -> dict:
         str(plan.run_manifest["campaign_id"]), str(plan.run_manifest["run_id"])
     )
     repository = ScenarioEventRepository(args.db_path or paths.database)
-    client = SchwabApiClient()
-    bar_source = SchwabBarSource(client=client)
+    client = SchwabReadOnlyMarketDataClient()
+    # Pass the already-stripped settings explicitly. SchwabBarSource's general
+    # constructor otherwise loads the repo dotenv for the live trading client.
+    bar_source = SchwabBarSource(client=client, settings=client.settings)
     chain_service = SchwabOptionChainService(client=client)
     try:
         payload = await export_live_cycle_input(
@@ -68,7 +72,8 @@ def _write_atomic(path: Path, payload: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    if os.getenv("BHIKSHA_SANITIZED_SUBPROCESS") != "1":
+        load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--plan", default="artifacts/chart_scenarios/active_shadow_plan.json"

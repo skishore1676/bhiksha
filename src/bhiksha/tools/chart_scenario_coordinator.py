@@ -4,29 +4,42 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from mala_bhiksha_kernel import canonical_sha256
+from mala_bhiksha_kernel import ScenarioShadowEvent, canonical_sha256
 
+from bhiksha.chart_scenarios.cycle import (
+    CYCLE_RECEIPT_SCHEMA,
+    validate_cycle_input,
+)
 from bhiksha.chart_scenarios.paths import require_experiment_path, run_artifact_paths
-from bhiksha.chart_scenarios.repository import ScenarioEventRepository
+from bhiksha.chart_scenarios.repository import (
+    ScenarioEventRepository,
+    canonical_observation_slot_id,
+)
 from bhiksha.chart_scenarios.timeframes import CALENDAR_VERSION, xnys_session_dates
 from bhiksha.chart_scenarios.validation import (
+    INSTALL_RECEIPT_SCHEMA_VERSION,
+    ShadowPlan,
     install_shadow_plan,
     read_installed_plan,
     validate_bundle,
 )
 from bhiksha.config.environment import load_dotenv
+from bhiksha.ops.chart_scenario_sheet import SPREADSHEET_ID
 
 SCHEMA = "bhiksha.chart-scenario-coordinator-contract.v1"
 CAMPAIGN_CONFIG_SCHEMA = "bhiksha.chart-scenario-campaign-config.v1"
@@ -35,6 +48,24 @@ CAMPAIGN_WINDOW_SCHEMA = "bhiksha.chart-scenario-campaign-window.v1"
 CENTRAL = ZoneInfo("America/Chicago")
 PREPARE_CUTOFF_MINUTES = 8 * 60 + 15
 _CYCLE_RECEIPT_RE = re.compile(r"slot-(\d{4})\.receipt\.json")
+_COMMON_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "PYTHONPATH",
+        "LANG",
+        "LC_ALL",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "TMPDIR",
+    }
+)
+_SCHWAB_MARKET_DATA_ENV = frozenset(
+    {"SCHWAB_TOKEN_FILE", "SCHWAB_API_BASE_URL", "SCHWAB_TIMEOUT_SECONDS"}
+)
+_GOOGLE_SHEET_ENV = frozenset(
+    {"BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH", "GOOGLE_API_CREDENTIALS_PATH"}
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -230,11 +261,11 @@ def _observe_once(
     candidate_ids = tuple(
         sorted({scenario.candidate_id for scenario in plan.scenarios})
     )
-    completed_slot = _completed_cycle_slot(paths.cycle_receipts)
+    completed_slot = _completed_cycle_slot(paths, plan=plan)
     latest_slot = repository.latest_observation_slot_ordinal(
         run_id=str(plan.run_manifest["run_id"]), candidate_ids=candidate_ids
     )
-    pending_input = paths.cycle_inputs / f"slot-{latest_slot:04d}.json"
+    pending_input = paths.cycle_inputs / f"slot-{latest_slot:04d}.cycle-input.json"
     if latest_slot > completed_slot:
         if latest_slot != completed_slot + 1 or not pending_input.is_file():
             raise ValueError("in-flight observation slot cannot be resumed exactly")
@@ -249,7 +280,7 @@ def _observe_once(
         slot = latest_slot
     else:
         slot = completed_slot + 1
-        cycle_input_path = paths.cycle_inputs / f"slot-{slot:04d}.json"
+        cycle_input_path = paths.cycle_inputs / f"slot-{slot:04d}.cycle-input.json"
         if cycle_input_path.is_file():
             export = {
                 "status": "skipped",
@@ -271,6 +302,7 @@ def _observe_once(
                     str(slot),
                 ],
                 cwd=Path.cwd(),
+                env=_sanitized_subprocess_env(role="schwab_market_data"),
             )
     cycle_input = json.loads(cycle_input_path.read_text(encoding="utf-8"))
     if int(cycle_input["observation_slot_ordinal"]) != slot:
@@ -292,6 +324,7 @@ def _observe_once(
             str(receipt_path),
         ],
         cwd=Path.cwd(),
+        env=_sanitized_subprocess_env(role="broker_inert"),
     )
     actions.extend(
         [
@@ -306,25 +339,8 @@ def _observe_once(
     )
 
 
-def _completed_cycle_slot(receipt_dir: Path) -> int:
-    if not receipt_dir.exists():
-        return 0
-    receipts = sorted(receipt_dir.glob("slot-*.receipt.json"))
-    for expected, path in enumerate(receipts, start=1):
-        if path.name != f"slot-{expected:04d}.receipt.json":
-            raise ValueError("cycle receipt filenames are not exact and contiguous")
-        receipt = json.loads(path.read_text(encoding="utf-8"))
-        receipt_hash = canonical_sha256(
-            {key: item for key, item in receipt.items() if key != "receipt_hash"}
-        )
-        if (
-            receipt.get("schema_version") != "bhiksha.chart-scenario-cycle-receipt.v3"
-            or receipt.get("status") != "succeeded"
-            or receipt.get("observation_slot_ordinal") != expected
-            or receipt.get("receipt_hash") != receipt_hash
-        ):
-            raise ValueError("cycle receipt chain contains an invalid receipt")
-    return len(receipts)
+def _completed_cycle_slot(paths: Any, *, plan: ShadowPlan) -> int:
+    return len(_validate_cycle_artifacts(paths, plan=plan, allow_pending_input=True))
 
 
 def _project_if_present(
@@ -349,8 +365,11 @@ def _project_if_present(
             str(request),
             "--receipt",
             str(paths.projection_receipt),
+            "--plan",
+            str(paths.plan),
         ],
         cwd=Path.cwd(),
+        env=_sanitized_subprocess_env(role="google_sheet"),
     )
     actions.append(
         {
@@ -364,10 +383,11 @@ def _project_if_present(
 def _run_tradelab_lifecycle(
     contract: Mapping[str, Any], *, command: str
 ) -> dict[str, Any]:
+    _verify_frozen_toolchain(contract)
     if command not in {"prepare-run", "refresh-projection", "finalize-run"}:
         raise ValueError("unsupported fixed TradeLab lifecycle command")
     cwd = Path(contract["tradelab_checkout"])
-    env = os.environ.copy()
+    env = _sanitized_subprocess_env(role="broker_inert")
     env["PYTHONPATH"] = os.pathsep.join(
         [str(cwd), str(Path(contract["kernel_src"])), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
@@ -429,6 +449,23 @@ def _run_command(
     }
 
 
+def _sanitized_subprocess_env(
+    *, role: str, additions: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    allowed = set(_COMMON_ENV_ALLOWLIST)
+    if role == "schwab_market_data":
+        allowed.update(_SCHWAB_MARKET_DATA_ENV)
+    elif role == "google_sheet":
+        allowed.update(_GOOGLE_SHEET_ENV)
+    elif role != "broker_inert":
+        raise ValueError(f"unsupported chart subprocess role: {role}")
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    env["BHIKSHA_SANITIZED_SUBPROCESS"] = "1"
+    if additions:
+        env.update({str(key): str(value) for key, value in additions.items()})
+    return env
+
+
 def _execute_command(
     command: list[str], *, cwd: Path, env: Mapping[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -436,7 +473,7 @@ def _execute_command(
         command,
         check=False,
         cwd=cwd,
-        env=dict(env) if env is not None else None,
+        env=dict(env or _sanitized_subprocess_env(role="broker_inert")),
         text=True,
         capture_output=True,
         timeout=float(
@@ -450,8 +487,11 @@ def _export_events(paths: Any) -> None:
     chain = repository.verify_event_chain()
     if not chain.valid:
         raise ValueError("run-scoped event chain failed verification")
-    events = [event.model_dump(mode="json") for event in repository.events()]
-    if events and events[0].get("previous_event_hash") is not None:
+    events = [
+        {**event.model_dump(mode="json"), "event_hash": event.event_hash}
+        for event in repository.events()
+    ]
+    if events and events[0].get("preceding_event_hash") is not None:
         raise ValueError("run-scoped event chain does not start at null predecessor")
     body = {
         "schema": "bhiksha.chart-scenario-events-export.v1",
@@ -481,9 +521,12 @@ def _validate_contract(
         "campaign_protocol_hash",
         "campaign_freeze_receipt_hash",
         "session_calendar_hash",
+        "toolchain",
+        "toolchain_hash",
         "tradelab_checkout",
         "tradelab_experiment_root",
         "agent_broker",
+        "agent_broker_checkout",
         "spreadsheet_id",
         "kernel_src",
         "plan_source",
@@ -497,6 +540,8 @@ def _validate_contract(
     )
     if str(value.get("content_hash", "")).removeprefix("sha256:") != computed:
         raise ValueError("coordinator contract content hash mismatch")
+    if value.get("toolchain_hash") != canonical_sha256(value.get("toolchain")):
+        raise ValueError("coordinator contract toolchain hash mismatch")
     if (
         re.fullmatch(
             r"[0-9a-f]{64}",
@@ -585,6 +630,7 @@ def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
         "tradelab_checkout",
         "tradelab_experiment_root",
         "agent_broker",
+        "agent_broker_checkout",
         "spreadsheet_id",
         "kernel_src",
         "cartographer_provider",
@@ -598,6 +644,7 @@ def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
         "session_calendar_hash",
         "session_calendar_id",
         "session_calendar_version",
+        "toolchain",
         "starts_on",
         "checkpoint_after_sessions",
         "max_sessions",
@@ -636,8 +683,8 @@ def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
     )
     if not str(value.get("agent_broker") or "").strip():
         raise ValueError("campaign agent_broker must be a fixed executable path")
-    if not str(value.get("spreadsheet_id") or "").strip():
-        raise ValueError("campaign spreadsheet_id is required")
+    if value.get("spreadsheet_id") != SPREADSHEET_ID:
+        raise ValueError("campaign spreadsheet_id must be the fixed experiment Sheet")
     birdclaw_db = Path(str(value.get("birdclaw_db") or "")).expanduser()
     if not birdclaw_db.is_absolute() or not birdclaw_db.is_file():
         raise ValueError("campaign birdclaw_db must be an existing absolute file")
@@ -764,6 +811,63 @@ def _normalized_hash(value: Any) -> str:
     return normalized
 
 
+def _verify_frozen_toolchain(config: Mapping[str, Any]) -> None:
+    toolchain = config.get("toolchain")
+    configured_fields = {
+        "birdclaw": "birdclaw_checkout",
+        "market_cartographer": "market_cartographer_checkout",
+        "tradelab": "tradelab_checkout",
+        "agent_broker": "agent_broker_checkout",
+    }
+    roles = {
+        role: Path(str(config[field]))
+        for role, field in configured_fields.items()
+        if field in config
+    }
+    if not isinstance(toolchain, Mapping) or set(toolchain) != set(configured_fields):
+        raise ValueError("campaign toolchain must bind every invoked checkout")
+    for role, configured_checkout in roles.items():
+        record = toolchain[role]
+        expected_fields = {"checkout", "commit", "entrypoint", "entrypoint_sha256"}
+        if not isinstance(record, Mapping) or set(record) != expected_fields:
+            raise ValueError(f"campaign toolchain record is invalid: {role}")
+        checkout = Path(str(record["checkout"])).expanduser().resolve()
+        if (
+            checkout != configured_checkout.expanduser().resolve()
+            or not checkout.is_dir()
+        ):
+            raise ValueError(f"campaign toolchain checkout differs for {role}")
+        entrypoint = Path(str(record["entrypoint"])).expanduser().resolve()
+        if not entrypoint.is_file() or not entrypoint.is_relative_to(checkout):
+            raise ValueError(f"campaign toolchain entrypoint escaped checkout: {role}")
+        if (
+            role == "agent_broker"
+            and entrypoint != Path(str(config["agent_broker"])).expanduser().resolve()
+        ):
+            raise ValueError("campaign Agent Broker entrypoint differs from executable")
+        status = subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain"],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=_sanitized_subprocess_env(role="broker_inert"),
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=_sanitized_subprocess_env(role="broker_inert"),
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            raise ValueError(f"campaign toolchain checkout is not clean: {role}")
+        if commit.returncode != 0 or commit.stdout.strip() != record["commit"]:
+            raise ValueError(f"campaign toolchain commit drift: {role}")
+        digest = hashlib.sha256(entrypoint.read_bytes()).hexdigest()
+        if digest != str(record["entrypoint_sha256"]).removeprefix("sha256:"):
+            raise ValueError(f"campaign toolchain entrypoint drift: {role}")
+
+
 def _read_content_addressed(path: Path, *, schema: str) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("schema") != schema:
@@ -844,6 +948,7 @@ def _campaign_window_preflight(
 def _prepare_daily_contract(
     config: Mapping[str, Any], *, contract_dir: Path, now: datetime
 ) -> Path:
+    _verify_frozen_toolchain(config)
     local = now.astimezone(CENTRAL) if now.tzinfo else now.replace(tzinfo=CENTRAL)
     target_date = local.date().isoformat()
     preparation_root = require_experiment_path(
@@ -895,7 +1000,7 @@ def _prepare_daily_contract(
     ]
     if config.get("cartographer_data_root"):
         command.extend(["--data-root", str(config["cartographer_data_root"])])
-    env = os.environ.copy()
+    env = _sanitized_subprocess_env(role="broker_inert")
     env["PYTHONPATH"] = os.pathsep.join(
         [
             str(cartographer_checkout / "src"),
@@ -938,9 +1043,12 @@ def _prepare_daily_contract(
         "campaign_protocol_hash": config["campaign_protocol_hash"],
         "campaign_freeze_receipt_hash": config["campaign_freeze_receipt_hash"],
         "session_calendar_hash": config["session_calendar_hash"],
+        "toolchain": config["toolchain"],
+        "toolchain_hash": canonical_sha256(config["toolchain"]),
         "tradelab_checkout": config["tradelab_checkout"],
         "tradelab_experiment_root": str(experiment_root),
         "agent_broker": config["agent_broker"],
+        "agent_broker_checkout": config["agent_broker_checkout"],
         "spreadsheet_id": config["spreadsheet_id"],
         "kernel_src": config["kernel_src"],
         "plan_source": str(tradelab_run / "outputs" / "shadow-plan.json"),
@@ -974,7 +1082,9 @@ def _export_birdclaw_context(
             "--json",
         ],
         cwd=checkout,
-        env={**os.environ, "BIRDCLAW_DB": str(config["birdclaw_db"])},
+        env=_sanitized_subprocess_env(
+            role="broker_inert", additions={"BIRDCLAW_DB": str(config["birdclaw_db"])}
+        ),
     )
     if completed.returncode != 0:
         raise RuntimeError(
@@ -1204,67 +1314,539 @@ def _validate_tradelab_paths(contract: Mapping[str, Any]) -> None:
 
 
 def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
+    plan = read_installed_plan(paths.plan)
+    if (
+        plan.run_manifest.get("campaign_id") != contract["campaign_id"]
+        or plan.run_manifest.get("run_id") != contract["run_id"]
+    ):
+        raise ValueError("installed plan differs from staging contract")
+    install_receipt = _validate_install_receipt(paths, plan=plan)
+    cycles = _validate_cycle_artifacts(paths, plan=plan)
+    events = _validate_events_export(paths.events_export)
+    covered_event_hashes = [
+        event_hash
+        for _cycle, receipt, _input_path, _receipt_path in cycles
+        for evidence in receipt["durable_slot_evidence"]
+        for event_hash in evidence["event_hashes"]
+    ]
+    _validate_staging_event_partition(
+        events["events"], covered_event_hashes=covered_event_hashes, plan=plan
+    )
+
     root = require_experiment_path(
         str(contract["tradelab_experiment_root"]), role="TradeLab experiment root"
     )
-    staging = (
+    run_root = (
         root
         / "campaigns"
         / str(contract["campaign_id"])
         / "runs"
         / str(contract["run_id"])
-        / "bhiksha"
     )
-    _write_atomic(
-        staging / "install-receipt.json",
-        json.loads(paths.install_receipt.read_text(encoding="utf-8")),
+    group_body = {
+        "schema": "bhiksha.chart-scenario-staging-group.v1",
+        "plan_hash": plan.plan_hash,
+        "install_receipt_hash": install_receipt["receipt_hash"],
+        "cycle_input_hashes": [cycle["content_hash"] for cycle, *_ in cycles],
+        "cycle_receipt_hashes": [receipt["receipt_hash"] for _, receipt, *_ in cycles],
+        "events_export_hash": events["content_hash"],
+    }
+    group = {**group_body, "content_hash": canonical_sha256(group_body)}
+    generations = require_experiment_path(
+        run_root / ".bhiksha-staging", role="TradeLab staging generations"
     )
-    completed_slots = _completed_cycle_slot(paths.cycle_receipts)
-    source_receipts = sorted(paths.cycle_receipts.glob("*.receipt.json"))
-    if len(source_receipts) != completed_slots:
-        raise ValueError("only succeeded canonical cycle receipts may be staged")
-    expected_names: set[str] = set()
-    for expected_slot, source in enumerate(source_receipts, start=1):
-        match = _CYCLE_RECEIPT_RE.fullmatch(source.name)
-        if match is None or int(match.group(1)) != expected_slot:
-            raise ValueError("Bhiksha cycle receipts are not exact and contiguous")
-        name = f"cycle-{expected_slot:04d}.receipt.json"
-        expected_names.add(name)
-        _write_atomic(
-            staging / "cycle-receipts" / name,
-            json.loads(source.read_text(encoding="utf-8")),
+    if generations.parent != run_root.resolve():
+        raise ValueError("TradeLab staging generations escaped the exact run root")
+    generations.mkdir(parents=True, exist_ok=True)
+    final_generation = generations / group["content_hash"]
+    expected_generation: dict[str, Mapping[str, Any]] = {
+        "install-receipt.json": install_receipt,
+        "events.json": events,
+        "group-manifest.json": group,
+    }
+    for ordinal, (cycle, receipt, _input, _receipt) in enumerate(cycles, 1):
+        expected_generation[f"cycle-inputs/cycle-{ordinal:04d}.json"] = cycle
+        expected_generation[
+            f"cycle-receipts/cycle-{ordinal:04d}.receipt.json"
+        ] = receipt
+    if final_generation.is_symlink():
+        raise ValueError("TradeLab staging generation cannot be a symlink")
+    if final_generation.exists():
+        _validate_existing_staging_generation(
+            final_generation, expected=expected_generation
         )
-    staged_dir = staging / "cycle-receipts"
+    else:
+        temporary = Path(tempfile.mkdtemp(prefix=".generation-", dir=generations))
+        try:
+            for relative, payload in expected_generation.items():
+                _write_atomic(temporary / relative, payload)
+            os.replace(temporary, final_generation)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        _validate_existing_staging_generation(
+            final_generation, expected=expected_generation
+        )
+    staging = run_root / "bhiksha"
+    if staging.exists() and not staging.is_symlink():
+        raise ValueError("TradeLab staging target must be an atomic generation link")
+    link = run_root / f".bhiksha-link-{group['content_hash'][:16]}"
+    try:
+        if link.exists() or link.is_symlink():
+            if not link.is_symlink():
+                raise ValueError("TradeLab staging temporary link path is occupied")
+            link.unlink()
+        os.symlink(os.path.relpath(final_generation, run_root), link)
+        os.replace(link, staging)
+    finally:
+        link.unlink(missing_ok=True)
+
+
+def _validate_existing_staging_generation(
+    generation: Path, *, expected: Mapping[str, Mapping[str, Any]]
+) -> None:
+    if generation.is_symlink() or not generation.is_dir():
+        raise ValueError("TradeLab staging generation is not an immutable directory")
+    members = list(generation.rglob("*"))
+    if any(member.is_symlink() for member in members):
+        raise ValueError("TradeLab staging generation contains a symlink")
+    files = {
+        member.relative_to(generation).as_posix(): member
+        for member in members
+        if member.is_file()
+    }
+    if set(files) != set(expected):
+        raise ValueError("TradeLab staging generation members are not exact")
+    for relative, payload in expected.items():
+        if json.loads(files[relative].read_text(encoding="utf-8")) != dict(payload):
+            raise ValueError("TradeLab staging generation content drift")
+
+
+def _validate_install_receipt(paths: Any, *, plan: ShadowPlan) -> dict[str, Any]:
+    receipt = json.loads(paths.install_receipt.read_text(encoding="utf-8"))
+    expected_fields = {
+        "receipt_schema_version",
+        "receipt_id",
+        "status",
+        "created_at",
+        "artifact_path",
+        "receipt_path",
+        "input_sha256",
+        "plan_id",
+        "plan_hash",
+        "run_manifest_hash",
+        "treatment_manifest_hash",
+        "cartographer_receipt_hash",
+        "cartographer_export_hash",
+        "option_selection_policy_hash",
+        "arm_b_selector_receipt_hash",
+        "target_session_date",
+        "target_session_window_hash",
+        "scenario_count",
+        "scenario_hashes",
+        "identities",
+        "component_manifest_hash",
+        "candidate_pool_hash",
+        "broker_effect_count",
+        "receipt_hash",
+    }
+    if set(receipt) != expected_fields:
+        raise ValueError("install receipt must declare exact fields")
+    body = {key: item for key, item in receipt.items() if key != "receipt_hash"}
+    expected_identities = [
+        {
+            "program_id": scenario.program_id,
+            "experiment_family_id": scenario.experiment_family_id,
+            "experiment_version": scenario.experiment_version,
+            "campaign_id": scenario.campaign_id,
+            "run_id": scenario.run_id,
+            "arm_id": scenario.arm_id.value,
+            "scenario_id": scenario.scenario_id,
+            "candidate_id": scenario.candidate_id,
+            "symbol": scenario.symbol,
+            "direction": scenario.direction.value,
+            "thesis_class": scenario.thesis_class.value,
+            "scenario_hash": scenario.scenario_hash,
+            "candidate_pool_hash": scenario.candidate_pool_hash,
+            "selection_packet_hash": scenario.selection_packet_hash,
+            "component_manifest_hash": scenario.component_manifest_hash,
+            "chart_evidence_hashes": [
+                item.evidence_hash for item in scenario.chart_evidence_refs
+            ],
+            "exit_policy_hash": scenario.exit_policy_hash,
+        }
+        for scenario in plan.scenarios
+    ]
     if (
-        staged_dir.exists()
-        and {item.name for item in staged_dir.iterdir() if item.is_file()}
-        != expected_names
+        receipt["receipt_schema_version"] != INSTALL_RECEIPT_SCHEMA_VERSION
+        or receipt["status"] != "installed"
+        or receipt["receipt_id"] != "install-" + plan.plan_hash[:32]
+        or Path(receipt["artifact_path"]).resolve() != paths.plan.resolve()
+        or Path(receipt["receipt_path"]).resolve() != paths.install_receipt.resolve()
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt["input_sha256"])) is None
+        or receipt["plan_id"] != plan.plan_id
+        or receipt["plan_hash"] != plan.plan_hash
+        or str(receipt["run_manifest_hash"]).removeprefix("sha256:")
+        != plan.run_manifest_hash.removeprefix("sha256:")
+        or str(receipt["treatment_manifest_hash"]).removeprefix("sha256:")
+        != plan.treatment_manifest_hash.removeprefix("sha256:")
+        or receipt["cartographer_receipt_hash"] != plan.cartographer_receipt_hash
+        or receipt["cartographer_export_hash"] != plan.cartographer_export_hash
+        or receipt["option_selection_policy_hash"]
+        != plan.option_selection_policy.content_hash
+        or receipt["arm_b_selector_receipt_hash"] != plan.arm_b_selector_receipt_hash
+        or receipt["target_session_date"] != plan.target_session_date
+        or receipt["target_session_window_hash"] != plan.target_session_window_hash
+        or receipt["scenario_count"] != len(plan.scenarios)
+        or receipt["scenario_hashes"]
+        != [scenario.scenario_hash for scenario in plan.scenarios]
+        or receipt["identities"] != expected_identities
+        or receipt["component_manifest_hash"] != plan.component_manifest_hash
+        or receipt["candidate_pool_hash"] != plan.candidate_pool.pool_hash
+        or receipt["broker_effect_count"] != 0
+        or receipt["receipt_hash"] != canonical_sha256(body)
     ):
-        raise ValueError("TradeLab staging contains non-exact cycle receipts")
-    source_inputs = sorted(paths.cycle_inputs.glob("slot-*.json"))
-    if len(source_inputs) != len(source_receipts):
+        raise ValueError("install receipt differs from installed plan")
+    return receipt
+
+
+def _validate_staging_event_partition(
+    events: list[dict[str, Any]],
+    *,
+    covered_event_hashes: list[str],
+    plan: ShadowPlan,
+) -> None:
+    """Partition the global chain into install lifecycle and slot evidence."""
+
+    covered = Counter(covered_event_hashes)
+    exported_non_install = Counter(
+        event["event_hash"] for event in events if event["event_type"] != "installed"
+    )
+    if covered != exported_non_install or any(count != 1 for count in covered.values()):
+        raise ValueError(
+            "non-installed events must be covered exactly once by durable slot evidence"
+        )
+    installed = [event for event in events if event["event_type"] == "installed"]
+    scenario_by_id = {scenario.scenario_id: scenario for scenario in plan.scenarios}
+    if len(installed) != len(scenario_by_id):
+        raise ValueError("event export must contain one installed event per scenario")
+    seen_scenarios: set[str] = set()
+    first_index_by_scenario: dict[str, int] = {}
+    for index, event in enumerate(events):
+        first_index_by_scenario.setdefault(str(event["scenario_id"]), index)
+    for event in installed:
+        scenario = scenario_by_id.get(str(event["scenario_id"]))
+        if scenario is None or scenario.scenario_id in seen_scenarios:
+            raise ValueError("installed event scenario coverage is invalid")
+        seen_scenarios.add(scenario.scenario_id)
+        if (
+            first_index_by_scenario[scenario.scenario_id] != events.index(event)
+            or event["program_id"] != scenario.program_id
+            or event["experiment_family_id"] != scenario.experiment_family_id
+            or event["experiment_version"] != scenario.experiment_version
+            or event["campaign_id"] != scenario.campaign_id
+            or event["run_id"] != scenario.run_id
+            or event["arm_id"] != scenario.arm_id.value
+            or event["scenario_hash"] != scenario.scenario_hash
+            or event["implementation_hash"] != scenario.component_manifest_hash
+            or event["event_time"]
+            != scenario.observation_window.start_at.isoformat().replace("+00:00", "Z")
+            or event["market_observation_id"]
+            != "install-" + scenario.scenario_hash[:24]
+            or event["broker_effect_count"] != 0
+            or event["authorization_mode"] != "shadow"
+            or event["source_type"] != "chart_scenario_experiment"
+            or event["details"].get("status") != "installed"
+            or event["details"].get("reason") != "validated_shadow_plan"
+            or event["details"].get("plan_hash") != plan.plan_hash
+            or str(event["details"].get("run_manifest_hash")).removeprefix("sha256:")
+            != plan.run_manifest_hash.removeprefix("sha256:")
+            or str(event["details"].get("treatment_manifest_hash")).removeprefix(
+                "sha256:"
+            )
+            != plan.treatment_manifest_hash.removeprefix("sha256:")
+        ):
+            raise ValueError("installed event differs from installed plan")
+
+
+def _validate_cycle_artifacts(
+    paths: Any, *, plan: ShadowPlan, allow_pending_input: bool = False
+) -> list[tuple[dict[str, Any], dict[str, Any], Path, Path]]:
+    input_paths = (
+        sorted(paths.cycle_inputs.glob("slot-*")) if paths.cycle_inputs.exists() else []
+    )
+    receipt_paths = (
+        sorted(paths.cycle_receipts.glob("slot-*.receipt.json"))
+        if paths.cycle_receipts.exists()
+        else []
+    )
+    pending = len(input_paths) == len(receipt_paths) + 1
+    if len(input_paths) != len(receipt_paths) and not (allow_pending_input and pending):
         raise ValueError("cycle input/receipt cardinality mismatch")
-    expected_input_names: set[str] = set()
-    for expected_slot, source in enumerate(source_inputs, start=1):
-        if source.name != f"slot-{expected_slot:04d}.json":
-            raise ValueError("Bhiksha cycle inputs are not exact and contiguous")
-        name = f"cycle-{expected_slot:04d}.json"
-        expected_input_names.add(name)
-        _write_atomic(
-            staging / "cycle-inputs" / name,
-            json.loads(source.read_text(encoding="utf-8")),
-        )
-    staged_inputs = staging / "cycle-inputs"
-    if (
-        staged_inputs.exists()
-        and {item.name for item in staged_inputs.iterdir() if item.is_file()}
-        != expected_input_names
+    validated = []
+    for ordinal, (input_path, receipt_path) in enumerate(
+        zip(input_paths, receipt_paths, strict=True), 1
     ):
-        raise ValueError("TradeLab staging contains non-exact cycle inputs")
-    _write_atomic(
-        staging / "events.json",
-        json.loads(paths.events_export.read_text(encoding="utf-8")),
-    )
+        if input_path.name != f"slot-{ordinal:04d}.cycle-input.json":
+            raise ValueError("cycle input filenames are not exact and contiguous")
+        if receipt_path.name != f"slot-{ordinal:04d}.receipt.json":
+            raise ValueError("cycle receipt filenames are not exact and contiguous")
+        raw_cycle = json.loads(input_path.read_text(encoding="utf-8"))
+        cycle = validate_cycle_input(raw_cycle, plan=plan)
+        receipt = _validate_cycle_receipt(
+            json.loads(receipt_path.read_text(encoding="utf-8")),
+            cycle=cycle,
+            plan=plan,
+            input_path=input_path,
+            run_root=paths.root,
+        )
+        if cycle["observation_slot_ordinal"] != ordinal:
+            raise ValueError("cycle input ordinal is not contiguous")
+        validated.append((raw_cycle, receipt, input_path, receipt_path))
+    if pending:
+        pending_path = input_paths[-1]
+        expected = len(receipt_paths) + 1
+        if pending_path.name != f"slot-{expected:04d}.cycle-input.json":
+            raise ValueError("pending cycle input filename is not exact")
+        pending_cycle = validate_cycle_input(
+            json.loads(pending_path.read_text(encoding="utf-8")), plan=plan
+        )
+        if pending_cycle["observation_slot_ordinal"] != expected:
+            raise ValueError("pending cycle input ordinal is not contiguous")
+    return validated
+
+
+def _validate_cycle_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    cycle: Mapping[str, Any],
+    plan: ShadowPlan,
+    input_path: Path,
+    run_root: Path,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "status",
+        "created_at",
+        "plan_hash",
+        "run_manifest_hash",
+        "treatment_manifest_hash",
+        "cycle_input_hash",
+        "cycle_input_artifact_path",
+        "cycle_input_artifact_hash",
+        "observation_slot_ordinal",
+        "evaluated_at",
+        "scenario_count",
+        "paired_fact_proof_count",
+        "paired_fact_proofs",
+        "durable_slot_evidence",
+        "proof_required_candidate_ids",
+        "terminal_carryforwards",
+        "candidate_diagnostics",
+        "results",
+        "errors",
+        "broker_effect_count",
+        "auth",
+        "effects",
+        "receipt_hash",
+    }
+    if set(receipt) != expected_fields:
+        raise ValueError("cycle receipt must declare exact fields")
+    body = {key: item for key, item in receipt.items() if key != "receipt_hash"}
+    false_effects = {
+        "broker": False,
+        "orders": False,
+        "auth_mutation": False,
+        "schedule": False,
+        "external_send": False,
+    }
+    expected_auth = {
+        "read": plan.option_selection_policy.provider_id == "schwab",
+        "mutation": False,
+        "token_refresh": False,
+        "token_persist": False,
+    }
+    if (
+        receipt["schema_version"] != CYCLE_RECEIPT_SCHEMA
+        or receipt["status"] != "succeeded"
+        or receipt["errors"] != []
+        or receipt["created_at"] != cycle["evaluated_at"]
+        or receipt["evaluated_at"] != cycle["evaluated_at"]
+        or receipt["plan_hash"] != plan.plan_hash
+        or str(receipt["run_manifest_hash"]).removeprefix("sha256:")
+        != plan.run_manifest_hash.removeprefix("sha256:")
+        or str(receipt["treatment_manifest_hash"]).removeprefix("sha256:")
+        != plan.treatment_manifest_hash.removeprefix("sha256:")
+        or receipt["cycle_input_hash"] != cycle["content_hash"]
+        or Path(receipt["cycle_input_artifact_path"]).resolve() != input_path.resolve()
+        or input_path.parent.resolve() != (run_root / "cycle-inputs").resolve()
+        or not input_path.resolve().is_relative_to(run_root.resolve())
+        or receipt["cycle_input_artifact_hash"] != canonical_sha256(cycle)
+        or receipt["observation_slot_ordinal"] != cycle["observation_slot_ordinal"]
+        or receipt["scenario_count"] != len(plan.scenarios)
+        or receipt["broker_effect_count"] != 0
+        or receipt["auth"] != expected_auth
+        or receipt["effects"] != false_effects
+        or receipt["receipt_hash"] != canonical_sha256(body)
+    ):
+        raise ValueError("cycle receipt identity or effects are invalid")
+    scenario_by_id = {scenario.scenario_id: scenario for scenario in plan.scenarios}
+    results = receipt["results"]
+    if not isinstance(results, list) or {
+        item.get("scenario_id") for item in results if isinstance(item, Mapping)
+    } != set(scenario_by_id):
+        raise ValueError("cycle receipt results do not exactly cover plan scenarios")
+    durable = receipt["durable_slot_evidence"]
+    if not isinstance(durable, list):
+        raise TypeError("cycle durable evidence must be an array")
+    events_by_scenario: dict[str, list[dict[str, Any]]] = {}
+    for evidence in durable:
+        evidence_body = {
+            key: item for key, item in evidence.items() if key != "content_hash"
+        }
+        if (
+            set(evidence)
+            != {
+                "schema",
+                "campaign_id",
+                "run_id",
+                "candidate_id",
+                "slot_ordinal",
+                "slot_id",
+                "facts_hash",
+                "paired",
+                "paired_proof_hash",
+                "scenario_ids",
+                "event_count",
+                "event_hashes",
+                "events",
+                "content_hash",
+            }
+            or evidence["schema"] != "bhiksha.chart-scenario-durable-slot-evidence.v1"
+            or evidence["campaign_id"] != plan.run_manifest["campaign_id"]
+            or evidence["run_id"] != plan.run_manifest["run_id"]
+            or evidence["slot_ordinal"] != cycle["observation_slot_ordinal"]
+            or evidence["candidate_id"] not in cycle["candidates"]
+            or evidence["slot_id"]
+            != canonical_observation_slot_id(
+                run_manifest_hash=plan.run_manifest_hash,
+                ordinal=cycle["observation_slot_ordinal"],
+            )
+            or evidence["paired"] is not True
+            or evidence["event_count"] != len(evidence["events"])
+            or evidence["event_hashes"]
+            != [event["event_hash"] for event in evidence["events"]]
+            or evidence["content_hash"] != canonical_sha256(evidence_body)
+        ):
+            raise ValueError("cycle durable slot evidence is invalid")
+        expected_scenario_ids = sorted(
+            scenario.scenario_id
+            for scenario in plan.scenarios
+            if scenario.candidate_id == evidence["candidate_id"]
+        )
+        if evidence["scenario_ids"] != expected_scenario_ids:
+            raise ValueError("durable evidence scenario identities are invalid")
+        for event in evidence["events"]:
+            event_body = dict(event)
+            claimed_event_hash = event_body.pop("event_hash", None)
+            sealed_event = ScenarioShadowEvent.model_validate(event_body)
+            if (
+                claimed_event_hash != sealed_event.event_hash
+                or sealed_event.scenario_id not in evidence["scenario_ids"]
+                or sealed_event.market_observation_id != evidence["slot_id"]
+            ):
+                raise ValueError("durable event identity differs from slot evidence")
+            events_by_scenario.setdefault(sealed_event.scenario_id, []).append(event)
+    for result in results:
+        if (
+            set(result)
+            != {
+                "scenario_id",
+                "status",
+                "terminal",
+                "new_event_count",
+                "events",
+                "broker_effect_count",
+                "error",
+            }
+            or result["broker_effect_count"] != 0
+            or result["error"] is not None
+            or result["events"] != events_by_scenario.get(result["scenario_id"], [])
+            or result["new_event_count"] != len(result["events"])
+        ):
+            raise ValueError("cycle scenario result differs from durable evidence")
+    proofs = receipt["paired_fact_proofs"]
+    if receipt["paired_fact_proof_count"] != len(proofs):
+        raise ValueError("cycle paired proof count mismatch")
+    for proof in proofs:
+        proof_body = {key: item for key, item in proof.items() if key != "proof_hash"}
+        if (
+            proof.get("paired") is not True
+            or proof.get("slot_ordinal") != cycle["observation_slot_ordinal"]
+            or proof.get("plan_hash") != plan.plan_hash
+            or proof.get("candidate_id") not in cycle["candidates"]
+            or proof.get("run_id") != plan.run_manifest["run_id"]
+            or proof.get("treatment_manifest_hash")
+            != plan.treatment_manifest_hash.removeprefix("sha256:")
+            or proof.get("proof_hash") != canonical_sha256(proof_body)
+        ):
+            raise ValueError("cycle paired fact proof is invalid")
+    if set(receipt["candidate_diagnostics"]) != set(cycle["candidates"]):
+        raise ValueError("cycle diagnostics do not exactly cover candidates")
+    required = receipt["proof_required_candidate_ids"]
+    carried = [item.get("candidate_id") for item in receipt["terminal_carryforwards"]]
+    if (
+        not isinstance(required, list)
+        or len(required) != len(set(required))
+        or set(required) != {proof["candidate_id"] for proof in proofs}
+        or set(required) != {evidence["candidate_id"] for evidence in durable}
+        or set(required).intersection(carried)
+        or set(required).union(carried) != set(cycle["candidates"])
+    ):
+        raise ValueError("cycle proof/carryforward candidate coverage is invalid")
+    proof_by_candidate = {proof["candidate_id"]: proof for proof in proofs}
+    if any(
+        evidence["facts_hash"]
+        != proof_by_candidate[evidence["candidate_id"]]["facts_hash"]
+        or evidence["paired_proof_hash"]
+        != proof_by_candidate[evidence["candidate_id"]]["proof_hash"]
+        for evidence in durable
+    ):
+        raise ValueError("durable evidence differs from paired fact proof")
+    return dict(receipt)
+
+
+def _validate_events_export(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if set(value) != {
+        "schema",
+        "event_count",
+        "last_event_hash",
+        "events",
+        "content_hash",
+    }:
+        raise ValueError("event export must declare exact fields")
+    body = {key: item for key, item in value.items() if key != "content_hash"}
+    previous = None
+    for raw in value["events"]:
+        if not isinstance(raw, Mapping):
+            raise TypeError("event export entries must be objects")
+        event_body = dict(raw)
+        claimed_event_hash = event_body.pop("event_hash", None)
+        event = ScenarioShadowEvent.model_validate(event_body)
+        if claimed_event_hash != event.event_hash:
+            raise ValueError("event export event_hash is invalid")
+        if event.preceding_event_hash != previous:
+            raise ValueError("event export predecessor chain is invalid")
+        previous = event.event_hash
+    if (
+        value["schema"] != "bhiksha.chart-scenario-events-export.v1"
+        or value["event_count"] != len(value["events"])
+        or value["last_event_hash"] != previous
+        or value["content_hash"] != canonical_sha256(body)
+    ):
+        raise ValueError("event export identity/hash is invalid")
+    return value
 
 
 def _install_or_verify_plan(contract: Mapping[str, Any], paths: Any) -> dict[str, Any]:

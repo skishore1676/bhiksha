@@ -1,13 +1,21 @@
-from datetime import UTC, datetime
 import asyncio
+from datetime import UTC, datetime
+
+import pytest
 
 from bhiksha.integrations.schwab.client import SchwabApiClient
+from bhiksha.integrations.schwab.market_data_client import (
+    SchwabReadOnlyMarketDataClient,
+)
 from bhiksha.integrations.schwab.settings import SchwabSettings
+from bhiksha.market_data.adapters.schwab import SchwabBarSource
 
 
 def test_price_history_omits_period_when_date_bounds_are_supplied() -> None:
     http = RecordingHttpClient()
-    client = SchwabApiClient(settings=SchwabSettings(api_base_url="https://example.test"))
+    client = SchwabApiClient(
+        settings=SchwabSettings(api_base_url="https://example.test")
+    )
     client._client = http
 
     async def headers() -> dict[str, str]:
@@ -45,6 +53,40 @@ def test_price_history_omits_period_when_date_bounds_are_supplied() -> None:
             },
         }
     ]
+
+
+def test_read_only_market_data_client_exposes_no_account_or_order_surface() -> None:
+    for prohibited in (
+        "linked_accounts",
+        "account_details",
+        "place_order",
+        "replace_order",
+        "cancel_order",
+        "orders",
+    ):
+        assert not hasattr(SchwabReadOnlyMarketDataClient, prohibited)
+
+
+def test_read_only_market_data_settings_never_load_or_capture_trading_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCHWAB_APP_KEY", "must-not-cross-wire")
+    monkeypatch.setenv("SCHWAB_APP_SECRET", "must-not-cross-wire")
+    monkeypatch.setenv("SCHWAB_TOKEN_FILE", "/secure/read-only-token.json")
+
+    def prohibited() -> None:
+        raise AssertionError("read-only settings attempted to load dotenv")
+
+    monkeypatch.setattr("bhiksha.integrations.schwab.settings.load_dotenv", prohibited)
+    settings = SchwabSettings.market_data_from_env()
+
+    assert settings.app_key is None
+    assert settings.app_secret is None
+    assert settings.token_file == "/secure/read-only-token.json"
+
+    client = type("ReadOnlyClient", (), {"settings": settings})()
+    source = SchwabBarSource(client=client)  # type: ignore[arg-type]
+    assert source.settings is settings
 
 
 class RecordingHttpClient:

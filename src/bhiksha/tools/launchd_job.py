@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 
 from bhiksha.app.bootstrap import build_runtime
+from bhiksha.chart_scenarios.paths import require_experiment_path
 from bhiksha.config.environment import load_dotenv
 from bhiksha.market_data.trading_calendar import is_trading_day
 from bhiksha.ops.alerts import (
@@ -54,7 +56,9 @@ def main(argv: list[str] | None = None) -> int:
             "chart-scenario-shadow",
         ],
     )
-    parser.add_argument("--force", action="store_true", help="Run even when today is not a trading day")
+    parser.add_argument(
+        "--force", action="store_true", help="Run even when today is not a trading day"
+    )
     parser.add_argument(
         "--browser-renewal-mode",
         default="auto",
@@ -68,8 +72,15 @@ def main(argv: list[str] | None = None) -> int:
         "--week-end",
         help="explicit reporting cutoff for a weekly-decisions replay (YYYY-MM-DD)",
     )
-    parser.add_argument("--alert-mode", default=os.getenv("BHIKSHA_LAUNCHD_ALERT_MODE", "live"), choices=["off", "spool", "live"])
-    parser.add_argument("--alert-profile", default=os.getenv("BHIKSHA_LATHI_PROFILE", "bhiksha-northstar"))
+    parser.add_argument(
+        "--alert-mode",
+        default=os.getenv("BHIKSHA_LAUNCHD_ALERT_MODE", "live"),
+        choices=["off", "spool", "live"],
+    )
+    parser.add_argument(
+        "--alert-profile",
+        default=os.getenv("BHIKSHA_LATHI_PROFILE", "bhiksha-northstar"),
+    )
     parser.add_argument(
         "--obsidian-review-mode",
         default=os.getenv("BHIKSHA_SESSION_REPORT_OBSIDIAN_MODE", "off"),
@@ -103,14 +114,21 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["BHIKSHA_ACTION_ID"] = args.action_id
 
     if _should_skip_for_calendar(args.job, force=args.force):
-        _print_result({"job": args.job, "status": "skipped", "reason": "non_trading_day"})
+        _print_result(
+            {"job": args.job, "status": "skipped", "reason": "non_trading_day"}
+        )
         return 0
 
     try:
         if args.job == "live-start":
             return _server_session_job(
                 args,
-                ["restart", "--live", "--post-start-check-seconds", _post_start_check_seconds()],
+                [
+                    "restart",
+                    "--live",
+                    "--post-start-check-seconds",
+                    _post_start_check_seconds(),
+                ],
                 repo_root=repo_root,
             )
         if args.job == "live-watchdog":
@@ -138,14 +156,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.job == "chart-scenario-shadow":
             return _chart_scenario_shadow_job(args, repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
-        alert = _send_failure_alert(args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc))
-        _print_result({"job": args.job, "status": "failed", "error": str(exc), "alert": alert.to_dict()})
+        alert = _send_failure_alert(
+            args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc)
+        )
+        _print_result(
+            {
+                "job": args.job,
+                "status": "failed",
+                "error": str(exc),
+                "alert": alert.to_dict(),
+            }
+        )
         return 2
     raise ValueError(f"Unsupported job: {args.job}")
 
 
-def _server_session_job(args: argparse.Namespace, command_args: list[str], *, repo_root: Path) -> int:
-    completed = _run_python_module(["bhiksha.tools.server_session", *command_args], repo_root=repo_root)
+def _server_session_job(
+    args: argparse.Namespace, command_args: list[str], *, repo_root: Path
+) -> int:
+    completed = _run_python_module(
+        ["bhiksha.tools.server_session", *command_args], repo_root=repo_root
+    )
     if completed.returncode == 0:
         _print_result(
             {
@@ -176,7 +207,9 @@ def _server_session_job(args: argparse.Namespace, command_args: list[str], *, re
 
 
 def _stop_job(args: argparse.Namespace, *, repo_root: Path) -> int:
-    status = _run_python_module(["bhiksha.tools.server_session", "status"], repo_root=repo_root)
+    status = _run_python_module(
+        ["bhiksha.tools.server_session", "status"], repo_root=repo_root
+    )
     if status.returncode == 0:
         runtime_status = _parse_runtime_status(status.stdout)
         if runtime_status is not None and not runtime_status.get("running"):
@@ -203,7 +236,13 @@ def _schwab_refresh_job(args: argparse.Namespace) -> int:
         alert_mode=args.alert_mode,
         alert_profile=args.alert_profile,
     )
-    _print_result({"job": args.job, "status": "ok" if result.ok else "failed", "result": result.to_dict()})
+    _print_result(
+        {
+            "job": args.job,
+            "status": "ok" if result.ok else "failed",
+            "result": result.to_dict(),
+        }
+    )
     return 0 if result.ok else 2
 
 
@@ -212,9 +251,13 @@ def _session_report_job(args: argparse.Namespace) -> int:
     runtime = build_runtime(active_plan_path=args.active_plan)
     db_path = Path(runtime.app_config.sqlite_path)
     output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
-    result = write_daily_report(db_path, output_dir=output_dir, deployments=runtime.deployments)
+    result = write_daily_report(
+        db_path, output_dir=output_dir, deployments=runtime.deployments
+    )
     level = _alert_level_for_report(result.report)
-    body = render_daily_report_telegram_summary(result.report, markdown_path=result.markdown_path)
+    body = render_daily_report_telegram_summary(
+        result.report, markdown_path=result.markdown_path
+    )
     alert = send_lathi_alert(
         title=f"Bhiksha {report_label} session report",
         body=body,
@@ -245,7 +288,8 @@ def _reconciliation_supervisor_job(args: argparse.Namespace, *, repo_root: Path)
     runtime = build_runtime(active_plan_path=args.active_plan)
     receipt = run_reconciliation_supervisor(
         runtime.app_config.sqlite_path,
-        receipt_dir=Path(runtime.app_config.playbook_artifacts_dir) / "reconciliation_supervision",
+        receipt_dir=Path(runtime.app_config.playbook_artifacts_dir)
+        / "reconciliation_supervision",
         alert_mode=args.alert_mode,
         alert_profile=args.alert_profile,
     )
@@ -282,30 +326,36 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             runtime.app_config.exit_edge_live_shadow_enabled
         ),
     )
-    workbook = _update_trading_decision_ledger(args, result.facts_path, repo_root=repo_root)
+    workbook = _update_trading_decision_ledger(
+        args, result.facts_path, repo_root=repo_root
+    )
     result = finalize_weekly_trading_decisions(result, workbook)
     if workbook.get("status") == "skipped" and args.weekly_review_mode == "off":
-        _print_result({
-            "job": args.job,
-            "status": "ok",
-            "preview_only": True,
-            "report_json": str(result.json_path),
-            "report_markdown": str(result.markdown_path),
-            "facts_export": str(result.facts_path),
-            "governance_evidence": str(result.governance_path),
-            "exit_edge_evidence": str(result.exit_edge_path),
-            "telegram_sent": False,
-        })
+        _print_result(
+            {
+                "job": args.job,
+                "status": "ok",
+                "preview_only": True,
+                "report_json": str(result.json_path),
+                "report_markdown": str(result.markdown_path),
+                "facts_export": str(result.facts_path),
+                "governance_evidence": str(result.governance_path),
+                "exit_edge_evidence": str(result.exit_edge_path),
+                "telegram_sent": False,
+            }
+        )
         return 0
     if workbook.get("status") != "ok":
-        _print_result({
-            "job": args.job,
-            "status": "failed",
-            "reason": "workbook_update_failed",
-            "report_json": str(result.json_path),
-            "report_markdown": str(result.markdown_path),
-            "workbook_update": workbook,
-        })
+        _print_result(
+            {
+                "job": args.job,
+                "status": "failed",
+                "reason": "workbook_update_failed",
+                "report_json": str(result.json_path),
+                "report_markdown": str(result.markdown_path),
+                "workbook_update": workbook,
+            }
+        )
         return 2
     review: ReviewPublishResult | None = None
     if args.weekly_review_mode == "on":
@@ -321,19 +371,21 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             review_id=result.report["artifact_id"],
         )
     ok = args.weekly_review_mode == "off" or bool(review and review.ok)
-    _print_result({
-        "job": args.job,
-        "status": "ok" if ok else "failed",
-        "artifact_id": result.report["artifact_id"],
-        "report_json": str(result.json_path),
-        "report_markdown": str(result.markdown_path),
-        "facts_export": str(result.facts_path),
-        "governance_evidence": str(result.governance_path),
-        "exit_edge_evidence": str(result.exit_edge_path),
-        "workbook_update": workbook,
-        "obsidian_review": review.to_dict() if review else None,
-        "telegram_sent": False,
-    })
+    _print_result(
+        {
+            "job": args.job,
+            "status": "ok" if ok else "failed",
+            "artifact_id": result.report["artifact_id"],
+            "report_json": str(result.json_path),
+            "report_markdown": str(result.markdown_path),
+            "facts_export": str(result.facts_path),
+            "governance_evidence": str(result.governance_path),
+            "exit_edge_evidence": str(result.exit_edge_path),
+            "workbook_update": workbook,
+            "obsidian_review": review.to_dict() if review else None,
+            "telegram_sent": False,
+        }
+    )
     return 0 if ok else 2
 
 
@@ -349,9 +401,7 @@ def _weekly_report_output_dir(
     return reports
 
 
-def _chart_scenario_shadow_job(
-    args: argparse.Namespace, *, repo_root: Path
-) -> int:
+def _chart_scenario_shadow_job(args: argparse.Namespace, *, repo_root: Path) -> int:
     completed = _run_python_module(
         ["bhiksha.tools.chart_scenario_coordinator", "--phase", "auto"],
         repo_root=repo_root,
@@ -393,8 +443,7 @@ def _update_trading_decision_ledger(
         check=False,
         cwd=str(repo_root),
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         timeout=float(os.getenv("BHIKSHA_WORKBOOK_UPDATE_TIMEOUT_SECONDS", "180")),
     )
     receipt = _last_json_object(completed.stdout)
@@ -402,7 +451,8 @@ def _update_trading_decision_ledger(
         return {
             "status": "failed",
             "return_code": completed.returncode,
-            "error": receipt.get("error") or _tail(completed.stderr or completed.stdout),
+            "error": receipt.get("error")
+            or _tail(completed.stderr or completed.stdout),
         }
     return receipt
 
@@ -478,7 +528,9 @@ def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
     return not is_trading_day(today)
 
 
-def _run_python_module(args: list[str], *, repo_root: Path) -> subprocess.CompletedProcess[str]:
+def _run_python_module(
+    args: list[str], *, repo_root: Path
+) -> subprocess.CompletedProcess[str]:
     module, *rest = args
     env = os.environ.copy()
     kernel_src = env.get("BHIKSHA_KERNEL_SRC", "").strip()
@@ -486,14 +538,13 @@ def _run_python_module(args: list[str], *, repo_root: Path) -> subprocess.Comple
         item for item in (str(repo_root / "src"), kernel_src) if item
     )
     env["PYTHONUNBUFFERED"] = "1"
-    return subprocess.run(  # noqa: S603
+    return subprocess.run(
         [sys.executable, "-m", module, *rest],
         check=False,
         cwd=str(repo_root),
         env=env,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         timeout=float(os.getenv("BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS", "600")),
     )
 
@@ -583,8 +634,52 @@ def _print_result(payload: dict) -> None:
 
 def _write_latest_status(payload: dict) -> None:
     try:
+        if payload.get("job") == "chart-scenario-shadow":
+            requested = (
+                Path.cwd()
+                / "artifacts"
+                / "chart_scenarios"
+                / "launchd"
+                / "latest_status.json"
+            )
+            path = require_experiment_path(requested, role="launchd status receipt")
+            if any(
+                parent.is_symlink() for parent in requested.parents if parent.exists()
+            ):
+                raise ValueError("chart launchd status parent cannot be a symlink")
+            if requested.is_symlink():
+                raise ValueError("chart launchd status target cannot be a symlink")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", dir=path.parent
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "schema": "bhiksha.chart-scenario-launchd-status.v1",
+                                "recorded_at": datetime.now(CENTRAL).isoformat(),
+                                "payload": payload,
+                            },
+                            indent=2,
+                            sort_keys=True,
+                            default=str,
+                        )
+                        + "\n"
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_name, path)
+            except Exception:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
+                raise
+            return
         write_latest_status(Path.cwd(), payload)
-    except Exception:
+    except (OSError, TypeError, ValueError):
         # Status snapshots are observational. They must never turn a successful
         # trading-domain job into a failed launchd job.
         return

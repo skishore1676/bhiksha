@@ -31,11 +31,13 @@ def extract_authorization_code(returned_url: str) -> str:
 
 def _basic_auth_header(settings: SchwabSettings) -> str:
     settings.validate_credentials()
-    raw = f"{settings.app_key}:{settings.app_secret}".encode("utf-8")
+    raw = f"{settings.app_key}:{settings.app_secret}".encode()
     return f"Basic {base64.b64encode(raw).decode('utf-8')}"
 
 
-def _normalize_token_payload(token_dictionary: dict[str, Any], refresh_issued_at: datetime | None = None) -> dict[str, Any]:
+def _normalize_token_payload(
+    token_dictionary: dict[str, Any], refresh_issued_at: datetime | None = None
+) -> dict[str, Any]:
     access_issued_at = datetime.now(UTC)
     refresh_issued_at = refresh_issued_at or access_issued_at
     return {
@@ -45,7 +47,9 @@ def _normalize_token_payload(token_dictionary: dict[str, Any], refresh_issued_at
     }
 
 
-async def exchange_code_for_tokens(returned_url: str, settings: SchwabSettings) -> dict[str, Any]:
+async def exchange_code_for_tokens(
+    returned_url: str, settings: SchwabSettings
+) -> dict[str, Any]:
     """Exchange a callback URL for fresh access and refresh tokens."""
     code = extract_authorization_code(returned_url)
     async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
@@ -94,8 +98,14 @@ async def refresh_access_token(settings: SchwabSettings) -> dict[str, Any]:
         if not new_tokens.get("refresh_token"):
             new_tokens["refresh_token"] = old_refresh
         new_refresh = new_tokens.get("refresh_token")
-        refresh_issued_at = datetime.now(UTC) if new_refresh and new_refresh != old_refresh else datetime.fromisoformat(existing["refresh_token_issued"])
-        payload = _normalize_token_payload(new_tokens, refresh_issued_at=refresh_issued_at)
+        refresh_issued_at = (
+            datetime.now(UTC)
+            if new_refresh and new_refresh != old_refresh
+            else datetime.fromisoformat(existing["refresh_token_issued"])
+        )
+        payload = _normalize_token_payload(
+            new_tokens, refresh_issued_at=refresh_issued_at
+        )
         write_tokens(settings.token_file, payload)
         return payload
 
@@ -106,10 +116,14 @@ def access_token_is_stale(payload: dict[str, Any], buffer_seconds: int = 60) -> 
     return datetime.now(UTC) >= issued_at + timedelta(seconds=1800 - buffer_seconds)
 
 
-def refresh_token_is_expired(payload: dict[str, Any], buffer_seconds: int = 1800) -> bool:
+def refresh_token_is_expired(
+    payload: dict[str, Any], buffer_seconds: int = 1800
+) -> bool:
     """Return True when the refresh token can no longer be trusted."""
     issued_at = datetime.fromisoformat(payload["refresh_token_issued"])
-    return datetime.now(UTC) >= issued_at + timedelta(days=7) - timedelta(seconds=buffer_seconds)
+    return datetime.now(UTC) >= issued_at + timedelta(days=7) - timedelta(
+        seconds=buffer_seconds
+    )
 
 
 async def get_valid_access_token(settings: SchwabSettings) -> str:
@@ -123,6 +137,26 @@ async def get_valid_access_token(settings: SchwabSettings) -> str:
         payload = await refresh_access_token(settings)
     token_dictionary = payload.get("token_dictionary", {})
     access_token = token_dictionary.get("access_token")
+    if not access_token:
+        raise ValueError("Schwab access token missing from token payload")
+    return str(access_token)
+
+
+def get_read_only_access_token(settings: SchwabSettings) -> str:
+    """Read a currently valid bearer token without refresh or persistence."""
+
+    payload = read_tokens(settings.token_file)
+    if not payload:
+        raise ValueError("No Schwab token file found; market-data shadowing degraded")
+    if refresh_token_is_expired(payload):
+        raise ValueError(
+            "Schwab refresh token has expired; market-data shadowing degraded"
+        )
+    if access_token_is_stale(payload, buffer_seconds=0):
+        raise ValueError(
+            "Schwab access token is stale; market-data shadowing cannot refresh"
+        )
+    access_token = payload.get("token_dictionary", {}).get("access_token")
     if not access_token:
         raise ValueError("Schwab access token missing from token payload")
     return str(access_token)

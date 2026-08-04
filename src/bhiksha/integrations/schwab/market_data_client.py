@@ -1,0 +1,116 @@
+"""Schwab market-data-only client that cannot refresh or persist OAuth state."""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any
+
+import httpx
+
+from bhiksha.integrations.schwab.auth import get_read_only_access_token
+from bhiksha.integrations.schwab.settings import SchwabSettings
+from bhiksha.net.retry import retry_async
+
+
+class SchwabReadOnlyMarketDataClient:
+    """Expose only quote/chain/history endpoints with a no-refresh token reader."""
+
+    def __init__(self, settings: SchwabSettings | None = None) -> None:
+        self.settings = settings or SchwabSettings.market_data_from_env()
+        self._client = httpx.AsyncClient(
+            base_url=self.settings.api_base_url.rstrip("/"),
+            timeout=self.settings.timeout_seconds,
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {get_read_only_access_token(self.settings)}"}
+
+    async def quote(self, symbol: str) -> dict[str, Any]:
+        async def operation() -> dict[str, Any]:
+            response = await self._client.get(
+                f"/marketdata/v1/{symbol}/quotes", headers=await self._headers()
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await retry_async(operation)
+
+    async def option_chain(
+        self,
+        symbol: str,
+        *,
+        contract_type: str = "ALL",
+        strike_count: int = 20,
+        from_date: date | None = None,
+        to_date: date | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "contractType": contract_type,
+            "strikeCount": strike_count,
+            "includeUnderlyingQuote": "false",
+        }
+        if from_date is not None:
+            params["fromDate"] = from_date.isoformat()
+        if to_date is not None:
+            params["toDate"] = to_date.isoformat()
+
+        async def operation() -> dict[str, Any]:
+            response = await self._client.get(
+                "/marketdata/v1/chains",
+                headers=await self._headers(),
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await retry_async(operation)
+
+    async def price_history(
+        self,
+        symbol: str,
+        *,
+        period_type: str = "day",
+        period: int | None = 1,
+        frequency_type: str = "minute",
+        frequency: int = 1,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        need_extended_hours_data: bool | None = None,
+        need_previous_close: bool | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "periodType": period_type,
+            "frequencyType": frequency_type,
+            "frequency": frequency,
+        }
+        if period is not None and start_date is None and end_date is None:
+            params["period"] = period
+        if start_date is not None:
+            params["startDate"] = int(start_date.timestamp() * 1000)
+        if end_date is not None:
+            params["endDate"] = int(end_date.timestamp() * 1000)
+        if need_extended_hours_data is not None:
+            params["needExtendedHoursData"] = str(
+                bool(need_extended_hours_data)
+            ).lower()
+        if need_previous_close is not None:
+            params["needPreviousClose"] = str(bool(need_previous_close)).lower()
+
+        async def operation() -> dict[str, Any]:
+            response = await self._client.get(
+                "/marketdata/v1/pricehistory",
+                headers=await self._headers(),
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await retry_async(operation)
+
+
+__all__ = ["SchwabReadOnlyMarketDataClient"]

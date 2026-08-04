@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -11,7 +11,12 @@ import httpx
 from mala_bhiksha_kernel import canonical_sha256
 
 from bhiksha.chart_scenarios.cycle import CYCLE_INPUT_SCHEMA
-from bhiksha.chart_scenarios.models import OptionQuoteSnapshot, timestamp_json
+from bhiksha.chart_scenarios.models import timestamp_json
+from bhiksha.chart_scenarios.quote_evidence import (
+    build_live_quote,
+    normalize_option_symbol,
+    selected_raw_quote,
+)
 from bhiksha.chart_scenarios.repository import ScenarioEventRepository
 from bhiksha.chart_scenarios.timeframes import (
     CALENDAR_VERSION,
@@ -38,17 +43,20 @@ async def export_live_cycle_input(
     quote_client: Any,
     evaluated_at: datetime | None = None,
     observation_slot_ordinal: int | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
     """Capture completed bars and an authentic selected-option quote per candidate."""
 
     sealed = validate_bundle(plan.model_dump(mode="json"))
-    now = (evaluated_at or datetime.now(UTC)).astimezone(UTC)
+    fixed = evaluated_at.astimezone(UTC) if evaluated_at is not None else None
+    capture_now = clock or (lambda: fixed or datetime.now(UTC))
+    cycle_started_at = capture_now().astimezone(UTC)
     candidates = sorted({scenario.candidate_id for scenario in sealed.scenarios})
     ordinal = observation_slot_ordinal or repository.next_observation_slot_ordinal(
         run_id=str(sealed.run_manifest["run_id"]),
         candidate_ids=tuple(candidates),
     )
-    rows: list[dict[str, Any]] = []
+    pending_rows: list[dict[str, Any]] = []
     for candidate_id in candidates:
         scenarios = [
             scenario
@@ -60,17 +68,17 @@ async def export_live_cycle_input(
             {scenario.direction.value for scenario in scenarios}, "direction"
         )
         start = min(scenario.observation_window.start_at for scenario in scenarios)
-        end = min(
-            now,
-            max(scenario.observation_window.end_at for scenario in scenarios),
-        )
+        requested_at = capture_now().astimezone(UTC)
+        end = min(requested_at, max(s.observation_window.end_at for s in scenarios))
         errors: list[dict[str, str]] = []
         try:
             bars = await bar_source.warm_start(symbol, start - timedelta(days=30), end)
-            completed = _completed_bars(bars, evaluated_at=now)
+            bar_acquired_at = capture_now().astimezone(UTC)
+            completed = _completed_bars(bars, evaluated_at=bar_acquired_at)
             if not completed:
                 errors.append(_diagnostic("bars", ValueError("no completed bars")))
         except Exception as exc:  # noqa: BLE001 - retain other candidate evidence.
+            bar_acquired_at = capture_now().astimezone(UTC)
             completed = []
             errors.append(_diagnostic("bars", exc))
 
@@ -88,15 +96,16 @@ async def export_live_cycle_input(
                     if direction == "long"
                     else sealed.option_selection_policy.short_signal_contract_type
                 ),
-                from_date=now.date(),
+                from_date=bar_acquired_at.date(),
             )
+            chain_acquired_at = capture_now().astimezone(UTC)
             contracts = [_normalize_contract(contract) for contract in contracts]
             selected_from_chain = _select_contract(
                 contracts,
                 candidate_id=candidate_id,
                 symbol=symbol,
                 direction=direction,
-                evaluated_at=now,
+                evaluated_at=chain_acquired_at,
                 plan=sealed,
             )
             if not selected_symbol:
@@ -108,20 +117,9 @@ async def export_live_cycle_input(
             RuntimeError,
             ValueError,
         ) as exc:
+            chain_acquired_at = capture_now().astimezone(UTC)
             if not persisted_symbol:
                 errors.append(_diagnostic("option_selection", exc))
-
-        option_selection = _option_selection_evidence(
-            contracts=contracts,
-            selected_from_chain=selected_from_chain,
-            effective_selected_symbol=selected_symbol,
-            candidate_id=candidate_id,
-            symbol=symbol,
-            direction=direction,
-            evaluated_at=now,
-            plan=sealed,
-            mode=("persisted_contract" if persisted_symbol else "canonical_selector"),
-        )
 
         quotes: list[dict[str, Any]] = []
         if selected_symbol:
@@ -129,17 +127,27 @@ async def export_live_cycle_input(
                 (
                     contract
                     for contract in contracts
-                    if contract.option_symbol == selected_symbol
+                    if normalize_option_symbol(contract.option_symbol)
+                    == normalize_option_symbol(selected_symbol)
                 ),
                 None,
             )
             try:
+                if quote_contract is None:
+                    raise ValueError(
+                        "selected contract is absent from acquired chain evidence"
+                    )
                 raw_quote = await quote_client.quote(selected_symbol)
+                quote_acquired_at = capture_now().astimezone(UTC)
+                raw_source = selected_raw_quote(
+                    raw_quote, option_symbol=selected_symbol
+                )
                 quotes.append(
-                    _live_quote(
-                        raw_quote,
+                    build_live_quote(
+                        raw_source,
                         option_symbol=selected_symbol,
-                        fallback_contract=quote_contract,
+                        selected_contract=quote_contract,
+                        acquired_at=quote_acquired_at,
                         policy_hash=str(sealed.option_selection_policy.content_hash),
                         selection_mode=(
                             "persisted_contract"
@@ -171,20 +179,32 @@ async def export_live_cycle_input(
         bars_by_timeframe = {
             timeframe: {
                 "timeframe": timeframe,
+                "bar_acquired_at": timestamp_json(bar_acquired_at),
                 **_timeframe_evidence(
                     completed,
                     timeframe=timeframe,
-                    evaluated_at=now,
+                    evaluated_at=bar_acquired_at,
                 ),
             }
             for timeframe in required_timeframes
         }
-        rows.append(
+        pending_rows.append(
             {
                 "candidate_id": candidate_id,
                 "symbol": symbol,
                 "bars_by_timeframe": bars_by_timeframe,
-                "option_selection": option_selection,
+                "_option_context": {
+                    "contracts": contracts,
+                    "selected_from_chain": selected_from_chain,
+                    "effective_selected_symbol": selected_symbol,
+                    "direction": direction,
+                    "chain_acquired_at": chain_acquired_at,
+                    "mode": (
+                        "persisted_contract"
+                        if persisted_symbol
+                        else "canonical_selector"
+                    ),
+                },
                 "quotes": quotes,
                 "diagnostics": {
                     "provider_id": sealed.option_selection_policy.provider_id,
@@ -208,13 +228,34 @@ async def export_live_cycle_input(
                 },
             }
         )
+    sealed_at = capture_now().astimezone(UTC)
+    if sealed_at < cycle_started_at:
+        raise ValueError("cycle seal precedes cycle start")
+    rows: list[dict[str, Any]] = []
+    for pending in pending_rows:
+        context = pending.pop("_option_context")
+        pending["option_selection"] = _option_selection_evidence(
+            contracts=context["contracts"],
+            selected_from_chain=context["selected_from_chain"],
+            effective_selected_symbol=context["effective_selected_symbol"],
+            candidate_id=pending["candidate_id"],
+            symbol=pending["symbol"],
+            direction=context["direction"],
+            chain_acquired_at=context["chain_acquired_at"],
+            evaluated_at=sealed_at,
+            plan=sealed,
+            mode=context["mode"],
+        )
+        rows.append(pending)
     body = {
         "schema_version": CYCLE_INPUT_SCHEMA,
         "plan_hash": sealed.plan_hash,
         "run_manifest_hash": sealed.run_manifest_hash,
         "treatment_manifest_hash": sealed.treatment_manifest_hash,
         "observation_slot_ordinal": ordinal,
-        "evaluated_at": timestamp_json(now),
+        "cycle_started_at": timestamp_json(cycle_started_at),
+        "evaluated_at": timestamp_json(sealed_at),
+        "sealed_at": timestamp_json(sealed_at),
         "candidates": rows,
     }
     return {**body, "content_hash": canonical_sha256(body)}
@@ -240,6 +281,7 @@ def _option_selection_evidence(
     candidate_id: str,
     symbol: str,
     direction: str,
+    chain_acquired_at: datetime,
     evaluated_at: datetime,
     plan: ShadowPlan,
     mode: str,
@@ -264,15 +306,16 @@ def _option_selection_evidence(
     chain_body = {
         "schema_version": "bhiksha.chart-scenario-option-chain-evidence.v1",
         "provider_id": plan.option_selection_policy.provider_id,
-        "observed_at": timestamp_json(evaluated_at),
+        "observed_at": timestamp_json(chain_acquired_at),
         "contract_count": len(contracts_payload),
         "contracts_hash": canonical_sha256(contracts_payload),
     }
     body = {
-        "schema_version": "bhiksha.chart-scenario-option-selection.v2",
+        "schema_version": "bhiksha.chart-scenario-option-selection.v3",
         "mode": mode,
         "provider_id": plan.option_selection_policy.provider_id,
-        "observed_at": timestamp_json(evaluated_at),
+        "observed_at": timestamp_json(chain_acquired_at),
+        "chain_acquired_at": timestamp_json(chain_acquired_at),
         "policy_hash": plan.option_selection_policy.content_hash,
         "evaluated_at": timestamp_json(evaluated_at),
         "request": request_payload,
@@ -403,135 +446,6 @@ def _select_contract(
     if len(matches) != 1:
         raise ValueError("canonical selector did not resolve one source contract")
     return matches[0]
-
-
-def _live_quote(
-    payload: Mapping[str, Any],
-    *,
-    option_symbol: str,
-    fallback_contract: OptionContractSnapshot | None,
-    policy_hash: str,
-    selection_mode: str,
-) -> dict[str, Any]:
-    raw = payload.get(option_symbol) or payload.get(option_symbol.replace(" ", ""))
-    if not isinstance(raw, Mapping):
-        values = list(payload.values())
-        if len(values) == 1 and isinstance(values[0], Mapping):
-            raw = values[0]
-        else:
-            raise ValueError("Schwab quote response omitted selected contract")
-    quote = raw.get("quote") if isinstance(raw.get("quote"), Mapping) else raw
-    reference = (
-        raw.get("reference") if isinstance(raw.get("reference"), Mapping) else {}
-    )
-    bid = _optional_float(quote.get("bidPrice", quote.get("bid")))
-    ask = _optional_float(quote.get("askPrice", quote.get("ask")))
-    last = _optional_float(quote.get("lastPrice", quote.get("last")))
-    quote_time = _provider_timestamp(
-        quote.get("quoteTime") if bid is not None and ask is not None else None,
-        quote.get("tradeTime"),
-    )
-    if quote_time is None:
-        raise ValueError("Schwab option quote has no provider timestamp")
-    parsed_type, parsed_expiration, parsed_strike, parsed_root = _occ_contract(
-        option_symbol
-    )
-    strike = _optional_float(reference.get("strikePrice"))
-    if strike is None:
-        strike = fallback_contract.strike if fallback_contract else parsed_strike
-    delta = _optional_float(quote.get("delta"))
-    if delta is None and fallback_contract is not None:
-        delta = fallback_contract.delta
-    open_interest = _optional_int(quote.get("openInterest"))
-    if open_interest is None and fallback_contract is not None:
-        open_interest = fallback_contract.open_interest
-    facts: dict[str, Any] = {
-        "option_symbol": option_symbol.replace(" ", ""),
-        "underlying_symbol": str(
-            reference.get("underlyingSymbol")
-            or (
-                fallback_contract.underlying_symbol
-                if fallback_contract
-                else parsed_root
-            )
-        ),
-        "contract_type": str(reference.get("contractType") or parsed_type).upper(),
-        "expiration_date": str(reference.get("expirationDate") or parsed_expiration),
-        "quote_time": timestamp_json(quote_time),
-        "source_id": "schwab-option-quote",
-        "bid": bid,
-        "ask": ask,
-        "last": last,
-        "strike": strike,
-        "delta": delta,
-        "open_interest": open_interest,
-        "scenario_id": None,
-        "is_selected": True,
-        "provenance": {
-            "provider_id": "schwab",
-            "option_selection_policy_hash": policy_hash,
-            "selection_mode": selection_mode,
-            "raw_source_hash": canonical_sha256(raw),
-        },
-    }
-    identity = canonical_sha256(
-        {"schema": "bhiksha.chart-scenario-live-option-snapshot.v1", **facts}
-    )
-    snapshot = {
-        "snapshot_id": "schwab-" + identity[:24],
-        **facts,
-        "snapshot_hash": None,
-    }
-    return OptionQuoteSnapshot.from_mapping(snapshot).to_dict()
-
-
-def _provider_timestamp(*values: Any) -> datetime | None:
-    for value in values:
-        if value is None:
-            continue
-        try:
-            if isinstance(value, int | float) and not isinstance(value, bool):
-                return datetime.fromtimestamp(float(value) / 1000, tz=UTC)
-            parsed = datetime.fromisoformat(str(value))
-            if parsed.tzinfo is not None:
-                return parsed.astimezone(UTC)
-        except (OverflowError, TypeError, ValueError):
-            continue
-    return None
-
-
-def _occ_contract(option_symbol: str) -> tuple[str, str, float, str]:
-    compact = option_symbol.replace(" ", "")
-    index = next((i for i, char in enumerate(compact) if char.isdigit()), -1)
-    if index < 1 or len(compact) < index + 15:
-        raise ValueError("selected option symbol is not a normalized OCC symbol")
-    root = compact[:index]
-    yymmdd = compact[index : index + 6]
-    side = compact[index + 6]
-    strike_digits = compact[index + 7 : index + 15]
-    if side not in {"C", "P"} or not (yymmdd + strike_digits).isdigit():
-        raise ValueError("selected option symbol is not a normalized OCC symbol")
-    expiration = f"20{yymmdd[:2]}-{yymmdd[2:4]}-{yymmdd[4:6]}"
-    return (
-        "CALL" if side == "C" else "PUT",
-        expiration,
-        int(strike_digits) / 1000,
-        root,
-    )
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_int(value: Any) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _diagnostic(stage: str, error: Exception) -> dict[str, str]:

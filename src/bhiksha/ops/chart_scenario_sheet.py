@@ -13,11 +13,14 @@ from typing import Any
 from mala_bhiksha_kernel import canonical_sha256
 
 from bhiksha.chart_scenarios.paths import require_experiment_path
+from bhiksha.chart_scenarios.validation import ShadowPlan, validate_bundle
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 
 REQUEST_SCHEMA = "tradelab.market_context_sheet_upsert_request.v1"
 RECEIPT_SCHEMA = "tradelab.market_context_sheet_projection_receipt.v1"
 SHEET_NAME = "Chart_Scenarios_v1"
+SPREADSHEET_ID = "1cJPWfkQB6pp91TAFNT86R5Pi1cUfzCgT3bUWgjY6rbc"
+ALLOWED_ARMS = frozenset({"chart_deterministic", "chart_agentic_rerank"})
 KEY_COLUMNS = ("campaign_id", "run_id", "arm", "scenario_id")
 HEADERS = (
     "trading_date",
@@ -65,10 +68,11 @@ def project_sheet_upsert_request(
     *,
     client: GoogleSheetTableClient,
     receipt_path: str | Path,
+    plan: ShadowPlan,
 ) -> dict[str, Any]:
     """Upsert only exact experiment keys, then authenticate an exact reread."""
 
-    sealed = validate_sheet_upsert_request(request)
+    sealed = validate_sheet_upsert_request(request, plan=plan)
     if client.spreadsheet_id != sealed["spreadsheet_id"]:
         raise ValueError("Google Sheet client spreadsheet differs from request")
     if client.sheet_name != SHEET_NAME:
@@ -142,7 +146,9 @@ def project_sheet_upsert_request(
     return receipt
 
 
-def validate_sheet_upsert_request(value: Mapping[str, Any]) -> dict[str, Any]:
+def validate_sheet_upsert_request(
+    value: Mapping[str, Any], *, plan: ShadowPlan
+) -> dict[str, Any]:
     expected = {
         "schema",
         "spreadsheet_id",
@@ -156,7 +162,11 @@ def validate_sheet_upsert_request(value: Mapping[str, Any]) -> dict[str, Any]:
     }
     if set(value) != expected:
         raise ValueError("Sheet upsert request must declare exact top-level fields")
-    if value.get("schema") != REQUEST_SCHEMA or value.get("sheet_name") != SHEET_NAME:
+    if (
+        value.get("schema") != REQUEST_SCHEMA
+        or value.get("sheet_name") != SHEET_NAME
+        or value.get("spreadsheet_id") != SPREADSHEET_ID
+    ):
         raise ValueError("unsupported Sheet upsert request schema or tab")
     if value.get("key_columns") != list(KEY_COLUMNS):
         raise ValueError("Sheet upsert request key columns differ from contract")
@@ -173,6 +183,14 @@ def validate_sheet_upsert_request(value: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("Sheet upsert request values do not match exact 37 columns")
     rows = [dict(zip(HEADERS, row, strict=True)) for row in values[1:]]
+    for row in rows:
+        if (
+            row["arm"] not in ALLOWED_ARMS
+            or row["authorization_mode"] != "shadow"
+            or row["source_type"] != "chart_scenario_experiment"
+        ):
+            raise ValueError("Sheet projection row is not an allowed shadow scenario")
+    _validate_rows_against_plan(rows, plan=plan)
     keys = [_row_key(row) for row in rows]
     if len(keys) != len(set(keys)):
         raise ValueError("Sheet upsert request contains duplicate keys")
@@ -196,6 +214,45 @@ def validate_sheet_upsert_request(value: Mapping[str, Any]) -> dict[str, Any]:
     if str(value.get("content_hash", "")).removeprefix("sha256:") != computed:
         raise ValueError("Sheet upsert request content hash mismatch")
     return {**dict(value), "content_hash": computed}
+
+
+def _validate_rows_against_plan(
+    rows: list[dict[str, Any]], *, plan: ShadowPlan
+) -> None:
+    sealed = validate_bundle(plan.model_dump(mode="json"))
+    scenarios = {
+        (scenario.arm_id.value, scenario.scenario_id): scenario
+        for scenario in sealed.scenarios
+    }
+    for row in rows:
+        scenario = scenarios.get((str(row["arm"]), str(row["scenario_id"])))
+        if scenario is None:
+            raise ValueError("Sheet projection row is not installed in the shadow plan")
+        evidence_hashes = [
+            reference.evidence_hash for reference in scenario.chart_evidence_refs
+        ]
+        exact = {
+            "program_id": scenario.program_id,
+            "experiment_family_id": scenario.experiment_family_id,
+            "experiment_version": scenario.experiment_version,
+            "campaign_id": scenario.campaign_id,
+            "run_id": scenario.run_id,
+            "candidate_id": scenario.candidate_id,
+            "symbol": scenario.symbol,
+            "direction": scenario.direction.value,
+            "exit_profile": scenario.exit_profile.value,
+            "component_manifest_hash": scenario.component_manifest_hash,
+            "candidate_pool_hash": scenario.candidate_pool_hash,
+            "scenario_hash": scenario.scenario_hash,
+            "exit_policy_hash": scenario.exit_policy_hash,
+            "chart_evidence_hash": ",".join(evidence_hashes),
+            "authorization_mode": "shadow",
+            "source_type": "chart_scenario_experiment",
+        }
+        if any(str(row[field]) != str(expected) for field, expected in exact.items()):
+            raise ValueError(
+                "Sheet projection row identity differs from installed plan"
+            )
 
 
 def _index_existing_rows(
@@ -261,6 +318,7 @@ __all__ = [
     "RECEIPT_SCHEMA",
     "REQUEST_SCHEMA",
     "SHEET_NAME",
+    "SPREADSHEET_ID",
     "project_sheet_upsert_request",
     "validate_sheet_upsert_request",
 ]

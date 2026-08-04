@@ -193,6 +193,7 @@ class BrokerInertScenarioObserver:
                     set(series)
                     != {
                         "timeframe",
+                        "bar_acquired_at",
                         "provenance",
                         "source_bars",
                         "bars",
@@ -215,7 +216,6 @@ class BrokerInertScenarioObserver:
         timestamps.extend(quote.quote_time for quote in normalized_path)
         if single_quote is not None:
             timestamps.append(single_quote.quote_time)
-        supplied_evaluated_at = evaluated_at is not None
         now = (
             as_utc(evaluated_at)
             if evaluated_at is not None
@@ -261,6 +261,14 @@ class BrokerInertScenarioObserver:
             "source_bars_by_timeframe": (
                 {
                     timeframe: list(series["source_bars"])
+                    for timeframe, series in sorted(bars_by_timeframe.items())
+                }
+                if bars_by_timeframe is not None
+                else None
+            ),
+            "bar_acquired_at_by_timeframe": (
+                {
+                    timeframe: str(series["bar_acquired_at"])
                     for timeframe, series in sorted(bars_by_timeframe.items())
                 }
                 if bars_by_timeframe is not None
@@ -575,9 +583,7 @@ class BrokerInertScenarioObserver:
                 if (
                     not self.quote_eligibility_policy.eligible(
                         entry_quote,
-                        evaluated_at=(
-                            now if supplied_evaluated_at else entry_quote.quote_time
-                        ),
+                        evaluated_at=entry_quote.acquired_at or entry_quote.quote_time,
                     )
                     or not entry_quote.is_selected
                 ):
@@ -756,7 +762,7 @@ class BrokerInertScenarioObserver:
                     continue
                 if not self.quote_eligibility_policy.eligible(
                     quote,
-                    evaluated_at=(now if supplied_evaluated_at else quote.quote_time),
+                    evaluated_at=quote.acquired_at or quote.quote_time,
                 ):
                     self._record(
                         new_events,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,20 +11,48 @@ import pytest
 from mala_bhiksha_kernel import canonical_sha256
 
 import bhiksha.tools.chart_scenario_coordinator as coordinator
+from bhiksha.chart_scenarios.cycle import run_observation_cycle
+from bhiksha.chart_scenarios.repository import ScenarioEventRepository
+from bhiksha.chart_scenarios.validation import install_shadow_plan
+from bhiksha.ops.chart_scenario_sheet import SPREADSHEET_ID
 from bhiksha.tools.chart_scenario_coordinator import (
     _before_prepare_cutoff,
     _campaign_window_preflight,
     _completed_cycle_slot,
+    _export_events,
     _phase,
     _prepare_daily_contract,
     _require_preopen_completion,
     _resolve_daily_contract,
     _run_tradelab_lifecycle,
+    _sanitized_subprocess_env,
     _stage_tradelab_evidence,
     _validate_campaign_config,
     _validate_contract,
+    _validate_existing_staging_generation,
+    _validate_staging_event_partition,
+    _verify_frozen_toolchain,
     _verify_kernel_source,
 )
+from tests.test_chart_scenarios import _bundle_payload, _cycle_input, _plan
+
+
+def _toolchain(tmp_path: Path) -> dict[str, dict[str, str]]:
+    roles = {
+        "birdclaw": tmp_path / "birdclaw",
+        "market_cartographer": tmp_path / "market-cartographer",
+        "tradelab": tmp_path / "tradelab",
+        "agent_broker": tmp_path / "agent-broker",
+    }
+    return {
+        role: {
+            "checkout": str(checkout),
+            "commit": "a" * 40,
+            "entrypoint": str(checkout / "entrypoint"),
+            "entrypoint_sha256": "b" * 64,
+        }
+        for role, checkout in roles.items()
+    }
 
 
 def _window(*, end_at: str = "2026-08-04T16:00:00-04:00") -> dict[str, str]:
@@ -62,6 +92,7 @@ def _contract(tmp_path: Path) -> dict[str, object]:
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     experiment_root = tmp_path / "artifacts" / "chart_scenarios" / "tradelab"
     run_root = experiment_root / "campaigns" / "campaign-1" / "runs" / "run-2026-08-04"
+    toolchain = _toolchain(tmp_path)
     body: dict[str, object] = {
         "schema": "bhiksha.chart-scenario-coordinator-contract.v1",
         "campaign_id": "campaign-1",
@@ -78,10 +109,13 @@ def _contract(tmp_path: Path) -> dict[str, object]:
         "campaign_protocol_hash": "d" * 64,
         "campaign_freeze_receipt_hash": "e" * 64,
         "session_calendar_hash": "f" * 64,
+        "toolchain": toolchain,
+        "toolchain_hash": canonical_sha256(toolchain),
         "tradelab_checkout": "/tmp/tradelab",
         "tradelab_experiment_root": str(experiment_root),
         "agent_broker": "/Users/sunny/code/agent-broker/agent-broker",
-        "spreadsheet_id": "sheet-1",
+        "agent_broker_checkout": str(tmp_path / "agent-broker"),
+        "spreadsheet_id": SPREADSHEET_ID,
         "kernel_src": "/tmp/kernel/src",
         "plan_source": str(run_root / "outputs" / "shadow-plan.json"),
         "projection_request": str(run_root / "outputs" / "sheet-upsert-request.json"),
@@ -329,6 +363,113 @@ def test_kernel_readback_must_resolve_under_reviewed_checkout(
         _verify_kernel_source()
 
 
+def test_subprocess_environments_are_role_scoped_and_strip_money_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {
+        "PUBLIC_API_SECRET": "public-secret",
+        "PUBLIC_API_KEY": "public-key",
+        "SCHWAB_APP_SECRET": "schwab-secret",
+        "SCHWAB_APP_KEY": "schwab-key",
+        "SCHWAB_TOKEN_FILE": "/secure/schwab-token.json",
+        "GOOGLE_API_CREDENTIALS_PATH": "/secure/google.json",
+    }
+    for key, value in secrets.items():
+        monkeypatch.setenv(key, value)
+
+    inert = _sanitized_subprocess_env(role="broker_inert")
+    market_data = _sanitized_subprocess_env(role="schwab_market_data")
+    sheet = _sanitized_subprocess_env(role="google_sheet")
+    assert not set(secrets).intersection(inert)
+    assert market_data["SCHWAB_TOKEN_FILE"] == secrets["SCHWAB_TOKEN_FILE"]
+    assert "SCHWAB_APP_SECRET" not in market_data
+    assert "SCHWAB_APP_KEY" not in market_data
+    assert "PUBLIC_API_SECRET" not in market_data
+    assert (
+        sheet["GOOGLE_API_CREDENTIALS_PATH"] == secrets["GOOGLE_API_CREDENTIALS_PATH"]
+    )
+    assert "SCHWAB_TOKEN_FILE" not in sheet
+
+
+def test_frozen_toolchain_rejects_dirty_hash_drift_and_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    checkouts = {
+        "birdclaw": tmp_path / "birdclaw",
+        "market_cartographer": tmp_path / "market-cartographer",
+        "tradelab": tmp_path / "tradelab",
+        "agent_broker": tmp_path / "agent-broker",
+    }
+    toolchain: dict[str, dict[str, str]] = {}
+    for role, checkout in checkouts.items():
+        entrypoint = (
+            checkout / ".venv/bin/agent-broker"
+            if role == "agent_broker"
+            else checkout / "entrypoint"
+        )
+        entrypoint.parent.mkdir(parents=True, exist_ok=True)
+        entrypoint.write_text(f"{role}\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            check=True,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        toolchain[role] = {
+            "checkout": str(checkout),
+            "commit": commit,
+            "entrypoint": str(entrypoint),
+            "entrypoint_sha256": hashlib.sha256(entrypoint.read_bytes()).hexdigest(),
+        }
+    config = {
+        "birdclaw_checkout": str(checkouts["birdclaw"]),
+        "market_cartographer_checkout": str(checkouts["market_cartographer"]),
+        "tradelab_checkout": str(checkouts["tradelab"]),
+        "agent_broker_checkout": str(checkouts["agent_broker"]),
+        "agent_broker": toolchain["agent_broker"]["entrypoint"],
+        "toolchain": toolchain,
+    }
+    _verify_frozen_toolchain(config)
+
+    birdclaw_entrypoint = Path(toolchain["birdclaw"]["entrypoint"])
+    birdclaw_entrypoint.write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not clean"):
+        _verify_frozen_toolchain(config)
+    birdclaw_entrypoint.write_text("birdclaw\n", encoding="utf-8")
+
+    toolchain["birdclaw"]["entrypoint_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="entrypoint drift"):
+        _verify_frozen_toolchain(config)
+    toolchain["birdclaw"]["entrypoint_sha256"] = hashlib.sha256(
+        birdclaw_entrypoint.read_bytes()
+    ).hexdigest()
+
+    outside = tmp_path / "outside-entrypoint"
+    outside.write_text("outside\n", encoding="utf-8")
+    symlink = checkouts["birdclaw"] / "escaped-entrypoint"
+    symlink.symlink_to(outside)
+    toolchain["birdclaw"]["entrypoint"] = str(symlink)
+    with pytest.raises(ValueError, match="escaped checkout"):
+        _verify_frozen_toolchain(config)
+
+
 def test_campaign_config_autonomously_emits_authenticated_daily_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -342,6 +483,10 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
     birdclaw_db = tmp_path / "production-birdclaw.sqlite"
     birdclaw_db.write_bytes(b"sqlite-fixture")
     experiment_root, frozen = _campaign_artifacts(tmp_path)
+    agent_broker_checkout = tmp_path / "agent-broker"
+    agent_broker = agent_broker_checkout / ".venv" / "bin" / "agent-broker"
+    toolchain = _toolchain(tmp_path)
+    toolchain["agent_broker"]["entrypoint"] = str(agent_broker)
     body: dict[str, object] = {
         "schema": "bhiksha.chart-scenario-campaign-config.v1",
         "campaign_id": "campaign-1",
@@ -350,8 +495,9 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
         "market_cartographer_checkout": str(cartographer),
         "tradelab_checkout": str(tmp_path / "tradelab"),
         "tradelab_experiment_root": str(experiment_root),
-        "agent_broker": "/Users/sunny/code/agent-broker/agent-broker",
-        "spreadsheet_id": "sheet-1",
+        "agent_broker": str(agent_broker),
+        "agent_broker_checkout": str(agent_broker_checkout),
+        "spreadsheet_id": SPREADSHEET_ID,
         "kernel_src": str(tmp_path / "kernel" / "src"),
         "cartographer_provider": "mala",
         "cartographer_data_root": str(tmp_path / "bars"),
@@ -359,6 +505,7 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
         **frozen,
         "session_calendar_id": "XNYS",
         "session_calendar_version": "exchange_calendars-4.13.2-XNYS",
+        "toolchain": toolchain,
         "starts_on": "2026-08-04",
         "checkpoint_after_sessions": 5,
         "max_sessions": 10,
@@ -441,6 +588,9 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
 
     monkeypatch.setattr(coordinator, "_run_command", fake_run)
     monkeypatch.setattr(coordinator, "_execute_command", fake_execute)
+    monkeypatch.setattr(
+        coordinator, "_verify_frozen_toolchain", lambda *args, **kwargs: None
+    )
     contract_dir = tmp_path / "artifacts" / "chart_scenarios" / "daily-contracts"
 
     path = _prepare_daily_contract(
@@ -504,6 +654,9 @@ def test_fixed_tradelab_lifecycle_has_no_caller_authored_output_argv(
         return {"status": "succeeded"}
 
     monkeypatch.setattr(coordinator, "_run_command", fake_run)
+    monkeypatch.setattr(
+        coordinator, "_verify_frozen_toolchain", lambda *args, **kwargs: None
+    )
 
     _run_tradelab_lifecycle(contract, command="prepare-run")
     _run_tradelab_lifecycle(contract, command="refresh-projection")
@@ -526,37 +679,54 @@ def test_fixed_tradelab_lifecycle_has_no_caller_authored_output_argv(
 def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
     tmp_path: Path,
 ) -> None:
-    contract = _validate_contract(_contract(tmp_path))
+    value = _contract(tmp_path)
+    value["run_id"] = "run-1"
+    receipt_path = Path(str(value["cartographer_receipt"]))
+    cartographer = json.loads(receipt_path.read_text(encoding="utf-8"))
+    cartographer["run_id"] = "run-1"
+    cartographer["receipt_hash"] = canonical_sha256(
+        {key: item for key, item in cartographer.items() if key != "receipt_hash"}
+    )
+    receipt_path.write_text(json.dumps(cartographer), encoding="utf-8")
+    run_root = (
+        Path(str(value["tradelab_experiment_root"])) / "campaigns/campaign-1/runs/run-1"
+    )
+    value["plan_source"] = str(run_root / "outputs/shadow-plan.json")
+    value["projection_request"] = str(run_root / "outputs/sheet-upsert-request.json")
+    value["content_hash"] = canonical_sha256(
+        {key: item for key, item in value.items() if key != "content_hash"}
+    )
+    contract = _validate_contract(value)
     source = tmp_path / "artifacts" / "chart_scenarios" / "source-run"
     cycles = source / "cycles"
     inputs = source / "cycle-inputs"
     cycles.mkdir(parents=True)
     inputs.mkdir(parents=True)
+    plan_path = source / "plan.json"
     install = source / "install.json"
     events = source / "events.json"
-    install.write_text(json.dumps({"status": "installed"}), encoding="utf-8")
-    events.write_text(json.dumps({"events": []}), encoding="utf-8")
-    for slot in (1, 2):
-        receipt_body = {
-            "schema_version": "bhiksha.chart-scenario-cycle-receipt.v3",
-            "status": "succeeded",
-            "observation_slot_ordinal": slot,
-        }
-        (cycles / f"slot-{slot:04d}.receipt.json").write_text(
-            json.dumps(
-                {**receipt_body, "receipt_hash": canonical_sha256(receipt_body)}
-            ),
-            encoding="utf-8",
-        )
-        (inputs / f"slot-{slot:04d}.json").write_text(
-            json.dumps({"slot": slot}), encoding="utf-8"
-        )
+    install_shadow_plan(_bundle_payload(), output_path=plan_path, receipt_path=install)
+    database = source / "events.sqlite3"
+    cycle_path = inputs / "slot-0001.cycle-input.json"
+    cycle = _cycle_input(_plan())
+    cycle_path.write_text(json.dumps(cycle), encoding="utf-8")
+    run_observation_cycle(
+        _plan(),
+        cycle,
+        repository=ScenarioEventRepository(database),
+        receipt_path=cycles / "slot-0001.receipt.json",
+        cycle_input_path=cycle_path,
+    )
     paths = SimpleNamespace(
+        root=source,
+        plan=plan_path,
         install_receipt=install,
         cycle_inputs=inputs,
         cycle_receipts=cycles,
         events_export=events,
+        database=database,
     )
+    _export_events(paths)
 
     _stage_tradelab_evidence(contract, paths)
 
@@ -565,26 +735,80 @@ def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
         / "campaigns"
         / "campaign-1"
         / "runs"
-        / "run-2026-08-04"
+        / "run-1"
         / "bhiksha"
     )
     assert sorted(path.name for path in (staged / "cycle-receipts").iterdir()) == [
         "cycle-0001.receipt.json",
-        "cycle-0002.receipt.json",
     ]
     assert (staged / "install-receipt.json").is_file()
     assert (staged / "events.json").is_file()
     assert sorted(path.name for path in (staged / "cycle-inputs").iterdir()) == [
         "cycle-0001.json",
-        "cycle-0002.json",
     ]
+    assert staged.is_symlink()
+
+    exported = json.loads(events.read_text(encoding="utf-8"))["events"]
+    cycle_receipt = json.loads(
+        (cycles / "slot-0001.receipt.json").read_text(encoding="utf-8")
+    )
+    covered = [
+        event_hash
+        for evidence in cycle_receipt["durable_slot_evidence"]
+        for event_hash in evidence["event_hashes"]
+    ]
+    with pytest.raises(ValueError, match="covered exactly once"):
+        _validate_staging_event_partition(
+            exported, covered_event_hashes=covered[:-1], plan=_plan()
+        )
+    with pytest.raises(ValueError, match="covered exactly once"):
+        _validate_staging_event_partition(
+            exported, covered_event_hashes=[*covered, covered[0]], plan=_plan()
+        )
+    with pytest.raises(ValueError, match="covered exactly once"):
+        _validate_staging_event_partition(
+            exported, covered_event_hashes=[*covered, "f" * 64], plan=_plan()
+        )
+    omitted_install = next(
+        event for event in exported if event["event_type"] == "installed"
+    )
+    with pytest.raises(ValueError, match="one installed event"):
+        _validate_staging_event_partition(
+            [event for event in exported if event is not omitted_install],
+            covered_event_hashes=covered,
+            plan=_plan(),
+        )
+    wrong_type = json.loads(json.dumps(exported))
+    next(event for event in wrong_type if event["event_type"] == "installed")[
+        "event_type"
+    ] = "watching"
+    with pytest.raises(ValueError, match="covered exactly once"):
+        _validate_staging_event_partition(
+            wrong_type, covered_event_hashes=covered, plan=_plan()
+        )
+
+    (staged / "events.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="content drift"):
+        _stage_tradelab_evidence(contract, paths)
+
+    outside_generation = tmp_path / "outside-generation"
+    outside_generation.mkdir()
+    escaped_generation = (
+        tmp_path / "artifacts/chart_scenarios/escaped-generation"
+    )
+    escaped_generation.symlink_to(outside_generation)
+    with pytest.raises(ValueError, match="not an immutable directory"):
+        _validate_existing_staging_generation(escaped_generation, expected={})
 
 
 def test_failed_cycle_receipt_never_advances_completed_slot(tmp_path: Path) -> None:
-    cycles = tmp_path / "cycles"
-    cycles.mkdir()
+    source = tmp_path / "source"
+    cycles = source / "cycles"
+    inputs = source / "cycle-inputs"
+    cycles.mkdir(parents=True)
+    inputs.mkdir()
     receipt_body = {
-        "schema_version": "bhiksha.chart-scenario-cycle-receipt.v3",
+        "schema_version": "bhiksha.chart-scenario-cycle-receipt.v4",
         "status": "failed",
         "observation_slot_ordinal": 1,
     }
@@ -592,9 +816,11 @@ def test_failed_cycle_receipt_never_advances_completed_slot(tmp_path: Path) -> N
         json.dumps({**receipt_body, "receipt_hash": canonical_sha256(receipt_body)}),
         encoding="utf-8",
     )
+    (inputs / "slot-0001.cycle-input.json").write_text("{}", encoding="utf-8")
+    paths = SimpleNamespace(root=source, cycle_inputs=inputs, cycle_receipts=cycles)
 
-    with pytest.raises(ValueError, match="invalid receipt"):
-        _completed_cycle_slot(cycles)
+    with pytest.raises(ValueError):
+        _completed_cycle_slot(paths, plan=_plan())
 
 
 def test_daily_contract_must_match_authenticated_cartographer_window(

@@ -20,6 +20,7 @@ from bhiksha.options.selectors import SelectorEmptyError, SingleLegOptionSelecto
 from .models import OptionQuoteSnapshot, as_utc, timestamp_json
 from .observer import BrokerInertScenarioObserver
 from .paths import require_experiment_path
+from .quote_evidence import build_live_quote, normalize_option_symbol
 from .repository import IdempotencyConflict, ScenarioEventRepository
 from .timeframes import (
     CALENDAR_VERSION,
@@ -32,8 +33,8 @@ from .validation import ShadowPlan, validate_bundle
 _BAR_PROVENANCE_SCHEMA = "bhiksha.chart-scenario-bar-provenance.v2"
 _BAR_AGGREGATION_IMPLEMENTATION = "xnys-session-anchor-v2"
 
-CYCLE_INPUT_SCHEMA = "bhiksha.chart-scenario-cycle-input.v3"
-CYCLE_RECEIPT_SCHEMA = "bhiksha.chart-scenario-cycle-receipt.v3"
+CYCLE_INPUT_SCHEMA = "bhiksha.chart-scenario-cycle-input.v4"
+CYCLE_RECEIPT_SCHEMA = "bhiksha.chart-scenario-cycle-receipt.v4"
 
 
 def _hash_payload(value: Mapping[str, Any], *, omit: str) -> str:
@@ -51,7 +52,9 @@ def validate_cycle_input(
         "run_manifest_hash",
         "treatment_manifest_hash",
         "observation_slot_ordinal",
+        "cycle_started_at",
         "evaluated_at",
+        "sealed_at",
         "candidates",
         "content_hash",
     }
@@ -74,7 +77,13 @@ def validate_cycle_input(
     ordinal = value.get("observation_slot_ordinal")
     if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
         raise ValueError("cycle input observation_slot_ordinal must be positive")
+    cycle_started_at = timestamp_json(as_utc(value.get("cycle_started_at")))
     evaluated_at = timestamp_json(as_utc(value.get("evaluated_at")))
+    sealed_at = timestamp_json(as_utc(value.get("sealed_at")))
+    if evaluated_at != sealed_at:
+        raise ValueError("cycle evaluated_at must equal sealed_at")
+    if as_utc(cycle_started_at) > as_utc(sealed_at):
+        raise ValueError("cycle_started_at exceeds sealed_at")
     candidates = value.get("candidates")
     if not isinstance(candidates, Sequence) or isinstance(
         candidates, (str, bytes, bytearray)
@@ -115,6 +124,8 @@ def validate_cycle_input(
             symbol=symbol,
             direction=scenarios[0].direction.value,
             evaluated_at=evaluated_at,
+            cycle_started_at=cycle_started_at,
+            sealed_at=sealed_at,
         )
         diagnostics = raw["diagnostics"]
         required_timeframes = {
@@ -144,6 +155,7 @@ def validate_cycle_input(
                 or set(raw_series)
                 != {
                     "timeframe",
+                    "bar_acquired_at",
                     "provenance",
                     "source_bars",
                     "bars",
@@ -153,6 +165,11 @@ def validate_cycle_input(
                 raise ValueError("cycle timeframe series has invalid provenance")
             bars = raw_series["bars"]
             source_bars = raw_series["source_bars"]
+            bar_acquired_at = timestamp_json(as_utc(raw_series.get("bar_acquired_at")))
+            if not (
+                as_utc(cycle_started_at) <= as_utc(bar_acquired_at) <= as_utc(sealed_at)
+            ):
+                raise ValueError("bar acquisition is outside cycle clock envelope")
             if not isinstance(bars, list) or not all(
                 type(item) is dict for item in bars
             ):
@@ -165,11 +182,14 @@ def validate_cycle_input(
                 raw_series["provenance"],
                 source_bars,
                 bars,
-                fact_deadline=fact_deadline,
+                candidate_symbol=symbol,
+                bar_acquired_at=as_utc(bar_acquired_at),
+                fact_deadline=min(fact_deadline, as_utc(bar_acquired_at)),
             )
             _validate_bar_intervals(timeframe, normalized_bars)
             normalized_series[str(timeframe)] = {
                 "timeframe": str(timeframe),
+                "bar_acquired_at": bar_acquired_at,
                 "provenance": provenance,
                 "source_bars": source_bars,
                 "bars": bars,
@@ -182,7 +202,9 @@ def validate_cycle_input(
         if quotes and not selected_symbol:
             raise ValueError("cycle quotes require a selector-proved option identity")
         for quote in quotes:
-            if quote.get("option_symbol") != selected_symbol:
+            if normalize_option_symbol(
+                str(quote.get("option_symbol"))
+            ) != normalize_option_symbol(str(selected_symbol)):
                 raise ValueError(
                     "cycle quote differs from selector-proved option identity"
                 )
@@ -198,6 +220,30 @@ def validate_cycle_input(
             sealed_quote = OptionQuoteSnapshot.from_mapping(quote)
             if sealed_quote.to_dict() != quote:
                 raise ValueError("cycle quote is not canonically normalized")
+            if not (
+                as_utc(cycle_started_at)
+                <= as_utc(sealed_quote.acquired_at)
+                <= as_utc(sealed_at)
+            ):
+                raise ValueError("quote acquisition is outside cycle clock envelope")
+            matching_contracts = [
+                OptionContractSnapshot(**dict(contract))
+                for contract in option_selection["contracts"]
+                if normalize_option_symbol(str(contract["option_symbol"]))
+                == normalize_option_symbol(sealed_quote.option_symbol)
+            ]
+            if len(matching_contracts) != 1:
+                raise ValueError("selected quote lacks one exact chain snapshot")
+            expected_quote = build_live_quote(
+                quote["raw_source"],
+                option_symbol=sealed_quote.option_symbol,
+                selected_contract=matching_contracts[0],
+                acquired_at=as_utc(sealed_quote.acquired_at),
+                policy_hash=str(plan.option_selection_policy.content_hash),
+                selection_mode=str(option_selection["mode"]),
+            )
+            if expected_quote != quote:
+                raise ValueError("cycle quote does not reproduce from raw source")
         if not isinstance(diagnostics, Mapping):
             raise TypeError("cycle candidate diagnostics must be an object")
         normalized[candidate_id] = {
@@ -218,6 +264,8 @@ def validate_cycle_input(
     return {
         **dict(value),
         "evaluated_at": evaluated_at,
+        "cycle_started_at": cycle_started_at,
+        "sealed_at": sealed_at,
         "candidates": normalized,
         "content_hash": computed,
     }
@@ -443,10 +491,16 @@ def run_observation_cycle(
         "results": results,
         "errors": errors,
         "broker_effect_count": 0,
+        "auth": {
+            "read": sealed_plan.option_selection_policy.provider_id == "schwab",
+            "mutation": False,
+            "token_refresh": False,
+            "token_persist": False,
+        },
         "effects": {
             "broker": False,
             "orders": False,
-            "auth": False,
+            "auth_mutation": False,
             "schedule": False,
             "external_send": False,
         },
@@ -499,6 +553,8 @@ def _validate_bar_provenance(
     source_bars: Any,
     raw_bars: Sequence[Mapping[str, Any]],
     *,
+    candidate_symbol: str,
+    bar_acquired_at: datetime,
     fact_deadline: datetime,
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
@@ -544,13 +600,15 @@ def _validate_bar_provenance(
     }
     if any(set(item) != source_fields for item in source_bars):
         raise ValueError("cycle source minute bar has non-exact fields")
+    if any(str(item["symbol"]) != candidate_symbol for item in source_bars):
+        raise ValueError("cycle source minute symbol differs from candidate")
     timestamps = [as_utc(item["timestamp"]) for item in source_bars]
     if any(left >= right for left, right in pairwise(timestamps)):
         raise ValueError("cycle source minute bars must be strictly chronological")
     if any(
-        timestamp + timedelta(minutes=1) > fact_deadline for timestamp in timestamps
+        timestamp + timedelta(minutes=1) > bar_acquired_at for timestamp in timestamps
     ):
-        raise ValueError("cycle source minute bar is not complete at fact deadline")
+        raise ValueError("cycle source minute provider fact exceeds acquisition time")
     source = [
         Bar(
             symbol=str(item["symbol"]),
@@ -567,6 +625,8 @@ def _validate_bar_provenance(
         source, timeframe=timeframe, evaluated_at=fact_deadline
     )
     recomputed_bars = [_bar_payload(bar) for bar, _visible_at in recomputed]
+    if any(bar.symbol != candidate_symbol for bar, _visible_at in recomputed):
+        raise ValueError("cycle aggregated bar symbol differs from candidate")
     if recomputed_bars != list(raw_bars):
         raise ValueError("cycle timeframe bars do not reproduce from source minutes")
     if value.get("source_bar_count") != len(source_bars):
@@ -611,6 +671,8 @@ def _validate_option_selection(
     symbol: str,
     direction: str,
     evaluated_at: str,
+    cycle_started_at: str,
+    sealed_at: str,
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("cycle option_selection must be an object")
@@ -619,6 +681,7 @@ def _validate_option_selection(
         "mode",
         "provider_id",
         "observed_at",
+        "chain_acquired_at",
         "policy_hash",
         "evaluated_at",
         "request",
@@ -631,14 +694,18 @@ def _validate_option_selection(
     if set(value) != expected:
         raise ValueError("cycle option_selection must declare exact fields")
     if (
-        value.get("schema_version") != "bhiksha.chart-scenario-option-selection.v2"
+        value.get("schema_version") != "bhiksha.chart-scenario-option-selection.v3"
         or value.get("mode") not in {"canonical_selector", "persisted_contract"}
         or value.get("provider_id") != plan.option_selection_policy.provider_id
-        or timestamp_json(as_utc(value.get("observed_at"))) != evaluated_at
+        or timestamp_json(as_utc(value.get("observed_at")))
+        != timestamp_json(as_utc(value.get("chain_acquired_at")))
         or value.get("policy_hash") != plan.option_selection_policy.content_hash
         or timestamp_json(as_utc(value.get("evaluated_at"))) != evaluated_at
     ):
         raise ValueError("cycle option_selection identity is invalid")
+    chain_acquired_at = timestamp_json(as_utc(value.get("chain_acquired_at")))
+    if not (as_utc(cycle_started_at) <= as_utc(chain_acquired_at) <= as_utc(sealed_at)):
+        raise ValueError("option chain acquisition is outside cycle clock envelope")
     request = value.get("request")
     request_fields = {
         "deployment_id",
@@ -702,7 +769,7 @@ def _validate_option_selection(
     if (
         chain.get("schema_version") != "bhiksha.chart-scenario-option-chain-evidence.v1"
         or chain.get("provider_id") != plan.option_selection_policy.provider_id
-        or timestamp_json(as_utc(chain.get("observed_at"))) != evaluated_at
+        or timestamp_json(as_utc(chain.get("observed_at"))) != chain_acquired_at
         or chain.get("contract_count") != len(raw_contracts)
         or chain.get("contracts_hash") != canonical_sha256(raw_contracts)
         or chain.get("content_hash") != canonical_sha256(chain_body)

@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -9,6 +9,7 @@ from bhiksha.integrations.schwab.auth import (
     access_token_is_stale,
     build_authorize_url,
     extract_authorization_code,
+    get_read_only_access_token,
     refresh_access_token,
 )
 from bhiksha.integrations.schwab.settings import SchwabSettings
@@ -57,7 +58,41 @@ def test_read_tokens_returns_none_for_missing_token_file(tmp_path) -> None:
     assert read_tokens(tmp_path / "missing_tokens.json") is None
 
 
-def test_refresh_access_token_preserves_existing_refresh_token_when_omitted(tmp_path, monkeypatch) -> None:
+def test_read_only_access_token_never_refreshes_or_persists(
+    tmp_path, monkeypatch
+) -> None:
+    token_file = tmp_path / "schwab_tokens.json"
+    now = datetime.now(UTC)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token_issued": (now - timedelta(minutes=31)).isoformat(),
+                "refresh_token_issued": now.isoformat(),
+                "token_dictionary": {
+                    "access_token": "stale-access",
+                    "refresh_token": "valid-refresh",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = token_file.read_bytes()
+
+    def prohibited(*args, **kwargs):
+        raise AssertionError("read-only token path attempted mutation")
+
+    monkeypatch.setattr(
+        "bhiksha.integrations.schwab.auth.refresh_access_token", prohibited
+    )
+    monkeypatch.setattr("bhiksha.integrations.schwab.auth.write_tokens", prohibited)
+    with pytest.raises(ValueError, match="cannot refresh"):
+        get_read_only_access_token(SchwabSettings(token_file=str(token_file)))
+    assert token_file.read_bytes() == original
+
+
+def test_refresh_access_token_preserves_existing_refresh_token_when_omitted(
+    tmp_path, monkeypatch
+) -> None:
     token_file = tmp_path / "schwab_tokens.json"
     issued_at = "2026-04-10T14:30:00+00:00"
     token_file.write_text(
@@ -73,8 +108,13 @@ def test_refresh_access_token_preserves_existing_refresh_token_when_omitted(tmp_
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("bhiksha.integrations.schwab.auth.httpx.AsyncClient", _fake_client({"access_token": "new-access"}))
-    settings = SchwabSettings(app_key="key", app_secret="secret", token_file=str(token_file))
+    monkeypatch.setattr(
+        "bhiksha.integrations.schwab.auth.httpx.AsyncClient",
+        _fake_client({"access_token": "new-access"}),
+    )
+    settings = SchwabSettings(
+        app_key="key", app_secret="secret", token_file=str(token_file)
+    )
 
     payload = asyncio.run(refresh_access_token(settings))
 
@@ -83,7 +123,9 @@ def test_refresh_access_token_preserves_existing_refresh_token_when_omitted(tmp_
     assert payload["refresh_token_issued"] == issued_at
 
 
-def test_refresh_access_token_rolls_refresh_issue_time_when_schwab_returns_new_refresh_token(tmp_path, monkeypatch) -> None:
+def test_refresh_access_token_rolls_refresh_issue_time_when_schwab_returns_new_refresh_token(
+    tmp_path, monkeypatch
+) -> None:
     token_file = tmp_path / "schwab_tokens.json"
     issued_at = "2026-04-10T14:30:00+00:00"
     token_file.write_text(
@@ -103,12 +145,16 @@ def test_refresh_access_token_rolls_refresh_issue_time_when_schwab_returns_new_r
         "bhiksha.integrations.schwab.auth.httpx.AsyncClient",
         _fake_client({"access_token": "new-access", "refresh_token": "new-refresh"}),
     )
-    settings = SchwabSettings(app_key="key", app_secret="secret", token_file=str(token_file))
+    settings = SchwabSettings(
+        app_key="key", app_secret="secret", token_file=str(token_file)
+    )
 
     payload = asyncio.run(refresh_access_token(settings))
 
     assert payload["token_dictionary"]["refresh_token"] == "new-refresh"
-    assert datetime.fromisoformat(payload["refresh_token_issued"]) > datetime.fromisoformat(issued_at)
+    assert datetime.fromisoformat(
+        payload["refresh_token_issued"]
+    ) > datetime.fromisoformat(issued_at)
     assert datetime.fromisoformat(payload["refresh_token_issued"]).tzinfo is not None
 
 

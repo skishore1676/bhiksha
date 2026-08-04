@@ -170,6 +170,9 @@ class OptionQuoteSnapshot:
     scenario_id: str | None = None
     is_selected: bool = False
     provenance: Mapping[str, Any] | None = None
+    acquired_at: datetime | None = None
+    raw_source: Mapping[str, Any] | None = None
+    raw_source_hash: str | None = None
     snapshot_hash: str | None = None
 
     def __post_init__(self) -> None:
@@ -186,6 +189,10 @@ class OptionQuoteSnapshot:
                 raise ValueError(f"{field} must be non-empty")
             object.__setattr__(self, field, value)
         object.__setattr__(self, "quote_time", as_utc(self.quote_time))
+        acquired_at = as_utc(self.acquired_at or self.quote_time)
+        if self.quote_time > acquired_at:
+            raise ValueError("option quote provider time exceeds acquisition time")
+        object.__setattr__(self, "acquired_at", acquired_at)
         if not isinstance(self.is_selected, bool):
             raise TypeError("is_selected must be a boolean")
         for field in ("bid", "ask", "last", "strike", "delta"):
@@ -212,6 +219,13 @@ class OptionQuoteSnapshot:
         if self.strike is None or self.strike <= 0:
             raise ValueError("option quote requires a positive strike")
         object.__setattr__(self, "provenance", _freeze_json(self.provenance or {}))
+        object.__setattr__(self, "raw_source", _freeze_json(self.raw_source or {}))
+        computed_raw_source_hash = canonical_sha256(_thaw_json(self.raw_source or {}))
+        if self.raw_source_hash is not None:
+            supplied_raw_source_hash = str(self.raw_source_hash).removeprefix("sha256:")
+            if supplied_raw_source_hash != computed_raw_source_hash:
+                raise ValueError("raw_source_hash does not match raw quote response")
+        object.__setattr__(self, "raw_source_hash", computed_raw_source_hash)
         computed = canonical_sha256(self._hash_payload())
         if self.snapshot_hash is not None:
             supplied = str(self.snapshot_hash).removeprefix("sha256:")
@@ -240,6 +254,9 @@ class OptionQuoteSnapshot:
             "scenario_id",
             "is_selected",
             "provenance",
+            "acquired_at",
+            "raw_source",
+            "raw_source_hash",
             "snapshot_hash",
         }
         if set(value) != expected:
@@ -264,6 +281,9 @@ class OptionQuoteSnapshot:
             scenario_id=str(value["scenario_id"]) if value["scenario_id"] else None,
             is_selected=value["is_selected"],
             provenance=value["provenance"],
+            acquired_at=as_utc(value["acquired_at"]),
+            raw_source=value["raw_source"],
+            raw_source_hash=value["raw_source_hash"],
             snapshot_hash=value["snapshot_hash"],
         )
 
@@ -285,6 +305,9 @@ class OptionQuoteSnapshot:
             "scenario_id": self.scenario_id,
             "is_selected": self.is_selected,
             "provenance": _thaw_json(self.provenance or {}),
+            "acquired_at": timestamp_json(self.acquired_at or self.quote_time),
+            "raw_source": _thaw_json(self.raw_source or {}),
+            "raw_source_hash": self.raw_source_hash,
         }
 
     @property
@@ -317,6 +340,7 @@ class OptionQuoteSnapshot:
             "snapshot_hash": self.snapshot_hash,
             "source_id": self.source_id,
             "quote_time": timestamp_json(self.quote_time),
+            "acquired_at": timestamp_json(self.acquired_at or self.quote_time),
             "option_symbol": self.option_symbol,
             "underlying_symbol": self.underlying_symbol,
             "contract_type": self.contract_type,
@@ -327,6 +351,7 @@ class OptionQuoteSnapshot:
             "ask": self.ask,
             "last": self.last,
             "provenance": dict(self.provenance or {}),
+            "raw_source_hash": self.raw_source_hash,
         }
 
 

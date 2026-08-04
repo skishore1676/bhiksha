@@ -239,19 +239,28 @@ same final observation/staging, then `finalize-run` deterministically consumes
 all cycle receipts to build terminal/evaluation/current projection artifacts.
 TradeLab never writes the Sheet directly.
 
-### Immutable cycle evidence v3
+### Immutable cycle evidence v4
 
-Each `cycle-inputs/slot-NNNN.json` uses
-`bhiksha.chart-scenario-cycle-input.v3`. Top-level identity binds the plan, run
+Each `cycle-inputs/slot-NNNN.cycle-input.json` uses
+`bhiksha.chart-scenario-cycle-input.v4`. Top-level identity binds the plan, run
 manifest, treatment manifest, ordinal, evaluation cutoff, candidate array, and
 content hash. A hash-valid schema example is in
-`docs/examples/chart_scenario_cycle_input_v3.json`. It intentionally exercises
+`docs/examples/chart_scenario_cycle_input_v4.json`. It intentionally exercises
 the campaign-conformance mix (`39m` entry/validation plus `daily` invalidation)
 and the frozen campaign selector bounds (absolute delta 0.20–0.40, minimum OI
 100, maximum spread 0.20, strict DTE). Its plan/run identities are illustrative;
 a real run must bind its own sealed identities. Every candidate has exactly
 `candidate_id`, `symbol`,
 `bars_by_timeframe`, `option_selection`, `quotes`, and `diagnostics`.
+
+The v4 acquisition envelope is explicit: `cycle_started_at` precedes all
+provider calls; each series carries `bar_acquired_at`; option evidence carries
+`chain_acquired_at`; every quote carries its own `acquired_at`; and
+`evaluated_at == sealed_at` is recorded only after all facts are acquired.
+Provider timestamps may not exceed their own acquisition clock, and no
+acquisition may fall outside the cycle envelope. These clocks participate in
+the relevant content hashes, so a later observer cannot relabel an old fact as
+newly acquired.
 
 There is one bar series for every entry, validation, and invalidation
 timeframe—no implicit substitution. `39m` bars are anchored to 09:30
@@ -265,8 +274,8 @@ hash, and its own content hash. Validation independently reconstructs every
 output. A 39-minute bucket is visible only at start plus 39 minutes; a daily
 bar is visible only at the authenticated XNYS close, including early closes.
 
-Option proof `bhiksha.chart-scenario-option-selection.v2` binds the provider,
-observation time, frozen policy hash, exact selection request, full
+Option proof `bhiksha.chart-scenario-option-selection.v3` binds the provider,
+chain acquisition time, frozen policy hash, exact selection request, full
 content-addressed point-in-time contract set,
 canonical and effective contract identities, selection mode, and receipt hash.
 Validation reconstructs DTE from expiration/evaluation date, checks normalized
@@ -274,6 +283,12 @@ unique contract identities, and independently reruns
 `SingleLegOptionSelector`. `canonical_selector` is required before entry.
 After entry, `persisted_contract` must exactly match the contract frozen in both
 durable arm states; a later chain result cannot rewrite it.
+
+Each selected quote embeds and hashes the exact sanitized provider response.
+The provider/OCC identity is joined to the selected chain contract on normalized
+underlying, call/put, expiration, and decimal strike. Delta and open interest
+remain quote-time facts and may legitimately differ from the earlier chain.
+Credential, account, and order-shaped keys are forbidden from raw evidence.
 
 The quote tape is chronological and unique, capped by both `evaluated_at` and
 the authenticated observation-window end. A transient missing, stale, or wide
@@ -284,9 +299,10 @@ never becomes a runtime-error exit. Every normalized quote is sealed by its
 deduplicated across slots, while reuse of an ID with different facts is a hard
 idempotency conflict.
 
-Cycle receipt v3 binds the immutable input artifact path and hash, paired-fact
+Cycle receipt v4 binds the immutable input artifact path and hash, paired-fact
 proofs, all durable events for each exact run/candidate/slot, diagnostics,
-scenario results, and an all-false effects map. Its
+scenario results, explicit read-only authentication facts, and an all-false
+effects map. Its
 `created_at` is the sealed input's `evaluated_at`, making clean replay
 byte-stable. A lost acknowledgement returns the exact existing receipt; the
 same ordinal with any different input hash is rejected. Failed attempts use
@@ -306,6 +322,24 @@ This producer self-check is not scientific acceptance. TradeLab must parse the
 immutable inputs, rerun selector/triggers/exits independently, verify receipt
 and event hashes, and reject any mismatch without trusting Bhiksha's replay
 conclusion.
+
+Before any external tool invocation, the coordinator verifies a frozen
+toolchain record for Birdclaw, Market Cartographer, TradeLab, and Agent Broker:
+resolved checkout, exact clean Git commit, resolved in-checkout entrypoint, and
+entrypoint SHA-256. Symlink escape, dirty checkout, commit drift, or executable
+drift fails closed. Subprocess environments are role-scoped. Broker-inert tools
+receive no Public or Schwab credentials; the live exporter receives only the
+existing Schwab token-file/data settings and uses a GET-only client that cannot
+refresh or persist OAuth state; the Sheet process receives only the Google
+credential path.
+
+TradeLab staging validates the installed plan, install receipt, every exact
+`slot-NNNN.cycle-input.json`/v4 receipt pair, and the hash-linked event export
+before publishing one immutable generation through an atomic `bhiksha`
+symlink. Every non-install event must be covered exactly once by slot evidence.
+The remaining global partition must be exactly one canonical `installed` event
+per plan scenario, first for that scenario and authenticated to the installed
+plan; omissions, extras, duplicates, or wrong event types are rejected.
 
 The isolated launchd plist pins `BHIKSHA_KERNEL_SRC` and the absolute executable
 `BHIKSHA_PYTHON`; coordinator startup

@@ -139,18 +139,20 @@ def _replay_cycles(args: argparse.Namespace) -> int:
     """Rebuild receipts and the event chain from sealed inputs in a fresh namespace."""
 
     plan = load_bundle(args.plan)
-    source = require_experiment_path(args.cycle_input_dir, role="replay input directory")
+    source = require_experiment_path(
+        args.cycle_input_dir, role="replay input directory"
+    )
     output = require_experiment_path(args.output, role="replay output directory")
     if output.exists() and any(output.iterdir()):
         raise ValueError("replay output directory must be absent or empty")
     output.mkdir(parents=True, exist_ok=True)
-    input_paths = sorted(source.glob("slot-*.json"))
+    input_paths = sorted(source.glob("slot-*.cycle-input.json"))
     if not input_paths:
         raise ValueError("replay requires at least one sealed cycle input")
     repository = ScenarioEventRepository(output / "replay.sqlite3")
     receipts: list[dict[str, Any]] = []
     for ordinal, input_path in enumerate(input_paths, start=1):
-        if input_path.name != f"slot-{ordinal:04d}.json":
+        if input_path.name != f"slot-{ordinal:04d}.cycle-input.json":
             raise ValueError("replay cycle inputs must be exact and contiguous")
         raw = _read_json(input_path)
         if not isinstance(raw, Mapping):
@@ -168,7 +170,10 @@ def _replay_cycles(args: argparse.Namespace) -> int:
     chain = repository.verify_event_chain()
     if not chain.valid:
         raise ValueError("replayed event chain is invalid")
-    events = [event.model_dump(mode="json") for event in repository.events()]
+    events = [
+        {**event.model_dump(mode="json"), "event_hash": event.event_hash}
+        for event in repository.events()
+    ]
     events_body = {
         "schema": "bhiksha.chart-scenario-events-export.v1",
         "event_count": len(events),

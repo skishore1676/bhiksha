@@ -89,8 +89,11 @@ def evaluate_exit_profile(
     entry_at = as_utc(entry_time)
     now = as_utc(evaluated_at)
     if not quote_eligibility_policy.eligible(
-        entry_quote, evaluated_at=entry_quote.quote_time
-    ) or not quote_eligibility_policy.eligible(current_quote, evaluated_at=now):
+        entry_quote, evaluated_at=entry_quote.acquired_at or entry_quote.quote_time
+    ) or not quote_eligibility_policy.eligible(
+        current_quote,
+        evaluated_at=current_quote.acquired_at or current_quote.quote_time,
+    ):
         raise ValueError("exit evaluation requires eligible option marks")
     if entry_quote.mark is None or current_quote.mark is None:
         raise ValueError("exit evaluation requires option marks")

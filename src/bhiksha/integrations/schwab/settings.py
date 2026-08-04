@@ -20,17 +20,34 @@ class SchwabSettings(BaseModel):
     timeout_seconds: float = 20.0
 
     @classmethod
-    def from_env(cls) -> "SchwabSettings":
-        load_dotenv()
+    def from_env(cls, *, load_environment: bool = True) -> SchwabSettings:
+        if load_environment:
+            load_dotenv()
         return cls(
             app_key=os.getenv("SCHWAB_APP_KEY"),
             app_secret=os.getenv("SCHWAB_APP_SECRET"),
             callback_url=os.getenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8080"),
-            authorize_url=os.getenv("SCHWAB_AUTHORIZE_URL", "https://api.schwabapi.com/v1/oauth/authorize"),
-            token_url=os.getenv("SCHWAB_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token"),
+            authorize_url=os.getenv(
+                "SCHWAB_AUTHORIZE_URL", "https://api.schwabapi.com/v1/oauth/authorize"
+            ),
+            token_url=os.getenv(
+                "SCHWAB_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token"
+            ),
             api_base_url=os.getenv("SCHWAB_API_BASE_URL", "https://api.schwabapi.com"),
             token_file=os.getenv("SCHWAB_TOKEN_FILE", "config/schwab_tokens.json"),
-            timeout_seconds=float(os.getenv("SCHWAB_TIMEOUT_SECONDS", 20.0)),
+            timeout_seconds=float(os.getenv("SCHWAB_TIMEOUT_SECONDS", "20.0")),
+        )
+
+    @classmethod
+    def market_data_from_env(cls) -> SchwabSettings:
+        """Build the read-only market-data settings from its strict allowlist."""
+
+        return cls(
+            app_key=None,
+            app_secret=None,
+            api_base_url=os.getenv("SCHWAB_API_BASE_URL", "https://api.schwabapi.com"),
+            token_file=os.getenv("SCHWAB_TOKEN_FILE", "config/schwab_tokens.json"),
+            timeout_seconds=float(os.getenv("SCHWAB_TIMEOUT_SECONDS", "20.0")),
         )
 
     def validate_credentials(self) -> None:
@@ -45,4 +62,3 @@ class SchwabSettings(BaseModel):
     def callback_needs_attention(self) -> bool:
         """Flag the callback URL the user said is still pending approval."""
         return self.callback_url.rstrip("/") == "https://127.0.0.1:8182/callback"
-

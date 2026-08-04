@@ -3,6 +3,7 @@
     {
       "bars_by_timeframe": {
         "39m": {
+          "bar_acquired_at": "2026-08-04T14:50:00Z",
           "bars": [],
           "provenance": {
             "calendar": "XNYS",
@@ -22,6 +23,7 @@
           "timeframe": "39m"
         },
         "daily": {
+          "bar_acquired_at": "2026-08-04T14:50:00Z",
           "bars": [],
           "provenance": {
             "calendar": "XNYS",
@@ -62,7 +64,7 @@
         "observed_at": "2026-08-04T14:50:00Z",
         "policy_hash": "40fea42cb84a7c9a82eae33200a4ea1175601b5705f89a93932930a8079c70cc",
         "provider_id": "schwab",
-        "receipt_hash": "aab33d2fd6dec3e48248e300d6de8b1770d157a2bb4138d7a475879d05a6b354",
+        "receipt_hash": "c6df17de00053359b588d1300454dd5d78d11dae734b9c3f3bda3f703bcc65b1",
         "request": {
           "deployment_id": "chart-scenario:candidate-1",
           "direction": "long",
@@ -81,17 +83,20 @@
           "signal_timestamp": "2026-08-04T14:50:00Z",
           "symbol": "SPY"
         },
-        "schema_version": "bhiksha.chart-scenario-option-selection.v2"
+        "schema_version": "bhiksha.chart-scenario-option-selection.v3",
+        "chain_acquired_at": "2026-08-04T14:50:00Z"
       },
       "quotes": [],
       "symbol": "SPY"
     }
   ],
-  "content_hash": "b2b0e19912572e340f313bf6e14f3bfcc8233a448599e9bb36913bb6e89e0298",
+  "content_hash": "4f221947d466487b5bb5f3aa996d9b5feca95b4d0a50ee03e5f2454de29ae9ed",
   "evaluated_at": "2026-08-04T14:50:00Z",
   "observation_slot_ordinal": 1,
   "plan_hash": "8cf19608e7050ffc2339af83c99b83a6c3cc246b4af4f961a81256bcf600d9cd",
   "run_manifest_hash": "sha256:187819a5466e5e30b7e8df2063d80ec0726bec7310f44a96af98f102cff25ace",
-  "schema_version": "bhiksha.chart-scenario-cycle-input.v3",
+  "schema_version": "bhiksha.chart-scenario-cycle-input.v4",
+  "cycle_started_at": "2026-08-04T14:49:00Z",
+  "sealed_at": "2026-08-04T14:50:00Z",
   "treatment_manifest_hash": "sha256:21f8558f8943e1619b1a40b3e21c1fad65e9104e6278462852a8b81c95d17072"
 }

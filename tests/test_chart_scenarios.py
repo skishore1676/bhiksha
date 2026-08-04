@@ -52,6 +52,7 @@ from bhiksha.chart_scenarios.policies import (
     OptionSelectionPolicy,
     QuoteEligibilityPolicy,
 )
+from bhiksha.chart_scenarios.quote_evidence import build_live_quote
 from bhiksha.chart_scenarios.repository import IdempotencyConflict
 from bhiksha.chart_scenarios.timeframes import (
     CALENDAR_VERSION,
@@ -398,12 +399,14 @@ def _cycle_input(plan=None, *, slot: int = 1) -> dict:
             }
         )
     body = {
-        "schema_version": "bhiksha.chart-scenario-cycle-input.v3",
+        "schema_version": "bhiksha.chart-scenario-cycle-input.v4",
         "plan_hash": active_plan.plan_hash,
         "run_manifest_hash": active_plan.run_manifest_hash,
         "treatment_manifest_hash": active_plan.treatment_manifest_hash,
         "observation_slot_ordinal": slot,
+        "cycle_started_at": "2026-08-04T14:49:00Z",
         "evaluated_at": "2026-08-04T14:50:00Z",
+        "sealed_at": "2026-08-04T14:50:00Z",
         "candidates": candidates,
     }
     return {**body, "content_hash": canonical_sha256(body)}
@@ -476,6 +479,7 @@ def _timeframe_series(timeframe: str) -> dict:
     }
     return {
         "timeframe": timeframe,
+        "bar_acquired_at": "2026-08-04T14:50:00Z",
         "provenance": {
             **provenance_body,
             "content_hash": canonical_sha256(provenance_body),
@@ -514,10 +518,11 @@ def _option_selection_evidence(
         "execution_params": plan.option_selection_policy.selector_params(),
     }
     body = {
-        "schema_version": "bhiksha.chart-scenario-option-selection.v2",
+        "schema_version": "bhiksha.chart-scenario-option-selection.v3",
         "mode": "canonical_selector",
         "provider_id": plan.option_selection_policy.provider_id,
         "observed_at": evaluated_at,
+        "chain_acquired_at": evaluated_at,
         "policy_hash": plan.option_selection_policy.content_hash,
         "evaluated_at": evaluated_at,
         "request": request,
@@ -537,11 +542,16 @@ def _option_selection_evidence(
 
 
 def _retime_cycle(cycle: dict, evaluated_at: str, *, persisted: bool = False) -> None:
+    cycle["cycle_started_at"] = evaluated_at
     cycle["evaluated_at"] = evaluated_at
+    cycle["sealed_at"] = evaluated_at
     for candidate in cycle["candidates"]:
+        for series in candidate["bars_by_timeframe"].values():
+            series["bar_acquired_at"] = evaluated_at
         selection = candidate["option_selection"]
         selection["evaluated_at"] = evaluated_at
         selection["observed_at"] = evaluated_at
+        selection["chain_acquired_at"] = evaluated_at
         selection["request"]["signal_timestamp"] = evaluated_at
         selection["chain_evidence"]["observed_at"] = evaluated_at
         selection["chain_evidence"]["content_hash"] = canonical_sha256(
@@ -609,33 +619,89 @@ def _bars() -> list[dict[str, object]]:
     ]
 
 
-def _quote(snapshot_id: str, mark: float, at: str) -> dict[str, object]:
-    payload = {
-        "snapshot_id": snapshot_id,
-        "option_symbol": "SPY260807C00100000",
-        "underlying_symbol": "SPY",
-        "contract_type": "CALL",
-        "expiration_date": "2026-08-07",
-        "quote_time": at,
-        "source_id": "fixture-read-only",
-        "bid": mark - 0.05,
-        "ask": mark + 0.05,
-        "last": None,
-        "strike": 100.0,
-        "delta": 0.5,
-        "open_interest": 100,
-        "scenario_id": None,
-        "is_selected": True,
-        "provenance": {"fixture": "chart-scenario"},
-        "snapshot_hash": None,
+def _quote(
+    snapshot_id: str,
+    mark: float,
+    at: str,
+    *,
+    acquired_at: str | None = None,
+    selection_mode: str = "canonical_selector",
+) -> dict[str, object]:
+    del snapshot_id
+    contract = OptionContractSnapshot(
+        option_symbol="SPY260807C00100000",
+        underlying_symbol="SPY",
+        contract_type="CALL",
+        expiration_date="2026-08-07",
+        dte=3,
+        strike=100.0,
+        delta=0.4,
+        bid=1.0,
+        ask=1.1,
+        open_interest=100,
+    )
+    raw = {
+        "quote": {
+            "bidPrice": mark - 0.05,
+            "askPrice": mark + 0.05,
+            "lastPrice": None,
+            "quoteTime": at,
+            "delta": 0.5,
+            "openInterest": 101,
+        },
+        "reference": {
+            "underlyingSymbol": "SPY",
+            "contractType": "CALL",
+            "expirationDate": "2026-08-07",
+            "strikePrice": "100.000",
+        },
     }
-    return OptionQuoteSnapshot.from_mapping(payload).to_dict()
+    return build_live_quote(
+        raw,
+        option_symbol=contract.option_symbol,
+        selected_contract=contract,
+        acquired_at=datetime.fromisoformat(acquired_at or at),
+        policy_hash=_plan().option_selection_policy.content_hash,
+        selection_mode=selection_mode,
+    )
 
 
-def _reseal_quote(payload: dict[str, object]) -> dict[str, object]:
-    return OptionQuoteSnapshot.from_mapping(
-        {**payload, "snapshot_hash": None}
-    ).to_dict()
+def _reseal_quote(
+    payload: dict[str, object], *, selection_mode: str | None = None
+) -> dict[str, object]:
+    raw = deepcopy(payload["raw_source"])
+    raw["quote"].update(
+        {
+            "bidPrice": payload["bid"],
+            "askPrice": payload["ask"],
+            "lastPrice": payload["last"],
+            "delta": payload["delta"],
+            "openInterest": payload["open_interest"],
+        }
+    )
+    contract = OptionContractSnapshot(
+        option_symbol=str(payload["option_symbol"]),
+        underlying_symbol=str(payload["underlying_symbol"]),
+        contract_type=str(payload["contract_type"]),
+        expiration_date=str(payload["expiration_date"]),
+        dte=3,
+        strike=float(payload["strike"]),
+        delta=0.4,
+        bid=1.0,
+        ask=1.1,
+        open_interest=100,
+    )
+    return build_live_quote(
+        raw,
+        option_symbol=contract.option_symbol,
+        selected_contract=contract,
+        acquired_at=datetime.fromisoformat(str(payload["acquired_at"])),
+        policy_hash=_plan().option_selection_policy.content_hash,
+        selection_mode=selection_mode
+        or str(
+            payload.get("provenance", {}).get("selection_mode", "canonical_selector")
+        ),
+    )
 
 
 def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(
@@ -979,7 +1045,7 @@ def test_cycle_rejects_incomplete_or_forged_source_minute_provenance() -> None:
 
 def test_documented_cycle_v3_fixture_is_hash_valid_and_current() -> None:
     documented = json.loads(
-        Path("docs/examples/chart_scenario_cycle_input_v3.json").read_text(
+        Path("docs/examples/chart_scenario_cycle_input_v4.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1284,11 +1350,9 @@ def test_bundle_refuses_live_active_plan_paths_without_reading_them(
 
 def test_raw_observations_are_exact_and_deeply_immutable() -> None:
     quote = _quote("q-exact", 1.0, "2026-08-04T11:20:00Z")
-    quote["provenance"] = {"nested": {"source": "fixture"}}
-    quote = _reseal_quote(quote)
     snapshot = OptionQuoteSnapshot.from_mapping(quote)
-    quote["provenance"]["nested"]["source"] = "mutated"  # type: ignore[index]
-    assert snapshot.to_dict()["provenance"]["nested"]["source"] == "fixture"
+    quote["raw_source"]["reference"]["underlyingSymbol"] = "IWM"  # type: ignore[index]
+    assert snapshot.to_dict()["raw_source"]["reference"]["underlyingSymbol"] == "SPY"
 
     missing_quote = _quote("q-missing", 1.0, "2026-08-04T11:20:00Z")
     missing_quote.pop("source_id")
@@ -1298,6 +1362,97 @@ def test_raw_observations_are_exact_and_deeply_immutable() -> None:
     missing_bar.pop("completed")
     with pytest.raises(ValueError, match="exact fields"):
         CompletedBar.from_mapping(missing_bar)
+
+
+def test_v4_cycle_rejects_rehashed_cross_symbol_source_bars() -> None:
+    plan = _plan()
+    cycle = _cycle_input(plan)
+    series = next(iter(cycle["candidates"][0]["bars_by_timeframe"].values()))
+    for source_bar in series["source_bars"]:
+        source_bar["symbol"] = "IWM"
+    series["provenance"]["source_hash"] = canonical_sha256(series["source_bars"])
+    series["provenance"]["content_hash"] = canonical_sha256(
+        {
+            key: item
+            for key, item in series["provenance"].items()
+            if key != "content_hash"
+        }
+    )
+    cycle["content_hash"] = canonical_sha256(
+        {key: item for key, item in cycle.items() if key != "content_hash"}
+    )
+
+    with pytest.raises(ValueError, match="source minute symbol"):
+        validate_cycle_input(cycle, plan=plan)
+
+
+def test_v4_cycle_rejects_provider_fact_after_own_acquisition() -> None:
+    plan = _plan()
+    cycle = _cycle_input(plan)
+    cycle["cycle_started_at"] = "2026-08-04T14:40:00Z"
+    series = next(iter(cycle["candidates"][0]["bars_by_timeframe"].values()))
+    series["bar_acquired_at"] = "2026-08-04T14:47:00Z"
+    cycle["content_hash"] = canonical_sha256(
+        {key: item for key, item in cycle.items() if key != "content_hash"}
+    )
+
+    with pytest.raises(ValueError, match="exceeds acquisition"):
+        validate_cycle_input(cycle, plan=plan)
+
+
+def test_raw_quote_rejects_secrets_and_static_occ_join_attacks() -> None:
+    quote = _quote("q-attack", 1.0, "2026-08-04T11:20:00Z")
+    contract = OptionContractSnapshot(
+        option_symbol="SPY260807C00100000",
+        underlying_symbol="SPY",
+        contract_type="CALL",
+        expiration_date="2026-08-07",
+        dte=3,
+        strike=100.0,
+        delta=0.4,
+        bid=1.0,
+        ask=1.1,
+        open_interest=100,
+    )
+    raw_with_secret = deepcopy(quote["raw_source"])
+    raw_with_secret["access_token"] = "must-not-cross-wire"
+    with pytest.raises(ValueError, match="forbidden sensitive key"):
+        build_live_quote(
+            raw_with_secret,
+            option_symbol=contract.option_symbol,
+            selected_contract=contract,
+            acquired_at=datetime.fromisoformat("2026-08-04T11:20:00Z"),
+            policy_hash=_plan().option_selection_policy.content_hash,
+            selection_mode="canonical_selector",
+        )
+
+    raw_with_wrong_strike = deepcopy(quote["raw_source"])
+    raw_with_wrong_strike["reference"]["strikePrice"] = "101.000"
+    with pytest.raises(ValueError, match="static identity"):
+        build_live_quote(
+            raw_with_wrong_strike,
+            option_symbol=contract.option_symbol,
+            selected_contract=contract,
+            acquired_at=datetime.fromisoformat("2026-08-04T11:20:00Z"),
+            policy_hash=_plan().option_selection_policy.content_hash,
+            selection_mode="canonical_selector",
+        )
+
+    raw_without_reference = deepcopy(quote["raw_source"])
+    raw_without_reference["reference"] = {}
+    without_optional_reference = build_live_quote(
+        raw_without_reference,
+        option_symbol=contract.option_symbol,
+        selected_contract=contract,
+        acquired_at=datetime.fromisoformat("2026-08-04T11:20:00Z"),
+        policy_hash=_plan().option_selection_policy.content_hash,
+        selection_mode="canonical_selector",
+    )
+    assert without_optional_reference["strike"] == contract.strike
+
+    # Delta and OI legitimately drift between chain and quote acquisition.
+    assert quote["delta"] == 0.5
+    assert quote["open_interest"] == 101
     with pytest.raises(ValidationError, match="frozen"):
         _cost_model().exit_fee_per_contract_usd = 99.0
     with pytest.raises(ValidationError, match="frozen"):
@@ -1321,7 +1476,12 @@ def test_stale_single_quote_and_treatment_drift_fail_closed(tmp_path: Path) -> N
     stale = _observer(repository).observe_one(
         scenario,
         bars=_bars(),
-        option_quote=_quote("q-stale", 1.0, "2026-08-04T11:20:00Z"),
+        option_quote=_quote(
+            "q-stale",
+            1.0,
+            "2026-08-04T11:20:00Z",
+            acquired_at="2026-08-04T11:30:00Z",
+        ),
         evaluated_at="2026-08-04T11:30:00Z",
         market_observation_id="caller-label-a",
     )
@@ -1713,7 +1873,7 @@ def test_post_entry_invalidation_is_managed_only_by_priced_frozen_exit(
     exit_quote = _quote("q-stop", 0.60, "2026-08-04T14:51:00Z")
     exit_quote["bid"] = 0.59
     exit_quote["ask"] = 0.61
-    exit_quote = _reseal_quote(exit_quote)
+    exit_quote = _reseal_quote(exit_quote, selection_mode="persisted_contract")
     second["candidates"][0]["quotes"] = [exit_quote]
     second["content_hash"] = canonical_sha256(
         {key: value for key, value in second.items() if key != "content_hash"}
@@ -2017,7 +2177,14 @@ def test_cycle_retry_recovers_paired_terminal_crash_without_new_slot_proof(
     )
     second = _cycle_input(plan, slot=2)
     _retime_cycle(second, "2026-08-04T14:51:00Z", persisted=True)
-    second["candidates"][0]["quotes"] = [_quote("q-exit", 2.0, "2026-08-04T14:51:00Z")]
+    second["candidates"][0]["quotes"] = [
+        _quote(
+            "q-exit",
+            2.0,
+            "2026-08-04T14:51:00Z",
+            selection_mode="persisted_contract",
+        )
+    ]
     second["content_hash"] = canonical_sha256(
         {key: value for key, value in second.items() if key != "content_hash"}
     )
@@ -2130,7 +2297,12 @@ def test_scheduled_cycle_uses_evaluated_at_for_zero_age_quote_policy(
     plan = _plan()
     cycle = _cycle_input(plan)
     cycle["candidates"][0]["quotes"] = [
-        _quote("q-one-minute-old", 1.0, "2026-08-04T14:49:00Z")
+        _quote(
+            "q-one-minute-old",
+            1.0,
+            "2026-08-04T14:49:00Z",
+            acquired_at="2026-08-04T14:50:00Z",
+        )
     ]
     cycle["content_hash"] = canonical_sha256(
         {key: value for key, value in cycle.items() if key != "content_hash"}
@@ -2287,7 +2459,7 @@ def test_observe_cycle_pairs_every_installed_arm_and_writes_zero_effect_receipt(
         )
 
 
-def test_transient_exit_quote_stays_open_and_cross_slot_tape_deduplicates(
+def test_transient_exit_quote_stays_open_and_cross_slot_reuse_is_rejected(
     tmp_path: Path,
 ) -> None:
     plan = _plan()
@@ -2310,7 +2482,7 @@ def test_transient_exit_quote_stays_open_and_cross_slot_tape_deduplicates(
 
     wide = _quote("q-wide-tape", 1.0, "2026-08-04T14:55:00Z")
     wide["bid"], wide["ask"] = 0.5, 1.5
-    wide = _reseal_quote(wide)
+    wide = _reseal_quote(wide, selection_mode="persisted_contract")
     second = _cycle_input(plan, slot=2)
     _retime_cycle(second, "2026-08-04T14:55:00Z", persisted=True)
     second["candidates"][0]["quotes"] = [wide]
@@ -2335,12 +2507,13 @@ def test_transient_exit_quote_stays_open_and_cross_slot_tape_deduplicates(
     third["content_hash"] = canonical_sha256(
         {key: value for key, value in third.items() if key != "content_hash"}
     )
-    run_observation_cycle(
-        plan,
-        third,
-        repository=repository,
-        receipt_path=tmp_path / "artifacts/chart_scenarios/tape-3.json",
-    )
+    with pytest.raises(ValueError, match="quote acquisition is outside cycle"):
+        run_observation_cycle(
+            plan,
+            third,
+            repository=repository,
+            receipt_path=tmp_path / "artifacts/chart_scenarios/tape-3.json",
+        )
     assert (
         sum(
             event.event_type.value == "quote_unavailable"
@@ -2359,7 +2532,7 @@ def test_replay_cycles_rebuilds_exact_receipts_and_event_chain(tmp_path: Path) -
     inputs = root / "sealed-inputs"
     inputs.mkdir()
     cycle = _cycle_input(plan)
-    input_path = inputs / "slot-0001.json"
+    input_path = inputs / "slot-0001.cycle-input.json"
     input_path.write_text(json.dumps(cycle), encoding="utf-8")
     source_receipt = run_observation_cycle(
         plan,

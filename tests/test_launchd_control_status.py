@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import json
 import subprocess
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -11,7 +11,9 @@ from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.tools import launchd_control, launchd_job, launchd_status
 
 
-def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path) -> None:
+def test_launchd_status_distinguishes_domain_and_transport(
+    monkeypatch, tmp_path
+) -> None:
     payload = {
         "schema": "bhiksha.launchd.latest_status.v1",
         "generated_at": "2026-06-30T15:00:00+00:00",
@@ -36,7 +38,9 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     }
     latest_status_path(tmp_path).parent.mkdir(parents=True)
     latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": True}},
@@ -47,7 +51,9 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 6, 30, 15, 0, tzinfo=UTC),
     )
-    session_job = next(job for job in snapshot["jobs"] if job["runner_job"] == "session-report")
+    session_job = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "session-report"
+    )
 
     assert session_job["last"]["domain"]["ok"] is True
     assert session_job["last"]["transport"]["status"] == "degraded"
@@ -58,7 +64,9 @@ def test_launchd_status_distinguishes_domain_and_transport(monkeypatch, tmp_path
     assert snapshot["transport"]["status"] == "degraded"
 
 
-def test_yellow_session_report_without_operator_gate_stays_out_of_attention(monkeypatch, tmp_path) -> None:
+def test_yellow_session_report_without_operator_gate_stays_out_of_attention(
+    monkeypatch, tmp_path
+) -> None:
     write_latest_status(
         tmp_path,
         {
@@ -67,7 +75,9 @@ def test_yellow_session_report_without_operator_gate_stays_out_of_attention(monk
             "report_status": {"level": "YELLOW", "reason": "provider_warning"},
         },
     )
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
@@ -78,7 +88,9 @@ def test_yellow_session_report_without_operator_gate_stays_out_of_attention(monk
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 18, 13, 0, tzinfo=UTC),
     )
-    report = next(job for job in snapshot["jobs"] if job["runner_job"] == "session-report")
+    report = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "session-report"
+    )
 
     assert report["last"]["domain"]["attention_required"] is False
     assert report["last"]["domain"]["ok"] is True
@@ -86,7 +98,9 @@ def test_yellow_session_report_without_operator_gate_stays_out_of_attention(monk
     assert report["findings"] == []
 
 
-def test_recovered_provider_warning_clears_historical_report(monkeypatch, tmp_path) -> None:
+def test_recovered_provider_warning_clears_historical_report(
+    monkeypatch, tmp_path
+) -> None:
     write_latest_status(
         tmp_path,
         {
@@ -95,7 +109,9 @@ def test_recovered_provider_warning_clears_historical_report(monkeypatch, tmp_pa
             "report_status": {"level": "YELLOW", "reason": "provider_warning"},
         },
     )
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
@@ -114,7 +130,9 @@ def test_recovered_provider_warning_clears_historical_report(monkeypatch, tmp_pa
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 18, 13, 0, tzinfo=UTC),
     )
-    report = next(job for job in snapshot["jobs"] if job["runner_job"] == "session-report")
+    report = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "session-report"
+    )
 
     assert report["last_run_status"] == "recovered"
     assert report["last"]["domain"]["reported_status"] == "YELLOW"
@@ -122,7 +140,9 @@ def test_recovered_provider_warning_clears_historical_report(monkeypatch, tmp_pa
     assert report["findings"] == []
 
 
-def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(monkeypatch, tmp_path) -> None:
+def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(
+    monkeypatch, tmp_path
+) -> None:
     payload = {
         "schema": "bhiksha.launchd.latest_status.v1",
         "generated_at": "2026-07-16T15:30:00+00:00",
@@ -154,7 +174,9 @@ def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(mo
     }
     latest_status_path(tmp_path).parent.mkdir(parents=True)
     latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": True}},
@@ -165,7 +187,11 @@ def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(mo
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 16, 15, 31, tzinfo=UTC),
     )
-    job = next(item for item in snapshot["jobs"] if item["runner_job"] == "reconciliation-supervisor")
+    job = next(
+        item
+        for item in snapshot["jobs"]
+        if item["runner_job"] == "reconciliation-supervisor"
+    )
 
     assert job["title"] == "Reconciliation supervision"
     assert job["lifecycle"] == "waiting_you"
@@ -177,7 +203,9 @@ def test_launchd_status_projects_stale_reconciliation_as_waiting_for_operator(mo
     assert job["summary"].startswith("Needs you: 1 entry reconciliation")
 
 
-def test_launchd_status_arms_failed_start_after_later_watchdog_recovery(monkeypatch, tmp_path) -> None:
+def test_launchd_status_arms_failed_start_after_later_watchdog_recovery(
+    monkeypatch, tmp_path
+) -> None:
     payload = {
         "schema": "bhiksha.launchd.latest_status.v1",
         "generated_at": "2026-07-14T17:50:00+00:00",
@@ -207,7 +235,9 @@ def test_launchd_status_arms_failed_start_after_later_watchdog_recovery(monkeypa
     }
     latest_status_path(tmp_path).parent.mkdir(parents=True)
     latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {
@@ -226,11 +256,16 @@ def test_launchd_status_arms_failed_start_after_later_watchdog_recovery(monkeypa
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 14, 17, 55, tzinfo=UTC),
     )
-    live_start = next(job for job in snapshot["jobs"] if job["runner_job"] == "live-start")
+    live_start = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "live-start"
+    )
 
     assert live_start["lifecycle"] == "armed"
     assert live_start["findings"] == []
-    assert live_start["summary"] == "Recovered by live watchdog; the live runtime is running."
+    assert (
+        live_start["summary"]
+        == "Recovered by live watchdog; the live runtime is running."
+    )
     assert live_start["last_run_status"] == "failed"
     assert live_start["last_run_at"] == "2026-07-14T13:20:15+00:00"
     assert live_start["last"]["domain"]["ok"] is False
@@ -246,7 +281,9 @@ def test_launchd_status_arms_failed_start_after_later_watchdog_recovery(monkeypa
     ]
 
 
-def test_launchd_status_preserves_recovery_after_clean_session_stop(monkeypatch, tmp_path) -> None:
+def test_launchd_status_preserves_recovery_after_clean_session_stop(
+    monkeypatch, tmp_path
+) -> None:
     payload = {
         "schema": "bhiksha.launchd.latest_status.v1",
         "generated_at": "2026-07-14T20:10:04+00:00",
@@ -282,10 +319,15 @@ def test_launchd_status_preserves_recovery_after_clean_session_stop(monkeypatch,
     }
     latest_status_path(tmp_path).parent.mkdir(parents=True)
     latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
-        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False, "detail": "missing_pid_file"}},
+        lambda *, repo_root, **kwargs: {
+            "ok": True,
+            "status": {"running": False, "detail": "missing_pid_file"},
+        },
     )
 
     snapshot = launchd_status.build_status_snapshot(
@@ -293,7 +335,9 @@ def test_launchd_status_preserves_recovery_after_clean_session_stop(monkeypatch,
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 14, 20, 15, tzinfo=UTC),
     )
-    live_start = next(job for job in snapshot["jobs"] if job["runner_job"] == "live-start")
+    live_start = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "live-start"
+    )
 
     assert live_start["lifecycle"] == "armed"
     assert live_start["findings"] == []
@@ -353,13 +397,17 @@ def test_stopped_runtime_does_not_hide_failed_start_without_matching_clean_stop(
         },
     ]
 
-    launchd_status._apply_live_start_recovery(jobs, {"ok": True, "status": {"running": False}})
+    launchd_status._apply_live_start_recovery(
+        jobs, {"ok": True, "status": {"running": False}}
+    )
 
     assert jobs[0]["lifecycle"] is None
     assert jobs[0]["findings"] == ["Domain health failed: failed"]
 
 
-def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery(monkeypatch, tmp_path) -> None:
+def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery(
+    monkeypatch, tmp_path
+) -> None:
     payload = {
         "schema": "bhiksha.launchd.latest_status.v1",
         "generated_at": "2026-07-14T13:25:00+00:00",
@@ -385,7 +433,9 @@ def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery
     }
     latest_status_path(tmp_path).parent.mkdir(parents=True)
     latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {
@@ -404,7 +454,9 @@ def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 14, 13, 25, tzinfo=UTC),
     )
-    live_start = next(job for job in snapshot["jobs"] if job["runner_job"] == "live-start")
+    live_start = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "live-start"
+    )
 
     assert live_start["lifecycle"] is None
     assert live_start["findings"] == ["Domain health failed: failed"]
@@ -443,7 +495,9 @@ def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery
         },
     ],
 )
-def test_live_start_recovery_requires_successful_explicit_live_runtime_probe(runtime_status) -> None:
+def test_live_start_recovery_requires_successful_explicit_live_runtime_probe(
+    runtime_status,
+) -> None:
     jobs = [
         {
             "runner_job": "live-start",
@@ -511,17 +565,43 @@ def test_launchd_job_writes_latest_status(tmp_path, monkeypatch) -> None:
     assert written["jobs"]["session-report"]["payload"]["status"] == "ok"
 
 
+def test_chart_launchd_status_is_isolated_and_rejects_symlink_escape(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    payload = {"job": "chart-scenario-shadow", "status": "ok"}
+    launchd_job._write_latest_status(payload)
+    dedicated = tmp_path / "artifacts/chart_scenarios/launchd/latest_status.json"
+    assert dedicated.is_file()
+    assert not latest_status_path(tmp_path).exists()
+
+    escaped_root = tmp_path / "escaped"
+    escaped_root.mkdir()
+    dedicated.unlink()
+    (tmp_path / "artifacts/chart_scenarios/launchd").rmdir()
+    (tmp_path / "artifacts/chart_scenarios").rmdir()
+    (tmp_path / "artifacts/chart_scenarios").symlink_to(escaped_root)
+    launchd_job._write_latest_status(payload)
+    assert not (escaped_root / "launchd/latest_status.json").exists()
+
+
 def test_weekly_preview_cannot_replace_passing_report(tmp_path) -> None:
     artifacts = tmp_path / "artifacts" / "playbook"
 
-    assert launchd_job._weekly_report_output_dir(
-        artifacts,
-        workbook_update_mode="on",
-    ) == artifacts / "reports"
-    assert launchd_job._weekly_report_output_dir(
-        artifacts,
-        workbook_update_mode="off",
-    ) == artifacts / "reports" / "previews"
+    assert (
+        launchd_job._weekly_report_output_dir(
+            artifacts,
+            workbook_update_mode="on",
+        )
+        == artifacts / "reports"
+    )
+    assert (
+        launchd_job._weekly_report_output_dir(
+            artifacts,
+            workbook_update_mode="off",
+        )
+        == artifacts / "reports" / "previews"
+    )
 
 
 def test_launchd_control_live_status(monkeypatch, tmp_path) -> None:
@@ -533,7 +613,9 @@ def test_launchd_control_live_status(monkeypatch, tmp_path) -> None:
             stderr="",
         )
 
-    monkeypatch.setattr("bhiksha.tools.launchd_control._run_server_session_status", fake_status)
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_control._run_server_session_status", fake_status
+    )
 
     result = launchd_control.run_control_action(
         action="live-status",
@@ -546,10 +628,15 @@ def test_launchd_control_live_status(monkeypatch, tmp_path) -> None:
     assert result["action_id"] == "act-live-status"
 
 
-def test_launchd_control_requires_confirmation_for_live_ensure(monkeypatch, tmp_path) -> None:
+def test_launchd_control_requires_confirmation_for_live_ensure(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setattr(
         "bhiksha.tools.launchd_control._confirmation_requirement",
-        lambda action, repo_root: {"required": True, "reasons": ["would_start_stopped_live_runtime"]},
+        lambda action, repo_root: {
+            "required": True,
+            "reasons": ["would_start_stopped_live_runtime"],
+        },
     )
 
     result = launchd_control.run_control_action(
@@ -577,7 +664,9 @@ def test_launchd_control_requires_confirmation_for_schwab_renewal(tmp_path) -> N
     assert result["confirmation"]["reasons"] == ["grants_schwab_account_access"]
 
 
-def test_launchd_control_confirmed_schwab_renewal_forces_browser(monkeypatch, tmp_path) -> None:
+def test_launchd_control_confirmed_schwab_renewal_forces_browser(
+    monkeypatch, tmp_path
+) -> None:
     def fake_run(command, **kwargs):
         return subprocess.CompletedProcess(
             command,
@@ -597,12 +686,21 @@ def test_launchd_control_confirmed_schwab_renewal_forces_browser(monkeypatch, tm
 
     assert result["ok"] is True
     assert result["confirmed"] is True
-    assert result["command"][1:5] == ["schwab-refresh", "--force", "--browser-renewal-mode", "force"]
+    assert result["command"][1:5] == [
+        "schwab-refresh",
+        "--force",
+        "--browser-renewal-mode",
+        "force",
+    ]
 
 
-def test_launchd_control_schwab_check_never_starts_browser(monkeypatch, tmp_path) -> None:
+def test_launchd_control_schwab_check_never_starts_browser(
+    monkeypatch, tmp_path
+) -> None:
     def fake_run(command, **kwargs):
-        return subprocess.CompletedProcess(command, 0, stdout='BHIKSHA_LAUNCHD_JOB={"status":"ok"}\n', stderr="")
+        return subprocess.CompletedProcess(
+            command, 0, stdout='BHIKSHA_LAUNCHD_JOB={"status":"ok"}\n', stderr=""
+        )
 
     monkeypatch.setattr("bhiksha.tools.launchd_control._run_control_command", fake_run)
 
@@ -613,10 +711,17 @@ def test_launchd_control_schwab_check_never_starts_browser(monkeypatch, tmp_path
     )
 
     assert result["ok"] is True
-    assert result["command"][1:5] == ["schwab-refresh", "--force", "--browser-renewal-mode", "off"]
+    assert result["command"][1:5] == [
+        "schwab-refresh",
+        "--force",
+        "--browser-renewal-mode",
+        "off",
+    ]
 
 
-def test_launchd_status_surfaces_schwab_auth_failure_and_confirmed_action(monkeypatch, tmp_path) -> None:
+def test_launchd_status_surfaces_schwab_auth_failure_and_confirmed_action(
+    monkeypatch, tmp_path
+) -> None:
     write_latest_status(
         tmp_path,
         {
@@ -630,7 +735,9 @@ def test_launchd_status_surfaces_schwab_auth_failure_and_confirmed_action(monkey
             },
         },
     )
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
@@ -641,22 +748,33 @@ def test_launchd_status_surfaces_schwab_auth_failure_and_confirmed_action(monkey
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 14, 16, 0, tzinfo=UTC),
     )
-    guard = next(job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh")
+    guard = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh"
+    )
 
     assert guard["title"] == "Schwab authentication"
     assert guard["lifecycle"] == "waiting_you"
     assert guard["findings"] == ["Schwab authentication expired; renewal is required."]
     assert "renew-schwab-access" in guard["available_actions"]
-    assert guard["action_requirements"]["renew-schwab-access"]["requires_confirmation"] is True
-    assert guard["action_requirements"]["renew-schwab-access"]["owner_confirmation_args"] == ["--confirm"]
+    assert (
+        guard["action_requirements"]["renew-schwab-access"]["requires_confirmation"]
+        is True
+    )
+    assert guard["action_requirements"]["renew-schwab-access"][
+        "owner_confirmation_args"
+    ] == ["--confirm"]
 
 
-def test_launchd_status_treats_non_trading_day_schwab_skip_as_healthy(monkeypatch, tmp_path) -> None:
+def test_launchd_status_treats_non_trading_day_schwab_skip_as_healthy(
+    monkeypatch, tmp_path
+) -> None:
     write_latest_status(
         tmp_path,
         {"job": "schwab-refresh", "status": "skipped", "reason": "non_trading_day"},
     )
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
@@ -667,13 +785,21 @@ def test_launchd_status_treats_non_trading_day_schwab_skip_as_healthy(monkeypatc
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 3, 13, 0, tzinfo=UTC),
     )
-    guard = next(job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh")
+    guard = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh"
+    )
 
-    assert guard["last"]["domain"] == {"ok": True, "status": "skipped", "reason": "non_trading_day"}
+    assert guard["last"]["domain"] == {
+        "ok": True,
+        "status": "skipped",
+        "reason": "non_trading_day",
+    }
     assert guard["findings"] == []
 
 
-def test_non_trading_day_skip_does_not_erase_unresolved_schwab_failure(monkeypatch, tmp_path) -> None:
+def test_non_trading_day_skip_does_not_erase_unresolved_schwab_failure(
+    monkeypatch, tmp_path
+) -> None:
     failed = {
         "job": "schwab-refresh",
         "status": "failed",
@@ -685,8 +811,13 @@ def test_non_trading_day_skip_does_not_erase_unresolved_schwab_failure(monkeypat
         },
     }
     write_latest_status(tmp_path, failed)
-    write_latest_status(tmp_path, {"job": "schwab-refresh", "status": "skipped", "reason": "non_trading_day"})
-    monkeypatch.setattr("bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {})
+    write_latest_status(
+        tmp_path,
+        {"job": "schwab-refresh", "status": "skipped", "reason": "non_trading_day"},
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
         lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
@@ -697,8 +828,12 @@ def test_non_trading_day_skip_does_not_erase_unresolved_schwab_failure(monkeypat
         active_plan_path=tmp_path / "active_plan.json",
         now=datetime(2026, 7, 3, 13, 0, tzinfo=UTC),
     )
-    guard = next(job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh")
-    stored = json.loads(latest_status_path(tmp_path).read_text(encoding="utf-8"))["jobs"]["schwab-refresh"]
+    guard = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "schwab-refresh"
+    )
+    stored = json.loads(latest_status_path(tmp_path).read_text(encoding="utf-8"))[
+        "jobs"
+    ]["schwab-refresh"]
 
     assert guard["lifecycle"] == "waiting_you"
     assert guard["findings"] == ["Automatic Schwab authentication renewal failed."]
@@ -790,17 +925,24 @@ def test_runtime_status_parses_runtime_status_line(monkeypatch, tmp_path) -> Non
 
     result = launchd_status._runtime_status(repo_root=tmp_path)
 
-    assert result is not None, "stranded-return regression: _runtime_status returned None"
+    assert result is not None, (
+        "stranded-return regression: _runtime_status returned None"
+    )
     assert result["ok"] is True
     assert result["return_code"] == 0
-    assert result["status"] == {"running": True, "active_plan_id": "active_plan_2026-07-02"}
+    assert result["status"] == {
+        "running": True,
+        "active_plan_id": "active_plan_2026-07-02",
+    }
 
 
 def test_runtime_status_handles_missing_runtime_line(monkeypatch, tmp_path) -> None:
     from bhiksha.tools import launchd_status
 
     def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args=args, returncode=3, stdout="no marker here\n", stderr="boom")
+        return subprocess.CompletedProcess(
+            args=args, returncode=3, stdout="no marker here\n", stderr="boom"
+        )
 
     monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", fake_run)
 
@@ -820,7 +962,9 @@ def test_launchd_state_probe_timeout_degrades_only_that_field(monkeypatch) -> No
     labels = [spec.label for spec in active_launchd_jobs()]
     slow_label = labels[0]
 
-    monkeypatch.setattr("bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl")
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl"
+    )
 
     def fake_run(command, **kwargs):
         if slow_label in command[-1]:
@@ -845,7 +989,9 @@ def test_status_snapshot_survives_all_probes_timing_out(monkeypatch, tmp_path) -
     """TimeoutExpired from any subprocess probe (launchctl or server_session)
     must never propagate; the snapshot stays valid same-schema JSON with
     degraded field values."""
-    monkeypatch.setattr("bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl")
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl"
+    )
 
     def always_timeout(command, **kwargs):
         raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout"))
@@ -869,16 +1015,22 @@ def test_status_snapshot_survives_all_probes_timing_out(monkeypatch, tmp_path) -
     assert round_tripped["runtime"]["stderr_tail"].startswith("timeout:")
 
 
-def test_status_snapshot_deadline_exhaustion_short_circuits_to_not_checked(monkeypatch, tmp_path) -> None:
+def test_status_snapshot_deadline_exhaustion_short_circuits_to_not_checked(
+    monkeypatch, tmp_path
+) -> None:
     """With the overall budget exhausted, remaining probes must not run at all:
     they short-circuit to explicit "not_checked" values and the snapshot
     returns immediately as valid JSON."""
     import time as _time
 
-    monkeypatch.setattr("bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl")
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status.shutil.which", lambda name: "/bin/launchctl"
+    )
 
     def must_not_run(command, **kwargs):
-        raise AssertionError("subprocess.run must not be called once the budget is exhausted")
+        raise AssertionError(
+            "subprocess.run must not be called once the budget is exhausted"
+        )
 
     monkeypatch.setattr("bhiksha.tools.launchd_status.subprocess.run", must_not_run)
 

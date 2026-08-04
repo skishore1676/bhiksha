@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import AsyncIterator
 
 from bhiksha.domain.models import Bar
 from bhiksha.integrations.schwab.client import SchwabApiClient
@@ -22,14 +22,18 @@ class SchwabBarSource(UnderlyingBarSource):
         settings: SchwabSettings | None = None,
         poll_interval_seconds: int = 15,
     ) -> None:
-        self.settings = settings or SchwabSettings.from_env()
+        self.settings = (
+            settings or getattr(client, "settings", None) or SchwabSettings.from_env()
+        )
         self.client = client or SchwabApiClient(self.settings)
         self.poll_interval_seconds = poll_interval_seconds
 
     async def close(self) -> None:
         await self.client.close()
 
-    async def warm_start(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
+    async def warm_start(
+        self, symbol: str, start: datetime, end: datetime
+    ) -> list[Bar]:
         payload = await self.client.price_history(
             symbol,
             period_type="day",
@@ -62,7 +66,9 @@ class SchwabBarSource(UnderlyingBarSource):
                     yield bar
             await asyncio.sleep(self.poll_interval_seconds)
 
-    async def fetch_latest_completed_bar(self, symbol: str, *, now: datetime | None = None) -> Bar | None:
+    async def fetch_latest_completed_bar(
+        self, symbol: str, *, now: datetime | None = None
+    ) -> Bar | None:
         end = now or datetime.now(UTC)
         start = end - timedelta(minutes=5)
         payload = await self.client.price_history(
@@ -104,7 +110,9 @@ class SchwabBarSource(UnderlyingBarSource):
     def _bar_from_candle(symbol: str, candle: dict) -> Bar:
         return Bar(
             symbol=symbol,
-            timestamp=ensure_utc(datetime.fromtimestamp(candle["datetime"] / 1000, tz=UTC)),
+            timestamp=ensure_utc(
+                datetime.fromtimestamp(candle["datetime"] / 1000, tz=UTC)
+            ),
             open=float(candle["open"]),
             high=float(candle["high"]),
             low=float(candle["low"]),
@@ -113,13 +121,17 @@ class SchwabBarSource(UnderlyingBarSource):
         )
 
     @classmethod
-    def _latest_completed_bar(cls, symbol: str, candles: list[dict], now: datetime) -> Bar | None:
+    def _latest_completed_bar(
+        cls, symbol: str, candles: list[dict], now: datetime
+    ) -> Bar | None:
         if not candles:
             return None
         minute_floor = ensure_utc(now).replace(second=0, microsecond=0)
         completed = [
-            candle for candle in candles
-            if ensure_utc(datetime.fromtimestamp(candle["datetime"] / 1000, tz=UTC)) < minute_floor
+            candle
+            for candle in candles
+            if ensure_utc(datetime.fromtimestamp(candle["datetime"] / 1000, tz=UTC))
+            < minute_floor
         ]
         if not completed:
             return None
