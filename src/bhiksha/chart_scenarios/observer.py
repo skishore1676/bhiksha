@@ -312,31 +312,35 @@ class BrokerInertScenarioObserver:
                 )
                 return self._result(scenario, state, new_events)
 
-            invalidation = evaluate_condition(
-                scenario.invalidation_condition,
-                normalized_bars,
-                scenario.observation_window,
-                evaluated_at=now,
-            )
-            if invalidation.triggered:
-                self._record_terminal(
-                    new_events,
-                    scenario,
-                    ShadowEventType.INVALIDATED,
-                    now,
-                    observation_id,
-                    role="invalidated",
-                    reason="typed_invalidation_condition",
-                    details={"condition": invalidation.to_dict()},
-                    status="invalidated",
-                )
-                state = (
-                    self.repository.get_state(scenario, self.trigger_version) or state
-                )
-                return self._result(scenario, state, new_events)
-
             triggered = bool(state.get("triggered"))
             if not triggered:
+                # The scenario's invalidation condition cancels an unentered
+                # setup.  After synthetic entry, only the selected frozen exit
+                # profile may terminate exposure, with a priced gross/net R.
+                invalidation = evaluate_condition(
+                    scenario.invalidation_condition,
+                    normalized_bars,
+                    scenario.observation_window,
+                    evaluated_at=now,
+                )
+                if invalidation.triggered:
+                    self._record_terminal(
+                        new_events,
+                        scenario,
+                        ShadowEventType.INVALIDATED,
+                        now,
+                        observation_id,
+                        role="invalidated",
+                        reason="typed_invalidation_condition",
+                        details={"condition": invalidation.to_dict()},
+                        status="invalidated",
+                    )
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
+                    return self._result(scenario, state, new_events)
+
                 entry = evaluate_condition(
                     scenario.entry_condition,
                     normalized_bars,
@@ -452,6 +456,7 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "validated",
                             "quote_status": "unavailable",
+                            **self._quote_counts(state, unavailable=True),
                         },
                     )
                     state = (
@@ -496,6 +501,7 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "validated",
                             "quote_status": "ineligible",
+                            **self._quote_counts(state, unavailable=True),
                         },
                     )
                     state = (
@@ -520,6 +526,7 @@ class BrokerInertScenarioObserver:
                     state_updates={
                         "status": "option_selected",
                         "selected_option_symbol": entry_quote.option_symbol,
+                        **self._quote_counts(state, eligible=True),
                     },
                 )
                 self._record(
@@ -560,6 +567,28 @@ class BrokerInertScenarioObserver:
                 ]
             if not exit_quotes and not entry_created and single_quote is not None:
                 exit_quotes = [single_quote]
+            if not exit_quotes and not entry_created:
+                self._record(
+                    new_events,
+                    scenario,
+                    ShadowEventType.QUOTE_UNAVAILABLE,
+                    event_time=now,
+                    market_observation_id=observation_id,
+                    role="quote-unavailable:" + observation_id,
+                    details=self._details(
+                        scenario,
+                        {"reason": "selected_contract_quote_unavailable"},
+                    ),
+                    state_updates={
+                        "status": "synthetic_entry",
+                        "quote_status": "unavailable",
+                        **self._quote_counts(state, unavailable=True),
+                    },
+                )
+                state = (
+                    self.repository.get_state(scenario, self.trigger_version) or state
+                )
+                return self._result(scenario, state, new_events)
             for quote in exit_quotes:
                 if quote.quote_time < entry_quote.quote_time:
                     continue
@@ -589,6 +618,7 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "synthetic_entry",
                             "quote_status": "contract_mismatch",
+                            **self._quote_counts(state, unavailable=True),
                         },
                     )
                     continue
@@ -636,6 +666,11 @@ class BrokerInertScenarioObserver:
                     observations.append((profile, result))
                 for profile, result in observations:
                     primary = profile is scenario.exit_profile
+                    primary_diagnostics = (
+                        self._primary_quote_diagnostics(state, result)
+                        if primary
+                        else {}
+                    )
                     self._record(
                         new_events,
                         scenario,
@@ -666,6 +701,7 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "exit_observing",
                             "profile_states": profile_states,
+                            **primary_diagnostics,
                         },
                     )
                 primary_result = (
@@ -798,6 +834,35 @@ class BrokerInertScenarioObserver:
         if write.created:
             events.append(write.event)
         return write
+
+    @staticmethod
+    def _quote_counts(
+        state: Mapping[str, Any], *, eligible: bool = False, unavailable: bool = False
+    ) -> dict[str, int]:
+        return {
+            "quote_attempt_count": int(state.get("quote_attempt_count") or 0) + 1,
+            "quote_eligible_count": int(state.get("quote_eligible_count") or 0)
+            + int(eligible),
+            "quote_unavailable_count": int(state.get("quote_unavailable_count") or 0)
+            + int(unavailable),
+        }
+
+    @classmethod
+    def _primary_quote_diagnostics(
+        cls, state: Mapping[str, Any], result: ExitObservation
+    ) -> dict[str, Any]:
+        previous_mfe = state.get("primary_mfe_net_r")
+        previous_mae = state.get("primary_mae_net_r")
+        net_r = float(result.net_r)
+        return {
+            **cls._quote_counts(state, eligible=True),
+            "primary_mfe_net_r": (
+                net_r if previous_mfe is None else max(float(previous_mfe), net_r)
+            ),
+            "primary_mae_net_r": (
+                net_r if previous_mae is None else min(float(previous_mae), net_r)
+            ),
+        }
 
     def _record_terminal(
         self,

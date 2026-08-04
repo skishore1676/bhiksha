@@ -70,7 +70,7 @@ def validate_cycle_input(
         scenario.candidate_id: scenario.symbol for scenario in plan.scenarios
     }
     normalized: dict[str, dict[str, Any]] = {}
-    candidate_fields = {"candidate_id", "symbol", "bars", "quotes"}
+    candidate_fields = {"candidate_id", "symbol", "bars", "quotes", "diagnostics"}
     for raw in candidates:
         if not isinstance(raw, Mapping) or set(raw) != candidate_fields:
             raise ValueError("cycle candidate must declare exact fields")
@@ -82,17 +82,21 @@ def validate_cycle_input(
             raise ValueError("cycle candidate identity differs from installed plan")
         bars = raw["bars"]
         quotes = raw["quotes"]
+        diagnostics = raw["diagnostics"]
         if not isinstance(bars, list) or not all(type(item) is dict for item in bars):
             raise TypeError("cycle bars must be exact raw JSON objects")
         if not isinstance(quotes, list) or not all(
             type(item) is dict for item in quotes
         ):
             raise TypeError("cycle quotes must be exact raw JSON objects")
+        if not isinstance(diagnostics, Mapping):
+            raise TypeError("cycle candidate diagnostics must be an object")
         normalized[candidate_id] = {
             "candidate_id": candidate_id,
             "symbol": symbol,
             "bars": bars,
             "quotes": quotes,
+            "diagnostics": dict(diagnostics),
         }
     if set(normalized) != set(expected_candidates):
         raise ValueError(
@@ -142,6 +146,37 @@ def run_observation_cycle(
     sealed_plan = validate_bundle(plan.model_dump(mode="json"))
     cycle = validate_cycle_input(cycle_input, plan=sealed_plan)
     observer = BrokerInertScenarioObserver(repository, plan=sealed_plan)
+    terminal_carryforwards: list[dict[str, Any]] = []
+    proof_required_candidate_ids: list[str] = []
+    for candidate_id in cycle["candidates"]:
+        scenarios = [
+            scenario
+            for scenario in sealed_plan.scenarios
+            if scenario.candidate_id == candidate_id
+        ]
+        states = [
+            (scenario, repository.get_state(scenario, sealed_plan.trigger_version))
+            for scenario in scenarios
+        ]
+        if states and all(state and state.get("terminal") for _, state in states):
+            terminal_carryforwards.append(
+                {
+                    "candidate_id": candidate_id,
+                    "scenario_terminal_proofs": [
+                        {
+                            "scenario_id": scenario.scenario_id,
+                            "arm_id": scenario.arm_id.value,
+                            "terminal_reason": state.get("terminal_reason"),
+                            "terminal_event_hash": state.get("last_event_hash"),
+                            "state_hash": canonical_sha256(state),
+                        }
+                        for scenario, state in states
+                        if state is not None
+                    ],
+                }
+            )
+        else:
+            proof_required_candidate_ids.append(candidate_id)
     results: list[dict[str, Any]] = []
     for scenario in sorted(
         sealed_plan.scenarios,
@@ -163,6 +198,12 @@ def run_observation_cycle(
         and proof["run_id"] == sealed_plan.run_manifest["run_id"]
     ]
     errors = [item["error"] for item in results if item["error"] is not None]
+    proved_candidates = {proof["candidate_id"] for proof in proofs}
+    missing_proofs = sorted(set(proof_required_candidate_ids) - proved_candidates)
+    errors.extend(
+        f"missing paired market-fact proof for active candidate {candidate_id}"
+        for candidate_id in missing_proofs
+    )
     body = {
         "schema_version": CYCLE_RECEIPT_SCHEMA,
         "status": "succeeded" if not errors else "failed",
@@ -176,6 +217,12 @@ def run_observation_cycle(
         "scenario_count": len(results),
         "paired_fact_proof_count": len(proofs),
         "paired_fact_proofs": proofs,
+        "proof_required_candidate_ids": proof_required_candidate_ids,
+        "terminal_carryforwards": terminal_carryforwards,
+        "candidate_diagnostics": {
+            candidate_id: facts["diagnostics"]
+            for candidate_id, facts in cycle["candidates"].items()
+        },
         "results": results,
         "errors": errors,
         "broker_effect_count": 0,

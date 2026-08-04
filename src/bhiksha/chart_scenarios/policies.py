@@ -11,6 +11,59 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .models import OptionQuoteSnapshot, as_utc
 
 
+class OptionSelectionPolicy(BaseModel):
+    """Frozen contract-selection inputs for the read-only experiment adapter."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    schema_version: Literal["bhiksha.chart-scenario-option-selection-policy.v1"]
+    provider_id: Literal["schwab"]
+    long_signal_contract_type: Literal["CALL"]
+    short_signal_contract_type: Literal["PUT"]
+    dte_min: int = Field(ge=0, le=365)
+    dte_max: int = Field(ge=0, le=365)
+    target_abs_delta_min: float | None = Field(
+        default=None, ge=0, le=1, allow_inf_nan=False
+    )
+    target_abs_delta_max: float | None = Field(
+        default=None, ge=0, le=1, allow_inf_nan=False
+    )
+    min_open_interest: int = Field(ge=0)
+    max_bid_ask_spread_pct: float | None = Field(
+        default=None, gt=0, le=1, allow_inf_nan=False
+    )
+    dte_fallback_policy: Literal["strict", "allow_nearest_after"]
+    content_hash: str | None = None
+
+    @model_validator(mode="after")
+    def bind_hash(self) -> OptionSelectionPolicy:
+        if self.dte_min > self.dte_max:
+            raise ValueError("dte_min must be <= dte_max")
+        if (
+            self.target_abs_delta_min is not None
+            and self.target_abs_delta_max is not None
+            and self.target_abs_delta_min > self.target_abs_delta_max
+        ):
+            raise ValueError("target_abs_delta_min must be <= target_abs_delta_max")
+        payload = self.model_dump(mode="json", exclude={"content_hash"})
+        computed = canonical_sha256(payload)
+        if (
+            self.content_hash is not None
+            and self.content_hash.removeprefix("sha256:") != computed
+        ):
+            raise ValueError("option selection policy content_hash mismatch")
+        object.__setattr__(self, "content_hash", computed)
+        return self
+
+    def selector_params(self) -> dict[str, object]:
+        """Return the exact parameter names consumed by the canonical selector."""
+
+        return self.model_dump(
+            mode="json",
+            exclude={"schema_version", "provider_id", "content_hash"},
+        )
+
+
 class CostModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -93,4 +146,4 @@ class QuoteEligibilityPolicy(BaseModel):
         return mark is not None
 
 
-__all__ = ["CostModel", "QuoteEligibilityPolicy"]
+__all__ = ["CostModel", "OptionSelectionPolicy", "QuoteEligibilityPolicy"]

@@ -417,6 +417,49 @@ class ScenarioEventRepository:
             for row in rows
         ]
 
+    def next_observation_slot_ordinal(
+        self, *, run_id: str, candidate_ids: tuple[str, ...]
+    ) -> int:
+        """Return the next run-wide slot only when every candidate is aligned."""
+
+        expected = tuple(sorted(set(candidate_ids)))
+        if not expected:
+            raise ValueError("at least one candidate is required")
+        if not self.db_path.exists() or not self._observation_slots_exist_readonly():
+            return 1
+        with self._connect(write=False) as conn:
+            rows = conn.execute(
+                """
+                SELECT candidate_id, MAX(slot_ordinal) AS slot_ordinal,
+                       MIN(paired) AS paired
+                FROM chart_scenario_observation_slots
+                WHERE run_id=?
+                GROUP BY candidate_id
+                """,
+                (run_id,),
+            ).fetchall()
+        by_candidate = {str(row["candidate_id"]): row for row in rows}
+        unknown = set(by_candidate) - set(expected)
+        if unknown:
+            raise IdempotencyConflict(
+                "run contains observation slots for unknown candidates: "
+                + ", ".join(sorted(unknown))
+            )
+        ordinals: set[int] = set()
+        for candidate_id in expected:
+            row = by_candidate.get(candidate_id)
+            if row is None:
+                ordinals.add(0)
+                continue
+            if not bool(row["paired"]):
+                raise IdempotencyConflict(
+                    f"candidate {candidate_id} has an unpaired latest slot"
+                )
+            ordinals.add(int(row["slot_ordinal"]))
+        if len(ordinals) != 1:
+            raise IdempotencyConflict("candidate observation slots are not run-aligned")
+        return ordinals.pop() + 1
+
     def register_scenario(
         self,
         scenario: ChartScenarioSpec,

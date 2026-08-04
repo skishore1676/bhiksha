@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import sqlite3
 import subprocess
@@ -9,6 +10,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, time
 from pathlib import Path
 
+import httpx
 import pytest
 from mala_bhiksha_kernel import (
     ArmId,
@@ -37,16 +39,25 @@ from bhiksha.chart_scenarios import (
     evaluate_condition,
     evaluate_exit_profile,
     install_shadow_plan,
+    run_artifact_paths,
     run_observation_cycle,
     validate_bundle,
 )
-from bhiksha.chart_scenarios.policies import CostModel, QuoteEligibilityPolicy
+from bhiksha.chart_scenarios.policies import (
+    CostModel,
+    OptionSelectionPolicy,
+    QuoteEligibilityPolicy,
+)
+from bhiksha.domain.enums import SignalDirection
+from bhiksha.domain.models import Bar, OptionContractSnapshot, OptionSelectionRequest
 from bhiksha.execution.profile_exit import (
     ProfileExitFields,
     ProfileExitState,
     ProfileMarketView,
     evaluate_profile_exit,
 )
+from bhiksha.ops.chart_scenario_live_export import export_live_cycle_input
+from bhiksha.options.selectors import SingleLegOptionSelector
 
 
 def _policy(profile: ExitProfile) -> ManagementPolicySpec:
@@ -97,6 +108,22 @@ def _quote_policy() -> QuoteEligibilityPolicy:
     )
 
 
+def _option_selection_policy() -> OptionSelectionPolicy:
+    return OptionSelectionPolicy(
+        schema_version="bhiksha.chart-scenario-option-selection-policy.v1",
+        provider_id="schwab",
+        long_signal_contract_type="CALL",
+        short_signal_contract_type="PUT",
+        dte_min=0,
+        dte_max=7,
+        target_abs_delta_min=0.25,
+        target_abs_delta_max=0.55,
+        min_open_interest=50,
+        max_bid_ask_spread_pct=0.15,
+        dte_fallback_policy="allow_nearest_after",
+    )
+
+
 def _bundle_payload() -> dict:
     vectors = load_market_context_conformance_vectors()
     manifest = ComponentManifest.model_validate(vectors["component_manifest"])
@@ -111,6 +138,7 @@ def _bundle_payload() -> dict:
     selected_policy = registry[scenario.exit_profile]
     cost_model = _cost_model()
     quote_policy = _quote_policy()
+    option_selection_policy = _option_selection_policy()
     scenario = scenario.model_copy(
         update={
             "management_policy": selected_policy,
@@ -136,6 +164,7 @@ def _bundle_payload() -> dict:
         "exit_policy_registry": registry_material,
         "cost_model": cost_model.model_dump(mode="json"),
         "quote_eligibility_policy": quote_policy.model_dump(mode="json"),
+        "option_selection_policy": option_selection_policy.model_dump(mode="json"),
         "selected_profile_by_thesis": {
             scenario.thesis_class.value: scenario.exit_profile.value
         },
@@ -274,6 +303,7 @@ def _bundle_payload() -> dict:
         },
         "cost_model": cost_model.model_dump(mode="json"),
         "quote_eligibility_policy": quote_policy.model_dump(mode="json"),
+        "option_selection_policy": option_selection_policy.model_dump(mode="json"),
         "scenarios": [
             deterministic_scenario.model_dump(mode="json"),
             scenario.model_dump(mode="json"),
@@ -303,6 +333,7 @@ def _cycle_input(plan=None, *, slot: int = 1) -> dict:
                 "symbol": scenario.symbol,
                 "bars": _bars(),
                 "quotes": [],
+                "diagnostics": {"comparable": True, "errors": []},
             }
         )
     body = {
@@ -433,6 +464,220 @@ def test_bundle_validation_joins_exact_hashes_and_install_is_atomic(
     assert failure["broker_effect_count"] == 0
     assert failure["receipt_hash"] == canonical_sha256(
         {key: value for key, value in failure.items() if key != "receipt_hash"}
+    )
+
+
+def test_run_artifact_paths_never_pool_two_daily_event_chains(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts" / "chart_scenarios" / "runs"
+    first = run_artifact_paths("campaign-1", "run-day-1", root=root)
+    second = run_artifact_paths("campaign-1", "run-day-2", root=root)
+
+    assert first.database != second.database
+    assert first.cycle_receipts.parent == first.root
+    assert second.cycle_receipts.parent == second.root
+    assert ScenarioEventRepository(first.database).events() == []
+    assert ScenarioEventRepository(second.database).events() == []
+
+
+def test_frozen_option_policy_drives_canonical_short_put_selection() -> None:
+    policy = _option_selection_policy()
+    request = OptionSelectionRequest(
+        deployment_id="chart-scenario:candidate-short",
+        symbol="SPY",
+        direction=SignalDirection.SHORT,
+        signal_timestamp=datetime(2026, 8, 4, 14, 0, tzinfo=UTC),
+        execution_profile="chart_scenario_shadow_v1",
+        execution_params=policy.selector_params(),
+    )
+    contracts = [
+        OptionContractSnapshot(
+            option_symbol="SPY260807C00100000",
+            underlying_symbol="SPY",
+            contract_type="CALL",
+            expiration_date="2026-08-07",
+            dte=3,
+            strike=100.0,
+            delta=0.40,
+            bid=1.0,
+            ask=1.1,
+            open_interest=100,
+        ),
+        OptionContractSnapshot(
+            option_symbol="SPY260807P00100000",
+            underlying_symbol="SPY",
+            contract_type="PUT",
+            expiration_date="2026-08-07",
+            dte=3,
+            strike=100.0,
+            delta=-0.40,
+            bid=1.0,
+            ask=1.1,
+            open_interest=100,
+        ),
+    ]
+
+    selected = SingleLegOptionSelector().select(request, contracts)
+
+    assert selected.option_symbol == "SPY260807P00100000"
+
+
+def test_live_export_uses_completed_schwab_bars_and_canonical_selector(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "live-export.sqlite3"
+    )
+
+    class _Bars:
+        async def warm_start(self, symbol, start, end):
+            del start, end
+            return [
+                Bar(
+                    symbol,
+                    datetime(2026, 8, 4, 11, 17, tzinfo=UTC),
+                    99,
+                    101,
+                    98,
+                    100,
+                    10,
+                ),
+                Bar(
+                    symbol,
+                    datetime(2026, 8, 4, 11, 18, tzinfo=UTC),
+                    100,
+                    102,
+                    99,
+                    101,
+                    11,
+                ),
+            ]
+
+    class _Chain:
+        async def get_chain(self, symbol, **kwargs):
+            assert kwargs["contract_type"] == "CALL"
+            return [
+                OptionContractSnapshot(
+                    option_symbol="SPY260807C00100000",
+                    underlying_symbol=symbol,
+                    contract_type="CALL",
+                    expiration_date="2026-08-07",
+                    dte=3,
+                    strike=100.0,
+                    delta=0.4,
+                    bid=1.0,
+                    ask=1.1,
+                    open_interest=100,
+                )
+            ]
+
+    class _QuoteClient:
+        async def quote(self, option_symbol):
+            return {
+                option_symbol: {
+                    "quote": {
+                        "bidPrice": 1.0,
+                        "askPrice": 1.1,
+                        "lastPrice": 1.05,
+                        "quoteTime": int(
+                            datetime(2026, 8, 4, 11, 18, 30, tzinfo=UTC).timestamp()
+                            * 1000
+                        ),
+                    },
+                    "reference": {
+                        "underlyingSymbol": "SPY",
+                        "contractType": "CALL",
+                        "expirationDate": "2026-08-07",
+                        "strikePrice": 100.0,
+                    },
+                }
+            }
+
+    payload = asyncio.run(
+        export_live_cycle_input(
+            plan,
+            repository=repository,
+            bar_source=_Bars(),  # type: ignore[arg-type]
+            chain_service=_Chain(),  # type: ignore[arg-type]
+            quote_client=_QuoteClient(),
+            evaluated_at=datetime(2026, 8, 4, 11, 18, 30, tzinfo=UTC),
+        )
+    )
+
+    assert payload["observation_slot_ordinal"] == 1
+    assert len(payload["candidates"][0]["bars"]) == 1
+    assert payload["candidates"][0]["quotes"][0]["contract_type"] == "CALL"
+    assert payload["candidates"][0]["quotes"][0]["quote_time"] == (
+        "2026-08-04T11:18:30Z"
+    )
+    assert payload["candidates"][0]["diagnostics"]["comparable"] is True
+    assert payload["content_hash"] == canonical_sha256(
+        {key: value for key, value in payload.items() if key != "content_hash"}
+    )
+
+
+def test_live_export_provider_timeout_keeps_paired_cycle_evidence(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "timeout.sqlite3"
+    )
+
+    class _Bars:
+        async def warm_start(self, symbol, start, end):
+            del start, end
+            return [
+                Bar(
+                    symbol,
+                    datetime(2026, 8, 4, 11, 17, tzinfo=UTC),
+                    99,
+                    101,
+                    98,
+                    100,
+                    10,
+                )
+            ]
+
+    class _TimedOutChain:
+        async def get_chain(self, symbol, **kwargs):
+            del symbol, kwargs
+            raise httpx.TimeoutException("fixture chain timeout")
+
+    class _QuoteClient:
+        async def quote(self, option_symbol):
+            raise AssertionError(
+                f"quote must not run without selection: {option_symbol}"
+            )
+
+    payload = asyncio.run(
+        export_live_cycle_input(
+            plan,
+            repository=repository,
+            bar_source=_Bars(),  # type: ignore[arg-type]
+            chain_service=_TimedOutChain(),  # type: ignore[arg-type]
+            quote_client=_QuoteClient(),
+            evaluated_at=datetime(2026, 8, 4, 11, 18, 30, tzinfo=UTC),
+        )
+    )
+
+    candidate = payload["candidates"][0]
+    assert candidate["quotes"] == []
+    assert candidate["diagnostics"]["comparable"] is False
+    assert candidate["diagnostics"]["errors"][0]["error_type"] == ("TimeoutException")
+    receipt = run_observation_cycle(
+        plan,
+        payload,
+        repository=repository,
+        receipt_path=(
+            tmp_path / "artifacts" / "chart_scenarios" / "timeout.receipt.json"
+        ),
+    )
+    assert receipt["status"] == "succeeded"
+    assert receipt["paired_fact_proof_count"] == 1
+    assert (
+        receipt["candidate_diagnostics"][candidate["candidate_id"]]["comparable"]
+        is False
     )
 
 
@@ -1003,6 +1248,103 @@ def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_
     )
     assert rearm.terminal
     assert repository.event_count() == count
+
+
+def test_post_entry_invalidation_is_managed_only_by_priced_frozen_exit(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "post-entry-invalidation.sqlite3"
+    )
+    first = _cycle_input(plan)
+    first["candidates"][0]["quotes"] = [_quote("q-entry", 1.05, "2026-08-04T11:18:00Z")]
+    first["content_hash"] = canonical_sha256(
+        {key: value for key, value in first.items() if key != "content_hash"}
+    )
+    run_observation_cycle(
+        plan,
+        first,
+        repository=repository,
+        receipt_path=(
+            tmp_path / "artifacts" / "chart_scenarios" / "post-entry-first.receipt.json"
+        ),
+    )
+
+    second_bars = [
+        *_bars(),
+        {
+            "timestamp": "2026-08-04T11:57:00Z",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 95.0,
+            "close": 96.0,
+            "volume": None,
+            "completed": True,
+            "bar_id": None,
+        },
+        {
+            "timestamp": "2026-08-04T12:36:00Z",
+            "open": 96.0,
+            "high": 97.0,
+            "low": 93.0,
+            "close": 94.0,
+            "volume": None,
+            "completed": True,
+            "bar_id": None,
+        },
+    ]
+    second = _cycle_input(plan, slot=2)
+    second["evaluated_at"] = "2026-08-04T12:36:00Z"
+    second["candidates"][0]["bars"] = second_bars
+    exit_quote = _quote("q-stop", 0.60, "2026-08-04T12:36:00Z")
+    exit_quote["bid"] = 0.59
+    exit_quote["ask"] = 0.61
+    second["candidates"][0]["quotes"] = [exit_quote]
+    second["content_hash"] = canonical_sha256(
+        {key: value for key, value in second.items() if key != "content_hash"}
+    )
+    run_observation_cycle(
+        plan,
+        second,
+        repository=repository,
+        receipt_path=(
+            tmp_path
+            / "artifacts"
+            / "chart_scenarios"
+            / "post-entry-second.receipt.json"
+        ),
+    )
+
+    events = repository.events()
+    assert not any(event.event_type.value == "invalidated" for event in events)
+    exits = [event for event in events if event.event_type.value == "synthetic_exit"]
+    assert len(exits) == 2
+    assert all(isinstance(event.details["primary_net_r"], float) for event in exits)
+    for scenario in plan.scenarios:
+        state = repository.get_state(scenario, plan.trigger_version)
+        assert state is not None
+        assert state["quote_attempt_count"] == 2
+        assert state["quote_eligible_count"] == 2
+        assert state["quote_unavailable_count"] == 0
+        assert state["primary_mae_net_r"] <= state["primary_mfe_net_r"]
+
+    third = _cycle_input(plan, slot=3)
+    carry = run_observation_cycle(
+        plan,
+        third,
+        repository=repository,
+        receipt_path=(
+            tmp_path / "artifacts" / "chart_scenarios" / "post-entry-third.receipt.json"
+        ),
+    )
+    assert carry["proof_required_candidate_ids"] == []
+    assert carry["paired_fact_proof_count"] == 0
+    assert len(carry["terminal_carryforwards"]) == 1
+    assert all(
+        item["terminal_event_hash"] and item["state_hash"]
+        for item in carry["terminal_carryforwards"][0]["scenario_terminal_proofs"]
+    )
 
 
 def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(

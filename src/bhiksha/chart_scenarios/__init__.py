@@ -14,7 +14,8 @@ from .observer import (
     ChartScenarioShadowObserver,
     ObservationResult,
 )
-from .policies import CostModel, QuoteEligibilityPolicy
+from .paths import RunArtifactPaths, run_artifact_paths
+from .policies import CostModel, OptionSelectionPolicy, QuoteEligibilityPolicy
 from .quotes import (
     PersistedOptionSnapshotSource,
     ReadOnlyOptionSnapshotSource,
@@ -79,9 +80,11 @@ __all__ = [
     "InstallError",
     "ObservationResult",
     "OptionQuoteSnapshot",
+    "OptionSelectionPolicy",
     "PersistedOptionSnapshotSource",
     "QuoteEligibilityPolicy",
     "ReadOnlyOptionSnapshotSource",
+    "RunArtifactPaths",
     "SQLiteScenarioRepository",
     "ScenarioEventRepository",
     "ShadowPlan",
@@ -98,6 +101,7 @@ __all__ = [
     "load_bundle",
     "normalize_bars",
     "read_installed_plan",
+    "run_artifact_paths",
     "run_observation_cycle",
     "scenario_identity_key",
     "timestamp_json",

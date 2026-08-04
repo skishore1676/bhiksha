@@ -27,7 +27,7 @@ from mala_bhiksha_kernel import (
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .paths import require_experiment_path
-from .policies import CostModel, QuoteEligibilityPolicy
+from .policies import CostModel, OptionSelectionPolicy, QuoteEligibilityPolicy
 
 DEFAULT_SHADOW_PLAN_PATH = Path("artifacts/chart_scenarios/active_shadow_plan.json")
 DEFAULT_SHADOW_RECEIPT_PATH = Path(
@@ -109,6 +109,7 @@ class ShadowPlan(BaseModel):
     exit_policy_registry: dict[ExitProfile, ManagementPolicySpec] = Field(min_length=1)
     cost_model: CostModel
     quote_eligibility_policy: QuoteEligibilityPolicy
+    option_selection_policy: OptionSelectionPolicy
     scenarios: list[ChartScenarioSpec] = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -143,6 +144,7 @@ class ShadowPlan(BaseModel):
             "exit_policy_registry",
             "cost_model",
             "quote_eligibility_policy",
+            "option_selection_policy",
             "scenarios",
         )
         missing = [key for key in required if key not in payload]
@@ -212,6 +214,11 @@ class ShadowPlan(BaseModel):
             payload["quote_eligibility_policy"],
             ("content_hash",),
             "quote_eligibility_policy",
+        )
+        _require_declared_hash(
+            payload["option_selection_policy"],
+            ("content_hash",),
+            "option_selection_policy",
         )
         for index, item in enumerate(payload["scenarios"]):
             _require_declared_hash(
@@ -346,13 +353,9 @@ class ShadowPlan(BaseModel):
                 "run manifest does not authorize candidate pool run_id"
             )
         as_of = self.candidate_pool.as_of.isoformat().replace("+00:00", "Z")
-        if (
-            self.run_manifest.get("as_of") != as_of
-            or self.run_manifest.get("trading_date")
-            != self.candidate_pool.as_of.date().isoformat()
-        ):
+        if self.run_manifest.get("as_of") != as_of:
             raise BundleValidationError(
-                "run manifest date/as_of does not match candidate pool"
+                "run manifest as_of does not match candidate pool"
             )
         if (
             not self.campaign_manifest.get("starts_on")
@@ -382,6 +385,7 @@ class ShadowPlan(BaseModel):
             "exit_policy_registry",
             "cost_model",
             "quote_eligibility_policy",
+            "option_selection_policy",
             "selected_profile_by_thesis",
         }
         if (
@@ -389,7 +393,7 @@ class ShadowPlan(BaseModel):
             or set(frozen_behavior) != required_frozen
         ):
             raise BundleValidationError(
-                "treatment must freeze four exact policy/economics mappings"
+                "treatment must freeze five exact policy/economics mappings"
             )
         frozen_material: dict[str, Mapping[str, Any]] = {}
         for name in sorted(required_frozen):
@@ -424,6 +428,8 @@ class ShadowPlan(BaseModel):
             != self.cost_model.model_dump(mode="json")
             or dict(frozen_material["quote_eligibility_policy"])
             != self.quote_eligibility_policy.model_dump(mode="json")
+            or dict(frozen_material["option_selection_policy"])
+            != self.option_selection_policy.model_dump(mode="json")
         ):
             raise BundleValidationError(
                 "plan policy/economics material differs from frozen treatment"
@@ -896,6 +902,7 @@ def install_shadow_plan(
             "treatment_manifest_hash": plan.treatment_manifest_hash,
             "cartographer_receipt_hash": plan.cartographer_receipt_hash,
             "cartographer_export_hash": plan.cartographer_export_hash,
+            "option_selection_policy_hash": plan.option_selection_policy.content_hash,
             "target_session_date": plan.target_session_date,
             "target_session_window_hash": plan.target_session_window_hash,
             "scenario_count": len(plan.scenarios),

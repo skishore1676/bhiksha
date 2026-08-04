@@ -50,12 +50,20 @@ defaults; missing, unresolved, or mismatched economics fail validation.
 Every management-policy field must be physically present in the input, even
 when its value is `null` or the kernel would otherwise provide a default.
 Unsupported risk-envelope/protective-floor semantics fail closed.
+The typed `invalidation_condition` is setup cancellation only and is evaluated
+only before synthetic entry. Once entry is established, terminal management is
+exclusively the selected frozen exit profile, so every post-entry terminal row
+has a priced gross and after-cost net R result.
 
 The exact cost model and quote-eligibility policy are material, content-addressed
 objects rather than hash labels. Scenarios bind their hashes. Gross R is
 reported separately from after-cost net R. After a staged T1 observation, the
 ledger carries realized R and the remaining fraction, so later exits are
 weighted rather than treating the original position as fully open.
+The treatment also freezes the exact `option_selection_policy`: Schwab provider,
+long-to-CALL/short-to-PUT mapping, DTE/delta/open-interest/spread filters, and
+fallback behavior. The v1 live exporter therefore measures shadow operational
+behavior on Schwab market data; it does not claim Public execution parity.
 
 ## Install
 
@@ -127,9 +135,18 @@ PYTHONPATH=/Users/suman/code/worktrees/bhiksha-market-context/src:/Users/suman/c
 
 The cycle snapshot is bound to the installed plan, registered run, frozen
 treatment, one positive slot ordinal, one evaluated time, and exactly one fact
-record per installed candidate. Its content hash is verified before any event
+record per installed candidate. Per-candidate diagnostics retain provider gaps;
+no eligible contract or quote produces `quotes=[]`, allowing both arms to bind
+the same facts and emit canonical quote-unavailable evidence. Its content hash is verified before any event
 write. Live snapshot capture and scheduling stay in the supervisor-owned
 read-only adapter; this command has no broker-submit capability.
+
+Operational storage is run-scoped at
+`artifacts/chart_scenarios/runs/<campaign_id>/<run_id>/`. Each daily run owns a
+separate SQLite event chain and cycle-receipt directory, so a later run never
+inherits an earlier run's predecessor hash. Already-terminal candidates are
+represented in later receipts by authenticated terminal state/event carryforward
+proofs rather than an invented current-slot market proof.
 
 ## Status and readback
 
