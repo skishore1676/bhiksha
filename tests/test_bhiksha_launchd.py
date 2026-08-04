@@ -8,6 +8,25 @@ from pathlib import Path
 import pytest
 
 from bhiksha.ops.launchd_registry import active_launchd_jobs, registered_launchd_jobs
+from bhiksha.tools.chart_kernel_runtime import (
+    capture_kernel_runtime,
+    write_runtime_record,
+)
+from bhiksha.tools.launchd_job import _chart_subprocess_env
+
+
+def _reviewed_kernel_src() -> Path:
+    import mala_bhiksha_kernel
+
+    return Path(str(mala_bhiksha_kernel.__file__)).resolve().parent.parent
+
+
+def _chart_credential_paths(tmp_path: Path) -> tuple[Path, Path]:
+    token = tmp_path / "schwab-token.json"
+    credentials = tmp_path / "google-credentials.json"
+    token.write_text("{}\n", encoding="utf-8")
+    credentials.write_text("{}\n", encoding="utf-8")
+    return token, credentials
 
 
 def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
@@ -45,6 +64,38 @@ def test_chart_scenario_schedule_is_registered_but_install_opt_in(monkeypatch) -
 
     monkeypatch.setenv("BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED", "true")
     assert "chart-scenario-shadow" in {job.runner_job for job in active_launchd_jobs()}
+
+
+def test_chart_first_hop_environment_is_an_exact_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in (
+        "PUBLIC_API_SECRET",
+        "PUBLIC_API_KEY",
+        "SCHWAB_APP_SECRET",
+        "SCHWAB_APP_KEY",
+        "BHIKSHA_ENV_FILE",
+        "BHIKSHA_ACTIVE_PLAN_ID",
+    ):
+        monkeypatch.setenv(key, "must-not-cross")
+    monkeypatch.setenv("SCHWAB_TOKEN_FILE", "/secure/read-only-token.json")
+    monkeypatch.setenv("BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH", "/secure/sheet.json")
+    monkeypatch.setenv("BHIKSHA_KERNEL_SRC", "/reviewed/kernel/src")
+
+    child = _chart_subprocess_env(Path.cwd().resolve())
+
+    assert child["SCHWAB_TOKEN_FILE"] == "/secure/read-only-token.json"
+    assert child["BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH"] == "/secure/sheet.json"
+    assert child["BHIKSHA_KERNEL_SRC"] == "/reviewed/kernel/src"
+    assert child["BHIKSHA_SANITIZED_SUBPROCESS"] == "1"
+    assert not {
+        "PUBLIC_API_SECRET",
+        "PUBLIC_API_KEY",
+        "SCHWAB_APP_SECRET",
+        "SCHWAB_APP_KEY",
+        "BHIKSHA_ENV_FILE",
+        "BHIKSHA_ACTIVE_PLAN_ID",
+    }.intersection(child)
 
 
 def test_exit_edge_launchd_enable_is_explicit_persistent_for_start_and_watchdog() -> (
@@ -108,7 +159,9 @@ def test_installer_persists_stable_plan_id_only_for_live_restart_jobs(
             assert "EnvironmentVariables" not in payload
 
 
-def test_chart_scenario_install_pins_kernel_and_existing_env_file(tmp_path) -> None:
+def test_chart_scenario_install_pins_kernel_and_exact_allowlisted_paths(
+    tmp_path,
+) -> None:
     repo = Path.cwd().resolve()
     launchd_dir = tmp_path / "LaunchAgents"
     fake_bin = tmp_path / "bin"
@@ -116,8 +169,11 @@ def test_chart_scenario_install_pins_kernel_and_existing_env_file(tmp_path) -> N
     launchctl = fake_bin / "launchctl"
     launchctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     launchctl.chmod(0o755)
-    kernel_src = tmp_path / "kernel" / "src"
-    (kernel_src / "mala_bhiksha_kernel").mkdir(parents=True)
+    kernel_src = _reviewed_kernel_src()
+    token, credentials = _chart_credential_paths(tmp_path)
+    chart_root = tmp_path / "artifacts/chart_scenarios"
+    chart_root.mkdir(parents=True)
+    (chart_root / "campaign-config.json").write_text("{}\n", encoding="utf-8")
     env_file = tmp_path / "production.env"
     env_file.write_text("SCHWAB_CLIENT_ID=not-read-by-test\n", encoding="utf-8")
     env = {
@@ -129,13 +185,15 @@ def test_chart_scenario_install_pins_kernel_and_existing_env_file(tmp_path) -> N
             tmp_path / "artifacts/chart_scenarios/launchd/logs"
         ),
         "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "artifacts/chart_scenarios/launchd"),
-        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
-            tmp_path / "artifacts/chart_scenarios"
-        ),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(chart_root),
         "BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED": "true",
         "BHIKSHA_KERNEL_SRC": str(kernel_src),
         "BHIKSHA_PYTHON": sys.executable,
         "BHIKSHA_ENV_FILE": str(env_file),
+        "SCHWAB_TOKEN_FILE": str(token),
+        "BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH": str(credentials),
+        "PUBLIC_API_SECRET": "must-not-enter-chart-plist",
+        "SCHWAB_APP_SECRET": "must-not-enter-chart-plist",
     }
 
     subprocess.run(
@@ -169,23 +227,68 @@ def test_chart_scenario_install_pins_kernel_and_existing_env_file(tmp_path) -> N
         text=True,
         capture_output=True,
     ).stdout.strip()
-    assert payload["EnvironmentVariables"] == {
-        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
-            tmp_path / "artifacts/chart_scenarios"
-        ),
-        "BHIKSHA_CHART_PYTHON_REALPATH": str(python_realpath),
-        "BHIKSHA_CHART_PYTHON_SHA256": hashlib.sha256(
-            python_realpath.read_bytes()
-        ).hexdigest(),
-        "BHIKSHA_CHART_PYTHON_VERSION": python_version,
-        "BHIKSHA_CHART_REPO_COMMIT": repo_commit,
-        "BHIKSHA_CHART_RUNNER_SHA256": hashlib.sha256(
-            runner_path.read_bytes()
-        ).hexdigest(),
-        "BHIKSHA_ENV_FILE": str(env_file),
-        "BHIKSHA_KERNEL_SRC": str(kernel_src),
-        "BHIKSHA_PYTHON": sys.executable,
+    environment = payload["EnvironmentVariables"]
+    assert environment["BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT"] == str(
+        tmp_path / "artifacts/chart_scenarios"
+    )
+    assert environment["BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG"] == str(
+        tmp_path / "artifacts/chart_scenarios/campaign-config.json"
+    )
+    assert environment["BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR"] == str(
+        tmp_path / "artifacts/chart_scenarios/daily-contracts"
+    )
+    assert environment["BHIKSHA_CHART_PYTHON_REALPATH"] == str(python_realpath)
+    assert (
+        environment["BHIKSHA_CHART_PYTHON_SHA256"]
+        == hashlib.sha256(python_realpath.read_bytes()).hexdigest()
+    )
+    assert environment["BHIKSHA_CHART_PYTHON_VERSION"] == python_version
+    assert environment["BHIKSHA_CHART_REPO_COMMIT"] == repo_commit
+    assert (
+        environment["BHIKSHA_CHART_RUNNER_SHA256"]
+        == hashlib.sha256(runner_path.read_bytes()).hexdigest()
+    )
+    assert environment["BHIKSHA_KERNEL_SRC"] == str(kernel_src)
+    assert environment["BHIKSHA_PYTHON"] == sys.executable
+    assert environment["SCHWAB_TOKEN_FILE"] == str(token)
+    assert environment["BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH"] == str(credentials)
+    record = Path(environment["BHIKSHA_CHART_KERNEL_RUNTIME_RECORD"])
+    assert record.is_file()
+    assert len(environment["BHIKSHA_CHART_KERNEL_RUNTIME_HASH"]) == 64
+    for forbidden in (
+        "BHIKSHA_ENV_FILE",
+        "PUBLIC_API_SECRET",
+        "SCHWAB_APP_SECRET",
+        "SCHWAB_APP_KEY",
+    ):
+        assert forbidden not in environment
+    allowed = {
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT",
+        "BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG",
+        "BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR",
+        "BHIKSHA_CHART_PYTHON_REALPATH",
+        "BHIKSHA_CHART_PYTHON_SHA256",
+        "BHIKSHA_CHART_PYTHON_VERSION",
+        "BHIKSHA_CHART_REPO_COMMIT",
+        "BHIKSHA_CHART_RUNNER_SHA256",
+        "BHIKSHA_CHART_KERNEL_RUNTIME_RECORD",
+        "BHIKSHA_CHART_KERNEL_RUNTIME_HASH",
+        "BHIKSHA_KERNEL_SRC",
+        "BHIKSHA_PYTHON",
+        "SCHWAB_TOKEN_FILE",
+        "BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH",
+        "SCHWAB_API_BASE_URL",
+        "SCHWAB_TIMEOUT_SECONDS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "BHIKSHA_CHART_SCENARIO_COMMAND_TIMEOUT_SECONDS",
+        "BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS",
     }
+    assert set(environment) <= allowed
     runner = Path("scripts/launchd/run_bhiksha_job.sh").read_text(encoding="utf-8")
     assert "BHIKSHA_KERNEL_SRC" in runner
     assert "chart-scenario-shadow requires an absolute BHIKSHA_PYTHON" in runner
@@ -207,8 +310,11 @@ def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> 
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
-    kernel_src = tmp_path / "kernel" / "src"
-    (kernel_src / "mala_bhiksha_kernel").mkdir(parents=True)
+    kernel_src = _reviewed_kernel_src()
+    token, credentials = _chart_credential_paths(tmp_path)
+    chart_root = tmp_path / "artifacts/chart_scenarios"
+    chart_root.mkdir(parents=True)
+    (chart_root / "campaign-config.json").write_text("{}\n", encoding="utf-8")
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -218,12 +324,12 @@ def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> 
             tmp_path / "artifacts/chart_scenarios/launchd/logs"
         ),
         "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "artifacts/chart_scenarios/launchd"),
-        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
-            tmp_path / "artifacts/chart_scenarios"
-        ),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(chart_root),
         "BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED": "true",
         "BHIKSHA_KERNEL_SRC": str(kernel_src),
         "BHIKSHA_PYTHON": sys.executable,
+        "SCHWAB_TOKEN_FILE": str(token),
+        "BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH": str(credentials),
     }
 
     subprocess.run(
@@ -334,9 +440,17 @@ def test_chart_runner_uses_only_installed_chart_marker(tmp_path) -> None:
     package.mkdir(parents=True)
     (repo / "src/bhiksha/__init__.py").write_text("", encoding="utf-8")
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "chart_kernel_runtime.py").write_text(
+        Path("src/bhiksha/tools/chart_kernel_runtime.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    capture = tmp_path / "capture.txt"
     (package / "launchd_job.py").write_text(
         "import os\nfrom pathlib import Path\n"
-        "Path(os.environ['CAPTURE']).write_text("
+        "assert 'PUBLIC_API_SECRET' not in os.environ\n"
+        "assert 'SCHWAB_APP_SECRET' not in os.environ\n"
+        "assert 'BHIKSHA_ENV_FILE' not in os.environ\n"
+        f"Path({str(capture)!r}).write_text("
         "os.environ['BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED'])\n",
         encoding="utf-8",
     )
@@ -346,7 +460,6 @@ def test_chart_runner_uses_only_installed_chart_marker(tmp_path) -> None:
     chart_launchd.mkdir(parents=True)
     playbook_flags = repo / "artifacts/playbook/runtime_flags"
     playbook_flags.mkdir(parents=True)
-    capture = tmp_path / "capture.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_python3 = fake_bin / "python3"
@@ -384,6 +497,11 @@ def test_chart_runner_uses_only_installed_chart_marker(tmp_path) -> None:
         capture_output=True,
     )
     runner = Path("scripts/launchd/run_bhiksha_job.sh").resolve()
+    kernel_src = _reviewed_kernel_src()
+    kernel_runtime = capture_kernel_runtime(kernel_src)
+    kernel_record = write_runtime_record(
+        chart_launchd / "kernel-runtime.json", kernel_runtime
+    )
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -397,7 +515,11 @@ def test_chart_runner_uses_only_installed_chart_marker(tmp_path) -> None:
         "BHIKSHA_CHART_PYTHON_VERSION": (version.stdout or version.stderr).strip(),
         "BHIKSHA_CHART_RUNNER_SHA256": hashlib.sha256(runner.read_bytes()).hexdigest(),
         "BHIKSHA_CHART_REPO_COMMIT": repo_commit,
-        "CAPTURE": str(capture),
+        "BHIKSHA_KERNEL_SRC": str(kernel_src),
+        "BHIKSHA_CHART_KERNEL_RUNTIME_RECORD": str(kernel_record),
+        "BHIKSHA_CHART_KERNEL_RUNTIME_HASH": kernel_runtime["content_hash"],
+        "PUBLIC_API_SECRET": "must-not-cross-env-i",
+        "SCHWAB_APP_SECRET": "must-not-cross-env-i",
     }
     marker = chart_launchd / "chart_scenario_shadow.enabled"
     marker.write_text("", encoding="utf-8")
@@ -476,7 +598,7 @@ def test_exit_edge_restart_paths_read_persistent_allowlisted_marker() -> None:
     assert "export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=false" in runner
     assert "chart_scenario_shadow.enabled" in runner
     assert "runtime_flags/chart_scenario_shadow.enabled" not in runner
-    assert "export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=true" in runner
+    assert 'chart_env+=("BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=true")' in runner
     assert "export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=false" in runner
 
 

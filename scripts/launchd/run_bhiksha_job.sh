@@ -59,8 +59,48 @@ fi
 
 export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=false
 if [ "${1:-}" = "chart-scenario-shadow" ]; then
+  chart_env=(
+    "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    "PYTHONPATH=$REPO_ROOT/src:$BHIKSHA_KERNEL_SRC"
+    "PYTHONUNBUFFERED=1"
+    "PYTHONDONTWRITEBYTECODE=1"
+    "BHIKSHA_SANITIZED_SUBPROCESS=1"
+  )
+  chart_allowed=(
+    BHIKSHA_KERNEL_SRC
+    BHIKSHA_CHART_KERNEL_RUNTIME_RECORD
+    BHIKSHA_CHART_KERNEL_RUNTIME_HASH
+    BHIKSHA_PYTHON
+    BHIKSHA_CHART_PYTHON_REALPATH
+    BHIKSHA_CHART_PYTHON_SHA256
+    BHIKSHA_CHART_PYTHON_VERSION
+    BHIKSHA_CHART_RUNNER_SHA256
+    BHIKSHA_CHART_REPO_COMMIT
+    BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT
+    BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG
+    BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR
+    BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH
+    SCHWAB_TOKEN_FILE
+    SCHWAB_API_BASE_URL
+    SCHWAB_TIMEOUT_SECONDS
+    SSL_CERT_FILE
+    SSL_CERT_DIR
+    REQUESTS_CA_BUNDLE
+    TMPDIR
+    LANG
+    LC_ALL
+    BHIKSHA_CHART_SCENARIO_COMMAND_TIMEOUT_SECONDS
+    BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS
+  )
+  for name in "${chart_allowed[@]}"; do
+    if [ "${!name+x}" = x ]; then
+      chart_env+=("$name=${!name}")
+    fi
+  done
+  /usr/bin/env -i "${chart_env[@]}" \
+    "$python_bin" -m bhiksha.tools.chart_kernel_runtime verify
   chart_root="${BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT:-$REPO_ROOT/artifacts/chart_scenarios}"
-  chart_scenario_marker="$($python_bin - "$chart_root" <<'PY'
+  chart_scenario_marker="$(/usr/bin/env -i "${chart_env[@]}" "$python_bin" - "$chart_root" <<'PY'
 import sys
 from pathlib import Path
 
@@ -80,8 +120,12 @@ print(marker)
 PY
 )"
   if [ -f "$chart_scenario_marker" ]; then
-    export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=true
+    chart_env+=("BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=true")
+  else
+    chart_env+=("BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=false")
   fi
+  exec /usr/bin/env -i "${chart_env[@]}" \
+    "$python_bin" -m bhiksha.tools.launchd_job "$@"
 fi
 
 exec "$python_bin" -m bhiksha.tools.launchd_job "$@"

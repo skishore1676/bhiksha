@@ -179,6 +179,22 @@ protocol whose inclusive window, 5-session checkpoint, 10-session maximum, or
 authorized dates differ. This preflight happens before any daily producer is
 invoked.
 
+The chart plist never carries `BHIKSHA_ENV_FILE` and the chart process never
+loads the production dotenv. Installation copies only explicit configuration
+paths, the Google credential-file path, and the read-only Schwab token-file path
+into the plist. The shell runner rebuilds the first Python environment with
+`env -i`; Public credentials, Schwab app credentials, active-plan controls, and
+all other live/order settings are absent before `launchd_job` or the coordinator
+starts. Each later subprocess applies a narrower role allowlist.
+
+Installation also freezes the kernel as an authenticated runtime record under
+the chart launchd artifact directory. The record binds a clean exact Git commit,
+the real non-symlink `src` path, the complete source-tree digest, and the exact
+`mala_bhiksha_kernel` import origin/digest. The shell verifies that record before
+starting the chart Python application, and the coordinator verifies the loaded
+module against it again. A dirty checkout, retargeted symlink, commit change, or
+copied/modified kernel fails closed.
+
 The configuration freezes both the isolated Birdclaw checkout and the external
 canonical Birdclaw SQLite file. On oldmac the database value is
 `/Users/sunny/Documents/birdclaw/birdclaw-home/birdclaw.sqlite`. Bhiksha passes
@@ -227,6 +243,16 @@ the supplied `end_at`. The schedule invokes the coordinator at 07:45 CT, every
 10 minutes from 08:30 through 15:00 CT, and at 15:15 CT, in addition to the
 bounded preparation retries. Morning and after-close completion receipts are
 immutable/idempotent; conflicting replay is rejected.
+
+An authenticated Cartographer `status=no_plan` is a successful broker-inert
+daily outcome, not a failed or new experiment. Bhiksha verifies the exact
+no-plan manifest, target session, artifact inventory, hashes, and zero-effect
+map before writing the daily contract. It does not run Birdclaw for that outcome.
+TradeLab must then return and persist its authenticated `status=no_plan`
+preparation receipt. Bhiksha stores one no-plan completion receipt and stops
+before narrative/ranker work, plan installation, observation, staging, or Sheet
+projection. All later ticks for that run return the same authenticated no-plan
+skip.
 
 Lifecycle receipts live under each run's `coordinator/` directory. Morning runs
 the fixed TradeLab preparation, validates/installs the plan, stages the install

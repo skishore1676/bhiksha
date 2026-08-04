@@ -41,6 +41,7 @@ from bhiksha.chart_scenarios.validation import (
 )
 from bhiksha.config.environment import load_dotenv
 from bhiksha.ops.chart_scenario_sheet import SPREADSHEET_ID
+from bhiksha.tools.chart_kernel_runtime import verify_kernel_runtime_from_env
 
 SCHEMA = "bhiksha.chart-scenario-coordinator-contract.v1"
 CAMPAIGN_CONFIG_SCHEMA = "bhiksha.chart-scenario-campaign-config.v1"
@@ -104,7 +105,8 @@ _TOOL_MODULES = {
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    if os.getenv("BHIKSHA_SANITIZED_SUBPROCESS") != "1":
+        load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--contract-dir",
@@ -214,6 +216,8 @@ def _main_locked(
 def _run_phase(contract: dict[str, Any], *, phase: str) -> dict[str, Any]:
     paths = run_artifact_paths(contract["campaign_id"], contract["run_id"])
     paths.root.mkdir(parents=True, exist_ok=True)
+    if contract["outcome"] == "no_plan":
+        return _run_no_plan_phase(contract, paths=paths, phase=phase)
     prior = _completed_phase_receipt(paths, contract, phase=phase)
     if prior is not None and phase in {"morning", "after-close"}:
         return {
@@ -285,6 +289,66 @@ def _run_phase(contract: dict[str, Any], *, phase: str) -> dict[str, Any]:
     _write_atomic(receipt_dir / "latest.json", receipt)
     if phase in {"morning", "after-close"}:
         _write_atomic(receipt_dir / f"{phase}.complete.json", receipt)
+    return receipt
+
+
+def _run_no_plan_phase(
+    contract: dict[str, Any], *, paths: Any, phase: str
+) -> dict[str, Any]:
+    marker = paths.root / "coordinator" / "no-plan.complete.json"
+    if marker.is_file():
+        prior = json.loads(marker.read_text(encoding="utf-8"))
+        _validate_no_plan_coordinator_receipt(prior, contract=contract)
+        return {
+            "schema": RECEIPT_SCHEMA,
+            "status": "skipped",
+            "reason": "authenticated_no_plan",
+            "outcome": "no_plan",
+            "phase": phase,
+            "campaign_id": contract["campaign_id"],
+            "run_id": contract["run_id"],
+            "contract_hash": contract["content_hash"],
+            "prior_receipt_hash": prior["content_hash"],
+            "effects": {
+                "broker": False,
+                "orders": False,
+                "authorization": False,
+                "sheet": False,
+                "plan_install": False,
+            },
+        }
+    if phase != "morning":
+        raise ValueError("authenticated no-plan run has no morning preparation receipt")
+    action = _run_tradelab_lifecycle(contract, command="prepare-run")
+    lifecycle = action.pop("lifecycle_receipt", None)
+    validated = _validate_tradelab_no_plan_receipt(lifecycle, contract=contract)
+    body = {
+        "schema": RECEIPT_SCHEMA,
+        "status": "succeeded",
+        "reason": "authenticated_no_plan",
+        "outcome": "no_plan",
+        "created_at": datetime.now(CENTRAL).isoformat(),
+        "phase": "morning",
+        "campaign_id": contract["campaign_id"],
+        "run_id": contract["run_id"],
+        "contract_hash": contract["content_hash"],
+        "campaign_config_hash": contract["campaign_config_hash"],
+        "campaign_protocol_hash": contract["campaign_protocol_hash"],
+        "campaign_freeze_receipt_hash": contract["campaign_freeze_receipt_hash"],
+        "session_calendar_hash": contract["session_calendar_hash"],
+        "tradelab_preparation_receipt_hash": validated["content_hash"],
+        "actions": [action],
+        "effects": {
+            "broker": False,
+            "orders": False,
+            "authorization": False,
+            "sheet": False,
+            "plan_install": False,
+        },
+    }
+    receipt = {**body, "content_hash": canonical_sha256(body)}
+    _write_atomic(marker, receipt)
+    _write_atomic(paths.root / "coordinator" / "morning.complete.json", receipt)
     return receipt
 
 
@@ -462,10 +526,13 @@ def _run_tradelab_lifecycle(
         )
         if command == "finalize-run":
             argv.extend(["--bhiksha-root", str(Path.cwd().resolve())])
+    execution = _run_command(argv, cwd=cwd, env=env)
+    lifecycle_receipt = execution.pop("_output", None)
     return {
         "action": f"tradelab:{command}",
         "command_hash": canonical_sha256(argv),
-        **_run_command(argv, cwd=cwd, env=env),
+        **execution,
+        "lifecycle_receipt": lifecycle_receipt,
     }
 
 
@@ -483,7 +550,19 @@ def _run_command(
         "return_code": completed.returncode,
         "stdout_hash": canonical_sha256(completed.stdout),
         "stdout_tail": completed.stdout[-2000:],
+        "_output": _last_json_object(completed.stdout),
     }
+
+
+def _last_json_object(text: str) -> dict[str, Any] | None:
+    for line in reversed(text.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def _sanitized_subprocess_env(
@@ -546,6 +625,7 @@ def _validate_contract(
         "schema",
         "campaign_id",
         "run_id",
+        "outcome",
         "target_session_date",
         "target_session_window",
         "target_session_window_hash",
@@ -572,6 +652,8 @@ def _validate_contract(
     }
     if set(value) != expected or value.get("schema") != SCHEMA:
         raise ValueError("coordinator contract has unsupported or non-exact fields")
+    if value.get("outcome") not in {"plan", "no_plan"}:
+        raise ValueError("coordinator contract outcome must be plan or no_plan")
     computed = canonical_sha256(
         {key: item for key, item in value.items() if key != "content_hash"}
     )
@@ -646,15 +728,7 @@ def _before_prepare_cutoff(now: datetime) -> bool:
 def _verify_kernel_source() -> None:
     import mala_bhiksha_kernel
 
-    configured = os.getenv("BHIKSHA_KERNEL_SRC")
-    if not configured:
-        raise ValueError("BHIKSHA_KERNEL_SRC is required for chart-scenario scheduling")
-    expected = Path(configured).expanduser().resolve()
-    actual = Path(str(mala_bhiksha_kernel.__file__)).resolve()
-    if not actual.is_relative_to(expected):
-        raise ValueError(
-            f"loaded kernel is not from reviewed BHIKSHA_KERNEL_SRC: {actual}"
-        )
+    verify_kernel_runtime_from_env(imported_module=mala_bhiksha_kernel)
 
 
 def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -722,6 +796,14 @@ def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("campaign agent_broker must be a fixed executable path")
     if value.get("spreadsheet_id") != SPREADSHEET_ID:
         raise ValueError("campaign spreadsheet_id must be the fixed experiment Sheet")
+    configured_kernel_src = Path(os.getenv("BHIKSHA_KERNEL_SRC", "")).expanduser()
+    campaign_kernel_src = Path(str(value.get("kernel_src") or "")).expanduser()
+    if os.getenv("BHIKSHA_KERNEL_SRC") and (
+        not configured_kernel_src.is_absolute()
+        or not campaign_kernel_src.is_absolute()
+        or campaign_kernel_src.resolve() != configured_kernel_src.resolve()
+    ):
+        raise ValueError("campaign kernel_src differs from frozen launchd runtime")
     birdclaw_db = Path(str(value.get("birdclaw_db") or "")).expanduser()
     if not birdclaw_db.is_absolute() or not birdclaw_db.is_file():
         raise ValueError("campaign birdclaw_db must be an existing absolute file")
@@ -1240,25 +1322,6 @@ def _prepare_daily_contract(
         role="daily preparation root",
     )
     attempt = preparation_root / f"attempt-{local.strftime('%H%M%S')}"
-    try:
-        birdclaw_export = _export_birdclaw_context(config, attempt=attempt, as_of=local)
-        narrative_failure = None
-    except Exception as exc:  # noqa: BLE001 - narrative is an observational sidecar.
-        failure_body = {
-            "schema": "bhiksha.chart-scenario-narrative-source-failure.v1",
-            "status": "unavailable_non_blocking",
-            "as_of": local.isoformat(),
-            "error_type": type(exc).__name__,
-            # Do not project local checkout/database paths into narrative data.
-            "error": "Birdclaw narrative source unavailable",
-            "selection_influence": False,
-        }
-        narrative_failure = {
-            **failure_body,
-            "content_hash": canonical_sha256(failure_body),
-        }
-        _write_atomic(attempt / "birdclaw-failure.json", narrative_failure)
-        birdclaw_export = {"path": None, "packet_hash": None, "output_hash": None}
     cartographer_output = attempt / "cartographer"
     cartographer_checkout = Path(str(config["market_cartographer_checkout"])).resolve()
     cartographer_runtime = _verify_toolchain_role(config, role="market_cartographer")
@@ -1297,6 +1360,38 @@ def _prepare_daily_contract(
     run_id = str(receipt.get("run_id") or "")
     if not run_id:
         raise ValueError("Cartographer preparation receipt is missing run_id")
+    if receipt.get("status") not in {"succeeded", "no_plan"}:
+        raise ValueError("Cartographer preparation receipt status is unsupported")
+    outcome = "no_plan" if receipt["status"] == "no_plan" else "plan"
+    if outcome == "no_plan":
+        _validate_cartographer_no_plan_export(
+            receipt,
+            root=cartographer_output,
+            campaign_id=str(config["campaign_id"]),
+        )
+        birdclaw_export = {"path": None, "packet_hash": None, "output_hash": None}
+        narrative_failure = None
+    else:
+        try:
+            birdclaw_export = _export_birdclaw_context(
+                config, attempt=attempt, as_of=local
+            )
+            narrative_failure = None
+        except Exception as exc:  # noqa: BLE001 - observational sidecar.
+            failure_body = {
+                "schema": "bhiksha.chart-scenario-narrative-source-failure.v1",
+                "status": "unavailable_non_blocking",
+                "as_of": local.isoformat(),
+                "error_type": type(exc).__name__,
+                "error": "Birdclaw narrative source unavailable",
+                "selection_influence": False,
+            }
+            narrative_failure = {
+                **failure_body,
+                "content_hash": canonical_sha256(failure_body),
+            }
+            _write_atomic(attempt / "birdclaw-failure.json", narrative_failure)
+            birdclaw_export = {"path": None, "packet_hash": None, "output_hash": None}
     experiment_root = require_experiment_path(
         str(config["tradelab_experiment_root"]), role="TradeLab experiment root"
     )
@@ -1307,6 +1402,7 @@ def _prepare_daily_contract(
         "schema": SCHEMA,
         "campaign_id": config["campaign_id"],
         "run_id": run_id,
+        "outcome": outcome,
         "target_session_date": target_date,
         "target_session_window": receipt["target_session_window"],
         "target_session_window_hash": receipt["target_session_window_hash"],
@@ -1329,9 +1425,15 @@ def _prepare_daily_contract(
         "agent_broker_checkout": config["agent_broker_checkout"],
         "spreadsheet_id": config["spreadsheet_id"],
         "kernel_src": config["kernel_src"],
-        "plan_source": str(tradelab_run / "outputs" / "shadow-plan.json"),
-        "projection_request": str(
-            tradelab_run / "outputs" / "sheet-upsert-request.json"
+        "plan_source": (
+            None
+            if outcome == "no_plan"
+            else str(tradelab_run / "outputs" / "shadow-plan.json")
+        ),
+        "projection_request": (
+            None
+            if outcome == "no_plan"
+            else str(tradelab_run / "outputs" / "sheet-upsert-request.json")
         ),
     }
     contract = {**body, "content_hash": canonical_sha256(body)}
@@ -1505,8 +1607,9 @@ def _validate_cartographer_receipt(
     )
     if str(receipt.get("receipt_hash", "")).removeprefix("sha256:") != receipt_hash:
         raise ValueError("Cartographer receipt hash mismatch")
+    expected_status = "no_plan" if contract["outcome"] == "no_plan" else "succeeded"
     if (
-        receipt.get("status") != "succeeded"
+        receipt.get("status") != expected_status
         or receipt.get("run_id") != contract["run_id"]
         or receipt.get("target_session_date") != contract["target_session_date"]
         or receipt.get("target_session_window") != dict(window)
@@ -1516,11 +1619,248 @@ def _validate_cartographer_receipt(
         raise ValueError(
             "daily contract does not match authenticated Cartographer session"
         )
+    if expected_status == "no_plan":
+        _validate_cartographer_no_plan_export(
+            receipt,
+            root=Path(str(contract["cartographer_receipt"])).parent,
+            campaign_id=str(contract["campaign_id"]),
+        )
+
+
+def _validate_cartographer_no_plan_export(
+    receipt: Mapping[str, Any], *, root: Path, campaign_id: str
+) -> None:
+    expected_receipt_fields = {
+        "schema",
+        "status",
+        "run_id",
+        "export_id",
+        "export_hash",
+        "target_session_date",
+        "target_session_window",
+        "target_session_window_hash",
+        "data_mode",
+        "candidate_pool_hash",
+        "arm_a_selection_hash",
+        "materialized_scenario_count",
+        "artifacts",
+        "effects",
+        "receipt_hash",
+    }
+    false_effects = {
+        "broker": False,
+        "orders": False,
+        "auth": False,
+        "schedule": False,
+        "external_send": False,
+    }
+    body = {key: item for key, item in receipt.items() if key != "receipt_hash"}
+    if (
+        set(receipt) != expected_receipt_fields
+        or receipt.get("status") != "no_plan"
+        or receipt.get("candidate_pool_hash") is not None
+        or receipt.get("arm_a_selection_hash") is not None
+        or receipt.get("materialized_scenario_count") != 0
+        or receipt.get("effects") != false_effects
+        or receipt.get("receipt_hash") != canonical_sha256(body)
+    ):
+        raise ValueError("Cartographer no-plan receipt is invalid")
+    export_root = root.expanduser().resolve()
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise TypeError("Cartographer no-plan artifact inventory is invalid")
+    expected_paths: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping) or set(artifact) != {
+            "path",
+            "content_hash",
+        }:
+            raise ValueError("Cartographer no-plan artifact record is invalid")
+        relative = Path(str(artifact["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("Cartographer no-plan artifact path escaped export")
+        requested_path = export_root / relative
+        path = requested_path.resolve()
+        if (
+            not path.is_relative_to(export_root)
+            or requested_path.is_symlink()
+            or any(
+                parent.is_symlink()
+                for parent in requested_path.parents
+                if parent.is_relative_to(export_root)
+            )
+            or not path.is_file()
+        ):
+            raise ValueError("Cartographer no-plan artifact is unavailable")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        observed_hash = (
+            payload.get("export_hash")
+            if relative.as_posix() == "manifest.json"
+            else canonical_sha256(payload)
+        )
+        if artifact["content_hash"] != observed_hash:
+            raise ValueError("Cartographer no-plan artifact hash mismatch")
+        expected_paths.add(relative.as_posix())
+    members = list(export_root.rglob("*"))
+    if any(path.is_symlink() for path in members):
+        raise ValueError("Cartographer no-plan export contains a symlink")
+    actual_paths = {
+        path.relative_to(export_root).as_posix()
+        for path in members
+        if path.is_file() and path.name != "receipt.json"
+    }
+    if actual_paths != expected_paths or "manifest.json" not in expected_paths:
+        raise ValueError("Cartographer no-plan artifact inventory is not exact")
+    manifest = json.loads((export_root / "manifest.json").read_text(encoding="utf-8"))
+    manifest_body = {
+        key: item
+        for key, item in manifest.items()
+        if key not in {"export_id", "export_hash"}
+    }
+    manifest_hash = canonical_sha256(manifest_body)
+    if (
+        manifest.get("schema") != "market_cartographer.market_context_no_plan.v1"
+        or manifest.get("status") != "no_plan"
+        or manifest.get("reason") != "all_symbols_quarantined"
+        or manifest.get("campaign_id") != campaign_id
+        or manifest.get("run_id") != receipt["run_id"]
+        or manifest.get("target_session_date") != receipt["target_session_date"]
+        or manifest.get("target_session_window") != receipt["target_session_window"]
+        or manifest.get("target_session_window_hash")
+        != receipt["target_session_window_hash"]
+        or manifest.get("effects") != false_effects
+        or manifest.get("export_hash") != manifest_hash
+        or manifest.get("export_hash") != receipt["export_hash"]
+        or manifest.get("export_id") != f"no-plan:{manifest_hash[:16]}"
+        or manifest.get("export_id") != receipt["export_id"]
+    ):
+        raise ValueError("Cartographer no-plan manifest identity is invalid")
+
+
+def _validate_tradelab_no_plan_receipt(
+    value: Any, *, contract: Mapping[str, Any]
+) -> dict[str, Any]:
+    expected = {
+        "schema",
+        "status",
+        "reason",
+        "campaign_id",
+        "run_id",
+        "run_root",
+        "run_manifest_hash",
+        "target_session_date",
+        "target_session_window",
+        "target_session_window_hash",
+        "cartographer_receipt_hash",
+        "cartographer_export_hash",
+        "chart_input_verification_hash",
+        "shadow_plan_hash",
+        "projection_receipt_hash",
+        "effects",
+        "content_hash",
+    }
+    false_effects = {
+        "sheet_write": False,
+        "broker": False,
+        "orders": False,
+        "auth_mutation": False,
+        "live_plan": False,
+        "schedule": False,
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("TradeLab no-plan preparation receipt fields are invalid")
+    body = {key: item for key, item in value.items() if key != "content_hash"}
+    cartographer = json.loads(
+        Path(str(contract["cartographer_receipt"])).read_text(encoding="utf-8")
+    )
+    run_root = (
+        Path(str(contract["tradelab_experiment_root"])).resolve()
+        / "campaigns"
+        / str(contract["campaign_id"])
+        / "runs"
+        / str(contract["run_id"])
+    )
+    if (
+        value.get("schema") != "tradelab.market_context_daily_preparation_receipt.v1"
+        or value.get("status") != "no_plan"
+        or value.get("reason") != "all_symbols_quarantined"
+        or value.get("campaign_id") != contract["campaign_id"]
+        or value.get("run_id") != contract["run_id"]
+        or Path(str(value.get("run_root"))).resolve() != run_root
+        or value.get("target_session_date") != contract["target_session_date"]
+        or value.get("target_session_window") != contract["target_session_window"]
+        or value.get("target_session_window_hash")
+        != contract["target_session_window_hash"]
+        or str(value.get("cartographer_receipt_hash", "")).removeprefix("sha256:")
+        != str(cartographer["receipt_hash"]).removeprefix("sha256:")
+        or str(value.get("cartographer_export_hash", "")).removeprefix("sha256:")
+        != str(cartographer["export_hash"]).removeprefix("sha256:")
+        or re.fullmatch(
+            r"(?:sha256:)?[0-9a-f]{64}",
+            str(value.get("chart_input_verification_hash", "")),
+        )
+        is None
+        or re.fullmatch(
+            r"(?:sha256:)?[0-9a-f]{64}", str(value.get("run_manifest_hash", ""))
+        )
+        is None
+        or value.get("shadow_plan_hash") is not None
+        or value.get("projection_receipt_hash") is not None
+        or value.get("effects") != false_effects
+        or str(value.get("content_hash", "")).removeprefix("sha256:")
+        != canonical_sha256(body)
+    ):
+        raise ValueError("TradeLab no-plan preparation receipt identity is invalid")
+    persisted = run_root / "outputs" / "preparation-receipt.json"
+    if not persisted.is_file() or json.loads(
+        persisted.read_text(encoding="utf-8")
+    ) != dict(value):
+        raise ValueError(
+            "TradeLab no-plan preparation receipt was not persisted exactly"
+        )
+    return dict(value)
+
+
+def _validate_no_plan_coordinator_receipt(
+    value: Mapping[str, Any], *, contract: Mapping[str, Any]
+) -> None:
+    body = {key: item for key, item in value.items() if key != "content_hash"}
+    if (
+        value.get("schema") != RECEIPT_SCHEMA
+        or value.get("status") != "succeeded"
+        or value.get("reason") != "authenticated_no_plan"
+        or value.get("outcome") != "no_plan"
+        or value.get("campaign_id") != contract["campaign_id"]
+        or value.get("run_id") != contract["run_id"]
+        or value.get("contract_hash") != contract["content_hash"]
+        or value.get("content_hash") != canonical_sha256(body)
+        or value.get("effects")
+        != {
+            "broker": False,
+            "orders": False,
+            "authorization": False,
+            "sheet": False,
+            "plan_install": False,
+        }
+    ):
+        raise ValueError("existing no-plan coordinator receipt conflicts with contract")
 
 
 def _validate_birdclaw_export(
     contract: Mapping[str, Any], *, window: Mapping[str, str]
 ) -> None:
+    if contract["outcome"] == "no_plan":
+        if any(
+            contract.get(field) is not None
+            for field in (
+                "birdclaw_export",
+                "birdclaw_packet_hash",
+                "birdclaw_output_hash",
+                "narrative_source_failure",
+            )
+        ):
+            raise ValueError("no-plan contract cannot run or bind narrative evidence")
+        return
     if contract.get("birdclaw_export") is None:
         failure = contract.get("narrative_source_failure")
         if (
@@ -1584,6 +1924,13 @@ def _validate_tradelab_paths(contract: Mapping[str, Any]) -> None:
         "plan_source": run_root / "outputs" / "shadow-plan.json",
         "projection_request": run_root / "outputs" / "sheet-upsert-request.json",
     }
+    if contract["outcome"] == "no_plan":
+        if (
+            contract.get("plan_source") is not None
+            or contract.get("projection_request") is not None
+        ):
+            raise ValueError("no-plan contract cannot bind plan or Sheet outputs")
+        return
     for field, path in expected.items():
         if Path(str(contract[field])).expanduser().resolve() != path.resolve():
             raise ValueError(f"daily contract {field} is not the fixed run-scoped path")

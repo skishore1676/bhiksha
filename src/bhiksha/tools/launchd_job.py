@@ -41,7 +41,10 @@ CENTRAL = ZoneInfo("America/Chicago")
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    chart_job = "chart-scenario-shadow" in raw_argv
+    if not chart_job:
+        load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "job",
@@ -106,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=["off", "on"],
     )
     parser.add_argument("--action-id", default=os.getenv("BHIKSHA_ACTION_ID"))
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     repo_root = Path(args.repo_root or Path(__file__).resolve().parents[3]).resolve()
     os.chdir(repo_root)
@@ -405,6 +408,7 @@ def _chart_scenario_shadow_job(args: argparse.Namespace, *, repo_root: Path) -> 
     completed = _run_python_module(
         ["bhiksha.tools.chart_scenario_coordinator", "--phase", "auto"],
         repo_root=repo_root,
+        env=_chart_subprocess_env(repo_root),
     )
     payload = _last_json_object(completed.stdout)
     status = str(payload.get("status") or "failed")
@@ -529,24 +533,68 @@ def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
 
 
 def _run_python_module(
-    args: list[str], *, repo_root: Path
+    args: list[str], *, repo_root: Path, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     module, *rest = args
-    env = os.environ.copy()
-    kernel_src = env.get("BHIKSHA_KERNEL_SRC", "").strip()
-    env["PYTHONPATH"] = os.pathsep.join(
+    child_env = os.environ.copy() if env is None else dict(env)
+    kernel_src = child_env.get("BHIKSHA_KERNEL_SRC", "").strip()
+    child_env["PYTHONPATH"] = os.pathsep.join(
         item for item in (str(repo_root / "src"), kernel_src) if item
     )
-    env["PYTHONUNBUFFERED"] = "1"
+    child_env["PYTHONUNBUFFERED"] = "1"
+    if env is not None:
+        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        child_env["BHIKSHA_SANITIZED_SUBPROCESS"] = "1"
     return subprocess.run(
         [sys.executable, "-m", module, *rest],
         check=False,
         cwd=str(repo_root),
-        env=env,
+        env=child_env,
         text=True,
         capture_output=True,
         timeout=float(os.getenv("BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS", "600")),
     )
+
+
+def _chart_subprocess_env(repo_root: Path) -> dict[str, str]:
+    """Return the exact first-hop environment for the chart coordinator."""
+
+    allowed = {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "TMPDIR",
+        "BHIKSHA_KERNEL_SRC",
+        "BHIKSHA_CHART_KERNEL_RUNTIME_RECORD",
+        "BHIKSHA_CHART_KERNEL_RUNTIME_HASH",
+        "BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED",
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT",
+        "BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG",
+        "BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR",
+        "BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH",
+        "SCHWAB_TOKEN_FILE",
+        "SCHWAB_API_BASE_URL",
+        "SCHWAB_TIMEOUT_SECONDS",
+        "BHIKSHA_CHART_SCENARIO_COMMAND_TIMEOUT_SECONDS",
+        "BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS",
+    }
+    child = {key: value for key, value in os.environ.items() if key in allowed}
+    child["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    child["PYTHONPATH"] = os.pathsep.join(
+        item
+        for item in (
+            str(repo_root / "src"),
+            child.get("BHIKSHA_KERNEL_SRC", "").strip(),
+        )
+        if item
+    )
+    child["PYTHONUNBUFFERED"] = "1"
+    child["PYTHONDONTWRITEBYTECODE"] = "1"
+    child["BHIKSHA_SANITIZED_SUBPROCESS"] = "1"
+    return child
 
 
 def _send_failure_alert(args: argparse.Namespace, *, title: str, detail: str):

@@ -15,6 +15,12 @@ from bhiksha.chart_scenarios.cycle import run_observation_cycle
 from bhiksha.chart_scenarios.repository import ScenarioEventRepository
 from bhiksha.chart_scenarios.validation import install_shadow_plan
 from bhiksha.ops.chart_scenario_sheet import SPREADSHEET_ID
+from bhiksha.tools.chart_kernel_runtime import (
+    RUNTIME_HASH_ENV,
+    RUNTIME_RECORD_ENV,
+    capture_kernel_runtime,
+    write_runtime_record,
+)
 from bhiksha.tools.chart_scenario_coordinator import (
     _before_prepare_cutoff,
     _campaign_window_preflight,
@@ -24,6 +30,7 @@ from bhiksha.tools.chart_scenario_coordinator import (
     _prepare_daily_contract,
     _require_preopen_completion,
     _resolve_daily_contract,
+    _run_phase,
     _run_tradelab_lifecycle,
     _sanitized_subprocess_env,
     _stage_tradelab_evidence,
@@ -97,6 +104,7 @@ def _contract(tmp_path: Path) -> dict[str, object]:
         "schema": "bhiksha.chart-scenario-coordinator-contract.v1",
         "campaign_id": "campaign-1",
         "run_id": "run-2026-08-04",
+        "outcome": "plan",
         "target_session_date": "2026-08-04",
         "target_session_window": window,
         "target_session_window_hash": canonical_sha256(window),
@@ -350,16 +358,21 @@ def test_narrative_source_failure_is_valid_non_blocking_contract(
 
 
 def test_kernel_readback_must_resolve_under_reviewed_checkout(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mala_bhiksha_kernel
 
     kernel_src = Path(str(mala_bhiksha_kernel.__file__)).resolve().parent.parent
+    runtime = capture_kernel_runtime(kernel_src)
+    record = write_runtime_record(tmp_path / "kernel-runtime.json", runtime)
     monkeypatch.setenv("BHIKSHA_KERNEL_SRC", str(kernel_src))
+    monkeypatch.setenv(RUNTIME_RECORD_ENV, str(record))
+    monkeypatch.setenv(RUNTIME_HASH_ENV, runtime["content_hash"])
     _verify_kernel_source()
 
     monkeypatch.setenv("BHIKSHA_KERNEL_SRC", "/tmp/not-the-loaded-kernel")
-    with pytest.raises(ValueError, match="not from reviewed"):
+    with pytest.raises(ValueError, match="configured kernel src"):
         _verify_kernel_source()
 
 
@@ -558,8 +571,9 @@ def _rewrite_runtime_record(record: dict[str, object]) -> None:
     Path(str(record["record_path"])).write_text(json.dumps(record), encoding="utf-8")
 
 
+@pytest.mark.parametrize("cartographer_status", ["succeeded", "no_plan"])
 def test_campaign_config_autonomously_emits_authenticated_daily_contract(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cartographer_status: str
 ) -> None:
     cartographer = tmp_path / "market-cartographer"
     python = cartographer / ".venv" / "bin" / "python"
@@ -658,6 +672,81 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
         del cwd, env
         output = Path(command[command.index("--output") + 1])
         output.mkdir(parents=True)
+        if cartographer_status == "no_plan":
+            effects = {
+                "broker": False,
+                "orders": False,
+                "auth": False,
+                "schedule": False,
+                "external_send": False,
+            }
+            manifest_body = {
+                "schema": "market_cartographer.market_context_no_plan.v1",
+                "program_id": "morning-market-scenario-selection-shadow.v1",
+                "experiment_family_id": "market-context-shadow.v1",
+                "experiment_version": "v1",
+                "campaign_id": "campaign-1",
+                "run_id": "run-auto-2026-08-04",
+                "status": "no_plan",
+                "reason": "all_symbols_quarantined",
+                "target_session_date": "2026-08-04",
+                "target_session_window": window,
+                "target_session_window_hash": canonical_sha256(window),
+                "effects": effects,
+            }
+            export_hash = canonical_sha256(manifest_body)
+            manifest = {
+                **manifest_body,
+                "export_id": f"no-plan:{export_hash[:16]}",
+                "export_hash": export_hash,
+            }
+            payloads = {
+                "manifest.json": manifest,
+                "freshness-evidence.json": {"schema": "fixture.freshness.v1"},
+                "normalized-inputs/index.json": {"schema": "fixture.index.v1"},
+                "universe-manifest.json": {"schema": "fixture.universe.v1"},
+            }
+            for relative, payload in payloads.items():
+                target = output / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(payload), encoding="utf-8")
+            artifacts = [
+                {
+                    "path": relative,
+                    "content_hash": (
+                        export_hash
+                        if relative == "manifest.json"
+                        else canonical_sha256(payload)
+                    ),
+                }
+                for relative, payload in sorted(payloads.items())
+            ]
+            receipt_body = {
+                "schema": "market_cartographer.market_context_receipt.v2",
+                "status": "no_plan",
+                "run_id": "run-auto-2026-08-04",
+                "export_id": manifest["export_id"],
+                "export_hash": export_hash,
+                "target_session_date": "2026-08-04",
+                "target_session_window": window,
+                "target_session_window_hash": canonical_sha256(window),
+                "data_mode": "fixture",
+                "candidate_pool_hash": None,
+                "arm_a_selection_hash": None,
+                "materialized_scenario_count": 0,
+                "artifacts": artifacts,
+                "effects": effects,
+            }
+            (output / "receipt.json").write_text(
+                json.dumps(
+                    {
+                        **receipt_body,
+                        "receipt_hash": canonical_sha256(receipt_body),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {"status": "succeeded"}
         receipt_body = {
             "schema": "market_cartographer.market_context_receipt.v2",
             "status": "succeeded",
@@ -704,8 +793,16 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
     assert payload["run_id"] == "run-auto-2026-08-04"
     assert payload["target_session_window"] == window
     assert payload["campaign_config_hash"] == config["content_hash"]
-    assert payload["birdclaw_packet_hash"]
-    assert birdclaw_envs[0]["BIRDCLAW_DB"] == str(birdclaw_db)
+    if cartographer_status == "no_plan":
+        assert payload["outcome"] == "no_plan"
+        assert payload["birdclaw_packet_hash"] is None
+        assert payload["plan_source"] is None
+        assert payload["projection_request"] is None
+        assert birdclaw_envs == []
+    else:
+        assert payload["outcome"] == "plan"
+        assert payload["birdclaw_packet_hash"]
+        assert birdclaw_envs[0]["BIRDCLAW_DB"] == str(birdclaw_db)
     assert str(birdclaw_db) not in json.dumps(payload)
 
     protocol_path = (
@@ -783,6 +880,176 @@ def test_fixed_tradelab_lifecycle_has_no_caller_authored_output_argv(
     assert captured[2][captured[2].index("--bhiksha-root") + 1] == str(
         Path.cwd().resolve()
     )
+
+
+def test_authenticated_no_plan_stops_before_plan_sheet_and_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = _contract(tmp_path)
+    window = value["target_session_window"]
+    false_cart_effects = {
+        "broker": False,
+        "orders": False,
+        "auth": False,
+        "schedule": False,
+        "external_send": False,
+    }
+    export_root = tmp_path / "cartographer-no-plan"
+    export_root.mkdir()
+    supporting = {
+        "freshness-evidence.json": {"schema": "fixture.freshness.v1"},
+        "normalized-inputs/index.json": {"schema": "fixture.index.v1"},
+        "universe-manifest.json": {"schema": "fixture.universe.v1"},
+    }
+    manifest_body = {
+        "schema": "market_cartographer.market_context_no_plan.v1",
+        "program_id": "morning-market-scenario-selection-shadow.v1",
+        "experiment_family_id": "market-context-shadow.v1",
+        "experiment_version": "v1",
+        "campaign_id": value["campaign_id"],
+        "run_id": value["run_id"],
+        "status": "no_plan",
+        "reason": "all_symbols_quarantined",
+        "target_session_date": value["target_session_date"],
+        "target_session_window": window,
+        "target_session_window_hash": value["target_session_window_hash"],
+        "effects": false_cart_effects,
+    }
+    export_hash = canonical_sha256(manifest_body)
+    manifest = {
+        **manifest_body,
+        "export_id": f"no-plan:{export_hash[:16]}",
+        "export_hash": export_hash,
+    }
+    payloads = {"manifest.json": manifest, **supporting}
+    for relative, payload in payloads.items():
+        path = export_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    artifacts = [
+        {
+            "path": relative,
+            "content_hash": (
+                export_hash
+                if relative == "manifest.json"
+                else canonical_sha256(payload)
+            ),
+        }
+        for relative, payload in sorted(payloads.items())
+    ]
+    cart_body = {
+        "schema": "market_cartographer.market_context_receipt.v2",
+        "status": "no_plan",
+        "run_id": value["run_id"],
+        "export_id": manifest["export_id"],
+        "export_hash": export_hash,
+        "target_session_date": value["target_session_date"],
+        "target_session_window": window,
+        "target_session_window_hash": value["target_session_window_hash"],
+        "data_mode": "fixture",
+        "candidate_pool_hash": None,
+        "arm_a_selection_hash": None,
+        "materialized_scenario_count": 0,
+        "artifacts": artifacts,
+        "effects": false_cart_effects,
+    }
+    cart_receipt = {**cart_body, "receipt_hash": canonical_sha256(cart_body)}
+    cart_receipt_path = export_root / "receipt.json"
+    cart_receipt_path.write_text(json.dumps(cart_receipt), encoding="utf-8")
+    value.update(
+        {
+            "outcome": "no_plan",
+            "cartographer_receipt": str(cart_receipt_path),
+            "birdclaw_export": None,
+            "birdclaw_packet_hash": None,
+            "birdclaw_output_hash": None,
+            "narrative_source_failure": None,
+            "plan_source": None,
+            "projection_request": None,
+        }
+    )
+    value["content_hash"] = canonical_sha256(
+        {key: item for key, item in value.items() if key != "content_hash"}
+    )
+    contract = _validate_contract(value)
+    run_root = (
+        Path(str(contract["tradelab_experiment_root"]))
+        / "campaigns"
+        / str(contract["campaign_id"])
+        / "runs"
+        / str(contract["run_id"])
+    )
+    preparation_body = {
+        "schema": "tradelab.market_context_daily_preparation_receipt.v1",
+        "status": "no_plan",
+        "reason": "all_symbols_quarantined",
+        "campaign_id": contract["campaign_id"],
+        "run_id": contract["run_id"],
+        "run_root": str(run_root),
+        "run_manifest_hash": "sha256:" + "1" * 64,
+        "target_session_date": contract["target_session_date"],
+        "target_session_window": contract["target_session_window"],
+        "target_session_window_hash": contract["target_session_window_hash"],
+        "cartographer_receipt_hash": cart_receipt["receipt_hash"],
+        "cartographer_export_hash": export_hash,
+        "chart_input_verification_hash": "sha256:" + "2" * 64,
+        "shadow_plan_hash": None,
+        "projection_receipt_hash": None,
+        "effects": {
+            "sheet_write": False,
+            "broker": False,
+            "orders": False,
+            "auth_mutation": False,
+            "live_plan": False,
+            "schedule": False,
+        },
+    }
+    preparation = {
+        **preparation_body,
+        "content_hash": "sha256:" + canonical_sha256(preparation_body),
+    }
+    persisted = run_root / "outputs" / "preparation-receipt.json"
+    persisted.parent.mkdir(parents=True)
+    persisted.write_text(json.dumps(preparation), encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        coordinator,
+        "_run_tradelab_lifecycle",
+        lambda *_args, **_kwargs: {
+            "action": "tradelab:prepare-run",
+            "status": "succeeded",
+            "lifecycle_receipt": preparation,
+        },
+    )
+    for forbidden in (
+        "_install_or_verify_plan",
+        "_observe_once",
+        "_stage_tradelab_evidence",
+        "_project_if_present",
+        "_export_birdclaw_context",
+    ):
+        monkeypatch.setattr(
+            coordinator,
+            forbidden,
+            lambda *_args, _name=forbidden, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"no-plan invoked {_name}")
+            ),
+        )
+
+    morning = _run_phase(contract, phase="morning")
+    intraday = _run_phase(contract, phase="intraday")
+    after_close = _run_phase(contract, phase="after-close")
+
+    assert morning["status"] == "succeeded"
+    assert morning["outcome"] == "no_plan"
+    assert intraday["status"] == "skipped"
+    assert after_close["status"] == "skipped"
+    assert intraday["reason"] == after_close["reason"] == "authenticated_no_plan"
+    assert not (
+        tmp_path
+        / "artifacts/chart_scenarios/runs/campaign-1/run-2026-08-04/active_shadow_plan.json"
+    ).exists()
 
 
 def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(

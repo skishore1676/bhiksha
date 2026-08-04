@@ -98,6 +98,12 @@ runner = repo / "scripts" / "launchd" / "run_bhiksha_job.sh"
 sys.path.insert(0, str(repo / "src"))
 
 from bhiksha.ops.launchd_registry import active_launchd_jobs
+from bhiksha.tools.chart_kernel_runtime import (
+    RUNTIME_HASH_ENV,
+    RUNTIME_RECORD_ENV,
+    capture_kernel_runtime,
+    write_runtime_record,
+)
 
 exit_edge_enabled = str(
     os.environ.get("BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED", "")
@@ -151,7 +157,17 @@ for job in jobs:
                 "BHIKSHA_KERNEL_SRC must be an absolute reviewed kernel src directory "
                 "when installing chart-scenario-shadow"
             )
-        environment["BHIKSHA_KERNEL_SRC"] = str(kernel_src)
+        try:
+            kernel_runtime = capture_kernel_runtime(kernel_src)
+            kernel_record_path = write_runtime_record(
+                chart_root.resolve() / "launchd" / "kernel-runtime.json",
+                kernel_runtime,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        environment["BHIKSHA_KERNEL_SRC"] = kernel_runtime["src"]
+        environment[RUNTIME_RECORD_ENV] = str(kernel_record_path)
+        environment[RUNTIME_HASH_ENV] = kernel_runtime["content_hash"]
         python_bin = Path(os.environ.get("BHIKSHA_PYTHON", "")).expanduser()
         if not python_bin.is_absolute() or not python_bin.is_file() or not os.access(python_bin, os.X_OK):
             raise SystemExit(
@@ -159,7 +175,77 @@ for job in jobs:
                 "installing chart-scenario-shadow"
             )
         environment["BHIKSHA_PYTHON"] = str(python_bin)
+        chart_root = chart_root.resolve()
         environment["BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT"] = str(chart_root)
+        campaign_config = Path(
+            os.environ.get(
+                "BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG",
+                chart_root / "campaign-config.json",
+            )
+        ).expanduser()
+        contract_dir = Path(
+            os.environ.get(
+                "BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR",
+                chart_root / "daily-contracts",
+            )
+        ).expanduser()
+        if (
+            not campaign_config.is_absolute()
+            or campaign_config.is_symlink()
+            or not campaign_config.is_file()
+            or not campaign_config.resolve().is_relative_to(chart_root)
+        ):
+            raise SystemExit(
+                "BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG must be an existing real "
+                "file under the chart artifact root"
+            )
+        if (
+            not contract_dir.is_absolute()
+            or contract_dir.is_symlink()
+            or not contract_dir.resolve().is_relative_to(chart_root)
+        ):
+            raise SystemExit(
+                "BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR must be a real directory "
+                "under the chart artifact root"
+            )
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        environment["BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG"] = str(
+            campaign_config.resolve()
+        )
+        environment["BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR"] = str(
+            contract_dir.resolve()
+        )
+        token_file = Path(os.environ.get("SCHWAB_TOKEN_FILE", "")).expanduser()
+        if not token_file.is_absolute() or not token_file.is_file():
+            raise SystemExit(
+                "SCHWAB_TOKEN_FILE must be an existing absolute read-only token file "
+                "when installing chart-scenario-shadow"
+            )
+        environment["SCHWAB_TOKEN_FILE"] = str(token_file)
+        credentials_value = os.environ.get(
+            "BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH"
+        ) or os.environ.get("GOOGLE_API_CREDENTIALS_PATH")
+        credentials = Path(credentials_value or "").expanduser()
+        if not credentials.is_absolute() or not credentials.is_file():
+            raise SystemExit(
+                "an existing absolute Google Sheets credentials path is required "
+                "when installing chart-scenario-shadow"
+            )
+        environment["BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH"] = str(credentials)
+        for optional in (
+            "SCHWAB_API_BASE_URL",
+            "SCHWAB_TIMEOUT_SECONDS",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "BHIKSHA_CHART_SCENARIO_COMMAND_TIMEOUT_SECONDS",
+            "BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS",
+        ):
+            if optional in os.environ:
+                environment[optional] = os.environ[optional]
         python_realpath = python_bin.resolve(strict=True)
         environment["BHIKSHA_CHART_PYTHON_REALPATH"] = str(python_realpath)
         environment["BHIKSHA_CHART_PYTHON_SHA256"] = hashlib.sha256(
@@ -187,12 +273,6 @@ for job in jobs:
             capture_output=True,
         ).stdout.strip()
         environment["BHIKSHA_CHART_REPO_COMMIT"] = commit
-        env_file = os.environ.get("BHIKSHA_ENV_FILE")
-        if env_file:
-            resolved_env = Path(env_file).expanduser()
-            if not resolved_env.is_absolute() or not resolved_env.is_file():
-                raise SystemExit("BHIKSHA_ENV_FILE must be an existing absolute file")
-            environment["BHIKSHA_ENV_FILE"] = str(resolved_env)
     if environment:
         plist["EnvironmentVariables"] = environment
     path = launchd_dir / f"{label}.plist"
