@@ -392,7 +392,7 @@ def test_subprocess_environments_are_role_scoped_and_strip_money_credentials(
 
 
 def test_frozen_toolchain_rejects_dirty_hash_drift_and_symlink_escape(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     checkouts = {
         "birdclaw": tmp_path / "birdclaw",
@@ -400,15 +400,30 @@ def test_frozen_toolchain_rejects_dirty_hash_drift_and_symlink_escape(
         "tradelab": tmp_path / "tradelab",
         "agent_broker": tmp_path / "agent-broker",
     }
-    toolchain: dict[str, dict[str, str]] = {}
+    toolchain: dict[str, dict[str, object]] = {}
+    runtime_records = tmp_path / "artifacts/chart_scenarios/runtime-records"
+    runtime_records.mkdir(parents=True)
     for role, checkout in checkouts.items():
-        entrypoint = (
-            checkout / ".venv/bin/agent-broker"
-            if role == "agent_broker"
-            else checkout / "entrypoint"
+        (checkout / ".gitignore").parent.mkdir(parents=True, exist_ok=True)
+        (checkout / ".gitignore").write_text(
+            "/.venv/\n/escaped-entrypoint\n", encoding="utf-8"
         )
-        entrypoint.parent.mkdir(parents=True, exist_ok=True)
+        import_root = checkout / "src"
+        import_root.mkdir()
+        entrypoint = import_root / "entrypoint.py"
         entrypoint.write_text(f"{role}\n", encoding="utf-8")
+        interpreter = checkout / ".venv/bin/runtime"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text(
+            "#!/bin/sh\n[ \"${1:-}\" = --version ] && echo 'Fixture 1.0'\n",
+            encoding="utf-8",
+        )
+        interpreter.chmod(0o755)
+        launcher = interpreter
+        if role == "agent_broker":
+            launcher = checkout / ".venv/bin/agent-broker"
+            launcher.write_text(f"#!{interpreter}\n", encoding="utf-8")
+            launcher.chmod(0o755)
         subprocess.run(["git", "init", "-q", str(checkout)], check=True)
         subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
         subprocess.run(
@@ -432,20 +447,74 @@ def test_frozen_toolchain_rejects_dirty_hash_drift_and_symlink_escape(
             text=True,
             capture_output=True,
         ).stdout.strip()
-        toolchain[role] = {
+        module = coordinator._TOOL_MODULES[role]
+        prefix = {
+            "birdclaw": [str(launcher), str(entrypoint)],
+            "market_cartographer": [
+                str(launcher),
+                "-m",
+                "market_cartographer.cli",
+            ],
+            "tradelab": [str(launcher), "-m", "scripts.market_context"],
+            "agent_broker": [str(launcher)],
+        }[role]
+        record_path = runtime_records / f"{role}.json"
+        body: dict[str, object] = {
+            "schema": coordinator._RUNTIME_RECORD_SCHEMA,
+            "role": role,
             "checkout": str(checkout),
             "commit": commit,
+            "clean": True,
+            "launcher": str(launcher),
+            "launcher_sha256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
+            "launcher_realpath": str(launcher.resolve()),
+            "launcher_realpath_sha256": hashlib.sha256(
+                launcher.resolve().read_bytes()
+            ).hexdigest(),
+            "launcher_symlink_target": None,
+            "interpreter": str(interpreter),
+            "interpreter_realpath": str(interpreter.resolve()),
+            "interpreter_sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+            "interpreter_symlink_target": None,
+            "runtime_version": "Fixture 1.0",
             "entrypoint": str(entrypoint),
             "entrypoint_sha256": hashlib.sha256(entrypoint.read_bytes()).hexdigest(),
+            "import_root": str(import_root),
+            "import_root_sha256": coordinator._source_tree_sha256(import_root),
+            "import_map": {
+                module: {
+                    "path": str(entrypoint.resolve()),
+                    "sha256": hashlib.sha256(entrypoint.read_bytes()).hexdigest(),
+                }
+            },
+            "dependency_identity": {
+                "mode": "source_tree_only",
+                "path": None,
+                "sha256": coordinator._source_tree_sha256(import_root),
+            },
+            "argv_prefix": prefix,
+            "captured_at": "2026-08-04T12:00:00Z",
+            "record_path": str(record_path),
         }
+        record = {**body, "content_hash": canonical_sha256(body)}
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        toolchain[role] = record
     config = {
         "birdclaw_checkout": str(checkouts["birdclaw"]),
         "market_cartographer_checkout": str(checkouts["market_cartographer"]),
         "tradelab_checkout": str(checkouts["tradelab"]),
         "agent_broker_checkout": str(checkouts["agent_broker"]),
-        "agent_broker": toolchain["agent_broker"]["entrypoint"],
+        "kernel_src": str(tmp_path / "kernel/src"),
+        "agent_broker": toolchain["agent_broker"]["launcher"],
         "toolchain": toolchain,
     }
+    monkeypatch.setattr(
+        coordinator,
+        "_resolve_module_origin",
+        lambda interpreter, *, module, role, config, cwd: Path(
+            toolchain[role]["entrypoint"]
+        ).resolve(),
+    )
     _verify_frozen_toolchain(config)
 
     birdclaw_entrypoint = Path(toolchain["birdclaw"]["entrypoint"])
@@ -455,19 +524,38 @@ def test_frozen_toolchain_rejects_dirty_hash_drift_and_symlink_escape(
     birdclaw_entrypoint.write_text("birdclaw\n", encoding="utf-8")
 
     toolchain["birdclaw"]["entrypoint_sha256"] = "f" * 64
+    _rewrite_runtime_record(toolchain["birdclaw"])
     with pytest.raises(ValueError, match="entrypoint drift"):
         _verify_frozen_toolchain(config)
     toolchain["birdclaw"]["entrypoint_sha256"] = hashlib.sha256(
         birdclaw_entrypoint.read_bytes()
     ).hexdigest()
+    _rewrite_runtime_record(toolchain["birdclaw"])
 
     outside = tmp_path / "outside-entrypoint"
     outside.write_text("outside\n", encoding="utf-8")
     symlink = checkouts["birdclaw"] / "escaped-entrypoint"
     symlink.symlink_to(outside)
     toolchain["birdclaw"]["entrypoint"] = str(symlink)
+    _rewrite_runtime_record(toolchain["birdclaw"])
     with pytest.raises(ValueError, match="escaped checkout"):
         _verify_frozen_toolchain(config)
+
+    toolchain["birdclaw"]["entrypoint"] = str(birdclaw_entrypoint)
+    _rewrite_runtime_record(toolchain["birdclaw"])
+    ignored_runtime = Path(toolchain["market_cartographer"]["interpreter"])
+    ignored_runtime.write_text(
+        "#!/bin/sh\n[ \"${1:-}\" = --version ] && echo 'Fixture 2.0'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="(launcher|interpreter) drift"):
+        _verify_frozen_toolchain(config)
+
+
+def _rewrite_runtime_record(record: dict[str, object]) -> None:
+    body = {key: value for key, value in record.items() if key != "content_hash"}
+    record["content_hash"] = canonical_sha256(body)
+    Path(str(record["record_path"])).write_text(json.dumps(record), encoding="utf-8")
 
 
 def test_campaign_config_autonomously_emits_authenticated_daily_contract(
@@ -591,6 +679,17 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
     monkeypatch.setattr(
         coordinator, "_verify_frozen_toolchain", lambda *args, **kwargs: None
     )
+    monkeypatch.setattr(
+        coordinator,
+        "_verify_toolchain_role",
+        lambda config, *, role, configured_checkout=None: {
+            "argv_prefix": (
+                ["bird-runtime", "bird-entrypoint"]
+                if role == "birdclaw"
+                else ["cartographer-python", "-m", "market_cartographer.cli"]
+            )
+        },
+    )
     contract_dir = tmp_path / "artifacts" / "chart_scenarios" / "daily-contracts"
 
     path = _prepare_daily_contract(
@@ -656,6 +755,16 @@ def test_fixed_tradelab_lifecycle_has_no_caller_authored_output_argv(
     monkeypatch.setattr(coordinator, "_run_command", fake_run)
     monkeypatch.setattr(
         coordinator, "_verify_frozen_toolchain", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_verify_toolchain_role",
+        lambda config, *, role, configured_checkout=None: {
+            "argv_prefix": ["python", "-m", "scripts.market_context"],
+            "record_path": str(
+                tmp_path / "artifacts/chart_scenarios/agent-broker.json"
+            ),
+        },
     )
 
     _run_tradelab_lifecycle(contract, command="prepare-run")

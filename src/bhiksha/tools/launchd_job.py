@@ -635,13 +635,15 @@ def _print_result(payload: dict) -> None:
 def _write_latest_status(payload: dict) -> None:
     try:
         if payload.get("job") == "chart-scenario-shadow":
-            requested = (
-                Path.cwd()
-                / "artifacts"
-                / "chart_scenarios"
-                / "launchd"
-                / "latest_status.json"
+            chart_root = Path(
+                os.getenv(
+                    "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT",
+                    str(Path.cwd() / "artifacts" / "chart_scenarios"),
+                )
             )
+            if not chart_root.is_absolute():
+                raise ValueError("chart launchd artifact root must be absolute")
+            requested = chart_root / "launchd" / "latest_status.json"
             path = require_experiment_path(requested, role="launchd status receipt")
             if any(
                 parent.is_symlink() for parent in requested.parents if parent.exists()

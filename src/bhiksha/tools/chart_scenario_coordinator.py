@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,40 @@ _SCHWAB_MARKET_DATA_ENV = frozenset(
 _GOOGLE_SHEET_ENV = frozenset(
     {"BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH", "GOOGLE_API_CREDENTIALS_PATH"}
 )
+_RUNTIME_RECORD_SCHEMA = "bhiksha.chart-scenario-tool-runtime.v1"
+_RUNTIME_RECORD_FIELDS = {
+    "schema",
+    "role",
+    "checkout",
+    "commit",
+    "clean",
+    "launcher",
+    "launcher_sha256",
+    "launcher_realpath",
+    "launcher_realpath_sha256",
+    "launcher_symlink_target",
+    "interpreter",
+    "interpreter_realpath",
+    "interpreter_sha256",
+    "interpreter_symlink_target",
+    "runtime_version",
+    "entrypoint",
+    "entrypoint_sha256",
+    "import_root",
+    "import_root_sha256",
+    "import_map",
+    "dependency_identity",
+    "argv_prefix",
+    "captured_at",
+    "record_path",
+    "content_hash",
+}
+_TOOL_MODULES = {
+    "birdclaw": "birdclaw.cli",
+    "market_cartographer": "market_cartographer.cli",
+    "tradelab": "scripts.market_context.__main__",
+    "agent_broker": "agent_broker.cli",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -391,10 +426,10 @@ def _run_tradelab_lifecycle(
     env["PYTHONPATH"] = os.pathsep.join(
         [str(cwd), str(Path(contract["kernel_src"])), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
+    tradelab_runtime = _verify_toolchain_role(contract, role="tradelab")
+    agent_broker_runtime = _verify_toolchain_role(contract, role="agent_broker")
     argv = [
-        sys.executable,
-        "-m",
-        "scripts.market_context",
+        *tradelab_runtime["argv_prefix"],
         command,
         "--experiment-store",
         str(contract["tradelab_experiment_root"]),
@@ -408,6 +443,8 @@ def _run_tradelab_lifecycle(
                 str(Path(str(contract["cartographer_receipt"])).parent),
                 "--agent-broker",
                 str(contract["agent_broker"]),
+                "--agent-broker-runtime-record",
+                str(agent_broker_runtime["record_path"]),
                 "--spreadsheet-id",
                 str(contract["spreadsheet_id"]),
             ]
@@ -827,45 +864,292 @@ def _verify_frozen_toolchain(config: Mapping[str, Any]) -> None:
     if not isinstance(toolchain, Mapping) or set(toolchain) != set(configured_fields):
         raise ValueError("campaign toolchain must bind every invoked checkout")
     for role, configured_checkout in roles.items():
-        record = toolchain[role]
-        expected_fields = {"checkout", "commit", "entrypoint", "entrypoint_sha256"}
-        if not isinstance(record, Mapping) or set(record) != expected_fields:
-            raise ValueError(f"campaign toolchain record is invalid: {role}")
-        checkout = Path(str(record["checkout"])).expanduser().resolve()
-        if (
-            checkout != configured_checkout.expanduser().resolve()
-            or not checkout.is_dir()
-        ):
-            raise ValueError(f"campaign toolchain checkout differs for {role}")
-        entrypoint = Path(str(record["entrypoint"])).expanduser().resolve()
-        if not entrypoint.is_file() or not entrypoint.is_relative_to(checkout):
-            raise ValueError(f"campaign toolchain entrypoint escaped checkout: {role}")
-        if (
-            role == "agent_broker"
-            and entrypoint != Path(str(config["agent_broker"])).expanduser().resolve()
-        ):
-            raise ValueError("campaign Agent Broker entrypoint differs from executable")
-        status = subprocess.run(
-            ["git", "-C", str(checkout), "status", "--porcelain"],
-            check=False,
-            text=True,
-            capture_output=True,
-            env=_sanitized_subprocess_env(role="broker_inert"),
+        _verify_toolchain_role(
+            config,
+            role=role,
+            configured_checkout=configured_checkout,
         )
-        commit = subprocess.run(
-            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
-            check=False,
-            text=True,
-            capture_output=True,
-            env=_sanitized_subprocess_env(role="broker_inert"),
+
+
+def _verify_toolchain_role(
+    config: Mapping[str, Any],
+    *,
+    role: str,
+    configured_checkout: Path | None = None,
+) -> dict[str, Any]:
+    """Revalidate the exact runtime record immediately before invocation."""
+
+    toolchain = config.get("toolchain")
+    record = toolchain.get(role) if isinstance(toolchain, Mapping) else None
+    if not isinstance(record, Mapping) or set(record) != _RUNTIME_RECORD_FIELDS:
+        raise ValueError(f"campaign toolchain runtime record is invalid: {role}")
+    if record.get("schema") != _RUNTIME_RECORD_SCHEMA or record.get("role") != role:
+        raise ValueError(f"campaign toolchain runtime schema is invalid: {role}")
+    computed = canonical_sha256(
+        {key: item for key, item in record.items() if key != "content_hash"}
+    )
+    if _normalized_hash(record.get("content_hash")) != computed:
+        raise ValueError(f"campaign toolchain runtime hash drift: {role}")
+    try:
+        captured_at = datetime.fromisoformat(str(record["captured_at"]))
+    except ValueError as exc:
+        raise ValueError(f"campaign toolchain captured_at is invalid: {role}") from exc
+    if captured_at.tzinfo is None or record.get("clean") is not True:
+        raise ValueError(f"campaign toolchain runtime was not cleanly captured: {role}")
+
+    requested_record = Path(str(record["record_path"])).expanduser()
+    if requested_record.is_symlink() or any(
+        parent.is_symlink() for parent in requested_record.parents
+    ):
+        raise ValueError(f"campaign toolchain runtime record path is invalid: {role}")
+    record_path = require_experiment_path(
+        requested_record, role=f"{role} runtime record"
+    )
+    if not record_path.is_file():
+        raise ValueError(f"campaign toolchain runtime record path is invalid: {role}")
+    persisted = json.loads(record_path.read_text(encoding="utf-8"))
+    if persisted != dict(record):
+        raise ValueError(f"campaign toolchain runtime record file drift: {role}")
+
+    requested_checkout = Path(str(record["checkout"])).expanduser()
+    if requested_checkout.is_symlink():
+        raise ValueError(f"campaign toolchain checkout cannot be a symlink: {role}")
+    checkout = requested_checkout.resolve()
+    configured = configured_checkout or Path(str(config[f"{role}_checkout"]))
+    if checkout != configured.expanduser().resolve() or not checkout.is_dir():
+        raise ValueError(f"campaign toolchain checkout differs for {role}")
+    status = _runtime_probe(
+        ["git", "-C", str(checkout), "status", "--porcelain"], cwd=checkout
+    )
+    commit = _runtime_probe(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"], cwd=checkout
+    )
+    if status.returncode != 0 or status.stdout.strip():
+        raise ValueError(f"campaign toolchain checkout is not clean: {role}")
+    if commit.returncode != 0 or commit.stdout.strip() != record["commit"]:
+        raise ValueError(f"campaign toolchain commit drift: {role}")
+
+    launcher = _verify_runtime_file(record, prefix="launcher", role=role)
+    interpreter = _verify_runtime_file(record, prefix="interpreter", role=role)
+    if not os.access(launcher, os.X_OK) or not os.access(interpreter, os.X_OK):
+        raise ValueError(f"campaign toolchain runtime is not executable: {role}")
+    version = _runtime_probe([str(interpreter), "--version"], cwd=checkout)
+    observed_version = (version.stdout or version.stderr).strip()
+    if version.returncode != 0 or observed_version != record["runtime_version"]:
+        raise ValueError(f"campaign toolchain runtime version drift: {role}")
+
+    entrypoint = _verified_checkout_file(
+        record["entrypoint"], checkout=checkout, role=role, label="entrypoint"
+    )
+    if _file_sha256(entrypoint) != _normalized_hash(record["entrypoint_sha256"]):
+        raise ValueError(f"campaign toolchain entrypoint drift: {role}")
+    requested_import_root = Path(str(record["import_root"])).expanduser()
+    import_root = requested_import_root.resolve()
+    if (
+        requested_import_root.is_symlink()
+        or not import_root.is_dir()
+        or not import_root.is_relative_to(checkout)
+    ):
+        raise ValueError(f"campaign toolchain import root escaped checkout: {role}")
+    if _source_tree_sha256(import_root) != _normalized_hash(
+        record["import_root_sha256"]
+    ):
+        raise ValueError(f"campaign toolchain import tree drift: {role}")
+
+    module = _TOOL_MODULES[role]
+    import_map = record.get("import_map")
+    expected_import = {"path": str(entrypoint), "sha256": _file_sha256(entrypoint)}
+    if not isinstance(import_map, Mapping) or dict(import_map) != {
+        module: expected_import
+    }:
+        raise ValueError(f"campaign toolchain import map drift: {role}")
+    if role != "birdclaw":
+        origin = _resolve_module_origin(
+            interpreter,
+            module=module,
+            role=role,
+            config=config,
+            cwd=(
+                Path(str(config["tradelab_checkout"])).resolve()
+                if role == "agent_broker"
+                else checkout
+            ),
         )
-        if status.returncode != 0 or status.stdout.strip():
-            raise ValueError(f"campaign toolchain checkout is not clean: {role}")
-        if commit.returncode != 0 or commit.stdout.strip() != record["commit"]:
-            raise ValueError(f"campaign toolchain commit drift: {role}")
-        digest = hashlib.sha256(entrypoint.read_bytes()).hexdigest()
-        if digest != str(record["entrypoint_sha256"]).removeprefix("sha256:"):
-            raise ValueError(f"campaign toolchain entrypoint drift: {role}")
+        if origin != entrypoint:
+            raise ValueError(f"campaign toolchain module resolution drift: {role}")
+
+    _verify_dependency_identity(
+        record["dependency_identity"],
+        checkout=checkout,
+        import_root=import_root,
+        role=role,
+    )
+    prefix = record.get("argv_prefix")
+    expected_prefix = {
+        "birdclaw": [str(launcher), str(entrypoint)],
+        "market_cartographer": [str(launcher), "-m", "market_cartographer.cli"],
+        "tradelab": [str(launcher), "-m", "scripts.market_context"],
+        "agent_broker": [str(launcher)],
+    }[role]
+    if prefix != expected_prefix:
+        raise ValueError(f"campaign toolchain argv prefix drift: {role}")
+    if role == "agent_broker":
+        _verify_launcher_shebang(launcher, interpreter=interpreter)
+        if (
+            launcher.resolve()
+            != Path(str(config["agent_broker"])).expanduser().resolve()
+        ):
+            raise ValueError("campaign Agent Broker launcher differs from executable")
+    return dict(record)
+
+
+def _runtime_probe(
+    command: list[str], *, cwd: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=False,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        env=_sanitized_subprocess_env(role="broker_inert"),
+    )
+
+
+def _verify_runtime_file(record: Mapping[str, Any], *, prefix: str, role: str) -> Path:
+    requested = Path(str(record[prefix])).expanduser()
+    if not requested.is_absolute() or not requested.is_file():
+        raise ValueError(f"campaign toolchain {prefix} is invalid: {role}")
+    observed_link = os.readlink(requested) if requested.is_symlink() else None
+    if observed_link != record[f"{prefix}_symlink_target"]:
+        raise ValueError(f"campaign toolchain {prefix} symlink drift: {role}")
+    resolved = requested.resolve()
+    if str(resolved) != record[f"{prefix}_realpath"]:
+        raise ValueError(f"campaign toolchain {prefix} realpath drift: {role}")
+    digest = _file_sha256(requested)
+    if digest != _normalized_hash(record[f"{prefix}_sha256"]):
+        raise ValueError(f"campaign toolchain {prefix} drift: {role}")
+    if prefix == "launcher" and digest != _normalized_hash(
+        record["launcher_realpath_sha256"]
+    ):
+        raise ValueError(f"campaign toolchain launcher realpath drift: {role}")
+    return requested
+
+
+def _verified_checkout_file(
+    value: Any, *, checkout: Path, role: str, label: str
+) -> Path:
+    requested = Path(str(value)).expanduser()
+    resolved = requested.resolve()
+    if (
+        not requested.is_absolute()
+        or requested.is_symlink()
+        or not resolved.is_file()
+        or not resolved.is_relative_to(checkout)
+    ):
+        raise ValueError(f"campaign toolchain {label} escaped checkout: {role}")
+    return resolved
+
+
+def _source_tree_sha256(root: Path) -> str:
+    entries: list[dict[str, str]] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root)
+        if path.is_symlink():
+            raise ValueError(
+                f"campaign toolchain import tree contains symlink: {relative}"
+            )
+        if not path.is_file():
+            continue
+        if (
+            "__pycache__" in relative.parts
+            or path.suffix in {".pyc", ".pyo"}
+            or path.name == ".DS_Store"
+        ):
+            continue
+        entries.append({"path": relative.as_posix(), "sha256": _file_sha256(path)})
+    if not entries:
+        raise ValueError("campaign toolchain import tree is empty")
+    return canonical_sha256(entries)
+
+
+def _resolve_module_origin(
+    interpreter: Path,
+    *,
+    module: str,
+    role: str,
+    config: Mapping[str, Any],
+    cwd: Path,
+) -> Path:
+    env = _sanitized_subprocess_env(role="broker_inert")
+    if role == "market_cartographer":
+        env["PYTHONPATH"] = os.pathsep.join(
+            [
+                str(Path(str(config["market_cartographer_checkout"])) / "src"),
+                str(Path(str(config["kernel_src"]))),
+            ]
+        )
+    elif role == "tradelab":
+        env["PYTHONPATH"] = os.pathsep.join(
+            [
+                str(Path(str(config["tradelab_checkout"]))),
+                str(Path(str(config["kernel_src"]))),
+            ]
+        )
+    script = (
+        "import importlib.util; "
+        f"spec=importlib.util.find_spec({module!r}); "
+        "print(spec.origin if spec and spec.origin else '')"
+    )
+    completed = subprocess.run(
+        [str(interpreter), "-c", script],
+        check=False,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise ValueError(f"campaign toolchain module is unavailable: {role}")
+    return Path(completed.stdout.strip()).resolve()
+
+
+def _verify_dependency_identity(
+    value: Any, *, checkout: Path, import_root: Path, role: str
+) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"mode", "path", "sha256"}:
+        raise ValueError(f"campaign toolchain dependency identity is invalid: {role}")
+    if value["mode"] == "source_tree_only":
+        if value["path"] is not None or _normalized_hash(
+            value["sha256"]
+        ) != _source_tree_sha256(import_root):
+            raise ValueError(f"campaign toolchain source dependency drift: {role}")
+        return
+    if value["mode"] != "lockfile":
+        raise ValueError(f"campaign toolchain dependency mode is invalid: {role}")
+    lock = Path(str(value["path"])).expanduser()
+    if (
+        not lock.is_absolute()
+        or lock.is_symlink()
+        or not lock.is_file()
+        or not lock.resolve().is_relative_to(checkout)
+    ):
+        raise ValueError(f"campaign toolchain dependency lock is invalid: {role}")
+    if _file_sha256(lock) != _normalized_hash(value["sha256"]):
+        raise ValueError(f"campaign toolchain dependency lock drift: {role}")
+
+
+def _verify_launcher_shebang(launcher: Path, *, interpreter: Path) -> None:
+    first = launcher.read_text(encoding="utf-8").splitlines()[0]
+    if not first.startswith("#!"):
+        raise ValueError("campaign Agent Broker launcher has no shebang")
+    tokens = shlex.split(first[2:].strip())
+    if len(tokens) != 1 or Path(tokens[0]).expanduser().resolve() != interpreter:
+        raise ValueError("campaign Agent Broker launcher shebang drift")
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _read_content_addressed(path: Path, *, schema: str) -> dict[str, Any]:
@@ -977,15 +1261,9 @@ def _prepare_daily_contract(
         birdclaw_export = {"path": None, "packet_hash": None, "output_hash": None}
     cartographer_output = attempt / "cartographer"
     cartographer_checkout = Path(str(config["market_cartographer_checkout"])).resolve()
-    cartographer_python = cartographer_checkout / ".venv" / "bin" / "python"
-    if not cartographer_python.is_file():
-        raise FileNotFoundError(
-            f"Cartographer virtualenv interpreter is unavailable: {cartographer_python}"
-        )
+    cartographer_runtime = _verify_toolchain_role(config, role="market_cartographer")
     command = [
-        str(cartographer_python),
-        "-m",
-        "market_cartographer.cli",
+        *cartographer_runtime["argv_prefix"],
         "market-context-export",
         "--provider",
         str(config["cartographer_provider"]),
@@ -1069,12 +1347,10 @@ def _export_birdclaw_context(
     config: Mapping[str, Any], *, attempt: Path, as_of: datetime
 ) -> dict[str, Any]:
     checkout = Path(str(config["birdclaw_checkout"])).resolve()
-    executable = checkout / "birdclawctl"
-    if not executable.is_file():
-        raise FileNotFoundError(f"Birdclaw entrypoint is unavailable: {executable}")
+    runtime = _verify_toolchain_role(config, role="birdclaw")
     completed = _execute_command(
         [
-            str(executable),
+            *runtime["argv_prefix"],
             "export",
             "temporal-market-context",
             "--as-of",

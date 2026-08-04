@@ -3,15 +3,72 @@ set -euo pipefail
 
 REPO_ROOT="${BHIKSHA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 LAUNCHD_DIR="${BHIKSHA_LAUNCHD_DIR:-$HOME/Library/LaunchAgents}"
-LOG_DIR="${BHIKSHA_LAUNCHD_LOG_DIR:-$REPO_ROOT/artifacts/playbook/launchd}"
-RUNTIME_FLAG_DIR="${BHIKSHA_RUNTIME_FLAG_DIR:-$REPO_ROOT/artifacts/playbook/runtime_flags}"
 ACTION="${1:-install}"
 INSTALL_SCOPE=all
 if [ "$ACTION" = "install-chart-scenario-shadow" ] || [ "$ACTION" = "uninstall-chart-scenario-shadow" ]; then
   INSTALL_SCOPE=chart-scenario-shadow
 fi
+if [ "$INSTALL_SCOPE" = "chart-scenario-shadow" ]; then
+  INSTALL_PYTHON="${BHIKSHA_PYTHON:-}"
+  case "$INSTALL_PYTHON" in
+    /*) ;;
+    *) echo "scoped chart install requires an absolute BHIKSHA_PYTHON" >&2; exit 2 ;;
+  esac
+  if [ ! -x "$INSTALL_PYTHON" ]; then
+    echo "scoped chart install requires an executable BHIKSHA_PYTHON" >&2
+    exit 2
+  fi
+  CHART_ROOT="${BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT:-$REPO_ROOT/artifacts/chart_scenarios}"
+  CHART_LOG_DIR="${BHIKSHA_LAUNCHD_LOG_DIR:-$CHART_ROOT/launchd/logs}"
+  CHART_FLAG_DIR="${BHIKSHA_RUNTIME_FLAG_DIR:-$CHART_ROOT/launchd}"
+  LOG_DIR="$CHART_LOG_DIR"
+  RUNTIME_FLAG_DIR="$CHART_FLAG_DIR"
+else
+  INSTALL_PYTHON="${BHIKSHA_PYTHON:-$(command -v python3)}"
+  CHART_ROOT="${BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT:-$REPO_ROOT/artifacts/chart_scenarios}"
+  CHART_LOG_DIR="$CHART_ROOT/launchd/logs"
+  CHART_FLAG_DIR="$CHART_ROOT/launchd"
+  LOG_DIR="${BHIKSHA_LAUNCHD_LOG_DIR:-$REPO_ROOT/artifacts/playbook/launchd}"
+  RUNTIME_FLAG_DIR="${BHIKSHA_RUNTIME_FLAG_DIR:-$REPO_ROOT/artifacts/playbook/runtime_flags}"
+fi
 
-mkdir -p "$LAUNCHD_DIR" "$LOG_DIR" "$RUNTIME_FLAG_DIR"
+"$INSTALL_PYTHON" - "$LAUNCHD_DIR" "$LOG_DIR" "$RUNTIME_FLAG_DIR" "$INSTALL_SCOPE" "$CHART_ROOT" "$CHART_LOG_DIR" "$CHART_FLAG_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+launchd_dir = Path(sys.argv[1]).expanduser()
+log_dir = Path(sys.argv[2]).expanduser()
+flag_dir = Path(sys.argv[3]).expanduser()
+install_scope = sys.argv[4]
+chart_root = Path(sys.argv[5]).expanduser()
+chart_log_dir = Path(sys.argv[6]).expanduser()
+chart_flag_dir = Path(sys.argv[7]).expanduser()
+
+def reject_symlinks(path: Path, *, label: str) -> Path:
+    if not path.is_absolute():
+        raise SystemExit(f"{label} must be absolute")
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise SystemExit(f"{label} cannot contain a symlink: {candidate}")
+    return path.resolve()
+
+launchd = reject_symlinks(launchd_dir, label="launchd directory")
+logs = reject_symlinks(log_dir, label="launchd log directory")
+flags = reject_symlinks(flag_dir, label="runtime marker directory")
+chart = reject_symlinks(chart_root, label="chart artifact root")
+chart_logs = reject_symlinks(chart_log_dir, label="chart launchd log directory")
+chart_flags = reject_symlinks(chart_flag_dir, label="chart runtime marker directory")
+if chart.parts[-2:] != ("artifacts", "chart_scenarios"):
+    raise SystemExit("chart artifact root must end in artifacts/chart_scenarios")
+if not chart_logs.is_relative_to(chart) or not chart_flags.is_relative_to(chart):
+    raise SystemExit("chart launchd logs and marker must stay under chart artifacts")
+if install_scope == "chart-scenario-shadow" and (
+    logs != chart_logs or flags != chart_flags
+):
+    raise SystemExit("scoped chart paths must use the chart artifact namespace")
+for directory in (launchd, logs, flags, chart_logs, chart_flags):
+    directory.mkdir(parents=True, exist_ok=True)
+PY
 
 case "$ACTION" in
   install|""|install-chart-scenario-shadow)
@@ -21,17 +78,22 @@ case "$ACTION" in
         *) echo "scoped chart install requires BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED=true" >&2; exit 2 ;;
       esac
     fi
-    python3 - "$REPO_ROOT" "$LAUNCHD_DIR" "$LOG_DIR" "$INSTALL_SCOPE" <<'PY'
+    "$INSTALL_PYTHON" - "$REPO_ROOT" "$LAUNCHD_DIR" "$LOG_DIR" "$INSTALL_SCOPE" "$CHART_ROOT" "$CHART_LOG_DIR" <<'PY'
 import plistlib
+import hashlib
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 repo = Path(sys.argv[1])
 launchd_dir = Path(sys.argv[2])
 log_dir = Path(sys.argv[3])
 install_scope = sys.argv[4]
+chart_root = Path(sys.argv[5])
+chart_log_dir = Path(sys.argv[6])
 runner = repo / "scripts" / "launchd" / "run_bhiksha_job.sh"
 sys.path.insert(0, str(repo / "src"))
 
@@ -81,6 +143,8 @@ for job in jobs:
         if active_plan_id is not None:
             environment["BHIKSHA_ACTIVE_PLAN_ID"] = active_plan_id
     if label == "com.bhiksha.chart-scenario-shadow":
+        plist["StandardOutPath"] = str(chart_log_dir / f"{label}.out.log")
+        plist["StandardErrorPath"] = str(chart_log_dir / f"{label}.err.log")
         kernel_src = Path(os.environ.get("BHIKSHA_KERNEL_SRC", "")).expanduser()
         if not kernel_src.is_absolute() or not (kernel_src / "mala_bhiksha_kernel").is_dir():
             raise SystemExit(
@@ -95,6 +159,34 @@ for job in jobs:
                 "installing chart-scenario-shadow"
             )
         environment["BHIKSHA_PYTHON"] = str(python_bin)
+        environment["BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT"] = str(chart_root)
+        python_realpath = python_bin.resolve(strict=True)
+        environment["BHIKSHA_CHART_PYTHON_REALPATH"] = str(python_realpath)
+        environment["BHIKSHA_CHART_PYTHON_SHA256"] = hashlib.sha256(
+            python_realpath.read_bytes()
+        ).hexdigest()
+        version = subprocess.run(
+            [str(python_bin), "--version"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        environment["BHIKSHA_CHART_PYTHON_VERSION"] = (
+            version.stdout or version.stderr
+        ).strip()
+        runner_realpath = runner.resolve(strict=True)
+        if runner.is_symlink() or not runner_realpath.is_relative_to(repo.resolve()):
+            raise SystemExit("chart launchd runner must be a real in-checkout file")
+        environment["BHIKSHA_CHART_RUNNER_SHA256"] = hashlib.sha256(
+            runner_realpath.read_bytes()
+        ).hexdigest()
+        commit = subprocess.run(
+            ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        environment["BHIKSHA_CHART_REPO_COMMIT"] = commit
         env_file = os.environ.get("BHIKSHA_ENV_FILE")
         if env_file:
             resolved_env = Path(env_file).expanduser()
@@ -104,8 +196,25 @@ for job in jobs:
     if environment:
         plist["EnvironmentVariables"] = environment
     path = launchd_dir / f"{label}.plist"
-    path.write_bytes(plistlib.dumps(plist, sort_keys=True))
-    path.chmod(0o600)
+    if path.is_symlink():
+        raise SystemExit(f"launchd plist cannot be a symlink: {path}")
+    for log_path in (Path(plist["StandardOutPath"]), Path(plist["StandardErrorPath"])):
+        if log_path.is_symlink():
+            raise SystemExit(f"chart launchd log cannot be a symlink: {log_path}")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=launchd_dir)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(plistlib.dumps(plist, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
     print(f"WROTE {path}")
 PY
     if [ "$INSTALL_SCOPE" = "all" ]; then
@@ -120,10 +229,32 @@ PY
     fi
     case "${BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED:-}" in
       1|true|TRUE|yes|YES|on|ON)
-        touch "$RUNTIME_FLAG_DIR/chart_scenario_shadow.enabled"
+        "$INSTALL_PYTHON" - "$CHART_FLAG_DIR/chart_scenario_shadow.enabled" <<'PY'
+import os
+import tempfile
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+    raise SystemExit(f"chart runtime marker cannot contain a symlink: {path}")
+descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
         ;;
       *)
-        rm -f "$RUNTIME_FLAG_DIR/chart_scenario_shadow.enabled"
+        rm -f "$CHART_FLAG_DIR/chart_scenario_shadow.enabled"
         ;;
     esac
     uid="$(id -u)"
@@ -194,7 +325,7 @@ PY
       rm -f "$LAUNCHD_DIR/$label.plist"
       echo "UNLOADED $label"
     done
-    rm -f "$RUNTIME_FLAG_DIR/chart_scenario_shadow.enabled"
+    rm -f "$CHART_FLAG_DIR/chart_scenario_shadow.enabled"
     if [ "$INSTALL_SCOPE" = "all" ]; then
       rm -f "$RUNTIME_FLAG_DIR/exit_edge_live_shadow.enabled"
     fi

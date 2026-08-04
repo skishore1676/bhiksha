@@ -324,10 +324,16 @@ and event hashes, and reject any mismatch without trusting Bhiksha's replay
 conclusion.
 
 Before any external tool invocation, the coordinator verifies a frozen
-toolchain record for Birdclaw, Market Cartographer, TradeLab, and Agent Broker:
-resolved checkout, exact clean Git commit, resolved in-checkout entrypoint, and
-entrypoint SHA-256. Symlink escape, dirty checkout, commit drift, or executable
-drift fails closed. Subprocess environments are role-scoped. Broker-inert tools
+runtime-record file for Birdclaw, Market Cartographer, TradeLab, and Agent
+Broker. Every record is content addressed and binds its stable path, resolved
+checkout and clean Git commit, actual argv prefix, launcher and interpreter
+path/symlink/realpath/digest/version, entrypoint and import-tree/map digests,
+and dependency-lock identity. The coordinator revalidates the applicable
+record immediately before each invocation and constructs argv only from its
+frozen prefix. TradeLab independently rereads and revalidates the Agent Broker
+record immediately before both ranker and narrative calls. Symlink escape,
+ignored-venv substitution, editable-import drift, dirty checkout, commit drift,
+or executable drift fails closed. Subprocess environments are role-scoped. Broker-inert tools
 receive no Public or Schwab credentials; the live exporter receives only the
 existing Schwab token-file/data settings and uses a GET-only client that cannot
 refresh or persist OAuth state; the Sheet process receives only the Google
@@ -341,13 +347,25 @@ The remaining global partition must be exactly one canonical `installed` event
 per plan scenario, first for that scenario and authenticated to the installed
 plan; omissions, extras, duplicates, or wrong event types are rejected.
 
-The isolated launchd plist pins `BHIKSHA_KERNEL_SRC` and the absolute executable
-`BHIKSHA_PYTHON`; coordinator startup
+The isolated launchd plist pins `BHIKSHA_KERNEL_SRC`, the absolute executable
+`BHIKSHA_PYTHON`, and `BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT`; coordinator startup
 verifies `mala_bhiksha_kernel.__file__` resolves beneath that reviewed source
-tree. `BHIKSHA_ENV_FILE` may point at the existing production `.env` so the
+tree. The installer also captures the Bhiksha commit, runner digest, and Python
+realpath/digest/version. Before reading the chart marker, the runner revalidates
+those identities with absolute system tools, requires a clean checkout, and
+uses the pinned Python for both path validation and the coordinator process;
+`PATH` cannot substitute a different interpreter. `BHIKSHA_ENV_FILE` may point
+at the existing production `.env` so the
 isolated checkout can reuse credentials without copying secrets. The Sheet
 projector prefers its lane-specific credential override and falls back to
 Bhiksha's existing `GOOGLE_API_CREDENTIALS_PATH`.
+
+The scoped installer rejects symlinks in the launchd, chart-log, chart-marker,
+and chart-artifact paths. It writes the plist and opt-in marker atomically. The
+chart logs, status, and marker live only under
+`artifacts/chart_scenarios/launchd/`; a legacy marker under
+`artifacts/playbook/runtime_flags/` cannot arm this job. Scoped install and
+rollback never rewrite or reload the seven production Bhiksha jobs.
 
 The Sheet writer accepts only `Chart_Scenarios_v1` with the exact v1 header
 contract and key `(campaign_id, run_id, arm, scenario_id)`. It identifies blank

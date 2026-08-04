@@ -1,8 +1,11 @@
+import hashlib
 import os
 import plistlib
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from bhiksha.ops.launchd_registry import active_launchd_jobs, registered_launchd_jobs
 
@@ -73,6 +76,9 @@ def test_installer_persists_stable_plan_id_only_for_live_restart_jobs(
         "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
         "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
         "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
+            tmp_path / "artifacts/chart_scenarios"
+        ),
         "BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED": "true",
         "BHIKSHA_ACTIVE_PLAN_ID": ("active_plan_2026-07-27_exit_engine_v2_iwm_canary"),
     }
@@ -119,8 +125,13 @@ def test_chart_scenario_install_pins_kernel_and_existing_env_file(tmp_path) -> N
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "BHIKSHA_REPO_ROOT": str(repo),
         "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
-        "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
-        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+        "BHIKSHA_LAUNCHD_LOG_DIR": str(
+            tmp_path / "artifacts/chart_scenarios/launchd/logs"
+        ),
+        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "artifacts/chart_scenarios/launchd"),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
+            tmp_path / "artifacts/chart_scenarios"
+        ),
         "BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED": "true",
         "BHIKSHA_KERNEL_SRC": str(kernel_src),
         "BHIKSHA_PYTHON": sys.executable,
@@ -143,14 +154,41 @@ def test_chart_scenario_install_pins_kernel_and_existing_env_file(tmp_path) -> N
     payload = plistlib.loads(
         (launchd_dir / "com.bhiksha.chart-scenario-shadow.plist").read_bytes()
     )
+    python_realpath = Path(sys.executable).resolve()
+    version_result = subprocess.run(
+        [sys.executable, "--version"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    python_version = (version_result.stdout or version_result.stderr).strip()
+    runner_path = repo / "scripts/launchd/run_bhiksha_job.sh"
+    repo_commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
     assert payload["EnvironmentVariables"] == {
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
+            tmp_path / "artifacts/chart_scenarios"
+        ),
+        "BHIKSHA_CHART_PYTHON_REALPATH": str(python_realpath),
+        "BHIKSHA_CHART_PYTHON_SHA256": hashlib.sha256(
+            python_realpath.read_bytes()
+        ).hexdigest(),
+        "BHIKSHA_CHART_PYTHON_VERSION": python_version,
+        "BHIKSHA_CHART_REPO_COMMIT": repo_commit,
+        "BHIKSHA_CHART_RUNNER_SHA256": hashlib.sha256(
+            runner_path.read_bytes()
+        ).hexdigest(),
         "BHIKSHA_ENV_FILE": str(env_file),
         "BHIKSHA_KERNEL_SRC": str(kernel_src),
         "BHIKSHA_PYTHON": sys.executable,
     }
     runner = Path("scripts/launchd/run_bhiksha_job.sh").read_text(encoding="utf-8")
     assert "BHIKSHA_KERNEL_SRC" in runner
-    assert "chart-scenario-shadow requires an absolute executable" in runner
+    assert "chart-scenario-shadow requires an absolute BHIKSHA_PYTHON" in runner
 
 
 def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> None:
@@ -165,7 +203,7 @@ def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> 
     launch_log = tmp_path / "launchctl.log"
     launchctl = fake_bin / "launchctl"
     launchctl.write_text(
-        f"#!/usr/bin/env bash\necho \"$*\" >> {launch_log}\n",
+        f'#!/usr/bin/env bash\necho "$*" >> {launch_log}\n',
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
@@ -176,8 +214,13 @@ def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> 
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "BHIKSHA_REPO_ROOT": str(repo),
         "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
-        "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
-        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+        "BHIKSHA_LAUNCHD_LOG_DIR": str(
+            tmp_path / "artifacts/chart_scenarios/launchd/logs"
+        ),
+        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "artifacts/chart_scenarios/launchd"),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
+            tmp_path / "artifacts/chart_scenarios"
+        ),
         "BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED": "true",
         "BHIKSHA_KERNEL_SRC": str(kernel_src),
         "BHIKSHA_PYTHON": sys.executable,
@@ -201,7 +244,9 @@ def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> 
     assert "com.bhiksha.chart-scenario-shadow" in calls
     assert "com.bhiksha.live-start" not in calls
 
-    marker = tmp_path / "flags" / "chart_scenario_shadow.enabled"
+    marker = (
+        tmp_path / "artifacts/chart_scenarios/launchd/chart_scenario_shadow.enabled"
+    )
     assert marker.exists()
     subprocess.run(
         [
@@ -217,6 +262,162 @@ def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> 
     )
     assert not marker.exists()
     assert live_plist.read_bytes() == sentinel
+
+
+@pytest.mark.parametrize("escaped", ["launchd", "logs", "marker"])
+def test_scoped_chart_install_rejects_symlinked_effect_paths(
+    tmp_path, escaped: str
+) -> None:
+    repo = Path.cwd().resolve()
+    chart_root = tmp_path / "artifacts/chart_scenarios"
+    chart_launchd = chart_root / "launchd"
+    chart_launchd.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    launchd_dir = tmp_path / "LaunchAgents"
+    logs = chart_launchd / "logs"
+    marker_dir = chart_launchd
+    if escaped == "launchd":
+        launchd_dir.symlink_to(outside)
+    else:
+        launchd_dir.mkdir()
+    if escaped == "logs":
+        logs.symlink_to(outside)
+    else:
+        logs.mkdir()
+    if escaped == "marker":
+        marker_dir = chart_root / "marker-link"
+        marker_dir.symlink_to(outside)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    launchctl.chmod(0o755)
+    path_python = fake_bin / "python3"
+    path_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path_python.chmod(0o755)
+    kernel_src = tmp_path / "kernel/src"
+    (kernel_src / "mala_bhiksha_kernel").mkdir(parents=True)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BHIKSHA_REPO_ROOT": str(repo),
+        "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
+        "BHIKSHA_LAUNCHD_LOG_DIR": str(logs),
+        "BHIKSHA_RUNTIME_FLAG_DIR": str(marker_dir),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(chart_root),
+        "BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED": "true",
+        "BHIKSHA_KERNEL_SRC": str(kernel_src),
+        "BHIKSHA_PYTHON": sys.executable,
+    }
+    completed = subprocess.run(
+        [
+            "bash",
+            "scripts/launchd/install_bhiksha_launchd.sh",
+            "install-chart-scenario-shadow",
+        ],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert not (outside / "com.bhiksha.chart-scenario-shadow.plist").exists()
+    assert not (outside / "chart_scenario_shadow.enabled").exists()
+
+
+def test_chart_runner_uses_only_installed_chart_marker(tmp_path) -> None:
+    repo = tmp_path / "isolated-bhiksha"
+    repo.mkdir()
+    package = repo / "src/bhiksha/tools"
+    package.mkdir(parents=True)
+    (repo / "src/bhiksha/__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "launchd_job.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['CAPTURE']).write_text("
+        "os.environ['BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED'])\n",
+        encoding="utf-8",
+    )
+    (repo / ".gitignore").write_text("/artifacts/\n", encoding="utf-8")
+    chart_root = repo / "artifacts/chart_scenarios"
+    chart_launchd = chart_root / "launchd"
+    chart_launchd.mkdir(parents=True)
+    playbook_flags = repo / "artifacts/playbook/runtime_flags"
+    playbook_flags.mkdir(parents=True)
+    capture = tmp_path / "capture.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python3 = fake_bin / "python3"
+    fake_python3.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    fake_python3.chmod(0o755)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    repo_commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    python = Path(sys.executable)
+    python_realpath = python.resolve()
+    version = subprocess.run(
+        [str(python), "--version"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    runner = Path("scripts/launchd/run_bhiksha_job.sh").resolve()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BHIKSHA_REPO_ROOT": str(repo),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(chart_root),
+        "BHIKSHA_PYTHON": str(python),
+        "BHIKSHA_CHART_PYTHON_REALPATH": str(python_realpath),
+        "BHIKSHA_CHART_PYTHON_SHA256": hashlib.sha256(
+            python_realpath.read_bytes()
+        ).hexdigest(),
+        "BHIKSHA_CHART_PYTHON_VERSION": (version.stdout or version.stderr).strip(),
+        "BHIKSHA_CHART_RUNNER_SHA256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+        "BHIKSHA_CHART_REPO_COMMIT": repo_commit,
+        "CAPTURE": str(capture),
+    }
+    marker = chart_launchd / "chart_scenario_shadow.enabled"
+    marker.write_text("", encoding="utf-8")
+    subprocess.run(
+        ["bash", "scripts/launchd/run_bhiksha_job.sh", "chart-scenario-shadow"],
+        cwd=Path.cwd(),
+        env=env,
+        check=True,
+    )
+    assert capture.read_text(encoding="utf-8") == "true"
+
+    marker.unlink()
+    (playbook_flags / "chart_scenario_shadow.enabled").write_text("", encoding="utf-8")
+    subprocess.run(
+        ["bash", "scripts/launchd/run_bhiksha_job.sh", "chart-scenario-shadow"],
+        cwd=Path.cwd(),
+        env=env,
+        check=True,
+    )
+    assert capture.read_text(encoding="utf-8") == "false"
 
 
 def test_generic_install_omits_plan_id_and_blank_explicit_value_fails(
@@ -236,6 +437,9 @@ def test_generic_install_omits_plan_id_and_blank_explicit_value_fails(
         "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
         "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
         "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT": str(
+            tmp_path / "artifacts/chart_scenarios"
+        ),
     }
     base_env.pop("BHIKSHA_ACTIVE_PLAN_ID", None)
     base_env.pop("BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED", None)
@@ -270,7 +474,8 @@ def test_exit_edge_restart_paths_read_persistent_allowlisted_marker() -> None:
     assert "runtime_flags/exit_edge_live_shadow.enabled" in runner
     assert "export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=true" in runner
     assert "export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=false" in runner
-    assert "runtime_flags/chart_scenario_shadow.enabled" in runner
+    assert "chart_scenario_shadow.enabled" in runner
+    assert "runtime_flags/chart_scenario_shadow.enabled" not in runner
     assert "export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=true" in runner
     assert "export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=false" in runner
 
@@ -326,7 +531,10 @@ def test_bhiksha_launchd_runner_points_at_bhiksha_policy_module() -> None:
     script = Path("scripts/launchd/run_bhiksha_job.sh").read_text(encoding="utf-8")
 
     assert "bhiksha.tools.launchd_job" in script
-    assert 'PYTHONPATH="$REPO_ROOT/src${BHIKSHA_KERNEL_SRC:+:$BHIKSHA_KERNEL_SRC}"' in script
+    assert (
+        'PYTHONPATH="$REPO_ROOT/src${BHIKSHA_KERNEL_SRC:+:$BHIKSHA_KERNEL_SRC}"'
+        in script
+    )
 
 
 def test_retired_weekly_calculators_are_not_live_publish_jobs() -> None:
