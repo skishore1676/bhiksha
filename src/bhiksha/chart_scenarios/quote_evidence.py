@@ -42,10 +42,6 @@ def selected_raw_quote(
         if normalize_option_symbol(str(key)) == normalized
         and isinstance(value, Mapping)
     ]
-    if not matches:
-        values = list(payload.values())
-        if len(values) == 1 and isinstance(values[0], Mapping):
-            matches = [values[0]]
     if len(matches) != 1:
         raise ValueError("Schwab quote response omitted the exact selected contract")
     raw = json.loads(json.dumps(dict(matches[0]), allow_nan=False))

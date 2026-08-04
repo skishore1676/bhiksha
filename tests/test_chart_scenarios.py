@@ -52,7 +52,7 @@ from bhiksha.chart_scenarios.policies import (
     OptionSelectionPolicy,
     QuoteEligibilityPolicy,
 )
-from bhiksha.chart_scenarios.quote_evidence import build_live_quote
+from bhiksha.chart_scenarios.quote_evidence import build_live_quote, selected_raw_quote
 from bhiksha.chart_scenarios.repository import IdempotencyConflict
 from bhiksha.chart_scenarios.timeframes import (
     CALENDAR_VERSION,
@@ -1449,6 +1449,26 @@ def test_raw_quote_rejects_secrets_and_static_occ_join_attacks() -> None:
         selection_mode="canonical_selector",
     )
     assert without_optional_reference["strike"] == contract.strike
+
+    wrong_symbol_payload = {
+        "IWM260807C00200000": {
+            **raw_without_reference,
+            "reference": {},
+        }
+    }
+    with pytest.raises(ValueError, match="omitted the exact selected contract"):
+        selected_raw_quote(
+            wrong_symbol_payload,
+            option_symbol=contract.option_symbol,
+        )
+    exact_symbol_payload = {contract.option_symbol: raw_without_reference}
+    assert (
+        selected_raw_quote(
+            exact_symbol_payload,
+            option_symbol=" SPY 260807C00100000 ",
+        )
+        == raw_without_reference
+    )
 
     # Delta and OI legitimately drift between chain and quote acquisition.
     assert quote["delta"] == 0.5
