@@ -189,6 +189,16 @@ class ProspectiveQuoteTapeRepository:
                   censored_at TEXT NOT NULL,
                   FOREIGN KEY (cohort_id) REFERENCES exit_edge_cohorts(cohort_id)
                 );
+                CREATE TABLE IF NOT EXISTS exit_edge_quote_rejections (
+                  cohort_id TEXT NOT NULL, rejection_sequence INTEGER NOT NULL,
+                  source TEXT NOT NULL, feed TEXT NOT NULL,
+                  reason TEXT NOT NULL, quote_timestamp_field TEXT,
+                  quote_at TEXT, received_at TEXT NOT NULL,
+                  bid REAL, ask REAL, last REAL, freshness_ms REAL,
+                  recorded_at TEXT NOT NULL,
+                  PRIMARY KEY (cohort_id, rejection_sequence),
+                  FOREIGN KEY (cohort_id) REFERENCES exit_edge_cohorts(cohort_id)
+                );
                 CREATE TABLE IF NOT EXISTS exit_edge_registration_attempts (
                   trade_id TEXT PRIMARY KEY, deployment_id TEXT NOT NULL,
                   symbol TEXT NOT NULL, option_symbol TEXT NOT NULL,
@@ -329,6 +339,86 @@ class ProspectiveQuoteTapeRepository:
             return True
         except (OSError, sqlite3.Error, TypeError, ValueError):
             return False
+
+    def try_record_quote_rejection(
+        self,
+        cohort_id: str,
+        *,
+        source: str,
+        feed: str,
+        reason: str,
+        quote_timestamp_field: str | None,
+        quote_at: datetime | None,
+        received_at: datetime,
+        bid: float | None,
+        ask: float | None,
+        last: float | None,
+    ) -> bool:
+        """Persist a rejected provider observation without poisoning the tape."""
+
+        try:
+            freshness_ms = (
+                (received_at - quote_at).total_seconds() * 1000
+                if quote_at is not None
+                else None
+            )
+            with self._connect() as conn:
+                cohort = conn.execute(
+                    "SELECT quote_source,quote_feed FROM exit_edge_cohorts "
+                    "WHERE cohort_id=?",
+                    (cohort_id,),
+                ).fetchone()
+                if cohort is None:
+                    raise ValueError("orphan rejection: cohort is not registered")
+                if tuple(cohort) != (source, feed):
+                    raise ValueError("rejected quote source/feed lineage changed")
+                row = conn.execute(
+                    "SELECT MAX(rejection_sequence) "
+                    "FROM exit_edge_quote_rejections WHERE cohort_id=?",
+                    (cohort_id,),
+                ).fetchone()
+                sequence = int(row[0]) + 1 if row and row[0] is not None else 1
+                conn.execute(
+                    "INSERT INTO exit_edge_quote_rejections "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        cohort_id,
+                        sequence,
+                        source,
+                        feed,
+                        reason,
+                        quote_timestamp_field,
+                        quote_at.isoformat() if quote_at is not None else None,
+                        received_at.isoformat(),
+                        bid,
+                        ask,
+                        last,
+                        freshness_ms,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            return True
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def quote_rejection_summary(self, cohort_id: str) -> dict[str, Any]:
+        """Return durable rejection counts for shutdown and operator readback."""
+
+        try:
+            with self._connect(
+                timeout_seconds=SQLITE_READBACK_TIMEOUT_SECONDS
+            ) as conn:
+                rows = conn.execute(
+                    "SELECT reason,COUNT(*) FROM exit_edge_quote_rejections "
+                    "WHERE cohort_id=? GROUP BY reason ORDER BY reason",
+                    (cohort_id,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table: exit_edge_quote_rejections" not in str(exc):
+                raise
+            rows = []
+        reasons = {str(reason): int(count) for reason, count in rows}
+        return {"count": sum(reasons.values()), "reasons": reasons}
 
     def record_censor(self, cohort_id: str, reason: str) -> None:
         if not reason:
@@ -876,6 +966,13 @@ def analyze_prospective_repository(
         observed_at_end=observed_at_end,
     )
     summary = report["summary"]
+    rejection_reasons: dict[str, int] = {}
+    for case in cases:
+        rejected = repository.quote_rejection_summary(case.cohort_id)
+        for reason, count in rejected["reasons"].items():
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + int(count)
+    summary["rejected_quote_count"] = sum(rejection_reasons.values())
+    summary["rejected_quote_reasons"] = dict(sorted(rejection_reasons.items()))
     blockers: list[str] = []
     if denominator["eligible_attempts"] != denominator["registered_cohorts"]:
         blockers.append("eligible_registration_denominator_incomplete")
@@ -913,7 +1010,7 @@ def analyze_prospective_repository(
     except (OSError, json.JSONDecodeError):
         blockers.append("live_health_readback_missing")
     if health is not None:
-        if int(health.get("schema_version") or 0) not in {1, 2}:
+        if int(health.get("schema_version") or 0) not in {1, 2, 3}:
             blockers.append("live_health_schema_invalid")
         if health.get("enabled") is not True:
             blockers.append("live_health_disabled")

@@ -404,6 +404,10 @@ def _report_summary(report: dict[str, Any]) -> dict[str, Any]:
         "risk_envelope_missingness": dict(
             summary.get("risk_envelope_missingness") or {}
         ),
+        "rejected_quote_count": int(summary.get("rejected_quote_count") or 0),
+        "rejected_quote_reasons": dict(
+            summary.get("rejected_quote_reasons") or {}
+        ),
         "inference_eligible": bool(summary.get("inference_eligible", False)),
         "inference_blockers": list(summary.get("inference_blockers") or []),
         "confidence": dict(summary.get("confidence") or {}),
@@ -429,6 +433,8 @@ def _empty_summary() -> dict[str, Any]:
         "homogeneous_experiment_spec": None,
         "risk_envelope_candidate_vs_control": {},
         "risk_envelope_missingness": {},
+        "rejected_quote_count": 0,
+        "rejected_quote_reasons": {},
         "inference_eligible": False,
         "inference_blockers": [],
         "confidence": {},

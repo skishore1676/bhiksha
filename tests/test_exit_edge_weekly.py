@@ -13,6 +13,7 @@ from bhiksha.ops.exit_edge_weekly import (
     _cohort_rows,
     _fail_closed_heterogeneity,
     _maturity_stage,
+    _report_summary,
     _v2_summary,
     build_exit_edge_weekly_evidence,
     stable_digest,
@@ -90,6 +91,26 @@ def test_missing_collection_is_explicitly_unavailable_not_zero_edge(tmp_path) ->
     assert evidence["cumulative"]["paired_count"] == 0
     assert evidence["inference"]["decision_ready"] is False
     assert evidence["receipt"]["status"] == "ok"
+
+
+def test_weekly_summary_preserves_durable_quote_rejections() -> None:
+    summary = _report_summary(
+        {
+            "summary": {
+                "rejected_quote_count": 3,
+                "rejected_quote_reasons": {
+                    "missing_provider_quote_timestamp": 1,
+                    "stale_quote_gap": 2,
+                },
+            }
+        }
+    )
+
+    assert summary["rejected_quote_count"] == 3
+    assert summary["rejected_quote_reasons"] == {
+        "missing_provider_quote_timestamp": 1,
+        "stale_quote_gap": 2,
+    }
 
 
 def test_heterogeneous_v2_summary_uses_explicit_fail_closed_verdict() -> None:
