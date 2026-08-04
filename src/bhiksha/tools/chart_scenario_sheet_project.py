@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt", required=True)
     parser.add_argument(
         "--credentials",
-        default=os.getenv("BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH"),
+        default=_credentials_path(),
     )
     args = parser.parse_args(argv)
     if not args.credentials:
@@ -43,6 +43,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(json.dumps(receipt, sort_keys=True))
     return 0
+
+
+def _credentials_path() -> str | None:
+    """Prefer the lane override, then Bhiksha's existing canonical credential."""
+
+    return os.getenv("BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH") or os.getenv(
+        "GOOGLE_API_CREDENTIALS_PATH"
+    )
 
 
 if __name__ == "__main__":

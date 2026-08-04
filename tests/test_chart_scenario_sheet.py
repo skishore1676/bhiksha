@@ -12,6 +12,7 @@ from bhiksha.ops.chart_scenario_sheet import (
     SHEET_NAME,
     project_sheet_upsert_request,
 )
+from bhiksha.tools.chart_scenario_sheet_project import _credentials_path
 
 
 def _request(row: list[object]) -> dict:
@@ -112,3 +113,16 @@ def test_sheet_projection_uses_key_occupancy_and_exact_reread(tmp_path: Path) ->
     assert second["exact_reread"] is True
     assert second["effects"]["sheet_tab"] == SHEET_NAME
     assert receipt_path.is_file()
+
+
+def test_sheet_projector_uses_existing_canonical_credentials_fallback(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH", raising=False)
+    monkeypatch.setenv("GOOGLE_API_CREDENTIALS_PATH", "/secure/google.json")
+    assert _credentials_path() == "/secure/google.json"
+
+    monkeypatch.setenv(
+        "BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH", "/secure/chart-only.json"
+    )
+    assert _credentials_path() == "/secure/chart-only.json"

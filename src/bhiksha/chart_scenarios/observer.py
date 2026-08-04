@@ -24,12 +24,17 @@ from .quotes import (
 )
 from .repository import (
     EventWrite,
+    IdempotencyConflict,
     ScenarioEventRepository,
     TerminalScenarioError,
     canonical_observation_slot_id,
 )
 from .triggers import evaluate_condition, normalize_bars
 from .validation import TRIGGER_VERSION, ShadowPlan, validate_bundle
+
+
+class QuoteTapeConflict(IdempotencyConflict):
+    """A persisted quote identity was reused with different immutable facts."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +140,10 @@ class BrokerInertScenarioObserver:
         scenario: ChartScenarioSpec,
         *,
         bars: Sequence[CompletedBar | Mapping[str, Any]] = (),
+        bars_by_timeframe: Mapping[str, Mapping[str, Any]] | None = None,
         option_quote: OptionQuoteSnapshot | Mapping[str, Any] | None = None,
         quote_path: Sequence[OptionQuoteSnapshot | Mapping[str, Any]] = (),
+        option_selection: Mapping[str, Any] | None = None,
         evaluated_at: datetime | str | None = None,
         market_observation_id: str | None = None,
         observation_slot_ordinal: int = 1,
@@ -159,12 +166,47 @@ class BrokerInertScenarioObserver:
             raise TypeError("observer option_quote requires an exact raw mapping")
         if any(not isinstance(quote, Mapping) for quote in quote_path):
             raise TypeError("observer quote_path requires exact raw mappings")
-        normalized_bars = normalize_bars(bars)
+        required_timeframes = {
+            scenario.entry_condition.timeframe,
+            scenario.validation_condition.timeframe,
+            scenario.invalidation_condition.timeframe,
+        }
+        if bars_by_timeframe is None:
+            if len(required_timeframes) != 1:
+                raise ValueError(
+                    "legacy bars cannot satisfy multiple condition timeframes"
+                )
+            normalized_by_timeframe = {
+                next(iter(required_timeframes)): normalize_bars(bars)
+            }
+        else:
+            if bars:
+                raise ValueError("bars and bars_by_timeframe are mutually exclusive")
+            if set(bars_by_timeframe) != required_timeframes:
+                raise ValueError(
+                    "bars_by_timeframe must exactly cover scenario conditions"
+                )
+            normalized_by_timeframe = {}
+            for timeframe, series in bars_by_timeframe.items():
+                if set(series) != {"timeframe", "provenance", "bars"} or series.get(
+                    "timeframe"
+                ) != timeframe:
+                    raise ValueError("timeframe series provenance mismatch")
+                normalized_by_timeframe[timeframe] = normalize_bars(series["bars"])
+        normalized_bars = normalized_by_timeframe[
+            scenario.entry_condition.timeframe
+        ]
         single_quote = (
             self._coerce_quote(option_quote) if option_quote is not None else None
         )
         normalized_path = [self._coerce_quote(quote) for quote in quote_path]
-        timestamps = [bar.timestamp for bar in normalized_bars]
+        if option_selection is not None and not isinstance(option_selection, Mapping):
+            raise TypeError("observer option_selection requires an exact raw mapping")
+        timestamps = [
+            bar.timestamp
+            for series in normalized_by_timeframe.values()
+            for bar in series
+        ]
         timestamps.extend(quote.quote_time for quote in normalized_path)
         if single_quote is not None:
             timestamps.append(single_quote.quote_time)
@@ -175,12 +217,46 @@ class BrokerInertScenarioObserver:
                 max(timestamps) if timestamps else scenario.observation_window.start_at
             )
         )
+        fact_deadline = min(now, scenario.observation_window.end_at)
+        if any(
+            bar.timestamp > fact_deadline
+            for series in normalized_by_timeframe.values()
+            for bar in series
+        ):
+            raise ValueError(
+                "completed bar timestamp exceeds evaluated_at or observation window"
+            )
+        quote_times = [quote.quote_time for quote in normalized_path]
+        quote_ids = [quote.snapshot_id for quote in normalized_path]
+        if single_quote is not None:
+            quote_times.append(single_quote.quote_time)
+            quote_ids.append(single_quote.snapshot_id)
+        if any(left >= right for left, right in zip(quote_times, quote_times[1:])):
+            raise ValueError("option quotes must be strictly chronological and unique")
+        if len(quote_ids) != len(set(quote_ids)):
+            raise ValueError("option quote snapshot IDs must be unique")
+        if any(quote_time > fact_deadline for quote_time in quote_times):
+            raise ValueError(
+                "option quote timestamp exceeds evaluated_at or observation window"
+            )
         facts_payload = {
-            "bars": [bar.to_dict() for bar in normalized_bars],
+            "bars_by_timeframe": {
+                timeframe: [bar.to_dict() for bar in series]
+                for timeframe, series in sorted(normalized_by_timeframe.items())
+            },
+            "bar_provenance_by_timeframe": (
+                {
+                    timeframe: dict(series["provenance"])
+                    for timeframe, series in sorted(bars_by_timeframe.items())
+                }
+                if bars_by_timeframe is not None
+                else None
+            ),
             "option_quote": single_quote.to_dict()
             if single_quote is not None
             else None,
             "quote_path": [quote.to_dict() for quote in normalized_path],
+            "option_selection": dict(option_selection) if option_selection else None,
             "evaluated_at": timestamp_json(now),
         }
         self.market_facts_hash = canonical_sha256(facts_payload)
@@ -319,7 +395,7 @@ class BrokerInertScenarioObserver:
                 # profile may terminate exposure, with a priced gross/net R.
                 invalidation = evaluate_condition(
                     scenario.invalidation_condition,
-                    normalized_bars,
+                    normalized_by_timeframe[scenario.invalidation_condition.timeframe],
                     scenario.observation_window,
                     evaluated_at=now,
                 )
@@ -343,7 +419,7 @@ class BrokerInertScenarioObserver:
 
                 entry = evaluate_condition(
                     scenario.entry_condition,
-                    normalized_bars,
+                    normalized_by_timeframe[scenario.entry_condition.timeframe],
                     scenario.observation_window,
                     evaluated_at=now,
                 )
@@ -393,7 +469,7 @@ class BrokerInertScenarioObserver:
             if not state.get("validated"):
                 validation = evaluate_condition(
                     scenario.validation_condition,
-                    normalized_bars,
+                    normalized_by_timeframe[scenario.validation_condition.timeframe],
                     scenario.observation_window,
                     evaluated_at=now,
                 )
@@ -501,6 +577,7 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "validated",
                             "quote_status": "ineligible",
+                            **self._quote_snapshot_updates(state, entry_quote),
                             **self._quote_counts(state, unavailable=True),
                         },
                     )
@@ -526,6 +603,7 @@ class BrokerInertScenarioObserver:
                     state_updates={
                         "status": "option_selected",
                         "selected_option_symbol": entry_quote.option_symbol,
+                        **self._quote_snapshot_updates(state, entry_quote),
                         **self._quote_counts(state, eligible=True),
                     },
                 )
@@ -588,6 +666,19 @@ class BrokerInertScenarioObserver:
                 state = (
                     self.repository.get_state(scenario, self.trigger_version) or state
                 )
+                if now >= scenario.observation_window.end_at:
+                    self._expire_if_open(
+                        new_events,
+                        scenario,
+                        state,
+                        now,
+                        observation_id,
+                        reason="quote_unavailable_at_expiry",
+                    )
+                    state = (
+                        self.repository.get_state(scenario, self.trigger_version)
+                        or state
+                    )
                 return self._result(scenario, state, new_events)
             for quote in exit_quotes:
                 if quote.quote_time < entry_quote.quote_time:
@@ -625,6 +716,39 @@ class BrokerInertScenarioObserver:
                 state = (
                     self.repository.get_state(scenario, self.trigger_version) or state
                 )
+                seen = dict(state.get("observed_quote_snapshots") or {})
+                prior_hash = seen.get(quote.snapshot_id)
+                if prior_hash is not None:
+                    if prior_hash != quote.snapshot_hash:
+                        raise QuoteTapeConflict(
+                            "option quote snapshot ID was reused with different facts"
+                        )
+                    continue
+                if not self.quote_eligibility_policy.eligible(
+                    quote, evaluated_at=quote.quote_time
+                ):
+                    self._record(
+                        new_events,
+                        scenario,
+                        ShadowEventType.QUOTE_UNAVAILABLE,
+                        event_time=quote.quote_time,
+                        market_observation_id=observation_id,
+                        role=f"quote-ineligible:{observation_id}:{quote.snapshot_id}",
+                        details=self._details(
+                            scenario,
+                            {
+                                "reason": "selected_contract_quote_ineligible",
+                                "quote": quote.quote_provenance(),
+                            },
+                        ),
+                        state_updates={
+                            "status": "synthetic_entry",
+                            "quote_status": "ineligible",
+                            **self._quote_snapshot_updates(state, quote),
+                            **self._quote_counts(state, unavailable=True),
+                        },
+                    )
+                    continue
                 profile_states = dict(state.get("profile_states") or {})
                 primary_prior = profile_states.get(scenario.exit_profile.value) or {}
                 if primary_prior.get("terminal"):
@@ -701,6 +825,7 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "exit_observing",
                             "profile_states": profile_states,
+                            **self._quote_snapshot_updates(state, quote),
                             **primary_diagnostics,
                         },
                     )
@@ -771,6 +896,8 @@ class BrokerInertScenarioObserver:
                     self.repository.get_state(scenario, self.trigger_version) or state
                 )
             return self._result(scenario, state, new_events)
+        except QuoteTapeConflict:
+            raise
         except TerminalScenarioError:
             state = self.repository.get_state(scenario, self.trigger_version) or {
                 "status": "terminal",
@@ -846,6 +973,19 @@ class BrokerInertScenarioObserver:
             "quote_unavailable_count": int(state.get("quote_unavailable_count") or 0)
             + int(unavailable),
         }
+
+    @staticmethod
+    def _quote_snapshot_updates(
+        state: Mapping[str, Any], quote: OptionQuoteSnapshot
+    ) -> dict[str, dict[str, str]]:
+        seen = dict(state.get("observed_quote_snapshots") or {})
+        prior = seen.get(quote.snapshot_id)
+        if prior is not None and prior != quote.snapshot_hash:
+            raise QuoteTapeConflict(
+                "option quote snapshot ID was reused with different facts"
+            )
+        seen[quote.snapshot_id] = quote.snapshot_hash
+        return {"observed_quote_snapshots": seen}
 
     @classmethod
     def _primary_quote_diagnostics(

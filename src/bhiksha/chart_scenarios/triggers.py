@@ -49,10 +49,12 @@ def normalize_bars(
         bar if isinstance(bar, CompletedBar) else CompletedBar.from_mapping(bar)
         for bar in bars
     ]
-    normalized.sort(key=lambda item: item.timestamp)
     timestamps = [bar.timestamp for bar in normalized]
-    if len(timestamps) != len(set(timestamps)):
-        raise ValueError("completed bar timestamps must be unique")
+    if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
+        raise ValueError("completed bars must be strictly chronological and unique")
+    bar_ids = [bar.bar_id for bar in normalized if bar.bar_id is not None]
+    if len(bar_ids) != len(set(bar_ids)):
+        raise ValueError("completed bar IDs must be unique")
     return normalized
 
 

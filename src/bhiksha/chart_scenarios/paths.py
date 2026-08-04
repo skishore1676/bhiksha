@@ -16,6 +16,7 @@ class RunArtifactPaths:
     install_receipt: Path
     database: Path
     live_cycle_input: Path
+    cycle_inputs: Path
     cycle_receipts: Path
     events_export: Path
     projection_receipt: Path
@@ -41,6 +42,7 @@ def run_artifact_paths(
         install_receipt=run_root / "install.receipt.json",
         database=run_root / "shadow_events.sqlite3",
         live_cycle_input=run_root / "live_cycle_input.json",
+        cycle_inputs=run_root / "cycle-inputs",
         cycle_receipts=run_root / "cycles",
         events_export=run_root / "events.json",
         projection_receipt=run_root / "sheet-projection.receipt.json",

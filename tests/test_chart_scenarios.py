@@ -7,8 +7,9 @@ import sqlite3
 import subprocess
 import sys
 from copy import deepcopy
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -48,6 +49,9 @@ from bhiksha.chart_scenarios.policies import (
     OptionSelectionPolicy,
     QuoteEligibilityPolicy,
 )
+from bhiksha.chart_scenarios.repository import IdempotencyConflict
+from bhiksha.chart_scenarios.cli import _replay_cycles
+from bhiksha.chart_scenarios.cycle import validate_cycle_input
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import Bar, OptionContractSnapshot, OptionSelectionRequest
 from bhiksha.execution.profile_exit import (
@@ -56,7 +60,10 @@ from bhiksha.execution.profile_exit import (
     ProfileMarketView,
     evaluate_profile_exit,
 )
-from bhiksha.ops.chart_scenario_live_export import export_live_cycle_input
+from bhiksha.ops.chart_scenario_live_export import (
+    _aggregate_completed_bars,
+    export_live_cycle_input,
+)
 from bhiksha.options.selectors import SingleLegOptionSelector
 
 
@@ -352,25 +359,142 @@ def _cycle_input(plan=None, *, slot: int = 1) -> dict:
         if scenario.candidate_id in seen:
             continue
         seen.add(scenario.candidate_id)
+        candidate_scenarios = [
+            item
+            for item in active_plan.scenarios
+            if item.candidate_id == scenario.candidate_id
+        ]
+        timeframes = {
+            condition.timeframe
+            for item in candidate_scenarios
+            for condition in (
+                item.entry_condition,
+                item.validation_condition,
+                item.invalidation_condition,
+            )
+        }
         candidates.append(
             {
                 "candidate_id": scenario.candidate_id,
                 "symbol": scenario.symbol,
-                "bars": _bars(),
+                "bars_by_timeframe": {
+                    timeframe: _timeframe_series(timeframe)
+                    for timeframe in sorted(timeframes)
+                },
+                "option_selection": _option_selection_evidence(
+                    active_plan,
+                    candidate_id=scenario.candidate_id,
+                    symbol=scenario.symbol,
+                    direction=scenario.direction.value,
+                    evaluated_at="2026-08-04T14:50:00Z",
+                ),
                 "quotes": [],
                 "diagnostics": {"comparable": True, "errors": []},
             }
         )
     body = {
-        "schema_version": "bhiksha.chart-scenario-cycle-input.v1",
+        "schema_version": "bhiksha.chart-scenario-cycle-input.v2",
         "plan_hash": active_plan.plan_hash,
         "run_manifest_hash": active_plan.run_manifest_hash,
         "treatment_manifest_hash": active_plan.treatment_manifest_hash,
         "observation_slot_ordinal": slot,
-        "evaluated_at": "2026-08-04T11:18:00Z",
+        "evaluated_at": "2026-08-04T14:50:00Z",
         "candidates": candidates,
     }
     return {**body, "content_hash": canonical_sha256(body)}
+
+
+def _timeframe_series(timeframe: str) -> dict:
+    if timeframe != "39m":
+        raise AssertionError(f"fixture does not support {timeframe}")
+    bars = deepcopy(_bars())
+    for bar, timestamp in zip(
+        bars,
+        (
+            "2026-08-04T13:30:00Z",
+            "2026-08-04T14:09:00Z",
+            "2026-08-04T14:48:00Z",
+        ),
+        strict=True,
+    ):
+        bar["timestamp"] = timestamp
+    provenance_body = {
+        "schema_version": "bhiksha.chart-scenario-bar-provenance.v1",
+        "implementation": "xnys-session-anchor-v1",
+        "calendar": "XNYS",
+        "timezone": "America/New_York",
+        "session_anchor": "09:30",
+        "interval": timeframe,
+        "completed_through": "2026-08-04T14:48:00Z",
+        "source_bar_count": len(bars),
+        "source_hash": canonical_sha256(bars),
+        "output_hash": canonical_sha256(bars),
+    }
+    return {
+        "timeframe": timeframe,
+        "provenance": {
+            **provenance_body,
+            "content_hash": canonical_sha256(provenance_body),
+        },
+        "bars": bars,
+    }
+
+
+def _option_selection_evidence(
+    plan,
+    *,
+    candidate_id: str,
+    symbol: str,
+    direction: str,
+    evaluated_at: str,
+) -> dict:
+    contract = {
+        "option_symbol": "SPY260807C00100000",
+        "underlying_symbol": symbol,
+        "contract_type": "CALL" if direction == "long" else "PUT",
+        "expiration_date": "2026-08-07",
+        "dte": 3,
+        "strike": 100.0,
+        "delta": 0.4 if direction == "long" else -0.4,
+        "bid": 1.0,
+        "ask": 1.1,
+        "open_interest": 100,
+    }
+    request = {
+        "deployment_id": f"chart-scenario:{candidate_id}",
+        "symbol": symbol,
+        "direction": direction,
+        "signal_timestamp": evaluated_at,
+        "execution_profile": "chart_scenario_shadow_v1",
+        "execution_params": plan.option_selection_policy.selector_params(),
+    }
+    body = {
+        "schema_version": "bhiksha.chart-scenario-option-selection.v1",
+        "mode": "canonical_selector",
+        "policy_hash": plan.option_selection_policy.content_hash,
+        "evaluated_at": evaluated_at,
+        "request": request,
+        "contracts": [contract],
+        "canonical_selected_option_symbol": contract["option_symbol"],
+        "effective_selected_option_symbol": contract["option_symbol"],
+    }
+    return {**body, "receipt_hash": canonical_sha256(body)}
+
+
+def _retime_cycle(cycle: dict, evaluated_at: str, *, persisted: bool = False) -> None:
+    cycle["evaluated_at"] = evaluated_at
+    for candidate in cycle["candidates"]:
+        selection = candidate["option_selection"]
+        selection["evaluated_at"] = evaluated_at
+        selection["request"]["signal_timestamp"] = evaluated_at
+        if persisted:
+            selection["mode"] = "persisted_contract"
+        selection["receipt_hash"] = canonical_sha256(
+            {key: value for key, value in selection.items() if key != "receipt_hash"}
+        )
+    cycle["content_hash"] = canonical_sha256(
+        {key: value for key, value in cycle.items() if key != "content_hash"}
+    )
 
 
 def _observer(
@@ -560,22 +684,15 @@ def test_live_export_uses_completed_schwab_bars_and_canonical_selector(
             return [
                 Bar(
                     symbol,
-                    datetime(2026, 8, 4, 11, 17, tzinfo=UTC),
-                    99,
-                    101,
-                    98,
-                    100,
-                    10,
-                ),
-                Bar(
-                    symbol,
-                    datetime(2026, 8, 4, 11, 18, tzinfo=UTC),
+                    datetime(2026, 8, 4, 13, 30, tzinfo=UTC)
+                    + timedelta(minutes=index),
                     100,
                     102,
                     99,
                     101,
                     11,
-                ),
+                )
+                for index in range(39)
             ]
 
     class _Chain:
@@ -605,7 +722,7 @@ def test_live_export_uses_completed_schwab_bars_and_canonical_selector(
                         "askPrice": 1.1,
                         "lastPrice": 1.05,
                         "quoteTime": int(
-                            datetime(2026, 8, 4, 11, 18, 30, tzinfo=UTC).timestamp()
+                            datetime(2026, 8, 4, 14, 9, 30, tzinfo=UTC).timestamp()
                             * 1000
                         ),
                     },
@@ -625,19 +742,147 @@ def test_live_export_uses_completed_schwab_bars_and_canonical_selector(
             bar_source=_Bars(),  # type: ignore[arg-type]
             chain_service=_Chain(),  # type: ignore[arg-type]
             quote_client=_QuoteClient(),
-            evaluated_at=datetime(2026, 8, 4, 11, 18, 30, tzinfo=UTC),
+            evaluated_at=datetime(2026, 8, 4, 14, 9, 30, tzinfo=UTC),
         )
     )
 
     assert payload["observation_slot_ordinal"] == 1
-    assert len(payload["candidates"][0]["bars"]) == 1
+    assert "bars_by_timeframe" in payload["candidates"][0]
     assert payload["candidates"][0]["quotes"][0]["contract_type"] == "CALL"
     assert payload["candidates"][0]["quotes"][0]["quote_time"] == (
-        "2026-08-04T11:18:30Z"
+        "2026-08-04T14:09:30Z"
     )
     assert payload["candidates"][0]["diagnostics"]["comparable"] is True
     assert payload["content_hash"] == canonical_sha256(
         {key: value for key, value in payload.items() if key != "content_hash"}
+    )
+
+
+def test_xnys_39m_aggregation_is_session_anchored_and_drops_boundaries() -> None:
+    def minutes(start: datetime, count: int) -> list[Bar]:
+        return [
+            Bar("SPY", start + timedelta(minutes=index), 100, 101, 99, 100, 1)
+            for index in range(count)
+        ]
+
+    regular = minutes(datetime(2026, 8, 4, 13, 30, tzinfo=UTC), 78)
+    overnight = minutes(datetime(2026, 8, 4, 1, 0, tzinfo=UTC), 39)
+    bars = _aggregate_completed_bars(
+        [*overnight, *regular],
+        timeframe="39m",
+        evaluated_at=datetime(2026, 8, 4, 14, 48, tzinfo=UTC),
+    )
+    assert [bar.timestamp for bar in bars] == [
+        datetime(2026, 8, 4, 13, 30, tzinfo=UTC),
+        datetime(2026, 8, 4, 14, 9, tzinfo=UTC),
+    ]
+
+    holiday = minutes(datetime(2025, 7, 4, 13, 30, tzinfo=UTC), 39)
+    assert not _aggregate_completed_bars(
+        holiday,
+        timeframe="39m",
+        evaluated_at=datetime(2025, 7, 4, 15, 0, tzinfo=UTC),
+    )
+
+    early_close = minutes(datetime(2026, 11, 27, 14, 30, tzinfo=UTC), 210)
+    early = _aggregate_completed_bars(
+        early_close,
+        timeframe="39m",
+        evaluated_at=datetime(2026, 11, 27, 18, 1, tzinfo=UTC),
+    )
+    assert len(early) == 5
+
+
+def test_cycle_rejects_non_reproducible_selector_dte(tmp_path: Path) -> None:
+    plan = _plan()
+    cycle = _cycle_input(plan)
+    selection = cycle["candidates"][0]["option_selection"]
+    selection["contracts"][0]["dte"] = 2
+    selection["receipt_hash"] = canonical_sha256(
+        {key: value for key, value in selection.items() if key != "receipt_hash"}
+    )
+    cycle["content_hash"] = canonical_sha256(
+        {key: value for key, value in cycle.items() if key != "content_hash"}
+    )
+    with pytest.raises(ValueError, match="DTE does not reproduce"):
+        run_observation_cycle(
+            plan,
+            cycle,
+            repository=ScenarioEventRepository(
+                tmp_path / "artifacts/chart_scenarios/test-selector-dte.sqlite3"
+            ),
+            receipt_path=tmp_path / "artifacts/chart_scenarios/test-selector-dte.json",
+        )
+
+
+def test_documented_cycle_v2_fixture_is_hash_valid_and_current() -> None:
+    documented = json.loads(
+        Path("docs/examples/chart_scenario_cycle_input_v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert documented["content_hash"] == canonical_sha256(
+        {key: value for key, value in documented.items() if key != "content_hash"}
+    )
+    candidate = documented["candidates"][0]
+    assert set(candidate["bars_by_timeframe"]) == {"39m", "daily"}
+    for series in candidate["bars_by_timeframe"].values():
+        assert series["provenance"]["output_hash"] == canonical_sha256(series["bars"])
+        assert series["provenance"]["content_hash"] == canonical_sha256(
+            {
+                key: value
+                for key, value in series["provenance"].items()
+                if key != "content_hash"
+            }
+        )
+    selection = candidate["option_selection"]
+    assert selection["receipt_hash"] == canonical_sha256(
+        {key: value for key, value in selection.items() if key != "receipt_hash"}
+    )
+    assert selection["request"]["execution_params"] == {
+        "dte_fallback_policy": "strict",
+        "dte_max": 7,
+        "dte_min": 0,
+        "long_signal_contract_type": "CALL",
+        "max_bid_ask_spread_pct": 0.2,
+        "min_open_interest": 100,
+        "short_signal_contract_type": "PUT",
+        "target_abs_delta_max": 0.4,
+        "target_abs_delta_min": 0.2,
+    }
+    fake_plan = SimpleNamespace(
+        plan_hash=documented["plan_hash"],
+        run_manifest_hash=documented["run_manifest_hash"],
+        treatment_manifest_hash=documented["treatment_manifest_hash"],
+        option_selection_policy=OptionSelectionPolicy(
+            schema_version="bhiksha.chart-scenario-option-selection-policy.v1",
+            provider_id="schwab",
+            long_signal_contract_type="CALL",
+            short_signal_contract_type="PUT",
+            dte_min=0,
+            dte_max=7,
+            target_abs_delta_min=0.2,
+            target_abs_delta_max=0.4,
+            min_open_interest=100,
+            max_bid_ask_spread_pct=0.2,
+            dte_fallback_policy="strict",
+        ),
+        scenarios=[
+            SimpleNamespace(
+                candidate_id="candidate-1",
+                symbol="SPY",
+                direction=SimpleNamespace(value="long"),
+                entry_condition=SimpleNamespace(timeframe="39m"),
+                validation_condition=SimpleNamespace(timeframe="39m"),
+                invalidation_condition=SimpleNamespace(timeframe="daily"),
+                observation_window=SimpleNamespace(
+                    end_at=datetime(2026, 8, 4, 16, 0, tzinfo=UTC)
+                ),
+            )
+        ],
+    )
+    assert validate_cycle_input(documented, plan=fake_plan)["content_hash"] == (
+        documented["content_hash"]
     )
 
 
@@ -1296,32 +1541,16 @@ def test_post_entry_invalidation_is_managed_only_by_priced_frozen_exit(
         ),
     )
 
-    second_bars = [
-        *_bars(),
-        {
-            "timestamp": "2026-08-04T11:57:00Z",
-            "open": 100.0,
-            "high": 101.0,
-            "low": 95.0,
-            "close": 96.0,
-            "volume": None,
-            "completed": True,
-            "bar_id": None,
-        },
-        {
-            "timestamp": "2026-08-04T12:36:00Z",
-            "open": 96.0,
-            "high": 97.0,
-            "low": 93.0,
-            "close": 94.0,
-            "volume": None,
-            "completed": True,
-            "bar_id": None,
-        },
-    ]
+    second_bars = deepcopy(_timeframe_series("39m")["bars"])
+    second_bars[-1].update({"open": 96.0, "high": 97.0, "low": 93.0, "close": 94.0})
     second = _cycle_input(plan, slot=2)
-    second["evaluated_at"] = "2026-08-04T12:36:00Z"
-    second["candidates"][0]["bars"] = second_bars
+    series = second["candidates"][0]["bars_by_timeframe"]["39m"]
+    series["bars"] = second_bars
+    series["provenance"]["output_hash"] = canonical_sha256(second_bars)
+    provenance_body = {
+        key: value for key, value in series["provenance"].items() if key != "content_hash"
+    }
+    series["provenance"]["content_hash"] = canonical_sha256(provenance_body)
     exit_quote = _quote("q-stop", 0.60, "2026-08-04T12:36:00Z")
     exit_quote["bid"] = 0.59
     exit_quote["ask"] = 0.61
@@ -1606,6 +1835,162 @@ def test_restart_recovers_latched_primary_terminal_after_crash(tmp_path: Path) -
     )
 
 
+def test_cycle_retry_recovers_paired_terminal_crash_without_new_slot_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "paired-crash.sqlite3"
+    )
+    first = _cycle_input(plan)
+    first["candidates"][0]["quotes"] = [
+        _quote("q-entry", 1.0, "2026-08-04T11:20:00Z"),
+        _quote("q-exit", 2.0, "2026-08-04T11:40:00Z"),
+    ]
+    first["content_hash"] = canonical_sha256(
+        {key: value for key, value in first.items() if key != "content_hash"}
+    )
+    original = BrokerInertScenarioObserver._record_terminal
+
+    def crash_after_second_arm_paired(self, events, scenario, event_type, *args, **kwargs):
+        if (
+            scenario.arm_id.value == "chart_deterministic"
+            and getattr(event_type, "value", event_type) == "synthetic_exit"
+        ):
+            raise SystemExit("simulated death after paired facts and terminal latch")
+        return original(self, events, scenario, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(
+        BrokerInertScenarioObserver,
+        "_record_terminal",
+        crash_after_second_arm_paired,
+    )
+    with pytest.raises(SystemExit, match="after paired facts"):
+        run_observation_cycle(
+            plan,
+            first,
+            repository=repository,
+            receipt_path=(
+                tmp_path / "artifacts" / "chart_scenarios" / "crashed.receipt.json"
+            ),
+        )
+    assert repository.paired_market_fact_proofs()[0]["slot_ordinal"] == 1
+
+    monkeypatch.setattr(BrokerInertScenarioObserver, "_record_terminal", original)
+    receipt = run_observation_cycle(
+        plan,
+        first,
+        repository=repository,
+        receipt_path=(
+            tmp_path / "artifacts" / "chart_scenarios" / "recovered.receipt.json"
+        ),
+    )
+
+    assert receipt["status"] == "succeeded"
+    assert receipt["paired_fact_proof_count"] == 1
+    assert all(result["terminal"] for result in receipt["results"])
+
+
+def test_exact_cycle_retry_reuses_receipt_bytes_and_conflict_fails(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts" / "chart_scenarios" / "lost-ack.sqlite3"
+    )
+    receipt_path = (
+        tmp_path / "artifacts" / "chart_scenarios" / "lost-ack.receipt.json"
+    )
+    cycle_input = _cycle_input(plan)
+    first = run_observation_cycle(
+        plan,
+        cycle_input,
+        repository=repository,
+        receipt_path=receipt_path,
+    )
+    original_bytes = receipt_path.read_bytes()
+    original_events = repository.event_count()
+
+    replay = run_observation_cycle(
+        plan,
+        cycle_input,
+        repository=repository,
+        receipt_path=receipt_path,
+    )
+
+    assert replay == first
+    assert receipt_path.read_bytes() == original_bytes
+    assert repository.event_count() == original_events
+
+    conflict = deepcopy(cycle_input)
+    conflict["candidates"][0]["diagnostics"]["retry_nonce"] = "conflict"
+    conflict["content_hash"] = canonical_sha256(
+        {key: value for key, value in conflict.items() if key != "content_hash"}
+    )
+    with pytest.raises(IdempotencyConflict, match="different cycle input hash"):
+        run_observation_cycle(
+            plan,
+            conflict,
+            repository=repository,
+            receipt_path=receipt_path,
+        )
+    assert receipt_path.read_bytes() == original_bytes
+
+
+def test_observer_rejects_future_post_window_and_reordered_market_facts(
+    tmp_path: Path,
+) -> None:
+    scenario = _scenario()
+    observer = _observer(
+        ScenarioEventRepository(
+            tmp_path / "artifacts" / "chart_scenarios" / "temporal.sqlite3"
+        )
+    )
+    future_bars = deepcopy(_bars())
+    future_bars[-1]["timestamp"] = "2026-08-04T11:19:00Z"
+    with pytest.raises(ValueError, match="completed bar timestamp exceeds"):
+        observer.observe_one(
+            scenario,
+            bars=future_bars,
+            evaluated_at="2026-08-04T11:18:00Z",
+        )
+
+    reversed_bars = list(reversed(_bars()))
+    with pytest.raises(ValueError, match="strictly chronological"):
+        observer.observe_one(
+            scenario,
+            bars=reversed_bars,
+            evaluated_at="2026-08-04T11:18:00Z",
+        )
+
+    future_quotes = [
+        _quote("q-now", 1.0, "2026-08-04T11:18:00Z"),
+        _quote("q-future", 1.1, "2026-08-04T11:19:00Z"),
+    ]
+    with pytest.raises(ValueError, match="option quote timestamp exceeds"):
+        observer.observe_one(
+            scenario,
+            bars=_bars(),
+            quote_path=future_quotes,
+            evaluated_at="2026-08-04T11:18:00Z",
+        )
+
+    post_window = scenario.observation_window.end_at.replace(microsecond=0)
+    after_window = post_window.timestamp() + 1
+    post_window_quote = _quote(
+        "q-post-window",
+        1.0,
+        datetime.fromtimestamp(after_window, tz=UTC).isoformat(),
+    )
+    with pytest.raises(ValueError, match="option quote timestamp exceeds"):
+        observer.observe_one(
+            scenario,
+            bars=[],
+            quote_path=[post_window_quote],
+            evaluated_at=datetime.fromtimestamp(after_window + 1, tz=UTC),
+        )
+
+
 def test_observe_cycle_pairs_every_installed_arm_and_writes_zero_effect_receipt(
     tmp_path: Path,
 ) -> None:
@@ -1630,21 +2015,120 @@ def test_observe_cycle_pairs_every_installed_arm_and_writes_zero_effect_receipt(
         "treatment_manifest_hash"
     ] == plan.treatment_manifest_hash.removeprefix("sha256:")
     assert proof["cartographer_export_hash"] == plan.cartographer_export_hash
-    assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
 
     drifted = deepcopy(_cycle_input(plan))
-    drifted["evaluated_at"] = "2026-08-04T11:18:01Z"
+    drifted["candidates"][0]["diagnostics"]["retry_nonce"] = "conflict"
     drifted["content_hash"] = canonical_sha256(
         {key: value for key, value in drifted.items() if key != "content_hash"}
     )
-    failed = run_observation_cycle(
-        plan,
-        drifted,
-        repository=repository,
-        receipt_path=receipt_path,
+    with pytest.raises(IdempotencyConflict, match="different cycle input hash"):
+        run_observation_cycle(
+            plan,
+            drifted,
+            repository=repository,
+            receipt_path=receipt_path,
+        )
+
+
+def test_transient_exit_quote_stays_open_and_cross_slot_tape_deduplicates(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    repository = ScenarioEventRepository(
+        tmp_path / "artifacts/chart_scenarios/quote-tape.sqlite3"
     )
-    assert failed["status"] == "failed"
-    assert all("different market facts" in error for error in failed["errors"])
+    first = _cycle_input(plan)
+    first["candidates"][0]["quotes"] = [
+        _quote("q-entry-tape", 1.05, "2026-08-04T14:45:00Z")
+    ]
+    first["content_hash"] = canonical_sha256(
+        {key: value for key, value in first.items() if key != "content_hash"}
+    )
+    run_observation_cycle(
+        plan,
+        first,
+        repository=repository,
+        receipt_path=tmp_path / "artifacts/chart_scenarios/tape-1.json",
+    )
+
+    wide = _quote("q-wide-tape", 1.0, "2026-08-04T14:55:00Z")
+    wide["bid"], wide["ask"] = 0.5, 1.5
+    second = _cycle_input(plan, slot=2)
+    _retime_cycle(second, "2026-08-04T14:55:00Z", persisted=True)
+    second["candidates"][0]["quotes"] = [wide]
+    second["content_hash"] = canonical_sha256(
+        {key: value for key, value in second.items() if key != "content_hash"}
+    )
+    receipt = run_observation_cycle(
+        plan,
+        second,
+        repository=repository,
+        receipt_path=tmp_path / "artifacts/chart_scenarios/tape-2.json",
+    )
+    assert receipt["status"] == "succeeded"
+    assert not any(result["terminal"] for result in receipt["results"])
+    unavailable_before = sum(
+        event.event_type.value == "quote_unavailable" for event in repository.events()
+    )
+
+    third = _cycle_input(plan, slot=3)
+    _retime_cycle(third, "2026-08-04T14:56:00Z", persisted=True)
+    third["candidates"][0]["quotes"] = [wide]
+    third["content_hash"] = canonical_sha256(
+        {key: value for key, value in third.items() if key != "content_hash"}
+    )
+    run_observation_cycle(
+        plan,
+        third,
+        repository=repository,
+        receipt_path=tmp_path / "artifacts/chart_scenarios/tape-3.json",
+    )
+    assert sum(
+        event.event_type.value == "quote_unavailable" for event in repository.events()
+    ) == unavailable_before
+
+
+def test_replay_cycles_rebuilds_exact_receipts_and_event_chain(tmp_path: Path) -> None:
+    plan = _plan()
+    root = tmp_path / "artifacts/chart_scenarios"
+    plan_path = root / "plan.json"
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(
+        json.dumps(plan.model_dump(mode="json")), encoding="utf-8"
+    )
+    inputs = root / "sealed-inputs"
+    inputs.mkdir()
+    cycle = _cycle_input(plan)
+    input_path = inputs / "slot-0001.json"
+    input_path.write_text(json.dumps(cycle), encoding="utf-8")
+    source_receipt = run_observation_cycle(
+        plan,
+        cycle,
+        repository=ScenarioEventRepository(root / "source.sqlite3"),
+        receipt_path=root / "source-receipt.json",
+        cycle_input_path=input_path,
+    )
+
+    output = root / "replay"
+    assert _replay_cycles(
+        SimpleNamespace(
+            plan=str(plan_path),
+            cycle_input_dir=str(inputs),
+            output=str(output),
+        )
+    ) == 0
+    replayed = json.loads(
+        (output / "receipts/slot-0001.receipt.json").read_text(encoding="utf-8")
+    )
+    assert replayed == source_receipt
+    replay_receipt = json.loads(
+        (output / "replay.receipt.json").read_text(encoding="utf-8")
+    )
+    assert replay_receipt["effects"] == {
+        "broker": False,
+        "orders": False,
+        "authorization": False,
+    }
 
 
 def test_new_package_import_graph_has_no_money_path_imports() -> None:

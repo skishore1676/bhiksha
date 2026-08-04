@@ -15,8 +15,9 @@ rejected before observation. Every receipt and every event records
 never a fill.
 
 Do not add this lane to `active_plan.json`, `manual_entry`, `active_strategies`,
-Google Sheets, a scheduler, or a broker service. The existing live plan is
-neither read nor written by this package.
+or a broker service. The existing live plan is neither read nor written by
+this package. The only scheduled and Sheet effects allowed are the dedicated
+Bhiksha shadow coordinator and exact-key projection to `Chart_Scenarios_v1`.
 
 ## Artifacts and state
 
@@ -148,6 +149,155 @@ inherits an earlier run's predecessor hash. Already-terminal candidates are
 represented in later receipts by authenticated terminal state/event carryforward
 proofs rather than an invented current-slot market proof.
 
+## Scheduled lifecycle
+
+The experiment is one governed campaign with a new immutable run each target
+session. Daily Chartographer/TradeLab inputs are executions of that experiment;
+they are not automatically new experiment versions. A treatment change—such as
+a changed chart reader, ranker prompt/model, frozen exit profile, cost model, or
+narrative influence—requires a new campaign/version rather than silently
+changing a daily run.
+
+Bhiksha owns one opt-in launchd job, `com.bhiksha.chart-scenario-shadow`. It is
+disabled unless the installer is run with
+`BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED=true`. The job uses a non-overlap
+lock and a content-addressed campaign-static configuration at
+`artifacts/chart_scenarios/campaign-config.json`. No daily human edit is part of
+the operating contract.
+
+The configuration freezes both the isolated Birdclaw checkout and the external
+canonical Birdclaw SQLite file. On oldmac the database value is
+`/Users/sunny/Documents/birdclaw/birdclaw-home/birdclaw.sqlite`. Bhiksha passes
+that path only through `BIRDCLAW_DB`; it is not copied into the sanitized
+narrative packet or daily contract. A missing narrative source writes a hashed
+`unavailable_non_blocking` sidecar and continues without `--birdclaw-export`.
+Narrative remains observational and cannot influence selection.
+
+Before the session, the coordinator invokes only the fixed broker-inert
+`market_cartographer.cli market-context-export` entrypoint. Its checkout,
+read-only bar provider/root, frozen symbol universe, campaign ID, TradeLab
+checkout/experiment root, kernel path, spreadsheet ID, and exact Agent Broker
+executable come from that static configuration. Arbitrary commands, output
+paths, shell strings, Bhiksha job names, and live/order entrypoints are not
+accepted. On oldmac, Agent Broker is rooted at
+`/Users/sunny/code/agent-broker`.
+
+The Cartographer receipt must be hash-valid and target the still-unopened XNYS
+session for the current Chicago date. The coordinator derives the new `run_id`
+from that receipt, renders only known placeholders, validates the resulting
+daily contract, and atomically emits it at:
+
+```text
+artifacts/chart_scenarios/daily-contracts/YYYY-MM-DD.json
+```
+
+The filename and
+`target_session_date` must match. The contract is content addressed and binds
+the campaign/run IDs, campaign-configuration hash, hash-valid Cartographer v2
+receipt/session window, hash-valid sanitized Birdclaw packet, TradeLab checkout,
+and exact run-scoped plan/projection paths. Bhiksha constructs only three fixed
+TradeLab invocations: `prepare-run`, `refresh-projection`, and `finalize-run`.
+All TradeLab writes are confined to the configured experiment root under
+`artifacts/chart_scenarios`; a contract cannot redirect output to
+`artifacts/playbook/active_plan.json` or another live path.
+
+Preparation is attempted at 07:45, 07:55, 08:05, and 08:15 CT. Exact success is
+idempotent. After that cutoff, a missing contract cannot run Cartographer (which
+would select a later session); Bhiksha instead writes one authenticated
+`missed_non_comparable` receipt and fails so the launchd wrapper alerts. Later
+scheduled invocations do not duplicate that alert.
+
+The authenticated Cartographer window—not a fixed 15:05 clock—determines the
+phase. This also makes an XNYS early-close day enter terminal evaluation after
+the supplied `end_at`. The schedule invokes the coordinator at 07:45 CT, every
+10 minutes from 08:30 through 15:00 CT, and at 15:15 CT, in addition to the
+bounded preparation retries. Morning and after-close completion receipts are
+immutable/idempotent; conflicting replay is rejected.
+
+Lifecycle receipts live under each run's `coordinator/` directory. Morning runs
+the fixed TradeLab preparation, validates/installs the plan, stages the install
+receipt plus empty authenticated event export, regenerates the current
+projection, and then projects. Intraday takes a Schwab-only read-only market
+snapshot, observes one paired slot, verifies/exports the event chain, stages
+contiguously numbered cycle receipts, asks TradeLab to regenerate projection
+from current evidence, and only then upserts the Sheet. After close does the
+same final observation/staging, then `finalize-run` deterministically consumes
+all cycle receipts to build terminal/evaluation/current projection artifacts.
+TradeLab never writes the Sheet directly.
+
+### Immutable cycle evidence v2
+
+Each `cycle-inputs/slot-NNNN.json` uses
+`bhiksha.chart-scenario-cycle-input.v2`. Top-level identity binds the plan, run
+manifest, treatment manifest, ordinal, evaluation cutoff, candidate array, and
+content hash. A hash-valid schema example is in
+`docs/examples/chart_scenario_cycle_input_v2.json`. It intentionally exercises
+the campaign-conformance mix (`39m` entry/validation plus `daily` invalidation)
+and the frozen campaign selector bounds (absolute delta 0.20–0.40, minimum OI
+100, maximum spread 0.20, strict DTE). Its plan/run identities are illustrative;
+a real run must bind its own sealed identities. Every candidate has exactly
+`candidate_id`, `symbol`,
+`bars_by_timeframe`, `option_selection`, `quotes`, and `diagnostics`.
+
+There is one bar series for every entry, validation, and invalidation
+timeframe—no implicit substitution. `39m` bars are anchored to 09:30
+America/New_York independently per XNYS session; `daily` bars are keyed to
+market sessions. Unsupported timeframes fail preparation. Bar provenance
+`bhiksha.chart-scenario-bar-provenance.v1` binds
+`implementation=xnys-session-anchor-v1`, calendar, timezone, session anchor,
+exact interval, `completed_through`, source count/hash, output hash, and its own
+content hash.
+
+Option proof `bhiksha.chart-scenario-option-selection.v1` binds the frozen
+policy hash, exact selection request, full point-in-time contract set,
+canonical and effective contract identities, selection mode, and receipt hash.
+Validation reconstructs DTE from expiration/evaluation date, checks normalized
+unique contract identities, and independently reruns
+`SingleLegOptionSelector`. `canonical_selector` is required before entry.
+After entry, `persisted_contract` must exactly match the contract frozen in both
+durable arm states; a later chain result cannot rewrite it.
+
+The quote tape is chronological and unique, capped by both `evaluated_at` and
+the authenticated observation-window end. A transient missing, stale, or wide
+exit quote records `quote_unavailable` and leaves the position open. At window
+expiry the frozen operations-failure policy terminates it; a transient quote
+never becomes a runtime-error exit. Snapshot IDs are deduplicated across slots,
+while reuse of an ID with different facts is a hard idempotency conflict.
+
+Cycle receipt v2 binds the immutable input artifact path and hash, paired-fact
+proofs, diagnostics, scenario results, and an all-false effects map. Its
+`created_at` is the sealed input's `evaluated_at`, making clean replay
+byte-stable. A lost acknowledgement returns the exact existing receipt; the
+same ordinal with any different input hash is rejected.
+
+Bhiksha can self-check evidence in a fresh namespace:
+
+```bash
+python -m bhiksha.chart_scenarios replay-cycles \
+  --plan artifacts/chart_scenarios/runs/CAMPAIGN/RUN/active_shadow_plan.json \
+  --cycle-input-dir artifacts/chart_scenarios/runs/CAMPAIGN/RUN/cycle-inputs \
+  --output artifacts/chart_scenarios/replays/RUN
+```
+
+This producer self-check is not scientific acceptance. TradeLab must parse the
+immutable inputs, rerun selector/triggers/exits independently, verify receipt
+and event hashes, and reject any mismatch without trusting Bhiksha's replay
+conclusion.
+
+The isolated launchd plist pins `BHIKSHA_KERNEL_SRC` and the absolute executable
+`BHIKSHA_PYTHON`; coordinator startup
+verifies `mala_bhiksha_kernel.__file__` resolves beneath that reviewed source
+tree. `BHIKSHA_ENV_FILE` may point at the existing production `.env` so the
+isolated checkout can reuse credentials without copying secrets. The Sheet
+projector prefers its lane-specific credential override and falls back to
+Bhiksha's existing `GOOGLE_API_CREDENTIALS_PATH`.
+
+The Sheet writer accepts only `Chart_Scenarios_v1` with the exact v1 header
+contract and key `(campaign_id, run_id, arm, scenario_id)`. It identifies blank
+preformatted rows from those key columns only, preserves validations, refuses
+to append beyond available rows, and hashes the exact reread values. No control
+tab or trading authorization field is writable through this lane.
+
 ## Status and readback
 
 ```bash
@@ -165,7 +315,10 @@ silently widen observation writes.
 
 ## Rollback
 
-Stop invoking the experiment-only observer and archive or remove the generated
+Run `install_bhiksha_launchd.sh uninstall-chart-scenario-shadow`. The scoped
+rollback unloads/removes only the chart plist and clears
+`chart_scenario_shadow.enabled`, so manual runner invocation is also disarmed;
+live trading jobs and plists are untouched. Then archive or remove the generated
 files under `artifacts/chart_scenarios/` according to the repository retention
 policy. Historical receipts remain evidence. Rollback does not alter the live
 active plan or existing strategy tables. A new behavior or policy must be

@@ -460,6 +460,37 @@ class ScenarioEventRepository:
             raise IdempotencyConflict("candidate observation slots are not run-aligned")
         return ordinals.pop() + 1
 
+    def latest_observation_slot_ordinal(
+        self, *, run_id: str, candidate_ids: tuple[str, ...]
+    ) -> int:
+        """Return the latest durable slot for crash-recovery coordination."""
+
+        expected = set(candidate_ids)
+        if (
+            not expected
+            or not self.db_path.exists()
+            or not self._observation_slots_exist_readonly()
+        ):
+            return 0
+        with self._connect(write=False) as conn:
+            rows = conn.execute(
+                """
+                SELECT candidate_id, MAX(slot_ordinal) AS slot_ordinal
+                FROM chart_scenario_observation_slots
+                WHERE run_id=?
+                GROUP BY candidate_id
+                """,
+                (run_id,),
+            ).fetchall()
+        by_candidate = {str(row["candidate_id"]): int(row["slot_ordinal"]) for row in rows}
+        unknown = set(by_candidate) - expected
+        if unknown:
+            raise IdempotencyConflict(
+                "run contains observation slots for unknown candidates: "
+                + ", ".join(sorted(unknown))
+            )
+        return max(by_candidate.values(), default=0)
+
     def register_scenario(
         self,
         scenario: ChartScenarioSpec,

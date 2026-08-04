@@ -6,13 +6,13 @@ import os
 from pathlib import Path
 
 
-def load_dotenv(path: str | Path = ".env") -> None:
+def load_dotenv(path: str | Path | None = None) -> None:
     """Load simple KEY=VALUE pairs into os.environ.
 
     Existing environment variables win over the file so local shell overrides
     still work.
     """
-    file_path = Path(path)
+    file_path = Path(path or os.getenv("BHIKSHA_ENV_FILE", ".env"))
     if not file_path.exists():
         return
 

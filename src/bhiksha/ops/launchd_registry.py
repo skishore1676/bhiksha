@@ -7,10 +7,10 @@ the command shape and safety metadata stay owned here.
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-
 
 ScheduleEntry = dict[str, int]
 
@@ -26,6 +26,17 @@ class LaunchdJobSpec:
     risk_class: str
     allowed_manual_actions: tuple[str, ...] = ()
     requires_confirmation_actions: tuple[str, ...] = ()
+    install_opt_in_env: str | None = None
+
+    def install_enabled(self) -> bool:
+        if self.install_opt_in_env is None:
+            return True
+        return os.getenv(self.install_opt_in_env, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def runner_args(self) -> list[str]:
         return [self.runner_job]
@@ -67,6 +78,29 @@ def every_10_minutes(start_hour: int, start_minute: int, end_hour: int, end_minu
 
 
 ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
+    LaunchdJobSpec(
+        label="com.bhiksha.chart-scenario-shadow",
+        runner_job="chart-scenario-shadow",
+        schedule=(
+            *weekdays(7, 45),
+            *weekdays(7, 55),
+            *weekdays(8, 5),
+            *weekdays(8, 15),
+            *every_10_minutes(8, 30, 15, 0),
+            *weekdays(15, 15),
+        ),
+        schedule_label=(
+            "Trading days prepare/retry 07:45, 07:55, 08:05, 08:15 CT; every "
+            "10 minutes 08:30-15:00 CT; 15:15 CT terminal evaluation"
+        ),
+        purpose=(
+            "Coordinate the run-scoped chart-scenario shadow experiment and "
+            "project only Chart_Scenarios_v1."
+        ),
+        skips_non_trading_days=True,
+        risk_class="broker_inert_experiment",
+        install_opt_in_env="BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED",
+    ),
     LaunchdJobSpec(
         label="com.bhiksha.live-start",
         runner_job="live-start",
@@ -142,6 +176,10 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
 
 
 def active_launchd_jobs() -> tuple[LaunchdJobSpec, ...]:
+    return tuple(job for job in ACTIVE_LAUNCHD_JOBS if job.install_enabled())
+
+
+def registered_launchd_jobs() -> tuple[LaunchdJobSpec, ...]:
     return ACTIVE_LAUNCHD_JOBS
 
 

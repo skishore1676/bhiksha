@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime, timedelta
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from bhiksha.config.environment import load_dotenv
-from bhiksha.ops.launchd_registry import active_launchd_jobs, latest_status_path
+from bhiksha.ops.launchd_registry import latest_status_path, registered_launchd_jobs
 from bhiksha.ops.provider_reconciliation_health import inspect_provider_reconciliation
 
 # External callers (lathi Control Tower) kill this command at 20s
@@ -85,7 +85,7 @@ def build_status_snapshot(
     jobs = []
     generated_at = now or datetime.now(UTC)
     provider_reconciliation = inspect_provider_reconciliation(repo_root / "bhiksha.db")
-    for spec in active_launchd_jobs():
+    for spec in registered_launchd_jobs():
         latest_record = latest_jobs.get(spec.runner_job) if isinstance(latest_jobs, dict) else None
         latest_payload = (latest_record or {}).get("payload") if isinstance(latest_record, dict) else None
         if not isinstance(latest_payload, dict):
@@ -102,7 +102,7 @@ def build_status_snapshot(
                 "runner_job": spec.runner_job,
                 "kind": "external_launchd_job",
                 "serves_job": "C",
-                "declared_enabled": True,
+                "declared_enabled": _declared_enabled(spec, repo_root=repo_root),
                 "effective_enabled": bool(launchd.get(spec.label, {}).get("loaded")),
                 "launchd": launchd.get(spec.label, {"available": False, "loaded": None}),
                 "schedule": spec.schedule_label,
@@ -300,11 +300,18 @@ def _parse_timestamp(value: Any) -> datetime | None:
 
 def _launchd_state(*, deadline: _Deadline | None = None) -> dict[str, dict[str, Any]]:
     if shutil.which("launchctl") is None:
-        return {spec.label: {"available": False, "loaded": None, "reason": "launchctl_not_found"} for spec in active_launchd_jobs()}
+        return {
+            spec.label: {
+                "available": False,
+                "loaded": None,
+                "reason": "launchctl_not_found",
+            }
+            for spec in registered_launchd_jobs()
+        }
     deadline = deadline or _Deadline(_status_budget_seconds())
     result: dict[str, dict[str, Any]] = {}
     uid = os.getuid()
-    for spec in active_launchd_jobs():
+    for spec in registered_launchd_jobs():
         probe_timeout = deadline.probe_timeout(_LAUNCHCTL_PROBE_SECONDS)
         if probe_timeout is None:
             result[spec.label] = _degraded_launchd_probe("not_checked", "status budget exhausted before probe")
@@ -354,6 +361,20 @@ def _parse_launchctl_field(text: str, key: str) -> str | None:
         if stripped.startswith(prefix):
             return stripped.split("=", 1)[1].strip()
     return None
+
+
+def _declared_enabled(spec: Any, *, repo_root: Path) -> bool:
+    if spec.install_opt_in_env is None:
+        return True
+    if spec.runner_job == "chart-scenario-shadow":
+        return (
+            repo_root
+            / "artifacts"
+            / "playbook"
+            / "runtime_flags"
+            / "chart_scenario_shadow.enabled"
+        ).is_file()
+    return spec.install_enabled()
 
 
 def _latest_log_payload(path: Path) -> dict[str, Any] | None:

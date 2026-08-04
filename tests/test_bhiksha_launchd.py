@@ -1,13 +1,16 @@
 import os
-from pathlib import Path
 import plistlib
 import subprocess
+import sys
+from pathlib import Path
 
-from bhiksha.ops.launchd_registry import active_launchd_jobs
+from bhiksha.ops.launchd_registry import active_launchd_jobs, registered_launchd_jobs
 
 
 def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
-    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
+    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert "com.bhiksha.live-start" in script
     assert "com.bhiksha.live-watchdog" in script
@@ -18,14 +21,38 @@ def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
     assert "ai.openclaw.bhiksha" not in script
 
 
-def test_exit_edge_launchd_enable_is_explicit_persistent_for_start_and_watchdog() -> None:
-    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
+def test_chart_scenario_schedule_is_registered_but_install_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED", raising=False)
+    assert "chart-scenario-shadow" not in {
+        job.runner_job for job in active_launchd_jobs()
+    }
+    registered = {job.runner_job: job for job in registered_launchd_jobs()}
+    chart = registered["chart-scenario-shadow"]
+    assert chart.install_opt_in_env == ("BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED")
+    times = {(item["Hour"], item["Minute"]) for item in chart.schedule}
+    assert {
+        (7, 45),
+        (7, 55),
+        (8, 5),
+        (8, 15),
+        (8, 30),
+        (15, 0),
+        (15, 15),
+    } <= times
+
+    monkeypatch.setenv("BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED", "true")
+    assert "chart-scenario-shadow" in {job.runner_job for job in active_launchd_jobs()}
+
+
+def test_exit_edge_launchd_enable_is_explicit_persistent_for_start_and_watchdog() -> (
+    None
+):
+    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(
+        encoding="utf-8"
+    )
     assert "BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED" in script
     assert '"com.bhiksha.live-start", "com.bhiksha.live-watchdog"' in script
-    assert (
-        'environment["BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED"] = "true"'
-        in script
-    )
+    assert 'environment["BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED"] = "true"' in script
     assert "exit_edge_live_shadow.enabled" in script
 
 
@@ -47,9 +74,7 @@ def test_installer_persists_stable_plan_id_only_for_live_restart_jobs(
         "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
         "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
         "BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED": "true",
-        "BHIKSHA_ACTIVE_PLAN_ID": (
-            "active_plan_2026-07-27_exit_engine_v2_iwm_canary"
-        ),
+        "BHIKSHA_ACTIVE_PLAN_ID": ("active_plan_2026-07-27_exit_engine_v2_iwm_canary"),
     }
 
     subprocess.run(
@@ -75,6 +100,123 @@ def test_installer_persists_stable_plan_id_only_for_live_restart_jobs(
             }
         else:
             assert "EnvironmentVariables" not in payload
+
+
+def test_chart_scenario_install_pins_kernel_and_existing_env_file(tmp_path) -> None:
+    repo = Path.cwd().resolve()
+    launchd_dir = tmp_path / "LaunchAgents"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    launchctl.chmod(0o755)
+    kernel_src = tmp_path / "kernel" / "src"
+    (kernel_src / "mala_bhiksha_kernel").mkdir(parents=True)
+    env_file = tmp_path / "production.env"
+    env_file.write_text("SCHWAB_CLIENT_ID=not-read-by-test\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BHIKSHA_REPO_ROOT": str(repo),
+        "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
+        "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
+        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+        "BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED": "true",
+        "BHIKSHA_KERNEL_SRC": str(kernel_src),
+        "BHIKSHA_PYTHON": sys.executable,
+        "BHIKSHA_ENV_FILE": str(env_file),
+    }
+
+    subprocess.run(
+        [
+            "bash",
+            "scripts/launchd/install_bhiksha_launchd.sh",
+            "install-chart-scenario-shadow",
+        ],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = plistlib.loads(
+        (launchd_dir / "com.bhiksha.chart-scenario-shadow.plist").read_bytes()
+    )
+    assert payload["EnvironmentVariables"] == {
+        "BHIKSHA_ENV_FILE": str(env_file),
+        "BHIKSHA_KERNEL_SRC": str(kernel_src),
+        "BHIKSHA_PYTHON": sys.executable,
+    }
+    runner = Path("scripts/launchd/run_bhiksha_job.sh").read_text(encoding="utf-8")
+    assert "BHIKSHA_KERNEL_SRC" in runner
+    assert "chart-scenario-shadow requires an absolute executable" in runner
+
+
+def test_scoped_chart_install_does_not_rewrite_or_reload_live_jobs(tmp_path) -> None:
+    repo = Path.cwd().resolve()
+    launchd_dir = tmp_path / "LaunchAgents"
+    launchd_dir.mkdir()
+    live_plist = launchd_dir / "com.bhiksha.live-start.plist"
+    sentinel = b"production-live-plist-sentinel"
+    live_plist.write_bytes(sentinel)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launch_log = tmp_path / "launchctl.log"
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        f"#!/usr/bin/env bash\necho \"$*\" >> {launch_log}\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    kernel_src = tmp_path / "kernel" / "src"
+    (kernel_src / "mala_bhiksha_kernel").mkdir(parents=True)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BHIKSHA_REPO_ROOT": str(repo),
+        "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
+        "BHIKSHA_LAUNCHD_LOG_DIR": str(tmp_path / "logs"),
+        "BHIKSHA_RUNTIME_FLAG_DIR": str(tmp_path / "flags"),
+        "BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED": "true",
+        "BHIKSHA_KERNEL_SRC": str(kernel_src),
+        "BHIKSHA_PYTHON": sys.executable,
+    }
+
+    subprocess.run(
+        [
+            "bash",
+            "scripts/launchd/install_bhiksha_launchd.sh",
+            "install-chart-scenario-shadow",
+        ],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert live_plist.read_bytes() == sentinel
+    calls = launch_log.read_text(encoding="utf-8")
+    assert "com.bhiksha.chart-scenario-shadow" in calls
+    assert "com.bhiksha.live-start" not in calls
+
+    marker = tmp_path / "flags" / "chart_scenario_shadow.enabled"
+    assert marker.exists()
+    subprocess.run(
+        [
+            "bash",
+            "scripts/launchd/install_bhiksha_launchd.sh",
+            "uninstall-chart-scenario-shadow",
+        ],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not marker.exists()
+    assert live_plist.read_bytes() == sentinel
 
 
 def test_generic_install_omits_plan_id_and_blank_explicit_value_fails(
@@ -128,6 +270,9 @@ def test_exit_edge_restart_paths_read_persistent_allowlisted_marker() -> None:
     assert "runtime_flags/exit_edge_live_shadow.enabled" in runner
     assert "export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=true" in runner
     assert "export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=false" in runner
+    assert "runtime_flags/chart_scenario_shadow.enabled" in runner
+    assert "export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=true" in runner
+    assert "export BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=false" in runner
 
 
 def test_bhiksha_launchd_installer_has_three_session_report_times() -> None:
@@ -160,7 +305,9 @@ def test_schwab_guard_has_premarket_and_after_close_checks() -> None:
     assert "renew-schwab-access" in guard.requires_confirmation_actions
 
 
-def test_bhiksha_launchd_has_one_friday_decision_review_and_no_duplicate_publishers() -> None:
+def test_bhiksha_launchd_has_one_friday_decision_review_and_no_duplicate_publishers() -> (
+    None
+):
     jobs = {job.runner_job: job for job in active_launchd_jobs()}
     weekly = jobs["weekly-trading-decisions"]
 
@@ -169,7 +316,9 @@ def test_bhiksha_launchd_has_one_friday_decision_review_and_no_duplicate_publish
     assert "weekly-scorecard" not in jobs
     assert "shadow-ev-report" not in jobs
 
-    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(encoding="utf-8")
+    script = Path("scripts/launchd/install_bhiksha_launchd.sh").read_text(
+        encoding="utf-8"
+    )
     assert "RETIRED $retired_label" in script
 
 
@@ -177,7 +326,7 @@ def test_bhiksha_launchd_runner_points_at_bhiksha_policy_module() -> None:
     script = Path("scripts/launchd/run_bhiksha_job.sh").read_text(encoding="utf-8")
 
     assert "bhiksha.tools.launchd_job" in script
-    assert "PYTHONPATH=src" in script
+    assert 'PYTHONPATH="$REPO_ROOT/src${BHIKSHA_KERNEL_SRC:+:$BHIKSHA_KERNEL_SRC}"' in script
 
 
 def test_retired_weekly_calculators_are_not_live_publish_jobs() -> None:

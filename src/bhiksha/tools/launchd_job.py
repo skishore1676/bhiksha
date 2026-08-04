@@ -3,22 +3,21 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from loguru import logger
 
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.config.environment import load_dotenv
 from bhiksha.market_data.trading_calendar import is_trading_day
-from loguru import logger
-
 from bhiksha.ops.alerts import (
-    AlertMode,
     ReviewPublishResult,
     publish_lathi_review,
     send_lathi_alert,
@@ -52,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             "schwab-refresh",
             "session-report",
             "weekly-trading-decisions",
+            "chart-scenario-shadow",
         ],
     )
     parser.add_argument("--force", action="store_true", help="Run even when today is not a trading day")
@@ -135,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
             return _session_report_job(args)
         if args.job == "weekly-trading-decisions":
             return _weekly_trading_decisions_job(args, repo_root=repo_root)
+        if args.job == "chart-scenario-shadow":
+            return _chart_scenario_shadow_job(args, repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
         alert = _send_failure_alert(args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc))
         _print_result({"job": args.job, "status": "failed", "error": str(exc), "alert": alert.to_dict()})
@@ -347,6 +349,32 @@ def _weekly_report_output_dir(
     return reports
 
 
+def _chart_scenario_shadow_job(
+    args: argparse.Namespace, *, repo_root: Path
+) -> int:
+    completed = _run_python_module(
+        ["bhiksha.tools.chart_scenario_coordinator", "--phase", "auto"],
+        repo_root=repo_root,
+    )
+    payload = _last_json_object(completed.stdout)
+    status = str(payload.get("status") or "failed")
+    ok = completed.returncode == 0 and status in {"succeeded", "skipped"}
+    _print_result(
+        {
+            "job": args.job,
+            "status": "ok" if ok else "failed",
+            "coordinator_status": status,
+            "phase": payload.get("phase"),
+            "receipt_hash": payload.get("content_hash"),
+            "reason": payload.get("reason"),
+            "return_code": completed.returncode,
+            "stdout_tail": _tail(completed.stdout),
+            "stderr_tail": _tail(completed.stderr),
+        }
+    )
+    return 0 if ok else 2
+
+
 def _update_trading_decision_ledger(
     args: argparse.Namespace,
     facts_path: Path,
@@ -453,7 +481,10 @@ def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
 def _run_python_module(args: list[str], *, repo_root: Path) -> subprocess.CompletedProcess[str]:
     module, *rest = args
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo_root / "src")
+    kernel_src = env.get("BHIKSHA_KERNEL_SRC", "").strip()
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (str(repo_root / "src"), kernel_src) if item
+    )
     env["PYTHONUNBUFFERED"] = "1"
     return subprocess.run(  # noqa: S603
         [sys.executable, "-m", module, *rest],

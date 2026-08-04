@@ -8,8 +8,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from mala_bhiksha_kernel import canonical_sha256
+
 from .cycle import run_observation_cycle
 from .observer import BrokerInertScenarioObserver
+from .paths import require_experiment_path
 from .quotes import PersistedOptionSnapshotSource
 from .repository import ScenarioEventRepository
 from .validation import (
@@ -126,9 +129,73 @@ def _observe_cycle(args: argparse.Namespace) -> int:
         cycle_input,
         repository=ScenarioEventRepository(args.db_path),
         receipt_path=args.receipt,
+        cycle_input_path=args.cycle_input,
     )
     print(json.dumps(receipt, indent=2, sort_keys=True))
     return 0 if receipt["status"] == "succeeded" else 2
+
+
+def _replay_cycles(args: argparse.Namespace) -> int:
+    """Rebuild receipts and the event chain from sealed inputs in a fresh namespace."""
+
+    plan = load_bundle(args.plan)
+    source = require_experiment_path(args.cycle_input_dir, role="replay input directory")
+    output = require_experiment_path(args.output, role="replay output directory")
+    if output.exists() and any(output.iterdir()):
+        raise ValueError("replay output directory must be absent or empty")
+    output.mkdir(parents=True, exist_ok=True)
+    input_paths = sorted(source.glob("slot-*.json"))
+    if not input_paths:
+        raise ValueError("replay requires at least one sealed cycle input")
+    repository = ScenarioEventRepository(output / "replay.sqlite3")
+    receipts: list[dict[str, Any]] = []
+    for ordinal, input_path in enumerate(input_paths, start=1):
+        if input_path.name != f"slot-{ordinal:04d}.json":
+            raise ValueError("replay cycle inputs must be exact and contiguous")
+        raw = _read_json(input_path)
+        if not isinstance(raw, Mapping):
+            raise TypeError("replay cycle input must be an object")
+        receipt_path = output / "receipts" / f"slot-{ordinal:04d}.receipt.json"
+        receipts.append(
+            run_observation_cycle(
+                plan,
+                raw,
+                repository=repository,
+                receipt_path=receipt_path,
+                cycle_input_path=input_path,
+            )
+        )
+    chain = repository.verify_event_chain()
+    if not chain.valid:
+        raise ValueError("replayed event chain is invalid")
+    events = [event.model_dump(mode="json") for event in repository.events()]
+    events_body = {
+        "schema": "bhiksha.chart-scenario-events-export.v1",
+        "event_count": len(events),
+        "last_event_hash": chain.last_event_hash,
+        "events": events,
+    }
+    events_payload = {**events_body, "content_hash": canonical_sha256(events_body)}
+    events_path = output / "events.json"
+    events_path.write_text(
+        json.dumps(events_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    body = {
+        "schema": "bhiksha.chart-scenario-replay-receipt.v1",
+        "plan_hash": plan.plan_hash,
+        "cycle_input_hashes": [receipt["cycle_input_hash"] for receipt in receipts],
+        "cycle_receipt_hashes": [receipt["receipt_hash"] for receipt in receipts],
+        "events_hash": events_payload["content_hash"],
+        "event_count": len(events),
+        "broker_effect_count": 0,
+        "effects": {"broker": False, "orders": False, "authorization": False},
+    }
+    replay = {**body, "receipt_hash": canonical_sha256(body)}
+    (output / "replay.receipt.json").write_text(
+        json.dumps(replay, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(replay, indent=2, sort_keys=True))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,6 +245,15 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--db-path", default=str(DEFAULT_SHADOW_DB_PATH))
     cycle.add_argument("--receipt", required=True)
     cycle.set_defaults(handler=_observe_cycle)
+
+    replay = subparsers.add_parser(
+        "replay-cycles",
+        help="purely rebuild receipts and events from sealed cycle inputs",
+    )
+    replay.add_argument("--plan", default=str(DEFAULT_SHADOW_PLAN_PATH))
+    replay.add_argument("--cycle-input-dir", required=True)
+    replay.add_argument("--output", required=True)
+    replay.set_defaults(handler=_replay_cycles)
 
     status = subparsers.add_parser(
         "status", help="read experiment state and verify the event chain"

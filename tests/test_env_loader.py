@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
@@ -16,6 +17,19 @@ def test_load_dotenv_sets_missing_values(tmp_path: Path, monkeypatch) -> None:
 
     assert settings.public_secret_token == "test-secret"
     assert settings.api_requests_per_second == 7.0
+
+
+def test_load_dotenv_supports_explicit_nonsecret_env_file_pointer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    env_file = tmp_path / "production.env"
+    env_file.write_text("EXPLICIT_ENV_FILE_VALUE=loaded\n", encoding="utf-8")
+    monkeypatch.setenv("BHIKSHA_ENV_FILE", str(env_file))
+    monkeypatch.delenv("EXPLICIT_ENV_FILE_VALUE", raising=False)
+
+    load_dotenv()
+
+    assert os.environ["EXPLICIT_ENV_FILE_VALUE"] == "loaded"
 
 
 def test_get_mala_evidence_sheet_name_prefers_clear_env(monkeypatch) -> None:

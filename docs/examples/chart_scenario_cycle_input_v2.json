@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "bars_by_timeframe": {
+        "39m": {
+          "bars": [
+            {"bar_id": null, "close": 99.0, "completed": true, "high": 99.0, "low": 97.0, "open": 98.0, "timestamp": "2026-08-04T13:30:00Z", "volume": null},
+            {"bar_id": null, "close": 101.0, "completed": true, "high": 102.0, "low": 99.0, "open": 100.0, "timestamp": "2026-08-04T14:09:00Z", "volume": null},
+            {"bar_id": null, "close": 102.0, "completed": true, "high": 103.0, "low": 100.0, "open": 101.0, "timestamp": "2026-08-04T14:48:00Z", "volume": null}
+          ],
+          "provenance": {
+            "calendar": "XNYS",
+            "completed_through": "2026-08-04T14:48:00Z",
+            "content_hash": "b1396d80b1458581de7e03b5f4ee8d6b2f1d03e32efc4eaf96a71786f0eaed86",
+            "implementation": "xnys-session-anchor-v1",
+            "interval": "39m",
+            "output_hash": "0f7fae5003c5d47575b477839ec1e43afc445e36bf7c96430c3ba367950ff3cb",
+            "schema_version": "bhiksha.chart-scenario-bar-provenance.v1",
+            "session_anchor": "09:30",
+            "source_bar_count": 3,
+            "source_hash": "0f7fae5003c5d47575b477839ec1e43afc445e36bf7c96430c3ba367950ff3cb",
+            "timezone": "America/New_York"
+          },
+          "timeframe": "39m"
+        },
+        "daily": {
+          "bars": [
+            {"bar_id": "SPY:daily:2026-08-03", "close": 102.0, "completed": true, "high": 103.0, "low": 96.0, "open": 97.0, "timestamp": "2026-08-03T19:59:00Z", "volume": 1000000.0}
+          ],
+          "provenance": {
+            "calendar": "XNYS",
+            "completed_through": "2026-08-03T19:59:00Z",
+            "content_hash": "6b87a0b7c59b7b3c4fbd68e56d74436e9eb30690e9957cc54e617cff555a01ad",
+            "implementation": "xnys-session-anchor-v1",
+            "interval": "daily",
+            "output_hash": "e9311b403032b46d63718723d0e45d07257c816ad831068f0246bc2b79303760",
+            "schema_version": "bhiksha.chart-scenario-bar-provenance.v1",
+            "session_anchor": "09:30",
+            "source_bar_count": 1,
+            "source_hash": "e9311b403032b46d63718723d0e45d07257c816ad831068f0246bc2b79303760",
+            "timezone": "America/New_York"
+          },
+          "timeframe": "daily"
+        }
+      },
+      "candidate_id": "candidate-1",
+      "diagnostics": {"comparable": true, "errors": []},
+      "option_selection": {
+        "canonical_selected_option_symbol": "SPY260807C00100000",
+        "contracts": [
+          {"ask": 1.1, "bid": 1.0, "contract_type": "CALL", "delta": 0.4, "dte": 3, "expiration_date": "2026-08-07", "open_interest": 100, "option_symbol": "SPY260807C00100000", "strike": 100.0, "underlying_symbol": "SPY"}
+        ],
+        "effective_selected_option_symbol": "SPY260807C00100000",
+        "evaluated_at": "2026-08-04T14:50:00Z",
+        "mode": "canonical_selector",
+        "policy_hash": "40fea42cb84a7c9a82eae33200a4ea1175601b5705f89a93932930a8079c70cc",
+        "receipt_hash": "c682f759a231697320512a371fb5da7307d5b7e898cffa12927bef7c4982f830",
+        "request": {
+          "deployment_id": "chart-scenario:candidate-1",
+          "direction": "long",
+          "execution_params": {
+            "dte_fallback_policy": "strict",
+            "dte_max": 7,
+            "dte_min": 0,
+            "long_signal_contract_type": "CALL",
+            "max_bid_ask_spread_pct": 0.2,
+            "min_open_interest": 100,
+            "short_signal_contract_type": "PUT",
+            "target_abs_delta_max": 0.4,
+            "target_abs_delta_min": 0.2
+          },
+          "execution_profile": "chart_scenario_shadow_v1",
+          "signal_timestamp": "2026-08-04T14:50:00Z",
+          "symbol": "SPY"
+        },
+        "schema_version": "bhiksha.chart-scenario-option-selection.v1"
+      },
+      "quotes": [],
+      "symbol": "SPY"
+    }
+  ],
+  "content_hash": "e0a3b51adc39c9435f277df7c917ec0961d903014a5abe0e2fa17837602d977d",
+  "evaluated_at": "2026-08-04T14:50:00Z",
+  "observation_slot_ordinal": 1,
+  "plan_hash": "8cf19608e7050ffc2339af83c99b83a6c3cc246b4af4f961a81256bcf600d9cd",
+  "run_manifest_hash": "sha256:187819a5466e5e30b7e8df2063d80ec0726bec7310f44a96af98f102cff25ace",
+  "schema_version": "bhiksha.chart-scenario-cycle-input.v2",
+  "treatment_manifest_hash": "sha256:21f8558f8943e1619b1a40b3e21c1fad65e9104e6278462852a8b81c95d17072"
+}
