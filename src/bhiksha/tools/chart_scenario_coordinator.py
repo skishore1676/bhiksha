@@ -20,6 +20,7 @@ from mala_bhiksha_kernel import canonical_sha256
 
 from bhiksha.chart_scenarios.paths import require_experiment_path, run_artifact_paths
 from bhiksha.chart_scenarios.repository import ScenarioEventRepository
+from bhiksha.chart_scenarios.timeframes import CALENDAR_VERSION, xnys_session_dates
 from bhiksha.chart_scenarios.validation import (
     install_shadow_plan,
     read_installed_plan,
@@ -30,6 +31,7 @@ from bhiksha.config.environment import load_dotenv
 SCHEMA = "bhiksha.chart-scenario-coordinator-contract.v1"
 CAMPAIGN_CONFIG_SCHEMA = "bhiksha.chart-scenario-campaign-config.v1"
 RECEIPT_SCHEMA = "bhiksha.chart-scenario-coordinator-receipt.v1"
+CAMPAIGN_WINDOW_SCHEMA = "bhiksha.chart-scenario-campaign-window.v1"
 CENTRAL = ZoneInfo("America/Chicago")
 PREPARE_CUTOFF_MINUTES = 8 * 60 + 15
 _CYCLE_RECEIPT_RE = re.compile(r"slot-(\d{4})\.receipt\.json")
@@ -71,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     _verify_kernel_source()
     now = args.at or datetime.now(CENTRAL)
+    config = _validate_campaign_config(
+        json.loads(Path(args.campaign_config).read_text(encoding="utf-8"))
+    )
     local = now.astimezone(CENTRAL) if now.tzinfo else now.replace(tzinfo=CENTRAL)
     lock_path = require_experiment_path(
         Path("artifacts/chart_scenarios/locks") / f"{local.date().isoformat()}.lock",
@@ -83,10 +88,18 @@ def main(argv: list[str] | None = None) -> int:
         except BlockingIOError:
             print(json.dumps({"status": "skipped", "reason": "non_overlap_lock_held"}))
             return 0
-        return _main_locked(args, now)
+        outside = _campaign_window_preflight(
+            config, now=now, artifact_root=Path(args.contract_dir).parent
+        )
+        if outside is not None:
+            print(json.dumps(outside, sort_keys=True))
+            return 0
+        return _main_locked(args, now, config=config)
 
 
-def _main_locked(args: argparse.Namespace, now: datetime) -> int:
+def _main_locked(
+    args: argparse.Namespace, now: datetime, *, config: Mapping[str, Any]
+) -> int:
     try:
         contract_path = _resolve_daily_contract(Path(args.contract_dir), now)
     except FileNotFoundError:
@@ -106,9 +119,7 @@ def _main_locked(args: argparse.Namespace, now: datetime) -> int:
                 "daily chart-scenario preparation missed the 08:15 CT cutoff"
             ) from None
         contract_path = _prepare_daily_contract(
-            _validate_campaign_config(
-                json.loads(Path(args.campaign_config).read_text(encoding="utf-8"))
-            ),
+            config,
             contract_dir=Path(args.contract_dir),
             now=now,
         )
@@ -116,6 +127,14 @@ def _main_locked(args: argparse.Namespace, now: datetime) -> int:
         json.loads(contract_path.read_text(encoding="utf-8")),
         contract_path=contract_path,
     )
+    for field in (
+        "campaign_config_hash",
+        "campaign_protocol_hash",
+        "campaign_freeze_receipt_hash",
+        "session_calendar_hash",
+    ):
+        if _normalized_hash(contract[field]) != _normalized_hash(config[field]):
+            raise ValueError(f"daily contract {field} differs from campaign freeze")
     phase = (
         _phase(now, contract["target_session_window"])
         if args.phase == "auto"
@@ -181,6 +200,9 @@ def _run_phase(contract: dict[str, Any], *, phase: str) -> dict[str, Any]:
         "run_id": contract["run_id"],
         "contract_hash": contract["content_hash"],
         "campaign_config_hash": contract["campaign_config_hash"],
+        "campaign_protocol_hash": contract["campaign_protocol_hash"],
+        "campaign_freeze_receipt_hash": contract["campaign_freeze_receipt_hash"],
+        "session_calendar_hash": contract["session_calendar_hash"],
         "run_root": str(paths.root),
         "actions": actions,
         "effects": {
@@ -228,22 +250,28 @@ def _observe_once(
     else:
         slot = completed_slot + 1
         cycle_input_path = paths.cycle_inputs / f"slot-{slot:04d}.json"
-        export = _run_command(
-            [
-                sys.executable,
-                "-m",
-                "bhiksha.tools.chart_scenario_live_export",
-                "--plan",
-                str(paths.plan),
-                "--db-path",
-                str(paths.database),
-                "--output",
-                str(cycle_input_path),
-                "--observation-slot",
-                str(slot),
-            ],
-            cwd=Path.cwd(),
-        )
+        if cycle_input_path.is_file():
+            export = {
+                "status": "skipped",
+                "reason": "reuse_failed_attempt_cycle_input",
+            }
+        else:
+            export = _run_command(
+                [
+                    sys.executable,
+                    "-m",
+                    "bhiksha.tools.chart_scenario_live_export",
+                    "--plan",
+                    str(paths.plan),
+                    "--db-path",
+                    str(paths.database),
+                    "--output",
+                    str(cycle_input_path),
+                    "--observation-slot",
+                    str(slot),
+                ],
+                cwd=Path.cwd(),
+            )
     cycle_input = json.loads(cycle_input_path.read_text(encoding="utf-8"))
     if int(cycle_input["observation_slot_ordinal"]) != slot:
         raise ValueError("exported cycle input used an unexpected observation slot")
@@ -290,8 +318,8 @@ def _completed_cycle_slot(receipt_dir: Path) -> int:
             {key: item for key, item in receipt.items() if key != "receipt_hash"}
         )
         if (
-            receipt.get("schema_version")
-            != "bhiksha.chart-scenario-cycle-receipt.v2"
+            receipt.get("schema_version") != "bhiksha.chart-scenario-cycle-receipt.v3"
+            or receipt.get("status") != "succeeded"
             or receipt.get("observation_slot_ordinal") != expected
             or receipt.get("receipt_hash") != receipt_hash
         ):
@@ -375,6 +403,8 @@ def _run_tradelab_lifecycle(
                 str(contract["spreadsheet_id"]),
             ]
         )
+        if command == "finalize-run":
+            argv.extend(["--bhiksha-root", str(Path.cwd().resolve())])
     return {
         "action": f"tradelab:{command}",
         "command_hash": canonical_sha256(argv),
@@ -402,7 +432,7 @@ def _run_command(
 def _execute_command(
     command: list[str], *, cwd: Path, env: Mapping[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603 - callers construct fixed module argv
+    return subprocess.run(
         command,
         check=False,
         cwd=cwd,
@@ -448,6 +478,9 @@ def _validate_contract(
         "birdclaw_output_hash",
         "narrative_source_failure",
         "campaign_config_hash",
+        "campaign_protocol_hash",
+        "campaign_freeze_receipt_hash",
+        "session_calendar_hash",
         "tradelab_checkout",
         "tradelab_experiment_root",
         "agent_broker",
@@ -464,14 +497,28 @@ def _validate_contract(
     )
     if str(value.get("content_hash", "")).removeprefix("sha256:") != computed:
         raise ValueError("coordinator contract content hash mismatch")
-    if re.fullmatch(
-        r"[0-9a-f]{64}",
-        str(value.get("campaign_config_hash", "")).removeprefix("sha256:"),
-    ) is None:
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(value.get("campaign_config_hash", "")).removeprefix("sha256:"),
+        )
+        is None
+    ):
         raise ValueError("coordinator contract campaign_config_hash is invalid")
+    for field in (
+        "campaign_protocol_hash",
+        "campaign_freeze_receipt_hash",
+        "session_calendar_hash",
+    ):
+        _normalized_hash(value.get(field))
     target_date = _parse_target_date(value.get("target_session_date"))
-    if contract_path is not None and contract_path.name != f"{target_date.isoformat()}.json":
-        raise ValueError("daily coordinator contract filename must equal target session date")
+    if (
+        contract_path is not None
+        and contract_path.name != f"{target_date.isoformat()}.json"
+    ):
+        raise ValueError(
+            "daily coordinator contract filename must equal target session date"
+        )
     window = _validate_session_window(
         value.get("target_session_window"),
         target_date=target_date,
@@ -503,7 +550,9 @@ def _resolve_daily_contract(directory: Path, now: datetime) -> Path:
     root = require_experiment_path(directory, role="daily contract directory")
     path = root / f"{local.date().isoformat()}.json"
     if not path.is_file():
-        raise FileNotFoundError(f"no daily chart-scenario contract for {local.date()}: {path}")
+        raise FileNotFoundError(
+            f"no daily chart-scenario contract for {local.date()}: {path}"
+        )
     return path
 
 
@@ -541,10 +590,24 @@ def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
         "cartographer_provider",
         "cartographer_data_root",
         "symbols",
+        "campaign_manifest_hash",
+        "campaign_protocol_hash",
+        "campaign_freeze_receipt_hash",
+        "treatment_manifest_hash",
+        "universe_hash",
+        "session_calendar_hash",
+        "session_calendar_id",
+        "session_calendar_version",
+        "starts_on",
+        "checkpoint_after_sessions",
+        "max_sessions",
+        "ends_on",
         "content_hash",
     }
     if set(value) != expected or value.get("schema") != CAMPAIGN_CONFIG_SCHEMA:
-        raise ValueError("chart-scenario campaign config has unsupported or non-exact fields")
+        raise ValueError(
+            "chart-scenario campaign config has unsupported or non-exact fields"
+        )
     computed = canonical_sha256(
         {key: item for key, item in value.items() if key != "content_hash"}
     )
@@ -578,7 +641,204 @@ def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
     birdclaw_db = Path(str(value.get("birdclaw_db") or "")).expanduser()
     if not birdclaw_db.is_absolute() or not birdclaw_db.is_file():
         raise ValueError("campaign birdclaw_db must be an existing absolute file")
-    return {**dict(value), "content_hash": computed}
+    try:
+        starts_on = date.fromisoformat(str(value.get("starts_on")))
+        ends_on = date.fromisoformat(str(value.get("ends_on")))
+    except ValueError as exc:
+        raise ValueError("campaign boundaries must use YYYY-MM-DD") from exc
+    if value.get("checkpoint_after_sessions") != 5:
+        raise ValueError("campaign checkpoint_after_sessions must be exactly 5")
+    if value.get("max_sessions") != 10:
+        raise ValueError("campaign max_sessions must be exactly 10")
+    campaign_root = (
+        Path(str(value["tradelab_experiment_root"]))
+        / "campaigns"
+        / str(value["campaign_id"])
+    )
+    campaign = _read_content_addressed(
+        campaign_root / "campaign.json", schema="tradelab.market_context_campaign.v2"
+    )
+    protocol = _read_content_addressed(
+        campaign_root / "campaign-protocol.json",
+        schema="tradelab.market_context_campaign_protocol.v1",
+    )
+    freeze = _read_content_addressed(
+        campaign_root / "campaign-freeze-receipt.json",
+        schema="tradelab.market_context_campaign_freeze_receipt.v1",
+    )
+    bindings = {
+        "campaign_manifest_hash": campaign["content_hash"],
+        "campaign_protocol_hash": protocol["content_hash"],
+        "campaign_freeze_receipt_hash": freeze["content_hash"],
+        "treatment_manifest_hash": protocol["treatment_manifest_hash"],
+        "universe_hash": protocol["universe_hash"],
+        "session_calendar_hash": protocol["session_calendar_hash"],
+    }
+    for field, actual in bindings.items():
+        if _normalized_hash(value.get(field)) != _normalized_hash(actual):
+            raise ValueError(f"campaign {field} does not match TradeLab freeze")
+    if (
+        campaign.get("campaign_id") != value["campaign_id"]
+        or _normalized_hash(campaign.get("treatment_manifest_hash"))
+        != _normalized_hash(protocol.get("treatment_manifest_hash"))
+        or _normalized_hash(campaign.get("universe_hash"))
+        != _normalized_hash(protocol.get("universe_hash"))
+    ):
+        raise ValueError("TradeLab campaign manifest identity is inconsistent")
+    calendar = protocol.get("session_calendar")
+    if not isinstance(calendar, Mapping):
+        raise TypeError("TradeLab campaign protocol has no session calendar")
+    calendar_body = {
+        key: item for key, item in calendar.items() if key != "content_hash"
+    }
+    authorized = protocol.get("authorized_session_dates")
+    if (
+        calendar.get("schema") != "tradelab.market_context_session_calendar.v1"
+        or calendar.get("calendar_id") != "XNYS"
+        or calendar.get("timezone") != "America/New_York"
+        or calendar.get("implementation") != "exchange_calendars"
+        or calendar.get("calendar_version") != CALENDAR_VERSION
+        or _normalized_hash(calendar.get("content_hash"))
+        != canonical_sha256(calendar_body)
+        or _normalized_hash(protocol.get("session_calendar_hash"))
+        != _normalized_hash(calendar.get("content_hash"))
+        or value.get("session_calendar_id") != calendar.get("calendar_id")
+        or value.get("session_calendar_version") != calendar.get("calendar_version")
+        or not isinstance(authorized, list)
+        or authorized != calendar.get("session_dates")
+        or calendar.get("session_count") != 10
+        or calendar.get("starts_on") != starts_on.isoformat()
+        or calendar.get("ends_on") != ends_on.isoformat()
+        or calendar.get("ends_on_semantics") != "inclusive"
+        or protocol.get("checkpoint_after_sessions") != 5
+        or protocol.get("max_sessions") != 10
+        or protocol.get("starts_on") != starts_on.isoformat()
+        or protocol.get("ends_on") != ends_on.isoformat()
+        or protocol.get("ends_on_semantics") != "inclusive"
+    ):
+        raise ValueError("TradeLab campaign session calendar bindings are invalid")
+    sessions = tuple(date.fromisoformat(item) for item in authorized)
+    if len(sessions) != 10 or sessions[0] != starts_on or sessions[-1] != ends_on:
+        raise ValueError("campaign boundaries must be exactly 10 XNYS sessions")
+    if sessions != xnys_session_dates(starts_on, ends_on):
+        raise ValueError("TradeLab authorized sessions drift from pinned XNYS calendar")
+    cross = (
+        campaign.get("content_hash"),
+        protocol.get("campaign_manifest_hash"),
+        freeze.get("campaign_manifest_hash"),
+    )
+    if len({_normalized_hash(item) for item in cross}) != 1:
+        raise ValueError("TradeLab campaign artifacts disagree on campaign manifest")
+    for field in (
+        "campaign_protocol_hash",
+        "treatment_manifest_hash",
+        "universe_hash",
+        "session_calendar_hash",
+    ):
+        expected_value = (
+            protocol["content_hash"]
+            if field == "campaign_protocol_hash"
+            else protocol[field]
+        )
+        if _normalized_hash(freeze.get(field)) != _normalized_hash(expected_value):
+            raise ValueError(f"TradeLab freeze receipt disagrees on {field}")
+    if (
+        freeze.get("starts_on") != starts_on.isoformat()
+        or freeze.get("ends_on") != ends_on.isoformat()
+        or freeze.get("checkpoint_after_sessions") != 5
+        or freeze.get("max_sessions") != 10
+        or freeze.get("minimum_closed_sessions_for_decision") != 10
+    ):
+        raise ValueError("TradeLab freeze receipt campaign boundaries are invalid")
+    return {
+        **dict(value),
+        "content_hash": computed,
+        "_authorized_session_dates": tuple(authorized),
+    }
+
+
+def _normalized_hash(value: Any) -> str:
+    normalized = str(value or "").removeprefix("sha256:")
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise ValueError("expected sha256 identity")
+    return normalized
+
+
+def _read_content_addressed(path: Path, *, schema: str) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema") != schema:
+        raise ValueError(f"unsupported TradeLab campaign artifact: {path.name}")
+    computed = canonical_sha256(
+        {key: item for key, item in value.items() if key != "content_hash"}
+    )
+    if _normalized_hash(value.get("content_hash")) != computed:
+        raise ValueError(f"TradeLab campaign artifact hash mismatch: {path.name}")
+    return value
+
+
+def _campaign_window_preflight(
+    config: Mapping[str, Any], *, now: datetime, artifact_root: Path
+) -> dict[str, Any] | None:
+    """Reject non-campaign clock ticks before any source or lifecycle invocation."""
+
+    local = now.astimezone(CENTRAL) if now.tzinfo else now.replace(tzinfo=CENTRAL)
+    target = local.date()
+    starts_on = date.fromisoformat(str(config["starts_on"]))
+    ends_on = date.fromisoformat(str(config["ends_on"]))
+    authorized = tuple(
+        date.fromisoformat(item) for item in config["_authorized_session_dates"]
+    )
+    ordinal = authorized.index(target) + 1 if target in authorized else None
+    if starts_on <= target <= ends_on and ordinal is not None and ordinal <= 10:
+        return None
+    if target < starts_on:
+        detail = "before_starts_on"
+    elif target > ends_on:
+        detail = "after_ends_on"
+    elif ordinal is None:
+        detail = "non_xnys_session"
+    else:
+        detail = "max_sessions_elapsed"
+    body = {
+        "schema": CAMPAIGN_WINDOW_SCHEMA,
+        "status": "skipped",
+        "reason": "outside_campaign_window",
+        "detail": detail,
+        "campaign_id": config["campaign_id"],
+        "campaign_config_hash": config["content_hash"],
+        "campaign_protocol_hash": config["campaign_protocol_hash"],
+        "campaign_freeze_receipt_hash": config["campaign_freeze_receipt_hash"],
+        "treatment_manifest_hash": config["treatment_manifest_hash"],
+        "universe_hash": config["universe_hash"],
+        "session_calendar_hash": config["session_calendar_hash"],
+        "session_calendar_id": config["session_calendar_id"],
+        "session_calendar_version": config["session_calendar_version"],
+        "target_date": target.isoformat(),
+        "starts_on": config["starts_on"],
+        "checkpoint_after_sessions": 5,
+        "max_sessions": 10,
+        "ends_on": config["ends_on"],
+        "session_ordinal": ordinal,
+        "effects": {
+            "birdclaw": False,
+            "cartographer": False,
+            "broker": False,
+            "orders": False,
+            "sheet": False,
+        },
+    }
+    receipt = {**body, "content_hash": canonical_sha256(body)}
+    path = require_experiment_path(
+        artifact_root / "campaign-window" / f"{target.isoformat()}.json",
+        role="campaign window receipt",
+    )
+    if path.exists():
+        prior = json.loads(path.read_text(encoding="utf-8"))
+        if prior != receipt:
+            raise ValueError("campaign window receipt conflicts with fixed campaign")
+    else:
+        _write_atomic(path, receipt)
+    return receipt
 
 
 def _prepare_daily_contract(
@@ -657,7 +917,9 @@ def _prepare_daily_contract(
     experiment_root = require_experiment_path(
         str(config["tradelab_experiment_root"]), role="TradeLab experiment root"
     )
-    tradelab_run = experiment_root / "campaigns" / str(config["campaign_id"]) / "runs" / run_id
+    tradelab_run = (
+        experiment_root / "campaigns" / str(config["campaign_id"]) / "runs" / run_id
+    )
     body = {
         "schema": SCHEMA,
         "campaign_id": config["campaign_id"],
@@ -673,6 +935,9 @@ def _prepare_daily_contract(
         "birdclaw_output_hash": birdclaw_export["output_hash"],
         "narrative_source_failure": narrative_failure,
         "campaign_config_hash": config["content_hash"],
+        "campaign_protocol_hash": config["campaign_protocol_hash"],
+        "campaign_freeze_receipt_hash": config["campaign_freeze_receipt_hash"],
+        "session_calendar_hash": config["session_calendar_hash"],
         "tradelab_checkout": config["tradelab_checkout"],
         "tradelab_experiment_root": str(experiment_root),
         "agent_broker": config["agent_broker"],
@@ -719,8 +984,7 @@ def _export_birdclaw_context(
     status = json.loads(completed.stdout)
     if (
         status.get("schema") != "birdclaw.temporal_market_context_export.v1"
-        or status.get("packet_schema")
-        != "birdclaw.temporal_market_context_packet.v1"
+        or status.get("packet_schema") != "birdclaw.temporal_market_context_packet.v1"
         or status.get("dry_run") is not False
         or not status.get("output")
     ):
@@ -748,7 +1012,11 @@ def _export_birdclaw_context(
         raise ValueError("Birdclaw temporal export hashes are invalid")
     target = attempt / "birdclaw-temporal-export.json"
     _write_atomic(target, payload)
-    return {"path": target.resolve(), "packet_hash": packet_hash, "output_hash": output_hash}
+    return {
+        "path": target.resolve(),
+        "packet_hash": packet_hash,
+        "output_hash": output_hash,
+    }
 
 
 def _record_missed_preparation(
@@ -777,7 +1045,9 @@ def _require_preopen_completion(
     contract: Mapping[str, Any], paths: Any, *, now: datetime | None = None
 ) -> None:
     completed_at = now or datetime.now(UTC)
-    session_start = datetime.fromisoformat(contract["target_session_window"]["start_at"])
+    session_start = datetime.fromisoformat(
+        contract["target_session_window"]["start_at"]
+    )
     if completed_at < session_start:
         return
     body = {
@@ -821,11 +1091,15 @@ def _validate_session_window(
         end = datetime.fromisoformat(window["end_at"])
         market_tz = ZoneInfo(window["market_timezone"])
     except (ValueError, KeyError) as exc:
-        raise ValueError("target_session_window timestamps/timezone are invalid") from exc
+        raise ValueError(
+            "target_session_window timestamps/timezone are invalid"
+        ) from exc
     if start.tzinfo is None or end.tzinfo is None or start >= end:
         raise ValueError("target_session_window must be aware and increasing")
     if start.astimezone(market_tz).date() != target_date:
-        raise ValueError("target_session_window start does not match target session date")
+        raise ValueError(
+            "target_session_window start does not match target session date"
+        )
     computed = canonical_sha256(window)
     if str(expected_hash or "").removeprefix("sha256:") != computed:
         raise ValueError("target_session_window hash mismatch")
@@ -853,7 +1127,9 @@ def _validate_cartographer_receipt(
         or str(receipt.get("target_session_window_hash", "")).removeprefix("sha256:")
         != str(contract["target_session_window_hash"]).removeprefix("sha256:")
     ):
-        raise ValueError("daily contract does not match authenticated Cartographer session")
+        raise ValueError(
+            "daily contract does not match authenticated Cartographer session"
+        )
 
 
 def _validate_birdclaw_export(
@@ -890,7 +1166,7 @@ def _validate_birdclaw_export(
         }
     )
     try:
-        cutoff = datetime.fromisoformat(str(packet["as_of"]).replace("Z", "+00:00"))
+        cutoff = datetime.fromisoformat(str(packet["as_of"]))
         session_start = datetime.fromisoformat(window["start_at"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Birdclaw temporal export cutoff is invalid") from exc
@@ -911,8 +1187,12 @@ def _validate_tradelab_paths(contract: Mapping[str, Any]) -> None:
     root = require_experiment_path(
         str(contract["tradelab_experiment_root"]), role="TradeLab experiment root"
     )
-    run_root = root / "campaigns" / str(contract["campaign_id"]) / "runs" / str(
-        contract["run_id"]
+    run_root = (
+        root
+        / "campaigns"
+        / str(contract["campaign_id"])
+        / "runs"
+        / str(contract["run_id"])
     )
     expected = {
         "plan_source": run_root / "outputs" / "shadow-plan.json",
@@ -939,7 +1219,10 @@ def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
         staging / "install-receipt.json",
         json.loads(paths.install_receipt.read_text(encoding="utf-8")),
     )
+    completed_slots = _completed_cycle_slot(paths.cycle_receipts)
     source_receipts = sorted(paths.cycle_receipts.glob("*.receipt.json"))
+    if len(source_receipts) != completed_slots:
+        raise ValueError("only succeeded canonical cycle receipts may be staged")
     expected_names: set[str] = set()
     for expected_slot, source in enumerate(source_receipts, start=1):
         match = _CYCLE_RECEIPT_RE.fullmatch(source.name)
@@ -952,9 +1235,11 @@ def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
             json.loads(source.read_text(encoding="utf-8")),
         )
     staged_dir = staging / "cycle-receipts"
-    if staged_dir.exists() and {
-        item.name for item in staged_dir.iterdir() if item.is_file()
-    } != expected_names:
+    if (
+        staged_dir.exists()
+        and {item.name for item in staged_dir.iterdir() if item.is_file()}
+        != expected_names
+    ):
         raise ValueError("TradeLab staging contains non-exact cycle receipts")
     source_inputs = sorted(paths.cycle_inputs.glob("slot-*.json"))
     if len(source_inputs) != len(source_receipts):
@@ -970,9 +1255,11 @@ def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
             json.loads(source.read_text(encoding="utf-8")),
         )
     staged_inputs = staging / "cycle-inputs"
-    if staged_inputs.exists() and {
-        item.name for item in staged_inputs.iterdir() if item.is_file()
-    } != expected_input_names:
+    if (
+        staged_inputs.exists()
+        and {item.name for item in staged_inputs.iterdir() if item.is_file()}
+        != expected_input_names
+    ):
         raise ValueError("TradeLab staging contains non-exact cycle inputs")
     _write_atomic(
         staging / "events.json",
@@ -981,7 +1268,9 @@ def _stage_tradelab_evidence(contract: Mapping[str, Any], paths: Any) -> None:
 
 
 def _install_or_verify_plan(contract: Mapping[str, Any], paths: Any) -> dict[str, Any]:
-    source_payload = json.loads(Path(contract["plan_source"]).read_text(encoding="utf-8"))
+    source_payload = json.loads(
+        Path(contract["plan_source"]).read_text(encoding="utf-8")
+    )
     source_plan = validate_bundle(source_payload)
     if (
         source_plan.run_manifest.get("campaign_id") != contract["campaign_id"]

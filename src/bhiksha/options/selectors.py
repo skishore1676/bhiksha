@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from bhiksha.domain.models import OptionContractSnapshot, OptionSelection, OptionSelectionRequest
+from bhiksha.domain.models import (
+    OptionContractSnapshot,
+    OptionSelection,
+    OptionSelectionRequest,
+)
 
 
 class SelectorEmptyError(ValueError):
@@ -12,11 +16,18 @@ class SelectorEmptyError(ValueError):
     constraint emptied the candidate set instead of just "no contracts".
     """
 
-    def __init__(self, deployment_id: str, breakdown: dict[str, int], diagnostics: dict | None = None) -> None:
+    def __init__(
+        self,
+        deployment_id: str,
+        breakdown: dict[str, int],
+        diagnostics: dict | None = None,
+    ) -> None:
         self.deployment_id = deployment_id
         self.breakdown = breakdown
         self.diagnostics = diagnostics or {}
-        detail = ", ".join(f"{name}={count}" for name, count in breakdown.items() if count)
+        detail = ", ".join(
+            f"{name}={count}" for name, count in breakdown.items() if count
+        )
         super().__init__(
             f"No contracts matched the execution profile for {deployment_id} ({detail or 'no candidates supplied'})"
         )
@@ -37,7 +48,11 @@ class SingleLegOptionSelector:
         delta_max = request.execution_params.get("target_abs_delta_max")
         min_open_interest = int(request.execution_params.get("min_open_interest", 0))
         max_spread_pct = request.execution_params.get("max_bid_ask_spread_pct")
-        dte_fallback_policy = str(request.execution_params.get("dte_fallback_policy") or "strict").strip().lower()
+        dte_fallback_policy = (
+            str(request.execution_params.get("dte_fallback_policy") or "strict")
+            .strip()
+            .lower()
+        )
 
         eliminated = {
             "total_candidates": len(contracts),
@@ -67,21 +82,30 @@ class SingleLegOptionSelector:
             if (contract.open_interest or 0) < min_open_interest:
                 eliminated["open_interest_below_min"] += 1
                 continue
-            if delta_min is not None and (contract.abs_delta is None or contract.abs_delta < float(delta_min)):
+            if delta_min is not None and (
+                contract.abs_delta is None or contract.abs_delta < float(delta_min)
+            ):
                 eliminated["delta_below_min"] += 1
                 continue
-            if delta_max is not None and (contract.abs_delta is None or contract.abs_delta > float(delta_max)):
+            if delta_max is not None and (
+                contract.abs_delta is None or contract.abs_delta > float(delta_max)
+            ):
                 eliminated["delta_above_max"] += 1
                 continue
             if max_spread_pct is not None and (
-                contract.spread_pct is None or contract.spread_pct > float(max_spread_pct)
+                contract.spread_pct is None
+                or contract.spread_pct > float(max_spread_pct)
             ):
                 eliminated["spread_above_max"] += 1
                 continue
             filtered.append(contract)
 
         fallback_policy_applied: str | None = None
-        if not filtered and dte_window_candidates == 0 and dte_fallback_policy == "allow_nearest_after":
+        if (
+            not filtered
+            and dte_window_candidates == 0
+            and dte_fallback_policy == "allow_nearest_after"
+        ):
             filtered = self._nearest_after_candidates(
                 desired_contracts,
                 dte_max=dte_max,
@@ -100,10 +124,14 @@ class SingleLegOptionSelector:
                 diagnostics={
                     "requested_dte_min": dte_min,
                     "requested_dte_max": dte_max,
-                    "available_dtes": sorted({contract.dte for contract in desired_contracts}),
+                    "available_dtes": sorted(
+                        {contract.dte for contract in desired_contracts}
+                    ),
                     "dte_window_candidates": dte_window_candidates,
                     "dte_fallback_policy": dte_fallback_policy,
-                    "nearest_after_dte": self._nearest_after_dte(desired_contracts, dte_max=dte_max),
+                    "nearest_after_dte": self._nearest_after_dte(
+                        desired_contracts, dte_max=dte_max
+                    ),
                 },
             )
 
@@ -114,6 +142,7 @@ class SingleLegOptionSelector:
                 abs((contract.abs_delta or 99.0) - target_delta),
                 contract.dte,
                 contract.spread_pct if contract.spread_pct is not None else 99.0,
+                contract.option_symbol.replace(" ", "").upper(),
             ),
         )
         chosen = ranked[0]
@@ -136,7 +165,9 @@ class SingleLegOptionSelector:
             ask=chosen.ask,
             strike=chosen.strike,
             open_interest=chosen.open_interest,
-            open_interest_percentile=self._open_interest_percentile(chosen, percentile_cohort),
+            open_interest_percentile=self._open_interest_percentile(
+                chosen, percentile_cohort
+            ),
             dte_fallback_policy=fallback_policy_applied,
             requested_dte_min=dte_min if fallback_policy_applied else None,
             requested_dte_max=dte_max if fallback_policy_applied else None,
@@ -144,8 +175,12 @@ class SingleLegOptionSelector:
 
     def _required_contract_type(self, request: OptionSelectionRequest) -> str:
         if request.direction.value == "long":
-            return str(request.execution_params.get("long_signal_contract_type", "CALL")).upper()
-        return str(request.execution_params.get("short_signal_contract_type", "PUT")).upper()
+            return str(
+                request.execution_params.get("long_signal_contract_type", "CALL")
+            ).upper()
+        return str(
+            request.execution_params.get("short_signal_contract_type", "PUT")
+        ).upper()
 
     @staticmethod
     def _target_delta(delta_min: float | None, delta_max: float | None) -> float:
@@ -167,7 +202,9 @@ class SingleLegOptionSelector:
         min_open_interest: int,
         max_spread_pct: float | None,
     ) -> list[OptionContractSnapshot]:
-        for dte in sorted({contract.dte for contract in contracts if contract.dte > dte_max}):
+        for dte in sorted(
+            {contract.dte for contract in contracts if contract.dte > dte_max}
+        ):
             candidates = [
                 contract
                 for contract in contracts
@@ -195,19 +232,29 @@ class SingleLegOptionSelector:
     ) -> bool:
         if (contract.open_interest or 0) < min_open_interest:
             return False
-        if delta_min is not None and (contract.abs_delta is None or contract.abs_delta < float(delta_min)):
-            return False
-        if delta_max is not None and (contract.abs_delta is None or contract.abs_delta > float(delta_max)):
-            return False
-        if max_spread_pct is not None and (
-            contract.spread_pct is None or contract.spread_pct > float(max_spread_pct)
+        if delta_min is not None and (
+            contract.abs_delta is None or contract.abs_delta < float(delta_min)
         ):
             return False
-        return True
+        if delta_max is not None and (
+            contract.abs_delta is None or contract.abs_delta > float(delta_max)
+        ):
+            return False
+        return not (
+            max_spread_pct is not None
+            and (
+                contract.spread_pct is None
+                or contract.spread_pct > float(max_spread_pct)
+            )
+        )
 
     @staticmethod
-    def _nearest_after_dte(contracts: list[OptionContractSnapshot], *, dte_max: int) -> int | None:
-        later_dtes = sorted({contract.dte for contract in contracts if contract.dte > dte_max})
+    def _nearest_after_dte(
+        contracts: list[OptionContractSnapshot], *, dte_max: int
+    ) -> int | None:
+        later_dtes = sorted(
+            {contract.dte for contract in contracts if contract.dte > dte_max}
+        )
         return later_dtes[0] if later_dtes else None
 
     @staticmethod
@@ -220,6 +267,7 @@ class SingleLegOptionSelector:
         at_or_below = sum(
             1
             for contract in cohort
-            if contract.open_interest is not None and contract.open_interest <= chosen.open_interest
+            if contract.open_interest is not None
+            and contract.open_interest <= chosen.open_interest
         )
         return at_or_below / len(cohort)

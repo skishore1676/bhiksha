@@ -11,6 +11,8 @@ from mala_bhiksha_kernel import canonical_sha256
 import bhiksha.tools.chart_scenario_coordinator as coordinator
 from bhiksha.tools.chart_scenario_coordinator import (
     _before_prepare_cutoff,
+    _campaign_window_preflight,
+    _completed_cycle_slot,
     _phase,
     _prepare_daily_contract,
     _require_preopen_completion,
@@ -73,17 +75,116 @@ def _contract(tmp_path: Path) -> dict[str, object]:
         "birdclaw_output_hash": birdclaw["output_hash"],
         "narrative_source_failure": None,
         "campaign_config_hash": "c" * 64,
+        "campaign_protocol_hash": "d" * 64,
+        "campaign_freeze_receipt_hash": "e" * 64,
+        "session_calendar_hash": "f" * 64,
         "tradelab_checkout": "/tmp/tradelab",
         "tradelab_experiment_root": str(experiment_root),
         "agent_broker": "/Users/sunny/code/agent-broker/agent-broker",
         "spreadsheet_id": "sheet-1",
         "kernel_src": "/tmp/kernel/src",
         "plan_source": str(run_root / "outputs" / "shadow-plan.json"),
-        "projection_request": str(
-            run_root / "outputs" / "sheet-upsert-request.json"
-        ),
+        "projection_request": str(run_root / "outputs" / "sheet-upsert-request.json"),
     }
     return {**body, "content_hash": canonical_sha256(body)}
+
+
+def _campaign_artifacts(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    root = tmp_path / "artifacts" / "chart_scenarios" / "tradelab"
+    campaign_root = root / "campaigns" / "campaign-1"
+    campaign_root.mkdir(parents=True)
+    treatment_hash = "sha256:" + "1" * 64
+    universe_hash = "sha256:" + "2" * 64
+    campaign_body = {
+        "schema": "tradelab.market_context_campaign.v2",
+        "campaign_id": "campaign-1",
+        "treatment_manifest_hash": treatment_hash,
+        "universe_hash": universe_hash,
+    }
+    campaign = {
+        **campaign_body,
+        "content_hash": "sha256:" + canonical_sha256(campaign_body),
+    }
+    sessions = [
+        "2026-08-04",
+        "2026-08-05",
+        "2026-08-06",
+        "2026-08-07",
+        "2026-08-10",
+        "2026-08-11",
+        "2026-08-12",
+        "2026-08-13",
+        "2026-08-14",
+        "2026-08-17",
+    ]
+    calendar_body = {
+        "schema": "tradelab.market_context_session_calendar.v1",
+        "calendar_id": "XNYS",
+        "timezone": "America/New_York",
+        "implementation": "exchange_calendars",
+        "calendar_version": "exchange_calendars-4.13.2-XNYS",
+        "starts_on": sessions[0],
+        "ends_on": sessions[-1],
+        "ends_on_semantics": "inclusive",
+        "session_count": 10,
+        "session_dates": sessions,
+    }
+    calendar = {
+        **calendar_body,
+        "content_hash": "sha256:" + canonical_sha256(calendar_body),
+    }
+    protocol_body = {
+        "schema": "tradelab.market_context_campaign_protocol.v1",
+        "campaign_manifest_hash": campaign["content_hash"],
+        "treatment_manifest_hash": treatment_hash,
+        "universe_hash": universe_hash,
+        "starts_on": sessions[0],
+        "ends_on": sessions[-1],
+        "ends_on_semantics": "inclusive",
+        "session_calendar": calendar,
+        "session_calendar_hash": calendar["content_hash"],
+        "authorized_session_dates": sessions,
+        "checkpoint_after_sessions": 5,
+        "max_sessions": 10,
+    }
+    protocol = {
+        **protocol_body,
+        "content_hash": "sha256:" + canonical_sha256(protocol_body),
+    }
+    freeze_body = {
+        "schema": "tradelab.market_context_campaign_freeze_receipt.v1",
+        "campaign_manifest_hash": campaign["content_hash"],
+        "campaign_protocol_hash": protocol["content_hash"],
+        "treatment_manifest_hash": treatment_hash,
+        "component_commits": {},
+        "frozen_behavior_hashes": {},
+        "universe_hash": universe_hash,
+        "session_calendar_hash": calendar["content_hash"],
+        "starts_on": sessions[0],
+        "ends_on": sessions[-1],
+        "checkpoint_after_sessions": 5,
+        "max_sessions": 10,
+        "minimum_closed_sessions_for_decision": 10,
+        "effects": {"broker": False, "orders": False},
+    }
+    freeze = {
+        **freeze_body,
+        "content_hash": "sha256:" + canonical_sha256(freeze_body),
+    }
+    for name, payload in (
+        ("campaign.json", campaign),
+        ("campaign-protocol.json", protocol),
+        ("campaign-freeze-receipt.json", freeze),
+    ):
+        (campaign_root / name).write_text(json.dumps(payload), encoding="utf-8")
+    return root, {
+        "campaign_manifest_hash": campaign["content_hash"],
+        "campaign_protocol_hash": protocol["content_hash"],
+        "campaign_freeze_receipt_hash": freeze["content_hash"],
+        "treatment_manifest_hash": treatment_hash,
+        "universe_hash": universe_hash,
+        "session_calendar_hash": calendar["content_hash"],
+    }
 
 
 def test_coordinator_contract_is_content_addressed_and_session_phases_are_explicit(
@@ -93,9 +194,17 @@ def test_coordinator_contract_is_content_addressed_and_session_phases_are_explic
 
     assert contract["run_id"] == "run-2026-08-04"
     window = contract["target_session_window"]
-    assert _phase(datetime.fromisoformat("2026-08-04T07:45:00-05:00"), window) == "morning"
-    assert _phase(datetime.fromisoformat("2026-08-04T10:00:00-05:00"), window) == "intraday"
-    assert _phase(datetime.fromisoformat("2026-08-04T15:15:00-05:00"), window) == "after-close"
+    assert (
+        _phase(datetime.fromisoformat("2026-08-04T07:45:00-05:00"), window) == "morning"
+    )
+    assert (
+        _phase(datetime.fromisoformat("2026-08-04T10:00:00-05:00"), window)
+        == "intraday"
+    )
+    assert (
+        _phase(datetime.fromisoformat("2026-08-04T15:15:00-05:00"), window)
+        == "after-close"
+    )
 
 
 def test_phase_uses_authenticated_early_close_end_instead_of_fixed_clock(
@@ -142,18 +251,22 @@ def test_daily_contract_resolution_rotates_run_without_scheduler_edits(
     first.write_text("{}", encoding="utf-8")
     second.write_text("{}", encoding="utf-8")
 
-    assert _resolve_daily_contract(
-        directory, datetime.fromisoformat("2026-08-04T07:45:00-05:00")
-    ) == first
-    assert _resolve_daily_contract(
-        directory, datetime.fromisoformat("2026-08-05T07:45:00-05:00")
-    ) == second
+    assert (
+        _resolve_daily_contract(
+            directory, datetime.fromisoformat("2026-08-04T07:45:00-05:00")
+        )
+        == first
+    )
+    assert (
+        _resolve_daily_contract(
+            directory, datetime.fromisoformat("2026-08-05T07:45:00-05:00")
+        )
+        == second
+    )
 
 
 def test_preparation_cutoff_allows_bounded_retries_only_before_open() -> None:
-    assert _before_prepare_cutoff(
-        datetime.fromisoformat("2026-08-04T08:15:00-05:00")
-    )
+    assert _before_prepare_cutoff(datetime.fromisoformat("2026-08-04T08:15:00-05:00"))
     assert not _before_prepare_cutoff(
         datetime.fromisoformat("2026-08-04T08:16:00-05:00")
     )
@@ -228,6 +341,7 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
     (birdclaw / "birdclawctl").write_text("", encoding="utf-8")
     birdclaw_db = tmp_path / "production-birdclaw.sqlite"
     birdclaw_db.write_bytes(b"sqlite-fixture")
+    experiment_root, frozen = _campaign_artifacts(tmp_path)
     body: dict[str, object] = {
         "schema": "bhiksha.chart-scenario-campaign-config.v1",
         "campaign_id": "campaign-1",
@@ -235,19 +349,41 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
         "birdclaw_db": str(birdclaw_db),
         "market_cartographer_checkout": str(cartographer),
         "tradelab_checkout": str(tmp_path / "tradelab"),
-        "tradelab_experiment_root": str(
-            tmp_path / "artifacts" / "chart_scenarios" / "tradelab"
-        ),
+        "tradelab_experiment_root": str(experiment_root),
         "agent_broker": "/Users/sunny/code/agent-broker/agent-broker",
         "spreadsheet_id": "sheet-1",
         "kernel_src": str(tmp_path / "kernel" / "src"),
         "cartographer_provider": "mala",
         "cartographer_data_root": str(tmp_path / "bars"),
         "symbols": ["IWM", "SPY"],
+        **frozen,
+        "session_calendar_id": "XNYS",
+        "session_calendar_version": "exchange_calendars-4.13.2-XNYS",
+        "starts_on": "2026-08-04",
+        "checkpoint_after_sessions": 5,
+        "max_sessions": 10,
+        "ends_on": "2026-08-17",
     }
-    config = _validate_campaign_config(
-        {**body, "content_hash": canonical_sha256(body)}
+    config_payload = {**body, "content_hash": canonical_sha256(body)}
+    config = _validate_campaign_config(config_payload)
+    assert (
+        _campaign_window_preflight(
+            config,
+            now=datetime.fromisoformat("2026-08-04T07:45:00-05:00"),
+            artifact_root=tmp_path / "artifacts" / "chart_scenarios",
+        )
+        is None
     )
+    outside = _campaign_window_preflight(
+        config,
+        now=datetime.fromisoformat("2026-08-03T07:45:00-05:00"),
+        artifact_root=tmp_path / "artifacts" / "chart_scenarios",
+    )
+    assert outside is not None
+    assert outside["reason"] == "outside_campaign_window"
+    assert outside["campaign_protocol_hash"] == config["campaign_protocol_hash"]
+    assert outside["session_calendar_hash"] == config["session_calendar_hash"]
+    assert not any(outside["effects"].values())
     window = _window()
 
     birdclaw_envs: list[dict[str, str]] = []
@@ -305,9 +441,7 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
 
     monkeypatch.setattr(coordinator, "_run_command", fake_run)
     monkeypatch.setattr(coordinator, "_execute_command", fake_execute)
-    contract_dir = (
-        tmp_path / "artifacts" / "chart_scenarios" / "daily-contracts"
-    )
+    contract_dir = tmp_path / "artifacts" / "chart_scenarios" / "daily-contracts"
 
     path = _prepare_daily_contract(
         config,
@@ -324,6 +458,18 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
     assert payload["birdclaw_packet_hash"]
     assert birdclaw_envs[0]["BIRDCLAW_DB"] == str(birdclaw_db)
     assert str(birdclaw_db) not in json.dumps(payload)
+
+    protocol_path = (
+        experiment_root / "campaigns" / "campaign-1" / "campaign-protocol.json"
+    )
+    tampered = json.loads(protocol_path.read_text(encoding="utf-8"))
+    tampered["max_sessions"] = 9
+    tampered["content_hash"] = "sha256:" + canonical_sha256(
+        {key: value for key, value in tampered.items() if key != "content_hash"}
+    )
+    protocol_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="campaign_protocol_hash"):
+        _validate_campaign_config(config_payload)
 
 
 def test_coordinator_rejects_generic_commands_and_non_run_scoped_outputs(
@@ -371,6 +517,10 @@ def test_fixed_tradelab_lifecycle_has_no_caller_authored_output_argv(
     assert all("--output" not in command for command in captured)
     assert all("active_plan.json" not in command for command in captured)
     assert "--birdclaw-export" in captured[0]
+    assert "--bhiksha-root" in captured[2]
+    assert captured[2][captured[2].index("--bhiksha-root") + 1] == str(
+        Path.cwd().resolve()
+    )
 
 
 def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
@@ -387,8 +537,16 @@ def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
     install.write_text(json.dumps({"status": "installed"}), encoding="utf-8")
     events.write_text(json.dumps({"events": []}), encoding="utf-8")
     for slot in (1, 2):
+        receipt_body = {
+            "schema_version": "bhiksha.chart-scenario-cycle-receipt.v3",
+            "status": "succeeded",
+            "observation_slot_ordinal": slot,
+        }
         (cycles / f"slot-{slot:04d}.receipt.json").write_text(
-            json.dumps({"slot": slot}), encoding="utf-8"
+            json.dumps(
+                {**receipt_body, "receipt_hash": canonical_sha256(receipt_body)}
+            ),
+            encoding="utf-8",
         )
         (inputs / f"slot-{slot:04d}.json").write_text(
             json.dumps({"slot": slot}), encoding="utf-8"
@@ -422,13 +580,28 @@ def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
     ]
 
 
+def test_failed_cycle_receipt_never_advances_completed_slot(tmp_path: Path) -> None:
+    cycles = tmp_path / "cycles"
+    cycles.mkdir()
+    receipt_body = {
+        "schema_version": "bhiksha.chart-scenario-cycle-receipt.v3",
+        "status": "failed",
+        "observation_slot_ordinal": 1,
+    }
+    (cycles / "slot-0001.receipt.json").write_text(
+        json.dumps({**receipt_body, "receipt_hash": canonical_sha256(receipt_body)}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid receipt"):
+        _completed_cycle_slot(cycles)
+
+
 def test_daily_contract_must_match_authenticated_cartographer_window(
     tmp_path: Path,
 ) -> None:
     value = _contract(tmp_path)
-    value["target_session_window"] = _window(
-        end_at="2026-08-04T13:00:00-04:00"
-    )
+    value["target_session_window"] = _window(end_at="2026-08-04T13:00:00-04:00")
     value["target_session_window_hash"] = canonical_sha256(
         value["target_session_window"]
     )

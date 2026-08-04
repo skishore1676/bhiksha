@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import pairwise
 from typing import Any
 
 from mala_bhiksha_kernel import (
@@ -188,14 +189,18 @@ class BrokerInertScenarioObserver:
                 )
             normalized_by_timeframe = {}
             for timeframe, series in bars_by_timeframe.items():
-                if set(series) != {"timeframe", "provenance", "bars"} or series.get(
-                    "timeframe"
-                ) != timeframe:
+                if (
+                    set(series)
+                    != {
+                        "timeframe",
+                        "provenance",
+                        "source_bars",
+                        "bars",
+                    }
+                    or series.get("timeframe") != timeframe
+                ):
                     raise ValueError("timeframe series provenance mismatch")
                 normalized_by_timeframe[timeframe] = normalize_bars(series["bars"])
-        normalized_bars = normalized_by_timeframe[
-            scenario.entry_condition.timeframe
-        ]
         single_quote = (
             self._coerce_quote(option_quote) if option_quote is not None else None
         )
@@ -210,6 +215,7 @@ class BrokerInertScenarioObserver:
         timestamps.extend(quote.quote_time for quote in normalized_path)
         if single_quote is not None:
             timestamps.append(single_quote.quote_time)
+        supplied_evaluated_at = evaluated_at is not None
         now = (
             as_utc(evaluated_at)
             if evaluated_at is not None
@@ -231,7 +237,7 @@ class BrokerInertScenarioObserver:
         if single_quote is not None:
             quote_times.append(single_quote.quote_time)
             quote_ids.append(single_quote.snapshot_id)
-        if any(left >= right for left, right in zip(quote_times, quote_times[1:])):
+        if any(left >= right for left, right in pairwise(quote_times)):
             raise ValueError("option quotes must be strictly chronological and unique")
         if len(quote_ids) != len(set(quote_ids)):
             raise ValueError("option quote snapshot IDs must be unique")
@@ -247,6 +253,14 @@ class BrokerInertScenarioObserver:
             "bar_provenance_by_timeframe": (
                 {
                     timeframe: dict(series["provenance"])
+                    for timeframe, series in sorted(bars_by_timeframe.items())
+                }
+                if bars_by_timeframe is not None
+                else None
+            ),
+            "source_bars_by_timeframe": (
+                {
+                    timeframe: list(series["source_bars"])
                     for timeframe, series in sorted(bars_by_timeframe.items())
                 }
                 if bars_by_timeframe is not None
@@ -532,7 +546,12 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "validated",
                             "quote_status": "unavailable",
-                            **self._quote_counts(state, unavailable=True),
+                            **self._quote_counts(
+                                state,
+                                observation_id,
+                                unavailable=True,
+                                deduplicate_observation=True,
+                            ),
                         },
                     )
                     state = (
@@ -553,10 +572,12 @@ class BrokerInertScenarioObserver:
                             or state
                         )
                     return self._result(scenario, state, new_events)
-                entry_observed_at = entry_quote.quote_time if normalized_path else now
                 if (
                     not self.quote_eligibility_policy.eligible(
-                        entry_quote, evaluated_at=entry_observed_at
+                        entry_quote,
+                        evaluated_at=(
+                            now if supplied_evaluated_at else entry_quote.quote_time
+                        ),
                     )
                     or not entry_quote.is_selected
                 ):
@@ -578,7 +599,9 @@ class BrokerInertScenarioObserver:
                             "status": "validated",
                             "quote_status": "ineligible",
                             **self._quote_snapshot_updates(state, entry_quote),
-                            **self._quote_counts(state, unavailable=True),
+                            **self._quote_counts(
+                                state, observation_id, unavailable=True
+                            ),
                         },
                     )
                     state = (
@@ -604,7 +627,7 @@ class BrokerInertScenarioObserver:
                         "status": "option_selected",
                         "selected_option_symbol": entry_quote.option_symbol,
                         **self._quote_snapshot_updates(state, entry_quote),
-                        **self._quote_counts(state, eligible=True),
+                        **self._quote_counts(state, observation_id, eligible=True),
                     },
                 )
                 self._record(
@@ -660,7 +683,12 @@ class BrokerInertScenarioObserver:
                     state_updates={
                         "status": "synthetic_entry",
                         "quote_status": "unavailable",
-                        **self._quote_counts(state, unavailable=True),
+                        **self._quote_counts(
+                            state,
+                            observation_id,
+                            unavailable=True,
+                            deduplicate_observation=True,
+                        ),
                     },
                 )
                 state = (
@@ -709,7 +737,9 @@ class BrokerInertScenarioObserver:
                         state_updates={
                             "status": "synthetic_entry",
                             "quote_status": "contract_mismatch",
-                            **self._quote_counts(state, unavailable=True),
+                            **self._quote_counts(
+                                state, observation_id, unavailable=True
+                            ),
                         },
                     )
                     continue
@@ -725,7 +755,8 @@ class BrokerInertScenarioObserver:
                         )
                     continue
                 if not self.quote_eligibility_policy.eligible(
-                    quote, evaluated_at=quote.quote_time
+                    quote,
+                    evaluated_at=(now if supplied_evaluated_at else quote.quote_time),
                 ):
                     self._record(
                         new_events,
@@ -745,7 +776,9 @@ class BrokerInertScenarioObserver:
                             "status": "synthetic_entry",
                             "quote_status": "ineligible",
                             **self._quote_snapshot_updates(state, quote),
-                            **self._quote_counts(state, unavailable=True),
+                            **self._quote_counts(
+                                state, observation_id, unavailable=True
+                            ),
                         },
                     )
                     continue
@@ -791,7 +824,9 @@ class BrokerInertScenarioObserver:
                 for profile, result in observations:
                     primary = profile is scenario.exit_profile
                     primary_diagnostics = (
-                        self._primary_quote_diagnostics(state, result)
+                        self._primary_quote_diagnostics(
+                            state, result, observation_id=observation_id
+                        )
                         if primary
                         else {}
                     )
@@ -860,7 +895,7 @@ class BrokerInertScenarioObserver:
                             "primary_gross_r": primary_result.gross_r,
                             "primary_net_r": primary_result.net_r,
                             "rule": primary_result.rule,
-                            "quote": quote.quote_provenance(),
+                            "observation": primary_result.to_dict(),
                         },
                         status="synthetic_exit",
                         state_updates={
@@ -904,30 +939,11 @@ class BrokerInertScenarioObserver:
                 "terminal": True,
             }
             return self._result(scenario, state, new_events)
-        except Exception as exc:  # noqa: BLE001 - fail closed and persist a terminal receipt
+        except Exception as exc:  # noqa: BLE001 - cycle attempt records retryable failure
             state = self.repository.get_state(scenario, self.trigger_version)
-            if state is not None and not state["terminal"]:
-                try:
-                    self._record_terminal(
-                        new_events,
-                        scenario,
-                        ShadowEventType.RUNTIME_ERROR,
-                        now,
-                        observation_id,
-                        role="runtime-error:" + observation_id,
-                        reason="observer_exception",
-                        details={"error_type": type(exc).__name__, "error": str(exc)},
-                        status="runtime_error",
-                    )
-                    state = (
-                        self.repository.get_state(scenario, self.trigger_version)
-                        or state
-                    )
-                except Exception:  # noqa: BLE001,S110 - preserve the original observer failure
-                    pass
             return ObservationResult(
                 scenario_id=scenario.scenario_id,
-                status=(state or {}).get("status", "runtime_error"),
+                status=(state or {}).get("status", "observation_failed"),
                 terminal=bool((state or {}).get("terminal", False)),
                 new_events=tuple(new_events),
                 broker_effect_count=0,
@@ -964,14 +980,24 @@ class BrokerInertScenarioObserver:
 
     @staticmethod
     def _quote_counts(
-        state: Mapping[str, Any], *, eligible: bool = False, unavailable: bool = False
+        state: Mapping[str, Any],
+        observation_id: str,
+        *,
+        eligible: bool = False,
+        unavailable: bool = False,
+        deduplicate_observation: bool = False,
     ) -> dict[str, int]:
+        replay = (
+            deduplicate_observation
+            and state.get("last_event_observation_id") == observation_id
+        )
         return {
-            "quote_attempt_count": int(state.get("quote_attempt_count") or 0) + 1,
+            "quote_attempt_count": int(state.get("quote_attempt_count") or 0)
+            + int(not replay),
             "quote_eligible_count": int(state.get("quote_eligible_count") or 0)
-            + int(eligible),
+            + int(eligible and not replay),
             "quote_unavailable_count": int(state.get("quote_unavailable_count") or 0)
-            + int(unavailable),
+            + int(unavailable and not replay),
         }
 
     @staticmethod
@@ -989,13 +1015,17 @@ class BrokerInertScenarioObserver:
 
     @classmethod
     def _primary_quote_diagnostics(
-        cls, state: Mapping[str, Any], result: ExitObservation
+        cls,
+        state: Mapping[str, Any],
+        result: ExitObservation,
+        *,
+        observation_id: str,
     ) -> dict[str, Any]:
         previous_mfe = state.get("primary_mfe_net_r")
         previous_mae = state.get("primary_mae_net_r")
         net_r = float(result.net_r)
         return {
-            **cls._quote_counts(state, eligible=True),
+            **cls._quote_counts(state, observation_id, eligible=True),
             "primary_mfe_net_r": (
                 net_r if previous_mfe is None else max(float(previous_mfe), net_r)
             ),
@@ -1109,7 +1139,6 @@ class BrokerInertScenarioObserver:
                 "primary_net_r": float(net_r),
                 "rule": primary.get("terminal_rule"),
                 "observation": dict(observation),
-                "recovered_after_restart": True,
             },
             status="synthetic_exit",
             state_updates={
@@ -1256,7 +1285,11 @@ class BrokerInertScenarioObserver:
             "cost_model_hash": self.cost_model.content_hash,
             "quote_eligibility_policy_hash": self.quote_eligibility_policy.content_hash,
             "market_facts_hash": self.market_facts_hash,
-            "market_fact_proof": dict(self.market_fact_proof or {}),
+            "market_fact_proof": {
+                key: value
+                for key, value in dict(self.market_fact_proof or {}).items()
+                if key not in {"observed_arm_ids", "paired", "proof_hash"}
+            },
             "scenario_hash": scenario.scenario_hash,
             "component_manifest_hash": scenario.component_manifest_hash,
             "candidate_pool_hash": scenario.candidate_pool_hash,

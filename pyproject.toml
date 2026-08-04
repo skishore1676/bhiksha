@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Config-driven live execution runtime for Mala strategy deployments."
 requires-python = ">=3.12"
 dependencies = [
+  "exchange-calendars==4.13.2",
   "google-api-python-client>=2.169.0",
   "google-auth>=2.40.0",
   "google-auth-httplib2>=0.2.0",

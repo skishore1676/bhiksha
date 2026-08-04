@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -13,7 +13,7 @@ def test_single_leg_selector_prefers_contract_near_target_delta() -> None:
         deployment_id="market_impulse_qqq_short_v1",
         symbol="QQQ",
         direction=SignalDirection.SHORT,
-        signal_timestamp=datetime(2026, 3, 30, 14, 30, 0),
+        signal_timestamp=datetime(2026, 3, 30, 14, 30, 0, tzinfo=UTC),
         execution_profile="single_leg_long_premium_v1",
         execution_params={
             "short_signal_contract_type": "PUT",
@@ -73,13 +73,38 @@ def test_single_leg_selector_prefers_contract_near_target_delta() -> None:
     assert selected.open_interest_percentile == pytest.approx(2 / 3)
 
 
+def test_single_leg_selector_uses_normalized_option_symbol_as_final_tie_break() -> None:
+    request = OptionSelectionRequest(
+        deployment_id="tie-break",
+        symbol="SMH",
+        direction=SignalDirection.SHORT,
+        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0, tzinfo=UTC),
+        execution_profile="single_leg_long_premium_v1",
+        execution_params={
+            "short_signal_contract_type": "PUT",
+            "dte_min": 9,
+            "dte_max": 9,
+            "target_abs_delta_min": 0.2,
+            "target_abs_delta_max": 0.4,
+            "min_open_interest": 100,
+            "max_bid_ask_spread_pct": 0.2,
+        },
+    )
+    alpha = _contract("SMH260626P00609000", dte=9, delta=-0.3, bid=10.0, ask=10.5)
+    omega = _contract("SMH260626P00610000", dte=9, delta=-0.3, bid=10.0, ask=10.5)
+    selector = SingleLegOptionSelector()
+
+    assert selector.select(request, [omega, alpha]).option_symbol == alpha.option_symbol
+    assert selector.select(request, [alpha, omega]).option_symbol == alpha.option_symbol
+
+
 def test_single_leg_selector_empty_reports_filter_breakdown() -> None:
     selector = SingleLegOptionSelector()
     request = OptionSelectionRequest(
         deployment_id="amd_short_lane",
         symbol="AMD",
         direction=SignalDirection.SHORT,
-        signal_timestamp=datetime(2026, 6, 10, 14, 30, 0),
+        signal_timestamp=datetime(2026, 6, 10, 14, 30, 0, tzinfo=UTC),
         execution_profile="single_leg_long_premium_v1",
         execution_params={
             "short_signal_contract_type": "PUT",
@@ -147,7 +172,7 @@ def test_single_leg_selector_empty_with_no_candidates() -> None:
         deployment_id="amd_short_lane",
         symbol="AMD",
         direction=SignalDirection.SHORT,
-        signal_timestamp=datetime(2026, 6, 10, 14, 30, 0),
+        signal_timestamp=datetime(2026, 6, 10, 14, 30, 0, tzinfo=UTC),
         execution_profile="single_leg_long_premium_v1",
         execution_params={},
     )
@@ -162,7 +187,7 @@ def test_single_leg_selector_allow_nearest_after_uses_next_later_dte_only() -> N
         deployment_id="smh_short_lane",
         symbol="SMH",
         direction=SignalDirection.SHORT,
-        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0),
+        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0, tzinfo=UTC),
         execution_profile="single_leg_long_premium_v1",
         execution_params={
             "short_signal_contract_type": "PUT",
@@ -192,13 +217,15 @@ def test_single_leg_selector_allow_nearest_after_uses_next_later_dte_only() -> N
     assert selected.requested_dte_max == 7
 
 
-def test_single_leg_selector_strict_reports_nearest_after_without_selecting_it() -> None:
+def test_single_leg_selector_strict_reports_nearest_after_without_selecting_it() -> (
+    None
+):
     selector = SingleLegOptionSelector()
     request = OptionSelectionRequest(
         deployment_id="smh_short_lane",
         symbol="SMH",
         direction=SignalDirection.SHORT,
-        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0),
+        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0, tzinfo=UTC),
         execution_profile="single_leg_long_premium_v1",
         execution_params={
             "short_signal_contract_type": "PUT",
@@ -215,8 +242,12 @@ def test_single_leg_selector_strict_reports_nearest_after_without_selecting_it()
         selector.select(
             request,
             [
-                _contract("SMH260618P00610000", dte=1, delta=-0.30, bid=11.45, ask=12.35),
-                _contract("SMH260626P00610000", dte=9, delta=-0.30, bid=11.45, ask=12.35),
+                _contract(
+                    "SMH260618P00610000", dte=1, delta=-0.30, bid=11.45, ask=12.35
+                ),
+                _contract(
+                    "SMH260626P00610000", dte=9, delta=-0.30, bid=11.45, ask=12.35
+                ),
             ],
         )
 
@@ -237,7 +268,7 @@ def test_single_leg_selector_fallback_does_not_rescue_non_dte_filter_failures() 
         deployment_id="amd_short_lane",
         symbol="AMD",
         direction=SignalDirection.SHORT,
-        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0),
+        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0, tzinfo=UTC),
         execution_profile="single_leg_long_premium_v1",
         execution_params={
             "short_signal_contract_type": "PUT",
@@ -255,8 +286,22 @@ def test_single_leg_selector_fallback_does_not_rescue_non_dte_filter_failures() 
         selector.select(
             request,
             [
-                _contract("AMD260622P00150000", symbol="AMD", dte=5, delta=-0.30, bid=2.00, ask=2.50),
-                _contract("AMD260626P00150000", symbol="AMD", dte=9, delta=-0.30, bid=2.00, ask=2.05),
+                _contract(
+                    "AMD260622P00150000",
+                    symbol="AMD",
+                    dte=5,
+                    delta=-0.30,
+                    bid=2.00,
+                    ask=2.50,
+                ),
+                _contract(
+                    "AMD260626P00150000",
+                    symbol="AMD",
+                    dte=9,
+                    delta=-0.30,
+                    bid=2.00,
+                    ask=2.05,
+                ),
             ],
         )
 

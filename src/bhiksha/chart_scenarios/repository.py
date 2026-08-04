@@ -417,6 +417,67 @@ class ScenarioEventRepository:
             for row in rows
         ]
 
+    def observation_slot_evidence(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        scenario_ids: tuple[str, ...],
+        slot_ordinal: int,
+        run_manifest_hash: str,
+    ) -> dict[str, Any]:
+        """Return every durable event bound to one exact candidate/slot identity."""
+
+        slot_id = canonical_observation_slot_id(
+            run_manifest_hash=run_manifest_hash, ordinal=slot_ordinal
+        )
+        self.ensure_schema()
+        with self._connect(write=False) as conn:
+            row = conn.execute(
+                """
+                SELECT campaign_id, run_id, candidate_id, slot_ordinal, slot_id,
+                       facts_hash, paired, proof_hash
+                FROM chart_scenario_observation_slots
+                WHERE run_id=? AND candidate_id=? AND slot_ordinal=? AND slot_id=?
+                """,
+                (run_id, candidate_id, slot_ordinal, slot_id),
+            ).fetchone()
+            event_rows = conn.execute(
+                """
+                SELECT sequence, event_hash, event_json FROM chart_scenario_events
+                WHERE run_id=? ORDER BY sequence
+                """,
+                (run_id,),
+            ).fetchall()
+        if row is None:
+            raise ValueError("durable observation slot identity is missing")
+        expected_scenarios = set(scenario_ids)
+        events = []
+        for event_row in event_rows:
+            event = json.loads(event_row["event_json"])
+            if (
+                event.get("scenario_id") in expected_scenarios
+                and event.get("market_observation_id") == slot_id
+            ):
+                event["event_hash"] = event_row["event_hash"]
+                events.append(event)
+        body = {
+            "schema": "bhiksha.chart-scenario-durable-slot-evidence.v1",
+            "campaign_id": row["campaign_id"],
+            "run_id": row["run_id"],
+            "candidate_id": row["candidate_id"],
+            "slot_ordinal": row["slot_ordinal"],
+            "slot_id": row["slot_id"],
+            "facts_hash": row["facts_hash"],
+            "paired": bool(row["paired"]),
+            "paired_proof_hash": row["proof_hash"],
+            "scenario_ids": sorted(expected_scenarios),
+            "event_count": len(events),
+            "event_hashes": [event["event_hash"] for event in events],
+            "events": events,
+        }
+        return {**body, "content_hash": canonical_sha256(body)}
+
     def next_observation_slot_ordinal(
         self, *, run_id: str, candidate_ids: tuple[str, ...]
     ) -> int:
@@ -482,7 +543,9 @@ class ScenarioEventRepository:
                 """,
                 (run_id,),
             ).fetchall()
-        by_candidate = {str(row["candidate_id"]): int(row["slot_ordinal"]) for row in rows}
+        by_candidate = {
+            str(row["candidate_id"]): int(row["slot_ordinal"]) for row in rows
+        }
         unknown = set(by_candidate) - expected
         if unknown:
             raise IdempotencyConflict(
