@@ -176,6 +176,13 @@ def _bundle_payload() -> dict:
         }
         for name, material in frozen_material.items()
     }
+    ranker_manifest = {
+        "provider_id": "fixture",
+        "model_id": "fixture",
+        "prompt_contract_path": "fixture",
+        "prompt_contract_sha256": "a" * 64,
+        "maximum": 10,
+    }
     treatment_body = {
         "schema": "tradelab.market_context_treatment.v1",
         "program_id": pool.program_id,
@@ -185,12 +192,7 @@ def _bundle_payload() -> dict:
         "component_commits": {
             name: "a" * 40 for name in ("kernel", "cartographer", "tradelab", "bhiksha")
         },
-        "ranker": {
-            "provider_id": "fixture",
-            "model_id": "fixture",
-            "prompt_contract_path": "fixture",
-            "prompt_contract_sha256": "a" * 64,
-        },
+        "ranker": ranker_manifest,
         "frozen_behavior": frozen_behavior,
         "narrative": {
             "mode": "observational_sidecar",
@@ -251,6 +253,27 @@ def _bundle_payload() -> dict:
     }
     receipt_hash = canonical_sha256(receipt_body)
     receipt = {**receipt_body, "receipt_hash": receipt_hash}
+    selector_body = {
+        "schema": "tradelab.market_context_ranker_receipt.v1",
+        "status": "succeeded",
+        "execution_mode": "deterministic_plumbing_canary",
+        "campaign_id": pool.campaign_id,
+        "run_id": pool.run_id,
+        "candidate_pool_hash": pool.pool_hash,
+        "selection_hash": selection.selection_hash,
+        "provider_id": ranker_manifest["provider_id"],
+        "model_id": ranker_manifest["model_id"],
+        "prompt_contract_sha256": ranker_manifest["prompt_contract_sha256"],
+        "maximum": ranker_manifest["maximum"],
+        "agent_broker_receipt": None,
+        "agent_broker_receipt_hash": None,
+        "run_comparable": False,
+        "non_comparable_reason": "deterministic_plumbing_canary",
+    }
+    selector_receipt = {
+        **selector_body,
+        "content_hash": "sha256:" + canonical_sha256(selector_body),
+    }
     run = {
         "schema": "tradelab.market_context_run.v2",
         "program_id": pool.program_id,
@@ -289,6 +312,8 @@ def _bundle_payload() -> dict:
         "cartographer_export_hash": export_hash,
         "target_session_date": trading_date,
         "target_session_window_hash": window_hash,
+        "arm_b_selector_receipt": selector_receipt,
+        "arm_b_selector_receipt_hash": selector_receipt["content_hash"],
         "component_manifest": manifest.model_dump(mode="json"),
         "component_manifest_hash": manifest.manifest_hash,
         "chart_evidence": [chart.model_dump(mode="json")],

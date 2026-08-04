@@ -101,6 +101,8 @@ class ShadowPlan(BaseModel):
     cartographer_export_hash: str
     target_session_date: str
     target_session_window_hash: str
+    arm_b_selector_receipt: dict[str, Any]
+    arm_b_selector_receipt_hash: str
     component_manifest: ComponentManifest
     component_manifest_hash: str = Field(min_length=64, max_length=64)
     chart_evidence: list[ChartEvidencePacket] = Field(min_length=1)
@@ -136,6 +138,8 @@ class ShadowPlan(BaseModel):
             "cartographer_export_hash",
             "target_session_date",
             "target_session_window_hash",
+            "arm_b_selector_receipt",
+            "arm_b_selector_receipt_hash",
             "component_manifest",
             "component_manifest_hash",
             "chart_evidence",
@@ -581,6 +585,95 @@ class ShadowPlan(BaseModel):
                 "shadow plan requires both experiment arms; missing="
                 + ", ".join(sorted(expected_arms - set(selections_by_arm)))
             )
+        selector_receipt = dict(self.arm_b_selector_receipt)
+        declared_selector_hash = str(
+            selector_receipt.pop("content_hash", "")
+        ).removeprefix("sha256:")
+        computed_selector_hash = canonical_sha256(selector_receipt)
+        selector_fields = {
+            "schema",
+            "status",
+            "execution_mode",
+            "campaign_id",
+            "run_id",
+            "candidate_pool_hash",
+            "selection_hash",
+            "provider_id",
+            "model_id",
+            "prompt_contract_sha256",
+            "maximum",
+            "agent_broker_receipt",
+            "agent_broker_receipt_hash",
+            "run_comparable",
+            "non_comparable_reason",
+        }
+        frozen_ranker = self.treatment_manifest.get("ranker")
+        arm_b = selections_by_arm["chart_agentic_rerank"]
+        if (
+            set(selector_receipt) != selector_fields
+            or selector_receipt.get("schema")
+            != "tradelab.market_context_ranker_receipt.v1"
+            or declared_selector_hash != computed_selector_hash
+            or self.arm_b_selector_receipt_hash.removeprefix("sha256:")
+            != computed_selector_hash
+            or not isinstance(frozen_ranker, Mapping)
+            or selector_receipt.get("campaign_id") != self.candidate_pool.campaign_id
+            or selector_receipt.get("run_id") != self.candidate_pool.run_id
+            or str(selector_receipt.get("candidate_pool_hash", "")).removeprefix(
+                "sha256:"
+            )
+            != self.candidate_pool.pool_hash
+            or str(selector_receipt.get("selection_hash", "")).removeprefix("sha256:")
+            != arm_b.selection_hash
+            or any(
+                selector_receipt.get(field) != frozen_ranker.get(field)
+                for field in (
+                    "provider_id",
+                    "model_id",
+                    "prompt_contract_sha256",
+                    "maximum",
+                )
+            )
+        ):
+            raise BundleValidationError("Arm B selector receipt identity/hash mismatch")
+        execution_mode = selector_receipt.get("execution_mode")
+        broker_receipt = selector_receipt.get("agent_broker_receipt")
+        broker_receipt_hash = selector_receipt.get("agent_broker_receipt_hash")
+        if execution_mode == "agent_broker":
+            if (
+                selector_receipt.get("status") != "succeeded"
+                or selector_receipt.get("run_comparable") is not True
+                or selector_receipt.get("non_comparable_reason") is not None
+                or not isinstance(broker_receipt, Mapping)
+                or str(broker_receipt_hash).removeprefix("sha256:")
+                != canonical_sha256(broker_receipt)
+            ):
+                raise BundleValidationError("invalid comparable Arm B selector receipt")
+        elif execution_mode == "deterministic_plumbing_canary":
+            if (
+                selector_receipt.get("run_comparable") is not False
+                or not selector_receipt.get("non_comparable_reason")
+                or broker_receipt is not None
+                or broker_receipt_hash is not None
+            ):
+                raise BundleValidationError(
+                    "invalid deterministic Arm B canary receipt"
+                )
+        elif execution_mode == "agent_broker_failure":
+            if (
+                selector_receipt.get("status") != "failed"
+                or selector_receipt.get("run_comparable") is not False
+                or not selector_receipt.get("non_comparable_reason")
+                or not isinstance(broker_receipt, Mapping)
+                or str(broker_receipt_hash).removeprefix("sha256:")
+                != canonical_sha256(broker_receipt)
+                or arm_b.selections
+                or {item.candidate_id for item in arm_b.abstentions}
+                != {item.candidate_id for item in self.candidate_pool.candidates}
+            ):
+                raise BundleValidationError("invalid failed Arm B selector receipt")
+        else:
+            raise BundleValidationError("unsupported Arm B selector execution mode")
 
         scenario_keys: set[tuple[str, str, str, str, str]] = set()
         required_profiles = {
@@ -903,6 +996,7 @@ def install_shadow_plan(
             "cartographer_receipt_hash": plan.cartographer_receipt_hash,
             "cartographer_export_hash": plan.cartographer_export_hash,
             "option_selection_policy_hash": plan.option_selection_policy.content_hash,
+            "arm_b_selector_receipt_hash": plan.arm_b_selector_receipt_hash,
             "target_session_date": plan.target_session_date,
             "target_session_window_hash": plan.target_session_window_hash,
             "scenario_count": len(plan.scenarios),
