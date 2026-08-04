@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Any
-
 
 _SHEET_ID_RE = re.compile(r"/d/(?P<sheet_id>[a-zA-Z0-9-_]+)")
 _DEFAULT_API_RETRIES = 4
@@ -41,7 +40,9 @@ class GoogleSheetTableClient:
         if layout is None:
             return []
         rows: list[dict[str, Any]] = []
-        for row_number, row in enumerate(values[layout.header_row_number :], start=layout.header_row_number + 1):
+        for row_number, row in enumerate(
+            values[layout.header_row_number :], start=layout.header_row_number + 1
+        ):
             relevant = list(row[layout.header_start_index :])
             if not any(str(value).strip() for value in relevant):
                 continue
@@ -51,11 +52,50 @@ class GoogleSheetTableClient:
             rows.append(payload)
         return rows
 
+    def read_headers(self) -> list[str]:
+        """Return the physical header row without modifying the tab."""
+
+        return list(self._read_layout().headers)
+
+    def update_exact_rows(
+        self,
+        *,
+        headers: list[str],
+        rows: list[tuple[int, list[Any]]],
+    ) -> None:
+        """Update only supplied data rows while preserving headers/validation."""
+
+        layout = self._read_layout()
+        if list(layout.headers) != headers:
+            raise ValueError(
+                "Google Sheet headers differ from the exact projection contract"
+            )
+        if any(len(values) != len(headers) for _, values in rows):
+            raise ValueError("exact row values must match the header width")
+        data: list[dict[str, Any]] = []
+        start_col = _column_letters(layout.header_start_index)
+        end_col = _column_letters(layout.header_start_index + len(headers) - 1)
+        for row_index, values in rows:
+            if row_index <= layout.header_row_number:
+                raise ValueError("projection row index overlaps the Sheet header")
+            data.append(
+                {
+                    "range": self._quoted_range(
+                        f"{start_col}{row_index}:{end_col}{row_index}"
+                    ),
+                    "values": [[_sheet_cell_value(value) for value in values]],
+                }
+            )
+        if data:
+            self._update_ranges(data)
+
     def ensure_columns(self, columns: list[str]) -> list[str]:
         values = self._read_values(range_suffix="A1:ZZ200")
         layout = _detect_layout(values)
         if layout is None:
-            raise ValueError(f"Could not find a header row in Google Sheet tab {self.sheet_name!r}")
+            raise ValueError(
+                f"Could not find a header row in Google Sheet tab {self.sheet_name!r}"
+            )
         headers = list(layout.headers)
         changed = False
         for column in columns:
@@ -69,7 +109,9 @@ class GoogleSheetTableClient:
             self._update_ranges(
                 [
                     {
-                        "range": self._quoted_range(f"{start_col}{layout.header_row_number}:{end_col}{layout.header_row_number}"),
+                        "range": self._quoted_range(
+                            f"{start_col}{layout.header_row_number}:{end_col}{layout.header_row_number}"
+                        ),
                         "values": [headers],
                     }
                 ]
@@ -109,11 +151,13 @@ class GoogleSheetTableClient:
         )
         return build("sheets", "v4", credentials=credentials)
 
-    def _read_layout(self) -> "_SheetLayout":
+    def _read_layout(self) -> _SheetLayout:
         values = self._read_values(range_suffix="A1:ZZ200")
         layout = _detect_layout(values)
         if layout is None:
-            raise ValueError(f"Could not find a header row in Google Sheet tab {self.sheet_name!r}")
+            raise ValueError(
+                f"Could not find a header row in Google Sheet tab {self.sheet_name!r}"
+            )
         return layout
 
     def _read_values(self, *, range_suffix: str) -> list[list[Any]]:
@@ -152,8 +196,7 @@ class GoogleSheetTableClient:
 
     def _list_sheet_titles(self) -> list[str]:
         result = self._execute(
-            self.service.spreadsheets()
-            .get(
+            self.service.spreadsheets().get(
                 spreadsheetId=self.spreadsheet_id,
                 fields="sheets.properties.title",
             )
@@ -161,7 +204,9 @@ class GoogleSheetTableClient:
         return [
             str(sheet["properties"]["title"])
             for sheet in result.get("sheets", [])
-            if isinstance(sheet, dict) and isinstance(sheet.get("properties"), dict) and sheet["properties"].get("title")
+            if isinstance(sheet, dict)
+            and isinstance(sheet.get("properties"), dict)
+            and sheet["properties"].get("title")
         ]
 
     def _execute(self, request: Any) -> dict[str, Any]:
@@ -189,11 +234,17 @@ def _detect_layout(values: list[list[Any]]) -> _SheetLayout | None:
     if not values:
         return None
     for row_number, row in enumerate(values, start=1):
-        non_empty_indexes = [index for index, value in enumerate(row) if str(value).strip()]
+        non_empty_indexes = [
+            index for index, value in enumerate(row) if str(value).strip()
+        ]
         if len(non_empty_indexes) < 2:
             continue
         header_start_index = non_empty_indexes[0]
-        headers = [str(header).strip() for header in row[header_start_index:] if str(header).strip()]
+        headers = [
+            str(header).strip()
+            for header in row[header_start_index:]
+            if str(header).strip()
+        ]
         if headers:
             return _SheetLayout(
                 header_row_number=row_number,
