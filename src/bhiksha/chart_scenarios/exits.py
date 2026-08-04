@@ -7,7 +7,7 @@ from datetime import datetime, time
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from mala_bhiksha_kernel import ExitProfile
+from mala_bhiksha_kernel import ExitProfile, ManagementPolicySpec
 
 from .models import OptionQuoteSnapshot, as_utc, timestamp_json
 
@@ -41,58 +41,12 @@ class ExitObservation:
         }
 
 
-_PROFILE_DEFAULT_TARGETS = {
-    ExitProfile.FLASH_REVERSAL: 1.0,
-    ExitProfile.EXHAUSTION_REVERSAL: 1.0,
-    ExitProfile.TREND_CONTINUATION: 2.0,
-    ExitProfile.RANGE_EXPANSION: 1.5,
-}
-
-
-def _get(policy: Any, name: str, default: Any = None) -> Any:
-    if policy is None:
-        return default
-    if isinstance(policy, Mapping):
-        return policy.get(name, default)
-    return getattr(policy, name, default)
-
-
-def _positive(value: Any, default: float) -> float:
-    try:
-        candidate = float(value)
-    except (TypeError, ValueError):
-        return default
-    return candidate if candidate > 0 else default
-
-
-def _nonnegative(value: Any, default: float) -> float:
-    if value is None:
-        return default
-    try:
-        candidate = float(value)
-    except (TypeError, ValueError):
-        return default
-    return candidate if candidate >= 0 else default
-
-
-def _optional_positive(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        candidate = float(value)
-    except (TypeError, ValueError):
-        return None
-    return candidate if candidate > 0 else None
-
-
-def _time_from_policy(value: Any) -> time:
-    if not isinstance(value, str):
-        return time(15, 55)
+def _time_from_policy(value: str) -> time:
     try:
         hour, minute = value.strip().split(":", 1)
         return time(int(hour), int(minute))
     except (TypeError, ValueError):
-        return time(15, 55)
+        raise ValueError(f"invalid hard_flat_time_et in management policy: {value!r}") from None
 
 
 def evaluate_exit_profile(
@@ -102,7 +56,7 @@ def evaluate_exit_profile(
     *,
     entry_time: datetime | str,
     evaluated_at: datetime | str,
-    management_policy: Any = None,
+    management_policy: ManagementPolicySpec,
     prior_state: Mapping[str, Any] | None = None,
 ) -> ExitObservation:
     """Evaluate one profile against the same option mark path.
@@ -125,36 +79,40 @@ def evaluate_exit_profile(
     if now < entry_at:
         raise ValueError("exit observation cannot precede synthetic entry")
 
+    # Resolve the identity before evaluating anything.  This fails closed for
+    # legacy label-only giveback policies and makes the exact economics part of
+    # every observation's provenance.
+    policy_identity = management_policy.policy_identity()
+
     state = dict(prior_state or {})
     entry_mark = entry_quote.mark
     current_mark = current_quote.mark
-    stop_pct = _positive(
-        _get(
-            management_policy,
-            "initial_stop_pct",
-            _get(management_policy, "option_stop_fallback_pct", 0.45),
-        ),
-        0.45,
+    stop_pct = (
+        management_policy.initial_stop_pct
+        if management_policy.initial_stop_pct is not None
+        else management_policy.option_stop_fallback_pct
     )
+    if stop_pct <= 0:
+        raise ValueError("management policy requires a positive stop percentage for R evaluation")
     r = (current_mark - entry_mark) / (entry_mark * stop_pct)
     peak_r = max(float(state.get("peak_r", r)), r)
     state["peak_r"] = peak_r
+    state["exit_policy_id"] = policy_identity["policy_id"]
+    state["exit_policy_schema_version"] = policy_identity["policy_schema_version"]
+    state["exit_policy_hash"] = policy_identity["policy_hash"]
     elapsed = (now - entry_at).total_seconds()
 
-    disaster_pct = _optional_positive(_get(management_policy, "premium_disaster_stop_pct"))
+    disaster_pct = management_policy.premium_disaster_stop_pct
     if disaster_pct is not None and current_mark <= entry_mark * (1.0 - disaster_pct):
         return _result(selected, "exit", "disaster_stop", current_mark, r, elapsed, state, "premium_disaster_stop")
     if current_mark <= entry_mark * (1.0 - stop_pct):
         return _result(selected, "exit", "initial_stop", current_mark, r, elapsed, state, "premium_initial_stop")
 
-    target_1 = _optional_positive(_get(management_policy, "target_1_r"))
-    target_2 = _optional_positive(_get(management_policy, "target_2_r"))
-    target_r = _optional_positive(_get(management_policy, "target_r"))
-    if target_1 is None and target_2 is None and target_r is None:
-        target_2 = _PROFILE_DEFAULT_TARGETS[selected]
-    if target_2 is None and target_r is not None:
-        target_2 = target_r
-    target_1_quantity = _nonnegative(_get(management_policy, "target_1_quantity", 1.0), 1.0)
+    target_1 = management_policy.target_1_r
+    target_2 = management_policy.target_2_r
+    if target_2 is None:
+        target_2 = management_policy.target_r
+    target_1_quantity = management_policy.target_1_quantity
     if target_1 is not None and not state.get("target_1_hit") and r >= target_1:
         state["target_1_hit"] = True
         if target_2 is None or target_1_quantity >= 1.0:
@@ -165,30 +123,14 @@ def evaluate_exit_profile(
     if target_1 is None and target_2 is not None and r >= target_2:
         return _result(selected, "exit", "target", current_mark, r, elapsed, state, "profile_target")
 
-    giveback_policy = str(
-        _get(
-            management_policy,
-            "high_water_giveback_policy",
-            _get(management_policy, "giveback_policy", "OFF"),
-        )
-        or "OFF"
-    ).upper()
-    tier_values = {
-        "STRICT": (1.0, 0.33),
-        "MODERATE": (1.25, 0.50),
-        "LOOSE": (1.50, 0.66),
-    }
-    tier_arm, tier_fraction = tier_values.get(giveback_policy, (0.0, 0.0))
-    giveback_fraction = _optional_positive(
-        _get(management_policy, "giveback_retrace_fraction", tier_fraction or None)
-    )
-    giveback_arm = _optional_positive(_get(management_policy, "giveback_arm_r", tier_arm or None))
+    giveback_fraction = management_policy.giveback_retrace_fraction
+    giveback_arm = management_policy.giveback_arm_r
     if giveback_fraction is not None and giveback_arm is not None and peak_r >= giveback_arm:
         floor = peak_r * (1.0 - min(giveback_fraction, 1.0))
         if r <= floor:
             return _result(selected, "exit", "high_water_giveback", current_mark, r, elapsed, state, "profile_giveback")
 
-    max_hold = _get(management_policy, "max_hold_seconds")
+    max_hold = management_policy.max_hold_seconds
     if max_hold is not None:
         try:
             if elapsed >= float(max_hold):
@@ -196,9 +138,8 @@ def evaluate_exit_profile(
         except (TypeError, ValueError):
             pass
 
-    eod_flat = _get(management_policy, "eod_flat", True)
-    if eod_flat:
-        hard_flat = _time_from_policy(_get(management_policy, "hard_flat_time_et", "15:55"))
+    if management_policy.eod_flat:
+        hard_flat = _time_from_policy(management_policy.hard_flat_time_et)
         if now.astimezone(ZoneInfo("America/New_York")).time() >= hard_flat:
             return _result(selected, "exit", "eod_flat", current_mark, r, elapsed, state, "profile_eod_flat")
 

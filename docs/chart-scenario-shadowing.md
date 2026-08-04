@@ -32,6 +32,13 @@ must use the v1 chart-scenario schema, `authorization_mode=shadow`,
 `source_type=chart_scenario_experiment`, and
 `trigger_version=market-context-trigger.v1`.
 
+The bundle must also carry an exact `exit_policy_registry` keyed by exit
+profile. It must cover the union of every scenario's compatible profiles. Each
+selected scenario embeds the same canonical policy material as its selected
+registry entry, and its policy ID, schema version, and hash must match. Bhiksha
+does not supply target, stop, hard-flat, giveback, or profile-selection
+defaults; missing, unresolved, or mismatched economics fail validation.
+
 ## Install
 
 From the Bhiksha checkout, using the shared kernel contract worktree first:
@@ -55,7 +62,9 @@ fails closed.
 The fixture format is an object with a validated `plan`, a `bars` array of
 completed OHLC bars, and a `quotes` array of persisted option snapshots. The
 first quote is the synthetic-entry mark; later quotes are the same quote path
-used for primary and counterfactual exit observations.
+used for primary and counterfactual exit observations. Each compatible profile
+is evaluated with its own frozen registry policy, and the exact policy identity
+is retained in observation state.
 
 ```bash
 PYTHONPATH=/Users/suman/code/worktrees/bhiksha-market-context/src:/Users/suman/code/worktrees/kernel-market-context/src \

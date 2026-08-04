@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping, Sequence
 
-from mala_bhiksha_kernel import ChartScenarioSpec, ExitProfile, ShadowEventType
+from mala_bhiksha_kernel import (
+    ChartScenarioSpec,
+    ExitProfile,
+    ManagementPolicySpec,
+    ShadowEventType,
+)
 
 from .exits import ExitObservation, evaluate_exit_profile
 from .models import CompletedBar, OptionQuoteSnapshot, as_utc, timestamp_json
@@ -51,12 +56,17 @@ class BrokerInertScenarioObserver:
         repository: ScenarioEventRepository,
         *,
         quote_source: ReadOnlyOptionSnapshotSource | None = None,
+        exit_policy_registry: Mapping[ExitProfile | str, ManagementPolicySpec],
         trigger_version: str = TRIGGER_VERSION,
     ) -> None:
         if trigger_version != TRIGGER_VERSION:
             raise ValueError(f"unsupported trigger version: {trigger_version!r}")
         self.repository = repository
         self.quote_source = ensure_read_only_quote_source(quote_source)
+        self.exit_policy_registry = {
+            profile if isinstance(profile, ExitProfile) else ExitProfile(profile): policy
+            for profile, policy in exit_policy_registry.items()
+        }
         self.trigger_version = trigger_version
 
     def observe_one(
@@ -334,7 +344,7 @@ class BrokerInertScenarioObserver:
                         quote,
                         entry_time=entry_quote.quote_time,
                         evaluated_at=quote.quote_time,
-                        management_policy=scenario.management_policy,
+                        management_policy=self.exit_policy_registry[profile],
                         prior_state=prior,
                     )
                     profile_states[profile.value] = result.state

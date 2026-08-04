@@ -19,6 +19,8 @@ from mala_bhiksha_kernel import (
     ComponentManifest,
     ConditionType,
     EntryCondition,
+    ExitProfile,
+    ManagementPolicySpec,
     ObservationWindow,
     ScenarioCandidatePool,
     load_market_context_conformance_vectors,
@@ -37,6 +39,31 @@ from bhiksha.chart_scenarios import (
 )
 
 
+def _policy(profile: ExitProfile) -> ManagementPolicySpec:
+    targets = {
+        ExitProfile.FLASH_REVERSAL: 0.75,
+        ExitProfile.EXHAUSTION_REVERSAL: 1.0,
+        ExitProfile.TREND_CONTINUATION: 2.0,
+        ExitProfile.RANGE_EXPANSION: 1.5,
+    }
+    return ManagementPolicySpec(
+        policy_id=f"fixture-{profile.value.lower()}",
+        policy_schema_version="exit-policy.v1",
+        stop_family="option_premium",
+        stop_anchor="entry_mark",
+        exit_family=profile.value.lower(),
+        target_model="r_multiple",
+        target_r=targets[profile],
+        option_stop_fallback_pct=0.40,
+        hard_flat_time_et="15:55",
+        eod_flat=True,
+    )
+
+
+def _registry() -> dict[ExitProfile, ManagementPolicySpec]:
+    return {profile: _policy(profile) for profile in ExitProfile}
+
+
 def _bundle_payload() -> dict:
     vectors = load_market_context_conformance_vectors()
     manifest = ComponentManifest.model_validate(vectors["component_manifest"])
@@ -44,6 +71,15 @@ def _bundle_payload() -> dict:
     pool = ScenarioCandidatePool.model_validate(vectors["candidate_pool"])
     selection = ArmSelection.model_validate(vectors["arm_selection"])
     scenario = ChartScenarioSpec.model_validate(vectors["chart_scenario"])
+    selected_policy = _registry()[scenario.exit_profile]
+    scenario = scenario.model_copy(
+        update={
+            "management_policy": selected_policy,
+            "exit_policy_id": selected_policy.policy_id,
+            "exit_policy_schema_version": selected_policy.policy_schema_version,
+            "exit_policy_hash": selected_policy.policy_hash,
+        }
+    )
     return {
         "schema_version": "bhiksha.chart-scenario-shadow-plan.v1",
         "plan_id": "fixture-plan",
@@ -55,6 +91,10 @@ def _bundle_payload() -> dict:
         "chart_evidence": [chart.model_dump(mode="json")],
         "candidate_pool": pool.model_dump(mode="json"),
         "arm_selections": [selection.model_dump(mode="json")],
+        "exit_policy_registry": {
+            profile.value: policy.model_dump(mode="json")
+            for profile, policy in _registry().items()
+        },
         "scenarios": [scenario.model_dump(mode="json")],
     }
 
@@ -166,6 +206,29 @@ def test_bundle_rejects_missing_hash_and_unknown_kernel_fields() -> None:
         ChartScenarioSpec.model_validate(bad_profile)
 
 
+def test_bundle_rejects_missing_or_mismatched_exit_policy_registry() -> None:
+    missing = _bundle_payload()
+    missing["exit_policy_registry"].pop(ExitProfile.RANGE_EXPANSION.value)
+    with pytest.raises(BundleValidationError, match="missing compatible profiles"):
+        validate_bundle(missing)
+
+    mismatched = _bundle_payload()
+    mismatched["exit_policy_registry"][ExitProfile.TREND_CONTINUATION.value] = _policy(
+        ExitProfile.RANGE_EXPANSION
+    ).model_dump(mode="json")
+    with pytest.raises(BundleValidationError, match="selected policy differs"):
+        validate_bundle(mismatched)
+
+    absent_selected_material = _bundle_payload()
+    absent_selected_material["scenarios"] = [
+        ChartScenarioSpec.model_validate(
+            load_market_context_conformance_vectors()["chart_scenario"]
+        ).model_dump(mode="json")
+    ]
+    with pytest.raises(BundleValidationError, match="missing selected management_policy"):
+        validate_bundle(absent_selected_material)
+
+
 def test_bundle_refuses_live_active_plan_paths_without_reading_them(tmp_path: Path) -> None:
     live = tmp_path / "artifacts" / "playbook" / "active_plan.json"
     live.parent.mkdir(parents=True)
@@ -264,7 +327,7 @@ def test_typed_trigger_primitives_require_completed_bars_and_respect_expiry() ->
 def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_marks(tmp_path: Path) -> None:
     scenario = _scenario()
     repository = ScenarioEventRepository(tmp_path / "events.sqlite3")
-    observer = BrokerInertScenarioObserver(repository)
+    observer = BrokerInertScenarioObserver(repository, exit_policy_registry=_registry())
     quotes = [
         _quote("q-entry", 1.05, "2026-08-04T11:20:00Z"),
         _quote("q-range", 1.85, "2026-08-04T11:40:00Z"),
@@ -314,7 +377,7 @@ def test_observer_is_restart_safe_terminal_and_emits_primary_and_counterfactual_
 def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(tmp_path: Path) -> None:
     scenario = _scenario()
     repository = ScenarioEventRepository(tmp_path / "events.sqlite3")
-    observer = BrokerInertScenarioObserver(repository)
+    observer = BrokerInertScenarioObserver(repository, exit_policy_registry=_registry())
     first = observer.observe_one(scenario, bars=_bars(), market_observation_id="missing-quote")
     assert not first.terminal
     assert "quote_unavailable" in [event.event_type.value for event in first.events]
@@ -337,7 +400,7 @@ def test_quote_unavailable_then_recovery_does_not_duplicate_trigger(tmp_path: Pa
 def test_repository_detects_event_chain_tampering(tmp_path: Path) -> None:
     scenario = _scenario()
     repository = ScenarioEventRepository(tmp_path / "events.sqlite3")
-    BrokerInertScenarioObserver(repository).observe_one(
+    BrokerInertScenarioObserver(repository, exit_policy_registry=_registry()).observe_one(
         scenario,
         bars=_bars(),
         quote_path=[_quote("q-entry", 1.05, "2026-08-04T11:20:00Z")],
@@ -363,6 +426,7 @@ def test_read_only_quote_source_rejects_order_capability() -> None:
         BrokerInertScenarioObserver(
             ScenarioEventRepository(":memory:"),
             quote_source=NotActuallyReadOnly(),
+            exit_policy_registry=_registry(),
         )
 
 

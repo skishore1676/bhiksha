@@ -75,7 +75,11 @@ def _observe_one(args: argparse.Namespace) -> int:
     scenario = _scenario(plan, args.scenario_id)
     repository = ScenarioEventRepository(args.db_path)
     quote_source = PersistedOptionSnapshotSource(quotes) if quotes else None
-    observer = BrokerInertScenarioObserver(repository, quote_source=quote_source)
+    observer = BrokerInertScenarioObserver(
+        repository,
+        quote_source=quote_source,
+        exit_policy_registry=plan.exit_policy_registry,
+    )
     result = observer.observe_one(
         scenario,
         bars=bars,

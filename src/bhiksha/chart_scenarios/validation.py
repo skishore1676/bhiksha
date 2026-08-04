@@ -18,6 +18,8 @@ from mala_bhiksha_kernel import (
     ChartEvidencePacket,
     ChartScenarioSpec,
     ComponentManifest,
+    ExitProfile,
+    ManagementPolicySpec,
     ScenarioCandidatePool,
     SourceType,
     canonical_sha256,
@@ -87,6 +89,7 @@ class ShadowPlan(BaseModel):
     chart_evidence: list[ChartEvidencePacket] = Field(min_length=1)
     candidate_pool: ScenarioCandidatePool
     arm_selections: list[ArmSelection] = Field(min_length=1)
+    exit_policy_registry: dict[ExitProfile, ManagementPolicySpec] = Field(min_length=1)
     scenarios: list[ChartScenarioSpec] = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -106,6 +109,7 @@ class ShadowPlan(BaseModel):
             "chart_evidence",
             "candidate_pool",
             "arm_selections",
+            "exit_policy_registry",
             "scenarios",
         )
         missing = [key for key in required if key not in payload]
@@ -214,6 +218,24 @@ class ShadowPlan(BaseModel):
             selections_by_arm[arm_key] = selection
 
         scenario_keys: set[tuple[str, str, str, str, str]] = set()
+        required_profiles = {
+            profile
+            for scenario in self.scenarios
+            for profile in scenario.compatible_exit_profiles
+        }
+        missing_profiles = required_profiles - set(self.exit_policy_registry)
+        if missing_profiles:
+            raise BundleValidationError(
+                "exit_policy_registry is missing compatible profiles: "
+                + ", ".join(sorted(profile.value for profile in missing_profiles))
+            )
+        for profile, policy in self.exit_policy_registry.items():
+            try:
+                policy.policy_identity()
+            except ValueError as exc:
+                raise BundleValidationError(
+                    f"exit_policy_registry[{profile.value}] is not canonically resolved: {exc}"
+                ) from exc
         for scenario in self.scenarios:
             self._check_identity(scenario, "scenario")
             if (
@@ -242,6 +264,25 @@ class ShadowPlan(BaseModel):
                 )
             scenario.validate_against_candidate(candidate)
             scenario.validate_against_selection(selection, self.candidate_pool)
+            selected_policy = self.exit_policy_registry[scenario.exit_profile]
+            selected_identity = selected_policy.policy_identity()
+            if scenario.management_policy is None:
+                raise BundleValidationError(
+                    f"scenario {scenario.scenario_id} is missing selected management_policy"
+                )
+            if scenario.management_policy.canonical_policy_json != selected_policy.canonical_policy_json:
+                raise BundleValidationError(
+                    f"scenario {scenario.scenario_id} selected policy differs from exit_policy_registry"
+                )
+            if (
+                scenario.exit_policy_id != selected_identity["policy_id"]
+                or scenario.exit_policy_schema_version
+                != selected_identity["policy_schema_version"]
+                or scenario.exit_policy_hash != selected_identity["policy_hash"]
+            ):
+                raise BundleValidationError(
+                    f"scenario {scenario.scenario_id} selected policy identity mismatch"
+                )
             key = (
                 scenario.campaign_id,
                 scenario.run_id,
