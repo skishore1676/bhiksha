@@ -68,9 +68,8 @@ def build_live_quote(
     selected_symbol = normalize_option_symbol(selected_contract.option_symbol)
     if normalized_symbol != selected_symbol:
         raise ValueError("selected quote symbol differs from chain snapshot")
-    if (
-        set(raw) != {normalized_symbol}
-        or not isinstance(raw.get(normalized_symbol), Mapping)
+    if set(raw) != {normalized_symbol} or not isinstance(
+        raw.get(normalized_symbol), Mapping
     ):
         raise ValueError("raw quote response must retain the exact selected OCC key")
     selected_raw = raw[normalized_symbol]

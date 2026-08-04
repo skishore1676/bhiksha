@@ -86,11 +86,13 @@
         "schema_version": "bhiksha.chart-scenario-option-selection.v3",
         "chain_acquired_at": "2026-08-04T14:50:00Z"
       },
-      "quotes": [],
+      "quotes": [
+        {"acquired_at": "2026-08-04T14:50:00Z", "ask": 1.1, "bid": 1.0, "contract_type": "CALL", "delta": 0.5, "expiration_date": "2026-08-07", "is_selected": true, "last": null, "open_interest": 101, "option_symbol": "SPY260807C00100000", "provenance": {"option_selection_policy_hash": "40fea42cb84a7c9a82eae33200a4ea1175601b5705f89a93932930a8079c70cc", "provider_id": "schwab", "selection_mode": "canonical_selector"}, "quote_time": "2026-08-04T14:49:30Z", "raw_source": {"SPY260807C00100000": {"quote": {"askPrice": 1.1, "bidPrice": 1.0, "delta": 0.5, "lastPrice": null, "openInterest": 101, "quoteTime": "2026-08-04T14:49:30Z"}, "reference": {"contractType": "CALL", "expirationDate": "2026-08-07", "strikePrice": "100.000", "underlyingSymbol": "SPY"}}}, "raw_source_hash": "2a401b5a6e87c6fa53f0ccbe69e6f48c0ec17b59f56059b6e1a7ea1b53437f7a", "scenario_id": null, "snapshot_hash": "83df373a09175f6ede384eee32fecfbc7776427432ccfdc169304e56d91f333c", "snapshot_id": "schwab-015d71fd5b13f2170d5ab1e6", "source_id": "schwab-option-quote", "strike": 100.0, "underlying_symbol": "SPY"}
+      ],
       "symbol": "SPY"
     }
   ],
-  "content_hash": "4f221947d466487b5bb5f3aa996d9b5feca95b4d0a50ee03e5f2454de29ae9ed",
+  "content_hash": "622d65e5dd58d783829afd8411d4ea9f499b7489597bb00b43e96a995178baaf",
   "evaluated_at": "2026-08-04T14:50:00Z",
   "observation_slot_ordinal": 1,
   "plan_hash": "8cf19608e7050ffc2339af83c99b83a6c3cc246b4af4f961a81256bcf600d9cd",

@@ -1082,6 +1082,11 @@ def test_documented_cycle_v3_fixture_is_hash_valid_and_current() -> None:
         "target_abs_delta_max": 0.4,
         "target_abs_delta_min": 0.2,
     }
+    documented_quote = candidate["quotes"][0]
+    assert set(documented_quote["raw_source"]) == {documented_quote["option_symbol"]}
+    assert documented_quote["raw_source_hash"] == canonical_sha256(
+        documented_quote["raw_source"]
+    )
     fake_plan = SimpleNamespace(
         plan_hash=documented["plan_hash"],
         run_manifest_hash=documented["run_manifest_hash"],
@@ -1354,7 +1359,10 @@ def test_raw_observations_are_exact_and_deeply_immutable() -> None:
     snapshot = OptionQuoteSnapshot.from_mapping(quote)
     symbol = str(quote["option_symbol"])
     quote["raw_source"][symbol]["reference"]["underlyingSymbol"] = "IWM"  # type: ignore[index]
-    assert snapshot.to_dict()["raw_source"][symbol]["reference"]["underlyingSymbol"] == "SPY"
+    assert (
+        snapshot.to_dict()["raw_source"][symbol]["reference"]["underlyingSymbol"]
+        == "SPY"
+    )
 
     missing_quote = _quote("q-missing", 1.0, "2026-08-04T11:20:00Z")
     missing_quote.pop("source_id")
