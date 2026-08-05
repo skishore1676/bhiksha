@@ -91,6 +91,7 @@ _RUNTIME_RECORD_FIELDS = {
     "import_root_sha256",
     "import_map",
     "dependency_identity",
+    "installed_environment_identity",
     "argv_prefix",
     "captured_at",
     "record_path",
@@ -526,7 +527,13 @@ def _run_tradelab_lifecycle(
         )
         if command == "finalize-run":
             argv.extend(["--bhiksha-root", str(Path.cwd().resolve())])
-    execution = _run_command(argv, cwd=cwd, env=env)
+    completed = _execute_command(argv, cwd=cwd, env=env)
+    # TradeLab may invoke Agent Broker while handling prepare-run.  Neither
+    # runtime is accepted on return until both still match the frozen campaign
+    # records.  This deliberately happens before stdout is parsed as a receipt.
+    _verify_toolchain_role(contract, role="tradelab")
+    _verify_toolchain_role(contract, role="agent_broker")
+    execution = _completed_command_result(completed)
     lifecycle_receipt = execution.pop("_output", None)
     return {
         "action": f"tradelab:{command}",
@@ -540,6 +547,12 @@ def _run_command(
     command: list[str], *, cwd: Path, env: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
     completed = _execute_command(command, cwd=cwd, env=env)
+    return _completed_command_result(completed)
+
+
+def _completed_command_result(
+    completed: subprocess.CompletedProcess[str],
+) -> dict[str, Any]:
     if completed.returncode != 0:
         raise RuntimeError(
             f"command failed rc={completed.returncode}: "
@@ -1066,6 +1079,15 @@ def _verify_toolchain_role(
         import_root=import_root,
         role=role,
     )
+    observed_environment = _capture_installed_environment_identity(
+        interpreter,
+        role=role,
+        checkout=checkout,
+    )
+    if record["installed_environment_identity"] != observed_environment:
+        raise ValueError(
+            f"campaign toolchain installed environment drift: {role}"
+        )
     prefix = record.get("argv_prefix")
     expected_prefix = {
         "birdclaw": [str(launcher), str(entrypoint)],
@@ -1221,6 +1243,112 @@ def _verify_dependency_identity(
         raise ValueError(f"campaign toolchain dependency lock drift: {role}")
 
 
+def _capture_installed_environment_identity(
+    interpreter: Path, *, role: str, checkout: Path
+) -> dict[str, Any]:
+    """Hash the effective isolated dependency tree, excluding mutable caches.
+
+    A lockfile states intent; it does not authenticate the packages the frozen
+    interpreter can actually import.  Python tool roles therefore require a
+    checkout-local virtual environment with system site packages disabled.
+    Birdclaw's Node runtime binds checkout-local ``node_modules`` and rejects
+    ambient ancestor module trees.
+    """
+
+    if role == "birdclaw":
+        roots: list[dict[str, str]] = []
+        local_modules = checkout / "node_modules"
+        for parent in checkout.parents:
+            ambient = parent / "node_modules"
+            if ambient.is_dir():
+                raise ValueError(
+                    "campaign Birdclaw runtime has ambient ancestor node_modules"
+                )
+        if local_modules.exists():
+            roots.append(
+                {
+                    "path": str(local_modules.resolve()),
+                    "sha256": _runtime_tree_sha256(local_modules),
+                }
+            )
+        body: dict[str, Any] = {
+            "schema": "bhiksha.chart-scenario-installed-environment.v1",
+            "mode": "isolated_node_environment",
+            "environment_root": str(checkout),
+            "site_packages": roots,
+            "pyvenv_cfg_sha256": None,
+        }
+        return {**body, "content_hash": canonical_sha256(body)}
+
+    environment_root = interpreter.parent.parent.resolve()
+    if not environment_root.is_relative_to(checkout):
+        raise ValueError(
+            f"campaign Python environment must be isolated under checkout: {role}"
+        )
+    pyvenv_cfg = environment_root / "pyvenv.cfg"
+    if not pyvenv_cfg.is_file() or pyvenv_cfg.is_symlink():
+        raise ValueError(f"campaign Python environment is not a real venv: {role}")
+    config_text = pyvenv_cfg.read_text(encoding="utf-8")
+    settings = {
+        key.strip().lower(): value.strip().lower()
+        for line in config_text.splitlines()
+        if "=" in line
+        for key, value in [line.split("=", 1)]
+    }
+    if settings.get("include-system-site-packages") != "false":
+        raise ValueError(
+            f"campaign Python environment exposes system site-packages: {role}"
+        )
+    roots = sorted(
+        {
+            path.resolve()
+            for lib in (environment_root / "lib", environment_root / "lib64")
+            if lib.is_dir()
+            for path in lib.glob("python*/site-packages")
+            if path.is_dir()
+        },
+        key=lambda item: item.as_posix(),
+    )
+    if not roots:
+        raise ValueError(f"campaign Python environment has no site-packages: {role}")
+    site_packages = [
+        {"path": str(path), "sha256": _runtime_tree_sha256(path)} for path in roots
+    ]
+    body = {
+        "schema": "bhiksha.chart-scenario-installed-environment.v1",
+        "mode": "isolated_python_environment",
+        "environment_root": str(environment_root),
+        "site_packages": site_packages,
+        "pyvenv_cfg_sha256": _file_sha256(pyvenv_cfg),
+    }
+    return {**body, "content_hash": canonical_sha256(body)}
+
+
+def _runtime_tree_sha256(root: Path) -> str:
+    requested = root.expanduser()
+    if requested.is_symlink() or not requested.is_dir():
+        raise ValueError(f"installed environment root is not a real directory: {root}")
+    entries: list[dict[str, str]] = []
+    for path in sorted(requested.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(requested)
+        if path.is_symlink():
+            raise ValueError(
+                f"installed environment contains symlink: {relative.as_posix()}"
+            )
+        if not path.is_file():
+            continue
+        if (
+            "__pycache__" in relative.parts
+            or path.suffix in {".pyc", ".pyo"}
+            or path.name == ".DS_Store"
+        ):
+            continue
+        entries.append(
+            {"path": relative.as_posix(), "sha256": _file_sha256(path)}
+        )
+    return canonical_sha256(entries)
+
+
 def _verify_launcher_shebang(launcher: Path, *, interpreter: Path) -> None:
     first = launcher.read_text(encoding="utf-8").splitlines()[0]
     if not first.startswith("#!"):
@@ -1349,7 +1477,9 @@ def _prepare_daily_contract(
             env.get("PYTHONPATH", ""),
         ]
     ).rstrip(os.pathsep)
-    _run_command(command, cwd=cartographer_checkout, env=env)
+    completed = _execute_command(command, cwd=cartographer_checkout, env=env)
+    _verify_toolchain_role(config, role="market_cartographer")
+    _completed_command_result(completed)
     cartographer_receipt = cartographer_output / "receipt.json"
     receipt = json.loads(cartographer_receipt.read_text(encoding="utf-8"))
     if receipt.get("target_session_date") != target_date:
@@ -1464,6 +1594,7 @@ def _export_birdclaw_context(
             role="broker_inert", additions={"BIRDCLAW_DB": str(config["birdclaw_db"])}
         ),
     )
+    _verify_toolchain_role(config, role="birdclaw")
     if completed.returncode != 0:
         raise RuntimeError(
             "Birdclaw temporal export failed: "
