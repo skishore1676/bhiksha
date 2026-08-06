@@ -134,6 +134,20 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root=repo_root,
             )
         if args.job == "live-watchdog":
+            # Freshness check: a running process on a stale active_plan is
+            # not healthy — it will keep trading yesterday's deployments.
+            # Instead of bubbling to the operator, try a fresh restart here.
+            if _should_watchdog_refresh(repo_root=repo_root, args=args):
+                return _server_session_job(
+                    args,
+                    [
+                        "restart",
+                        "--live",
+                        "--post-start-check-seconds",
+                        _post_start_check_seconds(),
+                    ],
+                    repo_root=repo_root,
+                )
             return _server_session_job(
                 args,
                 [
@@ -626,6 +640,59 @@ def _command_failure_detail(completed: subprocess.CompletedProcess[str]) -> str:
             _tail(completed.stderr),
         ]
     )
+
+
+def _should_watchdog_refresh(*, repo_root: Path, args: argparse.Namespace) -> bool:
+    """Return True when the live runtime is running but on a stale plan.
+
+    The watchdog previously only healed a dead process. After the Aug 6
+    dep incident the process stayed alive on yesterday's plan (2026-08-05)
+    while today's live-start failed to write a fresh plan. That stale
+    session still traded at 09:39. Instead of leaving it to the operator,
+    the next watchdog should attempt a fresh restart; if the restart fails
+    (e.g. canary pin mismatch) it will be surfaced as a failed job.
+    """
+    # Need a running process to be worth refreshing
+    try:
+        from bhiksha.tools.server_session import _runtime_status
+        from bhiksha.ops.launchd_registry import latest_status_path
+
+        pid_path = Path(args.pid_path) if hasattr(args, "pid_path") else repo_root / "artifacts" / "playbook" / "runtime" / "bhiksha.pid"
+        status = _runtime_status(pid_path)
+        if not status.get("running"):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+    # Check active_plan freshness
+    plan_path = Path(args.active_plan) if hasattr(args, "active_plan") else repo_root / "artifacts" / "playbook" / "active_plan.json"
+    if not plan_path.is_absolute():
+        plan_path = repo_root / plan_path
+    try:
+        if not plan_path.is_file():
+            return True
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        trading_date = str(payload.get("trading_date") or "")
+        generated_at_raw = str(payload.get("generated_at") or "")
+        today = datetime.now(CENTRAL).date().isoformat()
+        # If today is a trading day and plan's trading_date is not today, stale
+        if is_trading_day(datetime.now(CENTRAL).date()):
+            if trading_date and trading_date != today:
+                return True
+            # Also consider a plan generated >26h ago as stale across a session boundary
+            if generated_at_raw:
+                try:
+                    gen = datetime.fromisoformat(generated_at_raw.replace("Z", "+00:00"))
+                    if gen.tzinfo is None:
+                        gen = gen.replace(tzinfo=ZoneInfo("UTC"))
+                    age_hours = (datetime.now(ZoneInfo("UTC")) - gen.astimezone(ZoneInfo("UTC"))).total_seconds() / 3600.0
+                    if age_hours > 26:
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _post_start_check_seconds() -> str:
