@@ -96,6 +96,14 @@ def build_status_snapshot(
         if spec.runner_job == "session-report":
             _apply_current_provider_health(last, provider_reconciliation)
         findings = _job_findings(last)
+        findings = list(findings)
+        findings.extend(_launchd_exit_findings(spec, launchd.get(spec.label, {}), last, now=generated_at))
+        # Stale detection for launchd jobs that crash before writing latest_status —
+        # latest_status stays frozen at the last good run, so domain stays ok.
+        findings.extend(_stale_last_run_findings(spec, last, now=generated_at))
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        findings = [item for item in findings if not (item in seen or seen.add(item))]  # type: ignore[func-returns-value]
         job = {
                 "label": spec.label,
                 "title": _job_title(spec.runner_job, spec.label),
@@ -128,6 +136,8 @@ def build_status_snapshot(
                 "lifecycle": (
                     "waiting_you"
                     if findings and spec.runner_job in {"schwab-refresh", "reconciliation-supervisor"}
+                    else "stuck"
+                    if findings and any("launchd job failed" in f or "stale_last_run" in f for f in findings)
                     else None
                 ),
             }
@@ -503,6 +513,72 @@ def _job_findings(last: dict[str, Any] | None) -> list[str]:
     if status == "needs_human":
         return ["Entry reconciliation could not finish safely; the affected deployment remains blocked."]
     return [f"Domain health failed: {status}"]
+
+
+def _launchd_exit_findings(
+    spec: Any,
+    launchd: dict[str, Any],
+    last: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> list[str]:
+    """Surface a launchd non-zero exit as a finding when domain still says ok.
+
+    Historically Bhiksha only surfaced domain-level failures. When
+    launchd_job crashes at import (e.g. missing dep after a deploy), it never
+    writes latest_status, so the status file stays frozen at the last good
+    run and the Control Tower shows green. The launchd last_exit_code is
+    collected but never promoted. This helper bridges that gap.
+    """
+    code = str(launchd.get("last_exit_code") or "").strip()
+    if code in ("", "0", "-", "(never exited)"):
+        return []
+    # launchd loaded but last exit non-zero and we have no fresh last_run_at
+    # beyond the failure window — report it.
+    # For initial fix, any non-zero exit produces a finding; lifecycle
+    # handling below will surface it to Lathi.
+    label = spec.label if hasattr(spec, "label") else str(spec)
+    log_hint = spec.stderr_log(Path.cwd()).name if hasattr(spec, "stderr_log") else f"{label}.err.log"
+    return [f"launchd job failed: {label} last exit {code} — check {log_hint} and latest_status freshness"]
+
+
+def _stale_last_run_findings(
+    spec: Any,
+    last: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> list[str]:
+    """Detect stale latest_status for jobs that crash before writing it."""
+    last_at_raw = last.get("recorded_at") if isinstance(last, dict) else None
+    last_at = _parse_timestamp(last_at_raw) if last_at_raw else None
+    if last_at is None:
+        # No record at all — if the job is enabled, it's stale after install
+        return ["stale_last_run — no successful run recorded"]
+    age_hours = (now.astimezone(UTC) - last_at.astimezone(UTC)).total_seconds() / 3600.0
+    # Thresholds: watchdog/reconciliation every 10m should not be >3h old
+    # on a trading day; daily jobs not >26h across a trading day boundary.
+    runner = getattr(spec, "runner_job", "")
+    if runner in {"live-watchdog", "reconciliation-supervisor"}:
+        threshold = 3.0
+    elif runner in {"live-start", "schwab-refresh"}:
+        threshold = 26.0
+    elif runner in {"session-report"}:
+        threshold = 8.0
+    else:
+        threshold = 30.0
+    # Only flag stale on trading days — skip weekends/holidays.
+    try:
+        from bhiksha.market_data.trading_calendar import is_trading_day  # type: ignore
+
+        if not is_trading_day(now.date()):
+            return []
+        # If last_at was on a prior trading day and now is next trading day
+        # morning, still flag after threshold.
+    except Exception:  # noqa: BLE001
+        pass
+    if age_hours > threshold:
+        return [f"stale_last_run — last ok {last_at_raw} {age_hours:.1f}h ago, expected within {threshold:.0f}h"]
+    return []
 
 
 def _job_title(runner_job: str, label: str) -> str:

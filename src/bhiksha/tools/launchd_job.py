@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 
 from bhiksha.app.bootstrap import build_runtime
-from bhiksha.chart_scenarios.paths import require_experiment_path
 from bhiksha.config.environment import load_dotenv
 from bhiksha.market_data.trading_calendar import is_trading_day
 from bhiksha.ops.alerts import (
@@ -683,6 +682,8 @@ def _print_result(payload: dict) -> None:
 def _write_latest_status(payload: dict) -> None:
     try:
         if payload.get("job") == "chart-scenario-shadow":
+            # Imported lazily — only chart jobs need the kernel.
+            from bhiksha.chart_scenarios.paths import require_experiment_path  # noqa: WPS433
             chart_root = Path(
                 os.getenv(
                     "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT",

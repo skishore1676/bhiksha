@@ -124,8 +124,91 @@ PY
   else
     chart_env+=("BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED=false")
   fi
-  exec /usr/bin/env -i "${chart_env[@]}" \
+  set +e
+  /usr/bin/env -i "${chart_env[@]}" \
     "$python_bin" -m bhiksha.tools.launchd_job "$@"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    # Best-effort breadcrumb when the job crashes before it can write
+    # latest_status itself (e.g. missing dep after a deploy). Use a
+    # minimal payload that does not import bhiksha.
+    job_name="${1:-unknown}"
+    "$python_bin" - "$REPO_ROOT" "$job_name" "$rc" <<'PY' 2>/dev/null || true
+import json
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+job = sys.argv[2]
+rc = sys.argv[3]
+path = repo_root / "artifacts" / "playbook" / "launchd" / "latest_status.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+except Exception:
+    data = {}
+if not isinstance(data.get("jobs"), dict):
+    data["jobs"] = {}
+data["jobs"][job] = {
+    "recorded_at": datetime.now(UTC).isoformat(),
+    "label": f"com.bhiksha.{job}",
+    "payload": {
+        "job": job,
+        "status": "failed",
+        "return_code": int(rc),
+        "reason": "runner_crash_before_status_write",
+        "stderr_tail": f"run_bhiksha_job.sh captured non-zero exit {rc} without a payload — likely import-time failure (missing dep or kernel env)",
+    },
+}
+data["generated_at"] = data["jobs"][job]["recorded_at"]
+data["schema"] = "bhiksha.launchd.latest_status.v1"
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+tmp.replace(path)
+PY
+  fi
+  exit $rc
 fi
 
-exec "$python_bin" -m bhiksha.tools.launchd_job "$@"
+set +e
+"$python_bin" -m bhiksha.tools.launchd_job "$@"
+rc=$?
+if [ $rc -ne 0 ]; then
+  job_name="${1:-unknown}"
+  "$python_bin" - "$REPO_ROOT" "$job_name" "$rc" <<'PY' 2>/dev/null || true
+import json
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+job = sys.argv[2]
+rc = sys.argv[3]
+path = repo_root / "artifacts" / "playbook" / "launchd" / "latest_status.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+except Exception:
+    data = {}
+if not isinstance(data.get("jobs"), dict):
+    data["jobs"] = {}
+data["jobs"][job] = {
+    "recorded_at": datetime.now(UTC).isoformat(),
+    "label": f"com.bhiksha.{job}",
+    "payload": {
+        "job": job,
+        "status": "failed",
+        "return_code": int(rc),
+        "reason": "runner_crash_before_status_write",
+        "stderr_tail": f"run_bhiksha_job.sh captured non-zero exit {rc} without a payload — likely import-time failure",
+    },
+}
+data["generated_at"] = data["jobs"][job]["recorded_at"]
+data["schema"] = "bhiksha.launchd.latest_status.v1"
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+tmp.replace(path)
+PY
+fi
+exit $rc
