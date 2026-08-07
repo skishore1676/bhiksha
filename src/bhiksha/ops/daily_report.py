@@ -1557,11 +1557,23 @@ def _app_running_row(report: dict[str, Any], *, app_status: dict[str, Any] | Non
     running = bool(app_status.get("running"))
     live = bool(app_status.get("live"))
     pid = app_status.get("pid")
-    started = str(app_status.get("started_at") or "")[:16]
+    raw_started = str(app_status.get("started_at") or "")
+    started = raw_started[:16]  # fallback UTC slice
+    # Prefer CT (America/Chicago) — Bhiksha schedule is CT; show ET equivalent in parens if needed
+    try:
+        from zoneinfo import ZoneInfo
+
+        dt = datetime.fromisoformat(raw_started.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        ct = dt.astimezone(ZoneInfo("America/Chicago"))
+        started = ct.strftime("%Y-%m-%d %H:%M CT")
+    except Exception:
+        pass
     if running and live:
-        return ("App running", f"PID {pid} live since {started}" if pid else "live", _ryg("GREEN"), "session active")
+        return ("App running", f"PID {pid} live since {started}" if pid else f"live since {started}", _ryg("GREEN"), "session active")
     if running:
-        return ("App running", f"PID {pid} (not live)" if pid else "running (dry)", _ryg("YELLOW"), "dry mode")
+        return ("App running", f"PID {pid} (not live) since {started}" if pid else f"running (dry) since {started}", _ryg("YELLOW"), "dry mode")
     return ("App running", "stopped", _ryg("RED"), "not running")
 
 
