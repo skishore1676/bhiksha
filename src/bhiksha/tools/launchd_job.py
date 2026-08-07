@@ -25,6 +25,8 @@ from bhiksha.ops.alerts import (
 )
 from bhiksha.ops.daily_report import (
     DailyReportWriteResult,
+    render_daily_report_ryg_telegram_html,
+    render_daily_report_ryg_telegram_text,
     render_daily_report_telegram_summary,
     write_daily_report,
 )
@@ -267,13 +269,55 @@ def _session_report_job(args: argparse.Namespace) -> int:
     runtime = build_runtime(active_plan_path=args.active_plan)
     db_path = Path(runtime.app_config.sqlite_path)
     output_dir = Path(runtime.app_config.playbook_artifacts_dir) / "reports"
+    # Gather live probes for RYG APP block (best-effort, don't fail report)
+    app_status: dict[str, Any] | None = None
+    schwab_status: dict[str, Any] | None = None
+    try:
+        from bhiksha.tools.server_session import _runtime_status as _get_runtime_status
+        import json as _json
+
+        raw = _get_runtime_status(runtime.app_config.sqlite_path)  # fallback path
+        # _runtime_status expects repo_root; try direct probe via server_session tool
+        import subprocess as _sp
+        import sys as _sys
+
+        repo_root = Path(__file__).resolve().parents[2]
+        py = str(repo_root / ".venv" / "bin" / "python") if (repo_root / ".venv" / "bin" / "python").exists() else _sys.executable
+        cp = _sp.run(
+            [py, "-m", "bhiksha.tools.server_session", "status"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        for line in cp.stdout.splitlines():
+            if line.startswith("RUNTIME_STATUS="):
+                app_status = _json.loads(line.split("=", 1)[1])
+                break
+    except Exception:
+        app_status = None
+    try:
+        schwab_path = Path(runtime.app_config.playbook_artifacts_dir) / "schwab_token_guard" / "latest.json"
+        if schwab_path.is_file():
+            schwab_status = json.loads(schwab_path.read_text())
+    except Exception:
+        schwab_status = None
     result = write_daily_report(
-        db_path, output_dir=output_dir, deployments=runtime.deployments
+        db_path,
+        output_dir=output_dir,
+        deployments=runtime.deployments,
+        app_status=app_status,
+        schwab_status=schwab_status,
     )
     level = _alert_level_for_report(result.report)
-    body = render_daily_report_telegram_summary(
-        result.report, markdown_path=result.markdown_path
-    )
+    # User prefers RYG tables (APP/LIVE/SHADOW) - use HTML <pre> tables via Lathi
+    try:
+        body = render_daily_report_ryg_telegram_html(
+            result.report, app_status=app_status, schwab_status=schwab_status
+        )
+    except Exception:
+        body = render_daily_report_ryg_telegram_text(
+            result.report, app_status=app_status, schwab_status=schwab_status
+        )
     alert = send_lathi_alert(
         title=f"Bhiksha {report_label} session report",
         body=body,

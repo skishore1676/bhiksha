@@ -57,6 +57,8 @@ def write_daily_report(
     output_dir: str | Path,
     trading_date: date | str | None = None,
     deployments: list["DeploymentManifest"] | None = None,
+    app_status: dict[str, Any] | None = None,
+    schwab_status: dict[str, Any] | None = None,
 ) -> DailyReportWriteResult:
     report = build_daily_report(db_path, trading_date=trading_date, deployments=deployments)
     target_dir = Path(output_dir)
@@ -64,8 +66,14 @@ def write_daily_report(
     day = report["trading_date"]
     json_path = target_dir / f"trade_session_report_{day}.json"
     markdown_path = target_dir / f"trade_session_report_{day}.md"
+    ryg_markdown_path = target_dir / f"trade_session_report_{day}_ryg.md"
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     markdown_path.write_text(render_daily_report_markdown(report), encoding="utf-8")
+    # RYG table (user preference)
+    ryg_markdown_path.write_text(
+        render_daily_report_ryg_markdown(report, app_status=app_status, schwab_status=schwab_status),
+        encoding="utf-8",
+    )
     return DailyReportWriteResult(report=report, json_path=json_path, markdown_path=markdown_path)
 
 
@@ -1486,3 +1494,252 @@ def _fmt_money_or_na(value: Any) -> str:
     sign = "-" if number < 0 else ""
     return f"{sign}${abs(number):,.2f}"
 # --- end risk rails formatting helpers --------------------------------------
+
+
+# --- RYG tabular report (user preference: metrics + RYG + why) ------------
+
+_RYG_EMOJI = {"RED": "🔴", "YELLOW": "🟡", "GREEN": "🟢", "NO_DATA": "⚪"}
+
+
+def _ryg(level: str | None) -> str:
+    return _RYG_EMOJI.get(str(level or "").upper(), "⚪")
+
+
+def _signal_funnel_by_lane(report: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Funnel per lane from events + trades.
+
+    evaluated = signal_evaluation count (total, not lane-split)
+    selector_empty is lane-split via provider_health entry_selector_empty_by_deployment.
+    When deployments is None, lane is inferred from deployment_id containing 'shadow'.
+    """
+    counts = report.get("event_type_counts") or {}
+    selector_empty = report.get("provider_health", {}).get("entry_selector_empty_by_deployment") or []
+    # If deployments list was None, live flag may be unreliable (all False) — fallback to name heuristic
+    def _is_live_row(r: dict[str, Any]) -> bool:
+        if "live" in r and r["live"] is not None:
+            # If report has at least one live True, trust it; otherwise infer
+            return bool(r.get("live"))
+        return "shadow" not in str(r.get("deployment_id") or "").lower()
+
+    # Detect if live inference is broken (no live rows at all but we have live trades)
+    has_live_flag = any(bool(r.get("live")) for r in selector_empty)
+    if not has_live_flag and selector_empty:
+        # Fallback: infer from deployment_id string
+        live_selector = sum(r.get("count", 0) for r in selector_empty if "shadow" not in str(r.get("deployment_id") or "").lower())
+        shadow_selector = sum(r.get("count", 0) for r in selector_empty if "shadow" in str(r.get("deployment_id") or "").lower())
+    else:
+        live_selector = sum(r.get("count", 0) for r in selector_empty if _is_live_row(r))
+        shadow_selector = sum(r.get("count", 0) for r in selector_empty if not _is_live_row(r))
+    summary = report.get("trade_summary") or {}
+    live_trades = int(summary.get("live_count") or 0)
+    shadow_trades = int(summary.get("shadow_count") or 0)
+    total_eval = int(counts.get("signal_evaluation") or 0)
+    # When we can't split evaluated by lane, show total in live and — in shadow (see renderer)
+    return {
+        "live": {
+            "evaluated": total_eval,
+            "selector_empty": live_selector,
+            "attempted": live_trades + live_selector,
+            "filled": live_trades,
+        },
+        "shadow": {
+            "evaluated": 0,
+            "selector_empty": shadow_selector,
+            "attempted": shadow_trades + shadow_selector,
+            "filled": shadow_trades,
+        },
+    }
+
+
+def _app_running_row(report: dict[str, Any], *, app_status: dict[str, Any] | None = None) -> tuple[str, str, str, str]:
+    if app_status is None:
+        return ("App running", "unknown", _ryg("NO_DATA"), "no runtime probe")
+    running = bool(app_status.get("running"))
+    live = bool(app_status.get("live"))
+    pid = app_status.get("pid")
+    started = str(app_status.get("started_at") or "")[:16]
+    if running and live:
+        return ("App running", f"PID {pid} live since {started}" if pid else "live", _ryg("GREEN"), "session active")
+    if running:
+        return ("App running", f"PID {pid} (not live)" if pid else "running (dry)", _ryg("YELLOW"), "dry mode")
+    return ("App running", "stopped", _ryg("RED"), "not running")
+
+
+def _schwab_row(report: dict[str, Any], *, schwab_status: dict[str, Any] | None = None) -> tuple[str, str, str, str]:
+    # Try report-embedded schwab summary if passed, else fallback
+    state = None
+    if schwab_status:
+        # schwab_token_guard latest.json shape: final.state
+        final = schwab_status.get("final") or schwab_status
+        state = str(final.get("state") or schwab_status.get("state") or "").lower()
+        days = final.get("refresh_token_days_left")
+        if state in {"healthy"}:
+            val = f"healthy ({days:.1f}d left)" if isinstance(days, (int, float)) else "healthy"
+            return ("Schwab auth", val, _ryg("GREEN"), "token healthy")
+        if state in {"access_token_stale"}:
+            return ("Schwab auth", "access_token_stale", _ryg("YELLOW"), "will refresh")
+        if state in {"refresh_token_near_expiry"}:
+            return ("Schwab auth", f"near expiry ({days:.1f}d)" if isinstance(days, (int, float)) else "near expiry", _ryg("YELLOW"), "renew soon")
+        if state in {"refresh_token_expired", "missing"}:
+            return ("Schwab auth", state, _ryg("RED"), "renew required")
+    return ("Schwab auth", "unknown", _ryg("NO_DATA"), "no probe")
+
+
+def _provider_row(report: dict[str, Any]) -> tuple[str, str, str, str]:
+    prov = (report.get("provider_health") or {}).get("reconciliation") or {}
+    blocking = int(prov.get("active_blocking_count") or 0)
+    degraded = int(prov.get("active_degraded_count") or 0)
+    warning = int(prov.get("active_warning_count") or 0)
+    state = str(prov.get("state") or "healthy")
+    if blocking > 0:
+        return ("Broker rec.", f"{blocking} blocking", _ryg("RED"), f"{blocking} blocking")
+    if degraded > 0:
+        return ("Broker rec.", f"{degraded} degraded", _ryg("YELLOW"), f"{degraded} degraded")
+    if warning > 0:
+        return ("Broker rec.", f"{warning} warning", _ryg("YELLOW"), f"{warning} warning")
+    return ("Broker rec.", state, _ryg("GREEN"), "healthy")
+
+
+def _data_quality_row(report: dict[str, Any]) -> tuple[str, str, str, str]:
+    warnings = report.get("data_quality_warnings") or []
+    issues = (report.get("provider_health") or {}).get("runtime_issue_counts") or {}
+    dead = int(issues.get("dead_lane") or 0)
+    if dead > 0:
+        return ("Warnings", f"{dead} dead lane", _ryg("RED"), "live lane unfillable")
+    if warnings:
+        return ("Warnings", f"{len(warnings)} data-quality", _ryg("YELLOW"), warnings[0].get("message", "warning")[:40])
+    if issues:
+        total = sum(issues.values())
+        return ("Warnings", f"{total} runtime", _ryg("YELLOW"), ", ".join(list(issues.keys())[:2]))
+    return ("Warnings", "none", _ryg("GREEN"), "clean")
+
+
+def _open_row(positions: list[dict[str, Any]], lane: str) -> tuple[str, str, str, str]:
+    filtered = [p for p in positions if str(p.get("lane") or "").lower() == lane]
+    total = len(filtered)
+    if total == 0:
+        return ("Open positions", "0", _ryg("GREEN"), "flat")
+    unprotected = sum(1 for p in filtered if p.get("protection_state") == "unprotected")
+    if unprotected > 0:
+        return ("Open positions", f"{total} ({unprotected} unprotected)", _ryg("RED"), f"{unprotected} unprotected")
+    return ("Open positions", f"{total} all protected", _ryg("GREEN"), "all protected")
+
+
+def _pnl_row(report: dict[str, Any], lane: str) -> tuple[str, str, str, str]:
+    summary = report.get("trade_summary") or {}
+    key = f"{lane}_realized_pnl_usd"
+    val = summary.get(key)
+    text = _fmt_money_or_na(val) if val is not None else "$0.00"
+    count = int(summary.get(f"{lane}_count") or 0)
+    # P&L is info-only; keep GREEN unless we have no truth
+    missing = int(summary.get(f"{lane}_missing_exit_truth_count") or 0)
+    if missing > 0:
+        return (f"P&L ({lane})", f"{text} ({count} trades)", _ryg("YELLOW"), f"{missing} missing exit truth")
+    return (f"P&L ({lane})", f"{text} ({count} trades)", _ryg("GREEN"), "realized")
+
+
+def _reconciliation_row(report: dict[str, Any]) -> tuple[str, str, str, str]:
+    entry = report.get("entry_reconciliation") or {}
+    prov = (report.get("provider_health") or {}).get("reconciliation") or {}
+    needs = int(entry.get("needs_human_count") or 0)
+    if needs > 0 or prov.get("attention_required"):
+        return ("Reconciliation", f"{needs} needs you" if needs else "needs you", _ryg("RED"), "attention required")
+    healing = int(entry.get("self_healing_count") or 0)
+    if healing > 0:
+        return ("Reconciliation", f"{healing} self-healing", _ryg("YELLOW"), "auto-recovering")
+    return ("Reconciliation", "ok", _ryg("GREEN"), "healthy")
+
+
+def _signal_rows(report: dict[str, Any], lane: str, funnel: dict[str, dict[str, int]]) -> list[tuple[str, str, str, str]]:
+    f = funnel.get(lane) or {}
+    evaluated = int(f.get("evaluated") or 0)
+    selector_empty = int(f.get("selector_empty") or 0)
+    attempted = int(f.get("attempted") or 0)
+    filled = int(f.get("filled") or 0)
+    triggered = max(0, attempted)  # proxy for triggered that reached selector
+    # Only surface RYG on the "unfillable" case
+    if selector_empty > 0 and attempted == selector_empty:
+        ryg = _ryg("YELLOW")
+        why = f"{selector_empty} passed but no contract"
+    elif selector_empty > 0:
+        ryg = _ryg("YELLOW")
+        why = f"{selector_empty} selector_empty"
+    else:
+        ryg = _ryg("GREEN")
+        why = "flow ok" if attempted > 0 or evaluated == 0 else "quiet"
+    return [
+        ("Signals eval", str(evaluated) if lane == "live" else "—", ryg if lane == "live" else _ryg("GREEN"), why if lane == "live" else "shadow"),
+        ("Signals triggered", str(triggered), ryg, why),
+        ("Entry attempts", str(attempted), ryg, why),
+        ("Fills", str(filled), _ryg("GREEN"), "filled"),
+    ]
+
+
+def _build_ryg_tables(report: dict[str, Any], *, app_status: dict[str, Any] | None = None, schwab_status: dict[str, Any] | None = None) -> dict[str, list[tuple[str, str, str, str]]]:
+    positions = report.get("open_positions") or []
+    funnel = _signal_funnel_by_lane(report)
+    app_rows: list[tuple[str, str, str, str]] = [
+        _app_running_row(report, app_status=app_status),
+        _schwab_row(report, schwab_status=schwab_status),
+        _provider_row(report),
+        _data_quality_row(report),
+        _reconciliation_row(report),
+    ]
+    live_rows: list[tuple[str, str, str, str]] = [
+        _pnl_row(report, "live"),
+        _open_row(positions, "live"),
+        *_signal_rows(report, "live", funnel),
+    ]
+    shadow_rows: list[tuple[str, str, str, str]] = [
+        _pnl_row(report, "shadow"),
+        _open_row(positions, "shadow"),
+        *_signal_rows(report, "shadow", funnel),
+    ]
+    return {"app": app_rows, "live": live_rows, "shadow": shadow_rows}
+
+
+def render_daily_report_ryg_markdown(report: dict[str, Any], *, app_status: dict[str, Any] | None = None, schwab_status: dict[str, Any] | None = None) -> str:
+    tables = _build_ryg_tables(report, app_status=app_status, schwab_status=schwab_status)
+    day = report.get("trading_date") or ""
+    lines = [f"# Bhiksha RYG — {day}", ""]
+    for title, key in [("APP", "app"), ("LIVE", "live"), ("SHADOW", "shadow")]:
+        lines.extend([f"## {title}", "", "| Metric | Value | Status | Why |", "|---|---|---|---|"])
+        for metric, value, ryg, why in tables[key]:
+            lines.append(f"| {metric} | {value} | {ryg} | {why} |")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def render_daily_report_ryg_telegram_html(report: dict[str, Any], *, app_status: dict[str, Any] | None = None, schwab_status: dict[str, Any] | None = None) -> str:
+    tables = _build_ryg_tables(report, app_status=app_status, schwab_status=schwab_status)
+    day = report.get("trading_date") or ""
+    parts: list[str] = [f"<b>Bhiksha RYG — {day}</b>"]
+    for title, key in [("APP", "app"), ("LIVE", "live"), ("SHADOW", "shadow")]:
+        parts.append(f"<b>{title}</b>")
+        # Use <pre> for monospaced table; body will be HTML-escaped by Lathi but we
+        # emit raw <pre> here and the caller sends with parse_mode HTML - Lathi's
+        # _render_html_message escapes body, so we instead emit plain text that
+        # Telegram will render as code when wrapped in <pre> via fields path.
+        # For now emit markdown-like table that renders well in plain Telegram:
+        rows = tables[key]
+        # Build aligned <pre> content
+        header = f"{'Metric':<18} {'Value':<22} {'':<2} Why"
+        lines = [header, "-" * 60]
+        for metric, value, ryg, why in rows:
+            lines.append(f"{metric:<18} {value:<22} {ryg:<2} {why}")
+        parts.append("<pre>" + "\n".join(lines) + "</pre>")
+    return "\n\n".join(parts)
+
+
+def render_daily_report_ryg_telegram_text(report: dict[str, Any], *, app_status: dict[str, Any] | None = None, schwab_status: dict[str, Any] | None = None) -> str:
+    """Plain-text fallback (no HTML) for Telegram when HTML is not desired."""
+    tables = _build_ryg_tables(report, app_status=app_status, schwab_status=schwab_status)
+    day = report.get("trading_date") or ""
+    lines = [f"Bhiksha RYG — {day}", ""]
+    for title, key in [("APP", "app"), ("LIVE", "live"), ("SHADOW", "shadow")]:
+        lines.append(f"{title}")
+        lines.append("-" * 40)
+        for metric, value, ryg, why in tables[key]:
+            lines.append(f"{ryg} {metric}: {value} — {why}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
