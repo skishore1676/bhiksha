@@ -1723,24 +1723,34 @@ def render_daily_report_ryg_markdown(report: dict[str, Any], *, app_status: dict
 
 
 def render_daily_report_ryg_telegram_html(report: dict[str, Any], *, app_status: dict[str, Any] | None = None, schwab_status: dict[str, Any] | None = None) -> str:
+    """Telegram HTML — mobile-friendly, no <pre> tables.
+
+    See kamandal_v2/ops/daily_report.py for rationale: fixed-width <pre>
+    tables at 60 chars wrap on mobile (~40 cols, openclaw#36323) and force
+    truncation. Per https://core.telegram.org/bots/api#html-style the
+    allowed tags are <b><i><u><s><code><pre><a> etc. (no nesting); we use
+    inline  🟢 <b>Metric</b>: <code>value</code> — <i>why</i>  so lines
+    wrap naturally and render correctly with lathi-bus template=status
+    (parse_mode HTML via _render_html_message). Outer title is supplied
+    via send_lathi_alert(title=...), so body does not repeat the day.
+    """
+
+    from html import escape
+
     tables = _build_ryg_tables(report, app_status=app_status, schwab_status=schwab_status)
-    day = report.get("trading_date") or ""
-    parts: list[str] = [f"<b>Bhiksha RYG — {day}</b>"]
-    for title, key in [("APP", "app"), ("LIVE", "live"), ("SHADOW", "shadow")]:
-        parts.append(f"<b>{title}</b>")
-        # Use <pre> for monospaced table; body will be HTML-escaped by Lathi but we
-        # emit raw <pre> here and the caller sends with parse_mode HTML - Lathi's
-        # _render_html_message escapes body, so we instead emit plain text that
-        # Telegram will render as code when wrapped in <pre> via fields path.
-        # For now emit markdown-like table that renders well in plain Telegram:
-        rows = tables[key]
-        # Build aligned <pre> content
-        header = f"{'Metric':<18} {'Value':<22} {'':<2} Why"
-        lines = [header, "-" * 60]
-        for metric, value, ryg, why in rows:
-            lines.append(f"{metric:<18} {value:<22} {ryg:<2} {why}")
-        parts.append("<pre>" + "\n".join(lines) + "</pre>")
-    return "\n\n".join(parts)
+    lines: list[str] = []
+    for section, key in [("APP", "app"), ("LIVE", "live"), ("SHADOW", "shadow")]:
+        lines.append(f"<b>{section}</b>")
+        for metric, value, ryg, why in tables[key]:
+            metric_html = escape(metric)
+            value_html = escape(value) if value else "—"
+            why_html = escape(why) if why else ""
+            row = f"{ryg} <b>{metric_html}</b>: <code>{value_html}</code>"
+            if why_html:
+                row += f" — <i>{why_html}</i>"
+            lines.append(row)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
 
 def render_daily_report_ryg_telegram_text(report: dict[str, Any], *, app_status: dict[str, Any] | None = None, schwab_status: dict[str, Any] | None = None) -> str:
