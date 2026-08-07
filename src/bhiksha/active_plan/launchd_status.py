@@ -570,9 +570,6 @@ def _stale_last_run_findings(
         threshold = 26.0
     elif runner in {"session-report"}:
         threshold = 8.0
-    elif runner == "weekly-trading-decisions":
-        # Weekly Fridays 16:00 CT -> 168h period; allow until next Friday + 12h buffer
-        threshold = 180.0
     else:
         threshold = 30.0
     # Only flag stale on trading days — skip weekends/holidays.

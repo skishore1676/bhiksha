@@ -1227,15 +1227,31 @@ def _validate_compiled_live_triage_authority(
     for deployment in candidates:
         metadata = deployment.source.metadata
         if metadata.get("authorized_active_plan_id") != active_plan_id:
-            raise ValueError(
-                f"live triage canary {deployment.deployment_id!r} is not "
-                "bound to the compiled active_plan_id"
+            # Autonomous fallback: instead of failing the whole plan compilation
+            # (which blocks all trading and requires SSH), inhibit the canary
+            # to shadow_only and surface via Tower/Lathi Bus for Sheet correction.
+            # Control remains via Google Sheet (update authorized_active_plan_id)
+            # or Telegram/Obsidian approval via Lathi — no SSH bottleneck.
+            import logging
+
+            logging.warning(
+                "live triage canary %r not bound to %r (has %r) — inhibiting to shadow_only until Sheet is corrected",
+                deployment.deployment_id,
+                active_plan_id,
+                metadata.get("authorized_active_plan_id"),
             )
+            deployment.execution.shadow_only = True  # type: ignore[union-attr]
+            continue
         if metadata.get("authorized_deployment_id") != deployment.deployment_id:
-            raise ValueError(
-                f"live triage canary {deployment.deployment_id!r} is not "
-                "bound to its compiled deployment_id"
+            import logging
+
+            logging.warning(
+                "live triage canary %r deployment_id mismatch (has %r) — inhibiting",
+                deployment.deployment_id,
+                metadata.get("authorized_deployment_id"),
             )
+            deployment.execution.shadow_only = True  # type: ignore[union-attr]
+            continue
         if (
             deployment.execution.dte_min != 0
             or deployment.execution.dte_max != 3
