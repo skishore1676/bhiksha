@@ -23,8 +23,14 @@ from bhiksha.evidence.bindings import apply_evidence_binding, load_evidence_bind
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 
 try:
-    from bhiksha.experiments.auto_shadow import ensure_shadow_packets
+    from bhiksha.experiments.auto_shadow import reconcile_shadow_experiments, compute_deployment_experiment_fingerprint
 except ImportError:  # auto-shadow optional in tests without Mala
+    reconcile_shadow_experiments = None  # type: ignore
+    compute_deployment_experiment_fingerprint = None  # type: ignore
+# Legacy name kept for old import paths (early hook removed in Option C)
+try:
+    from bhiksha.experiments.auto_shadow import ensure_shadow_packets  # noqa: F401
+except ImportError:
     ensure_shadow_packets = None  # type: ignore
 from bhiksha.risk.canary_inhibition_store import (
     CanaryInhibitionRecord,
@@ -371,40 +377,6 @@ def compile_active_plan_from_rows(
         )
     strategy_catalog = load_strategy_catalog(strategy_catalog_path)
     catalog_by_id = {entry.strategy_id: entry for entry in strategy_catalog}
-    # Operator-friendly auto-freeze: Sheet row enabled+shadow → ensure Mala packet exists.
-    # This makes the Sheet the sole launcher; hashes stay underneath.
-    # Runs even when evidence_bindings wasn't passed (google_sheets path), deriving the default
-    # bindings path from strategy_catalog_path so the 07:05 CT sync auto-freezes.
-    if ensure_shadow_packets is not None:
-        try:
-            # Resolve sibling Mala packet root and bindings path from strategy_catalog_path
-            # strategy_catalog_path is .../config/strategy_catalog → repo root is parents[2]
-            _repo = Path(strategy_catalog_path).resolve().parents[2] if Path(strategy_catalog_path).is_absolute() else Path.cwd()
-            # Try well-known Mala locations
-            for _mala in [Path("/Users/suman/code/mala_v2/research/results/evidence_packets"), Path("/Users/sunny/code/mala_v2/research/results/evidence_packets"), _repo.parent / "mala_v2/research/results/evidence_packets"]:
-                if _mala.exists():
-                    _packet_root = _mala
-                    break
-            else:
-                _packet_root = Path("/Users/suman/code/mala_v2/research/results/evidence_packets")
-            # Evidence bindings path is sibling to strategy_catalog: config/evidence_bindings_v1.json
-            _bindings_path = Path(strategy_catalog_path).parent / "evidence_bindings_v1.json"
-            if not _bindings_path.exists():
-                _bindings_path = Path("/Users/suman/code/bhiksha/config/evidence_bindings_v1.json")
-            ensure_shadow_packets(
-                packet_root=_packet_root,
-                evidence_bindings_path=_bindings_path,
-                strategy_catalog_path=Path(strategy_catalog_path),
-                rows=rows,
-            )
-            # Re-load bindings so this same compile sees the new packet
-            try:
-                evidence_bindings = dict(load_evidence_bindings(_bindings_path))
-            except Exception:
-                pass
-        except Exception:
-            # Never fail the sheet sync on auto-freeze
-            pass
     google_catalog_by_id = {
         entry.catalog_key: entry
         for entry in (google_strategy_catalog or [])
@@ -461,6 +433,66 @@ def compile_active_plan_from_rows(
         deployments,
         inhibition_store=canary_inhibition_store,
     )
+    # Option C: reconcile shadow experiments AFTER final effective deployment is known,
+    # BEFORE apply_evidence_binding. Fingerprint = strategy+entry+option+Control exit.
+    # Tuesday reuse, DTE/delta/exit change → v2. Live untouched (fail-closed).
+    auto_experiment_findings: list[dict[str, Any]] = []
+    if reconcile_shadow_experiments is not None:
+        try:
+            _repo = Path(strategy_catalog_path).resolve().parents[2] if Path(strategy_catalog_path).is_absolute() else Path.cwd()
+            for _mala in [Path("/Users/suman/code/mala_v2/research/results/evidence_packets"), Path("/Users/sunny/code/mala_v2/research/results/evidence_packets"), _repo.parent / "mala_v2/research/results/evidence_packets"]:
+                if _mala.exists():
+                    _packet_root = _mala
+                    break
+            else:
+                _packet_root = Path("/Users/suman/code/mala_v2/research/results/evidence_packets")
+            _bindings_path = Path(strategy_catalog_path).parent / "evidence_bindings_v1.json"
+            if not _bindings_path.exists() and Path(strategy_catalog_path).resolve().is_relative_to(Path("/Users/suman/code/bhiksha").resolve()):
+                _bindings_path = Path("/Users/suman/code/bhiksha/config/evidence_bindings_v1.json")
+            # For pytest tmp_path (e.g. /private/var/.../tmp...), keep tmp path even if not exists
+            _reconcile_rows: dict[str, Any] = {}
+            for d in deployments:
+                rid = d.deployment_id
+                found = None
+                for r in rows:
+                    if rid.endswith(r.row_id) or rid == r.row_id:
+                        found = r
+                        break
+                if found is not None:
+                    _reconcile_rows[d.deployment_id] = found
+            # Also include strategy rows not yet deployed? reconcile filters by deployments anyway
+            _result = reconcile_shadow_experiments(
+                packet_root=_packet_root,
+                evidence_bindings_path=_bindings_path,
+                deployments=deployments,
+                rows_by_id=_reconcile_rows,
+                evidence_bindings=evidence_bindings,
+            )
+            if isinstance(_result, dict):
+                # Reload bindings after reconcile (created v2 etc preserves old packets)
+                try:
+                    if "bindings" in _result and _result["bindings"]:
+                        evidence_bindings = dict(_result["bindings"])
+                    else:
+                        evidence_bindings = dict(load_evidence_bindings(_bindings_path))
+                except Exception:
+                    pass
+                for b in _result.get("blocked", []):
+                    sid = str(b.get("strategy_id", ""))
+                    reason = str(b.get("reason", ""))
+                    # Find deployment for this sid to suppress only that shadow lane
+                    for dep in list(deployments):
+                        r = _reconcile_rows.get(dep.deployment_id)
+                        if r is not None and str(getattr(r, "strategy_id", "")) == sid:
+                            suppressed_rows.append(_suppressed_row(reason=f"AUTO_EXPERIMENT_BLOCKED: {sid} — Mala packet creation failed: {reason}", row=r))
+                    # Remove blocked deployments from further binding (fail locally)
+                    deployments = [d for d in deployments if not (_reconcile_rows.get(d.deployment_id) is not None and str(getattr(_reconcile_rows[d.deployment_id], "strategy_id", "")) == sid)]
+                    auto_experiment_findings.append({"strategy_id": sid, "status": "AUTO_EXPERIMENT_BLOCKED", "reason": reason})
+                for c in _result.get("created", []):
+                    auto_experiment_findings.append({"strategy_id": c.get("strategy_id"), "status": "AUTO_EXPERIMENT_CREATED", "packet_id": c.get("packet_id"), "version": c.get("version")})
+        except Exception as exc:
+            # Never fail whole plan on auto-freeze; record finding
+            auto_experiment_findings.append({"status": "AUTO_EXPERIMENT_RECONCILE_FAILED", "reason": str(exc)[:300]})
     bound_deployments: list[DeploymentManifest] = []
     rows_by_id = {row.row_id: row for row in rows}
     for deployment in deployments:
@@ -509,6 +541,7 @@ def compile_active_plan_from_rows(
                 for deployment in deployments
                 if deployment.source.metadata.get("evidence_binding_sha256")
             ),
+            "auto_experiment_findings": auto_experiment_findings,
         },
         suppressed=suppressed_rows,
         deployments=deployments,

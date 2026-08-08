@@ -38,6 +38,44 @@
     },
     {
       "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "c9ecda85c23f6459b7da4b69d7eccb5e204e916db247ab893cc7766492a7ba09",
+      "artifact_uri": "mala-evidence://sha256/f425e7237dd53755566f53737c722191b10c8844a57152d26c52728ebddc33fe/PROVIDER.json",
+      "binding_sha256": "d1c915ef95ebb81c5a93787caa34908707280e7e5d272aa8eb2c1434aa36d576",
+      "cohort_contract_sha256": "02dd750d10f6cff1b2ff1e56d8b49ff39fcb2e0211adacb5ce255ed8af455ef3",
+      "cohort_id": "market_impulse_spy_short_v1-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "market_impulse_spy_short_v1-option-v1",
+        "contract_sha256": "73f4f85b5213e5fdfdf11408aeeb09feea1319cb56e369aa1205103a8f4cfa3c",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.4,
+          "target_abs_delta_min": 0.2
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "f425e7237dd53755566f53737c722191b10c8844a57152d26c52728ebddc33fe",
+      "exit_policy_hash": null,
+      "experiment_fingerprint": "10e706049a9eab393914fe9fdcb27bcf435e113e9b064073ee17af9e362e77f0",
+      "experiment_id": "market_impulse_spy_short_v1-prospective-v2",
+      "run_id": "auto-shadow-market_impul-v2-10e70604",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "market_impulse_spy_short_v1",
+      "symbol": "SPY"
+    },
+    {
+      "allowed_authorization_modes": [
         "live"
       ],
       "artifact_sha256": "79463b175633d38949618789e973d0a6d82b1926e7725653c2d05e13ed7d7354",
@@ -71,6 +109,82 @@
       "schema_version": "bhiksha.evidence_binding.v1",
       "strategy_id": "opening-drive-current-basket-discovery__nvda_short",
       "symbol": "NVDA"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "c9ecda85c23f6459b7da4b69d7eccb5e204e916db247ab893cc7766492a7ba09",
+      "artifact_uri": "mala-evidence://sha256/ca02ec32b91cfcab0cca613eee7fd42d4507da2b84967fc2b5af5afd4b11057d/PROVIDER.json",
+      "binding_sha256": "3942847024fab4e983893e7632785ad1ab75e30b533f7df79ec087cae56a67aa",
+      "cohort_contract_sha256": "14fcbdced8664ca5c6bd12c98b470cc408b47993be73128037d4be7e8972fbd1",
+      "cohort_id": "qqq_market_impulse_short_v1-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "qqq_market_impulse_short_v1-option-v1",
+        "contract_sha256": "5461cc6c029cbe1786bbf6d78dd0f33bba365e02a1d11b8fddf0e58572968549",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.4,
+          "target_abs_delta_min": 0.2
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "ca02ec32b91cfcab0cca613eee7fd42d4507da2b84967fc2b5af5afd4b11057d",
+      "exit_policy_hash": null,
+      "experiment_fingerprint": "10e706049a9eab393914fe9fdcb27bcf435e113e9b064073ee17af9e362e77f0",
+      "experiment_id": "qqq_market_impulse_short_v1-prospective-v1",
+      "run_id": "auto-shadow-qqq_market_i-v1-10e70604",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "qqq_market_impulse_short_v1",
+      "symbol": "QQQ"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "e733cc4ba685d8ebd37164c484ad99e42ce85ac3c5e8eb5d3d07056f5dab2ee8",
+      "artifact_uri": "mala-evidence://sha256/0592903b2eb6075ddc456c76614b2241d7f7fc3dd842eef37b6625f9609da43a/PROVIDER.json",
+      "binding_sha256": "a0b165caf8d6d6f3f71e0bacd189a711a422f3b57af64eb244210cfb7d1c8872",
+      "cohort_contract_sha256": "9ea9f9e9e11d09a062d0788c47ca5891b29f3e87029f79585abdc549cdfe6e2c",
+      "cohort_id": "spy_jerk_pivot_short_v1-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "spy_jerk_pivot_short_v1-option-v1",
+        "contract_sha256": "6173ddaf85493242c77ab236b9f2fa48f79222a48d8f1d6f871df9bbc3047677",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.4,
+          "target_abs_delta_min": 0.2
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "0592903b2eb6075ddc456c76614b2241d7f7fc3dd842eef37b6625f9609da43a",
+      "exit_policy_hash": "a043eb1139049c361d3a160ff9b3b5ef085246780d59f81391f22810b41d0434",
+      "experiment_fingerprint": "44259edecd43373d5c79c05b794bb371d947bb7af401bb14c4d4da8ef2ab1e30",
+      "experiment_id": "spy_jerk_pivot_short_v1-prospective-v3",
+      "run_id": "auto-shadow-spy_jerk_piv-v3-44259ede",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "spy_jerk_pivot_short_v1",
+      "symbol": "SPY"
     },
     {
       "allowed_authorization_modes": [
@@ -109,6 +223,6 @@
       "symbol": "PDD"
     }
   ],
-  "registry_sha256": "0dcd37cc82f8f4ff44d02a5eaadbaa90037da289736d4056aa4c053a76383ea3",
+  "registry_sha256": "acb9660064717b87d0f659262287d379b05e0b8ab787dd50c8ec1f4ca9e20f6f",
   "schema_version": "bhiksha.evidence_binding_registry.v1"
 }
