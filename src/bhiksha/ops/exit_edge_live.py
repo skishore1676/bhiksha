@@ -68,7 +68,7 @@ class ExitEdgeLiveRecorder:
         status_path: str | Path,
         queue_capacity: int = 512,
         fill_latency_ms: int = 0,
-        max_freshness_ms: int = 2_000,
+        max_freshness_ms: int = 5_000,
         max_sequence_gap: int = 1,
         continuation_min_interval_seconds: float = 30.0,
         repository_factory: Callable[[str | Path], ProspectiveQuoteTapeRepository]
