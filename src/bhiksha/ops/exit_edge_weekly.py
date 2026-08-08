@@ -17,10 +17,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from bhiksha.ops.exit_edge_lab import (
+    CURRENT_MEASUREMENT_GENERATION,
     ProspectiveQuoteTapeRepository,
     RISK_ENVELOPE_EXPERIMENT_ID,
     SHADOW_CANDIDATE_IDS,
     analyze_prospective_repository,
+    classify_measurement_generation,
+    measurement_generation_id,
 )
 from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.shared_kernel import ensure_kernel_on_path
@@ -286,6 +289,7 @@ def build_exit_edge_weekly_evidence(
         verdict, reason, weekly_v2, cumulative_v2
     )
     maturity_stage = _maturity_stage(maturity, cumulative=cumulative_v2)
+    strata = _build_strata(cumulative_cases, weekly_cases)
     evidence: dict[str, Any] = {
         "schema": SCHEMA,
         "report_type": REPORT_TYPE,
@@ -340,6 +344,11 @@ def build_exit_edge_weekly_evidence(
                 "candidate_specific_promotion_gate_not_satisfied",
             ],
         },
+        "measurement_generation": {
+            "current_generation_id": measurement_generation_id(),
+            "current_protocol": dict(CURRENT_MEASUREMENT_GENERATION),
+        },
+        "strata": strata,
     }
     evidence["receipt"] = {
         "status": "ok",
@@ -847,6 +856,55 @@ def _maturity_summary(raw: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     return maturity
+
+
+def _build_strata(
+    cumulative_cases: list[dict[str, Any]],
+    weekly_cases: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    from collections import Counter
+
+    weekly_hashes = Counter(
+        str(case.get("experiment_spec_hash") or "unknown")
+        for case in weekly_cases
+    )
+    weekly_paired = Counter(
+        str(case.get("experiment_spec_hash") or "unknown")
+        for case in weekly_cases
+        if case.get("status") == "paired"
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for case in cumulative_cases:
+        h = str(case.get("experiment_spec_hash") or "unknown")
+        grouped.setdefault(h, []).append(case)
+    strata: list[dict[str, Any]] = []
+    for h, cases in grouped.items():
+        experiment = (cases[0].get("experiment_spec") or {}) if cases else {}
+        generation = classify_measurement_generation(experiment) if experiment else "legacy"
+        # Derive a human label from the control arm
+        arms = ((experiment.get("risk_envelope") or {}).get("arms") or [])
+        control = next((a for a in arms if a.get("candidate_id") == "control"), {})
+        strategy_label = str(control.get("candidate_policy_id") or cases[0].get("symbol") or "unknown")
+        # Shorten strategy label for display
+        eligible = len(cases)
+        paired = sum(1 for c in cases if c.get("status") == "paired")
+        w_eligible = int(weekly_hashes.get(h, 0))
+        w_paired = int(weekly_paired.get(h, 0))
+        strata.append({
+            "experiment_spec_hash": h,
+            "short_hash": h[:8],
+            "generation": generation,
+            "generation_label": "Current" if generation == "current" else "Legacy — diagnostic only",
+            "strategy_label": strategy_label,
+            "eligible_observation_count": eligible,
+            "terminal_paired_count": paired,
+            "weekly_eligible": w_eligible,
+            "weekly_paired": w_paired,
+            "status": "COLLECTING" if generation == "current" else "LEGACY",
+        })
+    # Current first, then legacy, sorted by eligible desc
+    strata.sort(key=lambda r: (0 if r["generation"] == "current" else 1, -r["eligible_observation_count"], r["short_hash"]))
+    return strata
 
 
 def _canary_errors(

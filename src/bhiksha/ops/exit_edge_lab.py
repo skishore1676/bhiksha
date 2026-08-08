@@ -57,6 +57,15 @@ FILL_MODEL = (
 )
 EVALUATOR_VERSION = "profile-evaluator-v1"
 FILL_MODEL_VERSION = "next-fresh-natural-bid-v2"
+# Generation 3 — current measurement protocol (frozen 2026-08-04).
+# Any change to these four dimensions must create a new generation id.
+CURRENT_MEASUREMENT_GENERATION = {
+    "generation_id": "gen3-bounded_retry_v2-2026-08-04",
+    "quote_feed": "order_manager_reused_quote_with_bounded_retry_v2",
+    "quote_source": "public_api",
+    "fill_model_version": FILL_MODEL_VERSION,
+    "evaluator_version": EVALUATOR_VERSION,
+}
 LEGACY_RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION = "exit-edge-risk-envelope.v1"
 LEGACY_RISK_ENVELOPE_EXPERIMENT_ID = "trend-continuation-control-a-b.v1"
 RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION = "exit-shadow-experiment.v1"
@@ -2033,6 +2042,24 @@ def _normalized_risk_envelope_experiment(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def classify_measurement_generation(experiment: dict[str, Any]) -> str:
+    """Return 'current' if the experiment matches the frozen Gen3 protocol, else 'legacy'."""
+    exp = _normalized_experiment(experiment) if experiment else {}
+    cur = CURRENT_MEASUREMENT_GENERATION
+    if (
+        exp.get("quote_feed") == cur["quote_feed"]
+        and exp.get("quote_source") == cur["quote_source"]
+        and exp.get("fill_model_version") == cur["fill_model_version"]
+        and exp.get("evaluator_version") == cur["evaluator_version"]
+    ):
+        return "current"
+    return "legacy"
+
+
+def measurement_generation_id() -> str:
+    return str(CURRENT_MEASUREMENT_GENERATION["generation_id"])
+
+
 def _canonical_json(value: Any)->str:return json.dumps(value,sort_keys=True,separators=(",",":"))
 def _float_or_none(value:Any)->float|None:return None if value is None else float(value)
 def _parse_datetime(value:Any)->datetime:
@@ -2043,6 +2070,6 @@ def _optional_datetime(value:Any)->datetime|None:return None if value in (None,"
 
 
 __all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","ShadowEnvelopeState","analyze_cases",
-         "analyze_prospective_repository","build_historical_coverage_report",
+         "analyze_prospective_repository","build_historical_coverage_report","classify_measurement_generation","measurement_generation_id","CURRENT_MEASUREMENT_GENERATION",
          "build_risk_envelope_experiment","experiment_spec_hash","load_fixture_cases",
          "policy_config_hash","render_markdown","write_exit_edge_report"]
