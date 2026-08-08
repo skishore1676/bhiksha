@@ -207,7 +207,7 @@ class AppConfig(BaseModel):
     exit_edge_live_shadow_status_path: str = "artifacts/observations/exit_edge_live_status.json"
     exit_edge_live_shadow_queue_capacity: int = Field(default=512, ge=1, le=100_000)
     exit_edge_live_shadow_fill_latency_ms: int = Field(default=0, ge=0)
-    exit_edge_live_shadow_max_freshness_ms: int = Field(default=2_000, ge=0)
+    exit_edge_live_shadow_max_freshness_ms: int = Field(default=5_000, ge=0)
     exit_edge_live_shadow_max_sequence_gap: int = Field(default=1, ge=1)
 
 
