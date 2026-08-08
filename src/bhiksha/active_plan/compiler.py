@@ -21,6 +21,11 @@ from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalo
 from bhiksha.execution.pricing import resolve_entry_reprice_max_chase_pct
 from bhiksha.evidence.bindings import apply_evidence_binding, load_evidence_bindings
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
+
+try:
+    from bhiksha.experiments.auto_shadow import ensure_shadow_packets
+except ImportError:  # auto-shadow optional in tests without Mala
+    ensure_shadow_packets = None  # type: ignore
 from bhiksha.risk.canary_inhibition_store import (
     CanaryInhibitionRecord,
     CanaryInhibitionStore,
@@ -366,6 +371,38 @@ def compile_active_plan_from_rows(
         )
     strategy_catalog = load_strategy_catalog(strategy_catalog_path)
     catalog_by_id = {entry.strategy_id: entry for entry in strategy_catalog}
+    # Operator-friendly auto-freeze: Sheet row enabled+shadow → ensure Mala packet exists.
+    # This makes the Sheet the sole launcher; hashes stay underneath.
+    if ensure_shadow_packets is not None and evidence_bindings is not None:
+        try:
+            # Resolve sibling Mala packet root and bindings path from strategy_catalog_path
+            # strategy_catalog_path is .../config/strategy_catalog → repo root is parents[2]
+            _repo = Path(strategy_catalog_path).resolve().parents[2] if Path(strategy_catalog_path).is_absolute() else Path.cwd()
+            # Try well-known Mala locations
+            for _mala in [Path("/Users/suman/code/mala_v2/research/results/evidence_packets"), Path("/Users/sunny/code/mala_v2/research/results/evidence_packets"), _repo.parent / "mala_v2/research/results/evidence_packets"]:
+                if _mala.exists():
+                    _packet_root = _mala
+                    break
+            else:
+                _packet_root = Path("/Users/suman/code/mala_v2/research/results/evidence_packets")
+            # Evidence bindings path is sibling to strategy_catalog: config/evidence_bindings_v1.json
+            _bindings_path = Path(strategy_catalog_path).parent / "evidence_bindings_v1.json"
+            if not _bindings_path.exists():
+                _bindings_path = Path("/Users/suman/code/bhiksha/config/evidence_bindings_v1.json")
+            ensure_shadow_packets(
+                packet_root=_packet_root,
+                evidence_bindings_path=_bindings_path,
+                strategy_catalog_path=Path(strategy_catalog_path),
+                rows=rows,
+            )
+            # Re-load bindings so this same compile sees the new packet
+            try:
+                evidence_bindings = dict(load_evidence_bindings(_bindings_path))
+            except Exception:
+                pass
+        except Exception:
+            # Never fail the sheet sync on auto-freeze
+            pass
     google_catalog_by_id = {
         entry.catalog_key: entry
         for entry in (google_strategy_catalog or [])
