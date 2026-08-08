@@ -38,6 +38,42 @@
     },
     {
       "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "3a08dda7290cf6814ee9cdb038cf3c5cc38fe0740c353c44c3bc789a7cf96f1f",
+      "artifact_uri": "mala-evidence://sha256/0d112e8735c5a2513dafc48f68aee601ce8028131f27c5350ae72452f39f355c/MI_SEMIS_PROVIDER.json",
+      "binding_sha256": "31c3938bc0fdeb68e1255044971517457a633a2b7a3dab9ff53567b939016112",
+      "cohort_contract_sha256": "0489857a391c1b2dfd32eeface792aab64c36641ef036a19f9a973a7493d514a",
+      "cohort_id": "mi-semis-short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "mi-semis-short-option-v1",
+        "contract_sha256": "81654a9b85e4262a63ce3a455d085bb1dfb34655dc6364624b573a730b2701ee",
+        "parameters": {
+          "dte_fallback_policy": "allow_nearest_after",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.08,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "0d112e8735c5a2513dafc48f68aee601ce8028131f27c5350ae72452f39f355c",
+      "experiment_id": "mi-semis-market-impulse-short-prospective-v1",
+      "run_id": "mi-semis-20260808-shadow",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "market-impulse-semis-discovery__mi_semis_short",
+      "symbol": "SMH"
+    },
+    {
+      "allowed_authorization_modes": [
         "live"
       ],
       "artifact_sha256": "79463b175633d38949618789e973d0a6d82b1926e7725653c2d05e13ed7d7354",
@@ -109,6 +145,6 @@
       "symbol": "PDD"
     }
   ],
-  "registry_sha256": "0dcd37cc82f8f4ff44d02a5eaadbaa90037da289736d4056aa4c053a76383ea3",
+  "registry_sha256": "8e19488793664c679264a006188e4085b096fbe75effb2844487b7d82646256b",
   "schema_version": "bhiksha.evidence_binding_registry.v1"
 }
