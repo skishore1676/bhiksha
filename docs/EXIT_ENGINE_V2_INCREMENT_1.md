@@ -61,7 +61,7 @@ and writes:
 <playbook_artifacts_dir>/session_manifests/session_manifest_<trading-date>_<config-fingerprint>.md
 ```
 
-For each material transition, audit the SQLite policy snapshot, runtime state,
+For each material transition, reconcile the SQLite policy snapshot, runtime state,
 action intent, trade/fill record, identified event, and broker readback
 together. A local state assertion or accepted order response is not broker
 fill proof. Local banked quantity and residual protection advance only after an
@@ -73,10 +73,12 @@ Deploy only at the normal post-flat session boundary after:
 
 1. kernel, Bhiksha, PAT, and TradeLab suites are green;
 2. current-behavior golden fixtures are unchanged;
-3. at least two fresh adversarial money-path audit rounds pass;
-4. oldmac is confirmed flat and its checkout/dirtiness are preserved; and
-5. post-deploy readback proves commit/tree, launchd health, startup policy
+3. oldmac is confirmed flat and its checkout/dirtiness are preserved; and
+4. post-deploy readback proves commit/tree, launchd health, startup policy
    identity, and fresh state/manifest output.
+
+Audit runs are outside this standing release gate and occur only when Suman
+explicitly requests them.
 
 ## 2026-07-24 deployment proof
 

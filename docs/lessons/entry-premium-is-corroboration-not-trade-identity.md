@@ -58,5 +58,6 @@ Pin regressions for:
 - ordinary post-partial residual state; and
 - recovery without mutating the precise durable seed.
 
-Money-path release still requires the complete suite, fresh adversarial review,
-same-auditor delta review, post-flat deployment, and oldmac restart/readback.
+Money-path release still requires the complete suite, post-flat deployment, and
+oldmac restart/readback. Audit runs occur only when Suman explicitly requests
+them.

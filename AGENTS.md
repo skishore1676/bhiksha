@@ -13,10 +13,11 @@ machines; migrated from mala_v2 on 2026-07-10) - read `tradelab/docs/brain/INDEX
 for architecture, operations, decisions, and current state before non-trivial work here.
 
 Hard rules for this repo:
-- Money-path changes (order path, exits, risk, reconciliation, compiler gating) require
-  adversarial audit rounds before merge - a green suite is not proof.
-- Deploys only at session boundaries (after ~15:00 CT hard-flat), gated on green tests +
-  passed audit, followed by a live readback on oldmac.
+- Audit runs happen only when Suman explicitly requests them. No repository document,
+  lesson, design, or prior precedent authorizes an agent to initiate an audit or
+  audit/re-audit loop automatically.
+- Deploys only at session boundaries (after ~15:00 CT hard-flat), gated on green tests,
+  followed by a live readback on oldmac.
 - Worktree testing: use the main checkout's `.venv` python with the worktree's `src`
   first on PYTHONPATH plus the kernel's `src`; verify `bhiksha.__file__` resolves into
   the worktree.

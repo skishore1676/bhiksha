@@ -1,13 +1,18 @@
 ---
-title: Money-path changes need multi-round adversarial audit — each round catches a different bug class
-type: pattern
+title: Historical findings from the 2026-07-02 adversarial reviews
+type: historical-lesson
 area: execution (profile-exit, risk rails), process
 date: 2026-07-02
 tags: [adversarial-audit, live-trading, testing, partials, settings-validation]
 refs: [src/bhiksha/risk/risk_settings.py, src/bhiksha/execution/supervisor.py (_profile_state_identity_mismatch), src/bhiksha/state/reconciliation.py (_resolve_trade), d7f5517, dcb2514]
 ---
 
-# Money-path changes need multi-round adversarial audit — each round catches a different bug class
+# Historical findings from the 2026-07-02 adversarial reviews
+
+This lesson preserves what those operator-requested reviews found. It is not a
+standing release requirement and does not authorize an agent to start an audit,
+review worker, or re-audit loop. Audit runs occur only when Suman explicitly
+requests them.
 
 ## Context
 The 2026-07-02 cycle shipped three money-path changes (risk rails, reconciliation
@@ -37,12 +42,10 @@ its tests encode. The audit rounds each caught a DIFFERENT class:
    record (fallback-to-limit entry price + price-improved fill) — reintroducing
    the gate-shut symptom AND letting `sync_lifecycle` mis-close the real trade.
 
-## Why / when it applies
-Any change that can place, size, or suppress real orders. The pattern that
-worked: (a) fresh adversarial agent with an explicit hunt list and "disprove
-readiness" framing; (b) **send the fix-delta back to the SAME auditor** to
-re-run its own repros (context makes round 2 sharp); (c) demand verdicts per
-finding (RESOLVED / STILL-BROKEN / RESIDUAL) plus pinned regression tests.
+## Why the history remains useful
+The reviews concerned changes that could place, size, or suppress real orders.
+Their concrete reproductions and pinned regression tests remain useful evidence,
+but they do not prescribe a future review workflow.
 
 ## Specifics
 - Identity/sanity predicates must be tested against the **routine lifecycle**
@@ -57,6 +60,6 @@ finding (RESOLVED / STILL-BROKEN / RESIDUAL) plus pinned regression tests.
   independent semantic backstop (tier-2 flatten implies the entry block).
 
 ## Apply it next time
-Before arming anything: one fresh adversarial round with repros, fix, then a
-delta re-audit by the same auditor against its own repros. Budget for round 2
-finding something round 1's fix introduced — it did, both times this cycle.
+Run the focused lifecycle, settings-validation, identity, and regression tests
+described above. If Suman explicitly requests an audit, use the historical
+reproductions to define its hunt list and scope.

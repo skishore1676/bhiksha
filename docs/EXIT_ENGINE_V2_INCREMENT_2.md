@@ -279,14 +279,14 @@ Before changing stage:
    authority fingerprint. There is no operator-supplied startup digest.
 5. Run focused canary, persistence, recovery, Exit Edge, and weekly tests, then
    the complete suite.
-6. Perform fresh adversarial money-path reviews. Green tests alone are not
-   release proof.
-7. Deploy only after the normal post-flat boundary and read back source SHA,
+6. Deploy only after the normal post-flat boundary and read back source SHA,
    oldmac SHA/tree, flat broker/database state, launchd state, generated session
    manifest, and weekly evidence schema.
-8. If arming a treatment later, change exactly one approved active-plan row,
+7. If arming a treatment later, change exactly one approved active-plan row,
    recompile, prove its session manifest says `safety_stack`, strict `4-7 DTE`,
    `max_contracts=1`, `state=armed`, and matching plan/startup authority
    fingerprints, then monitor the action-intent, rollback latch, and
    broker-order readbacks. Expired or not-yet-valid authorization must render
    disarmed/safety-blocked. Never infer authority from the shadow registry.
+
+Audit runs are performed only when Suman explicitly requests them.
