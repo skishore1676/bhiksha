@@ -4,18 +4,18 @@
       "allowed_authorization_modes": [
         "shadow"
       ],
-      "artifact_sha256": "5c30a2c3b2c6a58e5d250d97491e098aa3bd2b3adaac9afbb788b94be5b35841",
-      "artifact_uri": "mala-evidence://sha256/70cd93ec51015318e49e7a9b552b2e1d0be1f3d0582cb5273c43f5c7d6862dea/M7_provider_translation_report.json",
-      "binding_sha256": "9e56c3bcb3d8393cd6e2f63c81c98ee7bf24a667e03c4536b5bbb395df2af8f4",
-      "cohort_contract_sha256": "1b219f7b1e52e8c68c06c43138cd9aafd7f276faa4eab288380960a918847461",
-      "cohort_id": "meta-market-impulse-short-next20-or-28d-v1",
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/1a62983654375cca231e56490e1961e0d548a9069e2420b53b26a19194221dd8/PROVIDER.json",
+      "binding_sha256": "e30634de9f322b23dc33097ef380fe406e51b6fd5e8bbf7e0aec641a554f31da",
+      "cohort_contract_sha256": "a19abcc0f1dac91ec1c411e8583c3c24ee4f60bda6adf600674872a4a957805d",
+      "cohort_id": "iwm_short-next20-or-28d-v1",
       "declared_option_selection_contract": {
-        "contract_id": "meta-market-impulse-short-option-v1",
-        "contract_sha256": "f6142b8813a9411b302109d6e9f7d2db2eed1d232d76cea7cab341cd35484aa6",
+        "contract_id": "elastic-band-current-basket-discovery-iwm_short-option-v1",
+        "contract_sha256": "b7daa664b9706e292578f133d79fafc2dcccbfb6c7a6efb3014d0322b097eb99",
         "parameters": {
-          "dte_fallback_policy": "allow_nearest_after",
+          "dte_fallback_policy": "strict",
           "dte_max": 3,
-          "dte_min": 0,
+          "dte_min": 3,
           "long_signal_contract_type": "CALL",
           "max_bid_ask_spread_pct": 0.2,
           "min_open_interest": 100,
@@ -29,25 +29,99 @@
         "selector_version": "1"
       },
       "direction": "short",
-      "evidence_packet_id": "70cd93ec51015318e49e7a9b552b2e1d0be1f3d0582cb5273c43f5c7d6862dea",
-      "experiment_id": "meta-market-impulse-short-prospective-v1",
-      "run_id": "m7-20260522-meta-market-impulse-short",
+      "evidence_packet_id": "1a62983654375cca231e56490e1961e0d548a9069e2420b53b26a19194221dd8",
+      "experiment_id": "elastic-band-current-basket-discovery__iwm_short-prospective-v1",
+      "run_id": "auto-shadow-iwm_short-20260808",
       "schema_version": "bhiksha.evidence_binding.v1",
-      "strategy_id": "market-impulse-all-basket-discovery__meta_short",
+      "strategy_id": "elastic-band-current-basket-discovery__iwm_short",
+      "symbol": "IWM"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/b9c9ce87c2ada3665e7754be5b4f79be0c40929d5db62658f8b3eff05b7f3b09/PROVIDER.json",
+      "binding_sha256": "8f5a995051e26460f6768cc81f3ec1bd9b017171023c2bf0e16b9e9a04778154",
+      "cohort_contract_sha256": "441c15602256e758ea6cb68e4c5271d55eae30785a40dd671398583860c0b118",
+      "cohort_id": "meta_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "elastic-band-current-basket-discovery-meta_short-option-v1",
+        "contract_sha256": "a8db35aadcb2e21063371c316a914fd53579545f4c187912110744a64bc76b29",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "b9c9ce87c2ada3665e7754be5b4f79be0c40929d5db62658f8b3eff05b7f3b09",
+      "experiment_id": "elastic-band-current-basket-discovery__meta_short-prospective-v1",
+      "run_id": "auto-shadow-meta_short-20260808",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "elastic-band-current-basket-discovery__meta_short",
       "symbol": "META"
     },
     {
       "allowed_authorization_modes": [
         "shadow"
       ],
-      "artifact_sha256": "c9ecda85c23f6459b7da4b69d7eccb5e204e916db247ab893cc7766492a7ba09",
-      "artifact_uri": "mala-evidence://sha256/f425e7237dd53755566f53737c722191b10c8844a57152d26c52728ebddc33fe/PROVIDER.json",
-      "binding_sha256": "d1c915ef95ebb81c5a93787caa34908707280e7e5d272aa8eb2c1434aa36d576",
-      "cohort_contract_sha256": "02dd750d10f6cff1b2ff1e56d8b49ff39fcb2e0211adacb5ce255ed8af455ef3",
-      "cohort_id": "market_impulse_spy_short_v1-next20-or-28d-v1",
+      "artifact_sha256": "041ae18005a83f2c6d53c5e13a4d95630141b58678110acb76d786ee56467ab9",
+      "artifact_uri": "mala-evidence://sha256/57b697229d9ab389c22c980d92673f585b8feefef83380e93038397da0b28edb/PROVIDER.json",
+      "binding_sha256": "51767c137025dd32e9a76288a8024c492cdacbfe920e8bb907216b6efcefba4c",
+      "cohort_contract_sha256": "97c20ac7de0c55a45484c39be823b1df481f86a840f70e4618f3aa167b95bf69",
+      "cohort_id": "mu_long-next20-or-28d-v1",
       "declared_option_selection_contract": {
-        "contract_id": "market_impulse_spy_short_v1-option-v1",
-        "contract_sha256": "73f4f85b5213e5fdfdf11408aeeb09feea1319cb56e369aa1205103a8f4cfa3c",
+        "contract_id": "expand30-w1-b1-p2-mu-market-impulse-mu_long-option-v1",
+        "contract_sha256": "05f08012a8df351c8a660eb669a8feed911ac898b75e2740a3ad6beffe3cf6e3",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 14,
+          "dte_min": 7,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "57b697229d9ab389c22c980d92673f585b8feefef83380e93038397da0b28edb",
+      "exit_policy_hash": "8103cf32c3bb930a467dbd1aa9efc4f910c7f69cb55c081f95c9bf8d683ba6f3",
+      "experiment_fingerprint": "711b12307e220289b7c0e51ef0ceb834cb5bfdff96d49e2350af5cd2dcb5898b",
+      "experiment_id": "expand30-w1-b1-p2-mu-market-impulse__mu_long-prospective-v2",
+      "run_id": "auto-shadow-mu_long-v2-711b1230",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "expand30-w1-b1-p2-mu-market-impulse__mu_long",
+      "symbol": "MU"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/e379cc020df61bf818052961eb8fcd2ebc5b9d6f3de37d7af85a37b45680b9a7/PROVIDER.json",
+      "binding_sha256": "0d6847ea366575792a24eb71b1d0fedf5f94dcad317b5676512e7e2048f25de7",
+      "cohort_contract_sha256": "e35fb9a7dabadeafe676218a0286869d0a40dda660a4e2974621bb74830149e8",
+      "cohort_id": "smh_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "expand30-w1-b1-p3-market-impulse-smh-smh_short-option-v1",
+        "contract_sha256": "a09d88de3eedc8c1508d95db2bff809ebab4f9bfe3a48a8db3b4cc6248234b02",
         "parameters": {
           "dte_fallback_policy": "strict",
           "dte_max": 7,
@@ -56,8 +130,8 @@
           "max_bid_ask_spread_pct": 0.2,
           "min_open_interest": 100,
           "short_signal_contract_type": "PUT",
-          "target_abs_delta_max": 0.4,
-          "target_abs_delta_min": 0.2
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
         },
         "schema_version": "mala.option_selection_contract.v1",
         "selector_family": "single_leg_long_premium",
@@ -65,14 +139,650 @@
         "selector_version": "1"
       },
       "direction": "short",
-      "evidence_packet_id": "f425e7237dd53755566f53737c722191b10c8844a57152d26c52728ebddc33fe",
-      "exit_policy_hash": null,
-      "experiment_fingerprint": "10e706049a9eab393914fe9fdcb27bcf435e113e9b064073ee17af9e362e77f0",
-      "experiment_id": "market_impulse_spy_short_v1-prospective-v2",
-      "run_id": "auto-shadow-market_impul-v2-10e70604",
+      "evidence_packet_id": "e379cc020df61bf818052961eb8fcd2ebc5b9d6f3de37d7af85a37b45680b9a7",
+      "experiment_id": "expand30-w1-b1-p3-market-impulse-smh__smh_short-prospective-v1",
+      "run_id": "auto-shadow-smh_short-20260808",
       "schema_version": "bhiksha.evidence_binding.v1",
-      "strategy_id": "market_impulse_spy_short_v1",
+      "strategy_id": "expand30-w1-b1-p3-market-impulse-smh__smh_short",
+      "symbol": "SMH"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "e1c247aae6fd202360ceaafce93b601312abe838fdcd2717d080d0381514d94c",
+      "artifact_uri": "mala-evidence://sha256/21b7190362dcbcab8a3aa5b5674b6be4dea0047e5cecb8f7d368b308469f3fb8/PROVIDER.json",
+      "binding_sha256": "ff89d6d0e73d1bfb2cbc6cd5e0980741660d6fe1fa31b918bed7d71bbe29b92d",
+      "cohort_contract_sha256": "3d83472d8f9f0bf106cc6167574db5b76bb1c32d1201d88ea3c7dd4e50a2ad19",
+      "cohort_id": "amzn_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "expand30-w1-b2-p2-amzn-opening-drive-amzn_short-option-v1",
+        "contract_sha256": "54b6f8e17de17d33438f75ece9d5b940c75f3ea3acfc303fcd5391ae8b0ad21b",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "21b7190362dcbcab8a3aa5b5674b6be4dea0047e5cecb8f7d368b308469f3fb8",
+      "exit_policy_hash": "bc77e2f619b7b6b9090a42f9d023f934e482346f5702689700c7e94b41f49cc8",
+      "experiment_fingerprint": "963f9bc2be6879e52adcb0087643afd3b16f7d58cdeecad1e1eb287b3164f076",
+      "experiment_id": "expand30-w1-b2-p2-amzn-opening-drive__amzn_short-prospective-v2",
+      "run_id": "auto-shadow-amzn_short-v2-963f9bc2",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "expand30-w1-b2-p2-amzn-opening-drive__amzn_short",
+      "symbol": "AMZN"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "58f3e959f8f04fd5647ecd37cf141561c4b58321214f9c657fc528c0da7c0931",
+      "artifact_uri": "mala-evidence://sha256/6a1cf82e4bd04dcb7d947c59fb10fa7477e65a41ca5275ce7780b99c6b8ca7c8/PROVIDER.json",
+      "binding_sha256": "40e8ba6009904c5cc41e77ebbd48dd86e6594b9431476d41bd7d3449749c0679",
+      "cohort_contract_sha256": "095a511c35a5cae06bb2abc5d9a8b8251231eddfe93b487dc785c9ccd13de0d8",
+      "cohort_id": "avgo_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "expand30-w1-b2-p3-avgo-opening-drive-avgo_long-option-v1",
+        "contract_sha256": "0ccd083fcabe560b73b039f077fe550cce51d3ccf97703f8268d058ca73998b9",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "6a1cf82e4bd04dcb7d947c59fb10fa7477e65a41ca5275ce7780b99c6b8ca7c8",
+      "exit_policy_hash": "0c792d4c7790ee5d3d11bc516c52241a36bebdf4aefc8e83b0a0b5ac8686105e",
+      "experiment_fingerprint": "693f8e52237db53f7ec6c20e801560e01b0514bd14f6fdb8996bb48e5ce5c0f1",
+      "experiment_id": "expand30-w1-b2-p3-avgo-opening-drive__avgo_long-prospective-v2",
+      "run_id": "auto-shadow-avgo_long-v2-693f8e52",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "expand30-w1-b2-p3-avgo-opening-drive__avgo_long",
+      "symbol": "AVGO"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "aa6865e603459ba31d19dc8fd8628b8fb64e7eddbcc0640282100f1e1130b01c",
+      "artifact_uri": "mala-evidence://sha256/814970740a1d866ed9ea4ca02e3bfa9a5363334c4877c50f6008d3eebde86fd6/PROVIDER.json",
+      "binding_sha256": "32cc3ca6d3f1deb9eefc2eee6d394f133c0ec0ba1dcfa366ec4b2ac74a670513",
+      "cohort_contract_sha256": "97c20ac7de0c55a45484c39be823b1df481f86a840f70e4618f3aa167b95bf69",
+      "cohort_id": "mu_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "expand30-w1-b2-p3-mu-opening-drive-mu_long-option-v1",
+        "contract_sha256": "e0f02d94e32b7c2d26573cc769c4362b6ecd25e8f9f4eb5002fb30409350e900",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "814970740a1d866ed9ea4ca02e3bfa9a5363334c4877c50f6008d3eebde86fd6",
+      "exit_policy_hash": "34b06293851072680b73f76d23e154fa116f123a727cb82eaea3cc6726dd66a6",
+      "experiment_fingerprint": "03b029fe849c7e606baac21035a987247938bce1b984f47c33e5b90226aa1a9b",
+      "experiment_id": "expand30-w1-b2-p3-mu-opening-drive__mu_long-prospective-v2",
+      "run_id": "auto-shadow-mu_long-v2-03b029fe",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "expand30-w1-b2-p3-mu-opening-drive__mu_long",
+      "symbol": "MU"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "3e53ffad21c40e1e86febb31762fa80ca4d9fa6bccec4e90fef1ff1cd3f8acf7",
+      "artifact_uri": "mala-evidence://sha256/d06b21346607131379fa572cd0275a038e1b964d450b866b3822a2aab0985897/PROVIDER.json",
+      "binding_sha256": "463d2f04f11bc4d822bbc8d3defb07ae91024f22e6e9994687859ea5ca940739",
+      "cohort_contract_sha256": "e35fb9a7dabadeafe676218a0286869d0a40dda660a4e2974621bb74830149e8",
+      "cohort_id": "smh_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "expand30-w1-b3-p1-smh-opening-drive-smh_short-option-v1",
+        "contract_sha256": "acbb544b0932a2619cc9a314a25f4b3ad3c3fc830b7db4061f68ad78cace0fad",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "d06b21346607131379fa572cd0275a038e1b964d450b866b3822a2aab0985897",
+      "exit_policy_hash": "9c267120688d4bccd2bff9f2d5005a03fe143c67560e849d405675c53c3df1fe",
+      "experiment_fingerprint": "ad491a099c35fa9a8461dbdfa50cb0c8757694be6b1c6878cd7bf4476499d3de",
+      "experiment_id": "expand30-w1-b3-p1-smh-opening-drive__smh_short-prospective-v2",
+      "run_id": "auto-shadow-smh_short-v2-ad491a09",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "expand30-w1-b3-p1-smh-opening-drive__smh_short",
+      "symbol": "SMH"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "3adb2df9c509cff6a6d039e1b40777db65e8a9cd81ac3f64aa4563a7cb1fa62c",
+      "artifact_uri": "mala-evidence://sha256/d94778d1dfb2c8508bdfca083bc228547fbb864863a5746b6ade0444e88dd49a/PROVIDER.json",
+      "binding_sha256": "c168a097bbee158858e116745ca89f1df6ba848c4da21823c80243ee0f21906e",
+      "cohort_contract_sha256": "095a511c35a5cae06bb2abc5d9a8b8251231eddfe93b487dc785c9ccd13de0d8",
+      "cohort_id": "avgo_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "expand30-w1-b4-p2-avgo-elastic-band-avgo_long-option-v1",
+        "contract_sha256": "571b232ebe3009bedb1c0a47890be98542f8bdf6fe4ab72cae7f5beaa486be30",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "d94778d1dfb2c8508bdfca083bc228547fbb864863a5746b6ade0444e88dd49a",
+      "exit_policy_hash": null,
+      "experiment_fingerprint": "590ab5f2a9cb070d308137b0daa71cb1d2fb05267b28fbba2cb24a87b25b3ba5",
+      "experiment_id": "expand30-w1-b4-p2-avgo-elastic-band__avgo_long-prospective-v2",
+      "run_id": "auto-shadow-avgo_long-v2-590ab5f2",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "expand30-w1-b4-p2-avgo-elastic-band__avgo_long",
+      "symbol": "AVGO"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/434ea492c1c91777a169ce0c5010cec88bc07e08670fe7c5dc70113a0d0aaa29/PROVIDER.json",
+      "binding_sha256": "656b5f016fc94268bdff925d5148b639f330e895006d691bd1e886d16f52e9ed",
+      "cohort_contract_sha256": "6e204b2ad92e86eabb54a6d6770ab44d8ccb90347b96c6baa0ed6faee5a113e4",
+      "cohort_id": "smh_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "expand30-w1-b4-p2-smh-elastic-band-smh_long-option-v1",
+        "contract_sha256": "ba03127bad5c13f851b6dda74f2a3e5d7afe415777a7a23905bb376bbe55ae82",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 3,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "434ea492c1c91777a169ce0c5010cec88bc07e08670fe7c5dc70113a0d0aaa29",
+      "experiment_id": "expand30-w1-b4-p2-smh-elastic-band__smh_long-prospective-v1",
+      "run_id": "auto-shadow-smh_long-20260808",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "expand30-w1-b4-p2-smh-elastic-band__smh_long",
+      "symbol": "SMH"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/94cf5ef84e76b11b07f38e83c63a7fd80d4fd39e3c8f6111aa6d1ec66d42002b/PROVIDER.json",
+      "binding_sha256": "7a1f3fba67977dd364b806dbd333a2a831de63ead8f13e8746a036c109ca8f27",
+      "cohort_contract_sha256": "95cf47d698157f284c61e984ab3a517cce5f5046522794a70855607979bffbc7",
+      "cohort_id": "amd_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "jerk-pivot-current-basket-discovery-amd_short-option-v1",
+        "contract_sha256": "8b8a4f61908c2659a062a4081392dd2da92fafcf8674770878c0f9cba6f1a2ba",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "94cf5ef84e76b11b07f38e83c63a7fd80d4fd39e3c8f6111aa6d1ec66d42002b",
+      "experiment_id": "jerk-pivot-current-basket-discovery__amd_short-prospective-v1",
+      "run_id": "auto-shadow-amd_short-20260808",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "jerk-pivot-current-basket-discovery__amd_short",
+      "symbol": "AMD"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/c367e60c80c1a1f01d1a8d704fe22210c2daf699c9515cc0b05a16b4b1041c9e/PROVIDER.json",
+      "binding_sha256": "0033e9fa107daf1d1a8cf58f36d69e7cf781f1a5b3d61c4b88ae6a642db180d1",
+      "cohort_contract_sha256": "441c15602256e758ea6cb68e4c5271d55eae30785a40dd671398583860c0b118",
+      "cohort_id": "meta_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "jerk-pivot-current-basket-discovery-meta_short-option-v1",
+        "contract_sha256": "e6730584a52472962f0eb0760bcc703f1ad9624c7969e99a2123a1691b23ad72",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "c367e60c80c1a1f01d1a8d704fe22210c2daf699c9515cc0b05a16b4b1041c9e",
+      "experiment_id": "jerk-pivot-current-basket-discovery__meta_short-prospective-v1",
+      "run_id": "auto-shadow-meta_short-20260808",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "jerk-pivot-current-basket-discovery__meta_short",
+      "symbol": "META"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/01ab1057521152102ea1bfa69a18662f86885716ae9a41f40ddca566d810a01a/PROVIDER.json",
+      "binding_sha256": "3ca44ff197bd2e1392a34857aad526a1d4bd2f88ff5105daa0472599f8fa7fe8",
+      "cohort_contract_sha256": "a45ce7ad8796f677ab3c1ab04871640ade59ddd1cabe90bc7beee752fca4d067",
+      "cohort_id": "tsla_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "jerk-pivot-current-basket-discovery-tsla_short-option-v1",
+        "contract_sha256": "729f53a402a1fa03eb411ed60f71f3f5b59032928aa005267e35471f5073f587",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "01ab1057521152102ea1bfa69a18662f86885716ae9a41f40ddca566d810a01a",
+      "experiment_id": "jerk-pivot-current-basket-discovery__tsla_short-prospective-v1",
+      "run_id": "auto-shadow-tsla_short-20260808",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "jerk-pivot-current-basket-discovery__tsla_short",
+      "symbol": "TSLA"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "cf36be094c9f1cbe3b4b934c072ed019f6d4c20dda3fa3c2ba1fe61339e7e982",
+      "artifact_uri": "mala-evidence://sha256/1a9675ac501aa840de572e5f9dc76ee7c6e55f83a29f2a31698576ecb73b2dab/PROVIDER.json",
+      "binding_sha256": "b96a36d365dfc4adb23ed4b6a6db1ff1a6506e938e97881d9cff9874643c6ad0",
+      "cohort_contract_sha256": "0d5d0fcad048777b693df9e3737c541e960b70d2628ca58db8375959fb5fb2c6",
+      "cohort_id": "aapl_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "market-impulse-all-basket-discovery-aapl_short-option-v1",
+        "contract_sha256": "d8fb9237503ecf697774e9eda148f05f0e5aad17f7eff351f41c9c52b2c71bd9",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "1a9675ac501aa840de572e5f9dc76ee7c6e55f83a29f2a31698576ecb73b2dab",
+      "exit_policy_hash": "4c767538ca9f40c4cd4c0b8454839a6dff62739a21aea41cc79da62dee3652e4",
+      "experiment_fingerprint": "f36bd02ebc4b29fdc05139676664999044b99b41da99c7d66ad5e492b9c93b4c",
+      "experiment_id": "market-impulse-all-basket-discovery__aapl_short-prospective-v2",
+      "run_id": "auto-shadow-aapl_short-v2-f36bd02e",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "market-impulse-all-basket-discovery__aapl_short",
+      "symbol": "AAPL"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "1268d6c14ce94e9a1090773d796e5ee3185e1155858a758e0b531da188bc1178",
+      "artifact_uri": "mala-evidence://sha256/785d826cf6037f92767d520ecdbcbd04530f3104b9a5a2af235fcbbcf249bd74/PROVIDER.json",
+      "binding_sha256": "9a57f47a45c22fdac25ae846f069a80d8fda1c40e3a35e54bcb3cf5f001b2a65",
+      "cohort_contract_sha256": "441c15602256e758ea6cb68e4c5271d55eae30785a40dd671398583860c0b118",
+      "cohort_id": "meta_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "market-impulse-all-basket-discovery-meta_short-option-v1",
+        "contract_sha256": "1c41dd8699ce997cce4b24a0a1af5c3131752cb2d8403ebad9f9dc693b97c355",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "785d826cf6037f92767d520ecdbcbd04530f3104b9a5a2af235fcbbcf249bd74",
+      "exit_policy_hash": "0a49a60a37925fd2fc03060e8a9892ce746c53dc8ea15cd1d502c50954290335",
+      "experiment_fingerprint": "2e4c1fcc1c356b55856a188fc4c58a212cfde574b3397bd8022b09361bac3076",
+      "experiment_id": "market-impulse-all-basket-discovery__meta_short-prospective-v1",
+      "run_id": "auto-shadow-meta_short-v1-2e4c1fcc",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "market-impulse-all-basket-discovery__meta_short",
+      "symbol": "META"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "cb798f77d69cecffec01350ec9bb28c170b456ea3b8d32b40cae8ef09c82b94e",
+      "artifact_uri": "mala-evidence://sha256/2e5c8b0bfa0a257a6ce4310fcef7e23ada1a77e29b2b9cdee9af549f472d1e0c/PROVIDER.json",
+      "binding_sha256": "0103f08f911ffb6d43c38abe2d09fce15eb42c287edd9090a399adf48e0ef51e",
+      "cohort_contract_sha256": "59c8e2698eab760f9e54d61604541d8f5306c8ed72b74316234ede2320903412",
+      "cohort_id": "pltr_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "market-impulse-all-basket-discovery-pltr_short-option-v1",
+        "contract_sha256": "dfe1419141aec31461db41396d5c0392c7ad8bfec052e190597f1b99ede8760b",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 14,
+          "dte_min": 7,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "2e5c8b0bfa0a257a6ce4310fcef7e23ada1a77e29b2b9cdee9af549f472d1e0c",
+      "exit_policy_hash": "ab9a6dfba21d92a2c1bcfd5a63537b56667ad80fbf62b93f35e43b16c8a8f0eb",
+      "experiment_fingerprint": "cb669499072fe20b62cdf9922ee0c7dc29f957eb11d4f4528a368fce3756e71b",
+      "experiment_id": "market-impulse-all-basket-discovery__pltr_short-prospective-v2",
+      "run_id": "auto-shadow-pltr_short-v2-cb669499",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "market-impulse-all-basket-discovery__pltr_short",
+      "symbol": "PLTR"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "4776ac4cb63db06973934d191716539dd8ef24a2399d95a2084a336473576b51",
+      "artifact_uri": "mala-evidence://sha256/084d731a27ceeb36e37275a8771d0823f9178e0d8005b474dd60d9bcc1218347/PROVIDER.json",
+      "binding_sha256": "f3931970c133d28e8d12c03bbe482788e911478753eb6da99027addd51f94a3c",
+      "cohort_contract_sha256": "33d2e6ab4172bf9bb720a160e3a9fe801c22d77969b132138be94d0c4abef699",
+      "cohort_id": "spy_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "market-impulse-all-basket-discovery-spy_long-option-v1",
+        "contract_sha256": "fd54fc49eb928bfaf1415a9063584a25bce1591a2b5128634a99dc5ce4d34631",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "084d731a27ceeb36e37275a8771d0823f9178e0d8005b474dd60d9bcc1218347",
+      "exit_policy_hash": "12e14bea86592156b079a227f32fe2367fb95a1c2e36610b02a23d3f36d57bd4",
+      "experiment_fingerprint": "72cadb2a442fa8890e40805b9e7d9ad2c8fac52eb8c0593830d3a4fccca592a6",
+      "experiment_id": "market-impulse-all-basket-discovery__spy_long-prospective-v2",
+      "run_id": "auto-shadow-spy_long-v2-72cadb2a",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "market-impulse-all-basket-discovery__spy_long",
       "symbol": "SPY"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "cc5276e7c65831dea1af3d330fdffe5e788f056113ff0911c7e62c6dfe2c645a",
+      "artifact_uri": "mala-evidence://sha256/ba120aa23d62cabeb88918ce62235b306650a0720bfebd7f789d0394eecdce5e/PROVIDER.json",
+      "binding_sha256": "bb841dd3378b45cd847abfe99f32ee687dc602d0d6428b0cca26202e9c1546c3",
+      "cohort_contract_sha256": "a45ce7ad8796f677ab3c1ab04871640ade59ddd1cabe90bc7beee752fca4d067",
+      "cohort_id": "tsla_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "market-impulse-all-basket-discovery-tsla_short-option-v1",
+        "contract_sha256": "41fb00b133385fca09211744fa0f0b94bf0f8f9ea20bf61d8e29e9fc47af5ee5",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 14,
+          "dte_min": 7,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "ba120aa23d62cabeb88918ce62235b306650a0720bfebd7f789d0394eecdce5e",
+      "exit_policy_hash": "1ed8b10b9595055f478f5a994504ad269ac9b4158885d8fb3e180cd4827724d7",
+      "experiment_fingerprint": "7f5b43ce0b562dfb304aeb7ddde65bb73c3e6d8a49e04517294729f64ff4a498",
+      "experiment_id": "market-impulse-all-basket-discovery__tsla_short-prospective-v2",
+      "run_id": "auto-shadow-tsla_short-v2-7f5b43ce",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "market-impulse-all-basket-discovery__tsla_short",
+      "symbol": "TSLA"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "1811097a32655e617bb5fe2c6df498fd700ca907f9399fa0f35973cd98742672",
+      "artifact_uri": "mala-evidence://sha256/e3d55701a18a2f3435dbbe88e72bb08a9870bcfe99400c4d69780d44462fe7c0/PROVIDER.json",
+      "binding_sha256": "63b72203e5fc24ddaaeeb613976e4f644a602ccde86a9ed00f5fea1f07825b89",
+      "cohort_contract_sha256": "29a9ee328a8811a607084fc7d0ce27e8b45704b4439ecdf3cc2b0366a16c67c6",
+      "cohort_id": "aapl_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "opening-drive-current-basket-discovery-aapl_long-option-v1",
+        "contract_sha256": "845635b0315994dfeb3768957052e58df443d5217ade17b4e66da6bb87af99ae",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "e3d55701a18a2f3435dbbe88e72bb08a9870bcfe99400c4d69780d44462fe7c0",
+      "exit_policy_hash": null,
+      "experiment_fingerprint": "9dd735461dee5ed900f641526637e784fa8ee6b9c67118d518c3925fe3f2895e",
+      "experiment_id": "opening-drive-current-basket-discovery__aapl_long-prospective-v2",
+      "run_id": "auto-shadow-aapl_long-v2-9dd73546",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "opening-drive-current-basket-discovery__aapl_long",
+      "symbol": "AAPL"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "3a348ac1d5e4ab19aa1804d42e2de450c312d1eeaf2af71e00399e01987ede10",
+      "artifact_uri": "mala-evidence://sha256/a2bfa65b708a3e7adca58fa3a74ca50ff7010afaa414b6a2bfd19f9ef91d7a60/PROVIDER.json",
+      "binding_sha256": "75c9dfc9eca0be9f7413a022bd1e1346757915551d42594794a209c5ab9d9a6f",
+      "cohort_contract_sha256": "95cf47d698157f284c61e984ab3a517cce5f5046522794a70855607979bffbc7",
+      "cohort_id": "amd_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "opening-drive-current-basket-discovery-amd_short-option-v1",
+        "contract_sha256": "d402c7ef45c69648f0de4df42dd02c7851bda17e0acb4fa95049b5cf8aa9d539",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "a2bfa65b708a3e7adca58fa3a74ca50ff7010afaa414b6a2bfd19f9ef91d7a60",
+      "exit_policy_hash": "996534bef9f7657eee818e69d820481f35911aabccf7f3c6fab851fec04264f7",
+      "experiment_fingerprint": "f4a1af34cee5f5aba8c224c25131a59350b86cfe9cc77c46a5983fdb5fe36169",
+      "experiment_id": "opening-drive-current-basket-discovery__amd_short-prospective-v2",
+      "run_id": "auto-shadow-amd_short-v2-f4a1af34",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "opening-drive-current-basket-discovery__amd_short",
+      "symbol": "AMD"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "06a73f60ad21e40486e97ad71e54304d68788f4ca4f0121bd0bed46a3ea9c032",
+      "artifact_uri": "mala-evidence://sha256/5cc96807dd8e102421ca1891cf95e196dcfc9dbd7f50b7f982a711706bf59095/PROVIDER.json",
+      "binding_sha256": "c421a7507db49140dc04c0cac75550f9feade12bcdbb844c2b7475906f1a27e7",
+      "cohort_contract_sha256": "a19abcc0f1dac91ec1c411e8583c3c24ee4f60bda6adf600674872a4a957805d",
+      "cohort_id": "iwm_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "opening-drive-current-basket-discovery-iwm_short-option-v1",
+        "contract_sha256": "d2f520fa6a3f9e1c2b61beeb97eb83769b7bd629b51f6637a0f8f348ccc6e4ce",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 100,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "5cc96807dd8e102421ca1891cf95e196dcfc9dbd7f50b7f982a711706bf59095",
+      "exit_policy_hash": "78fcfe93fe8a8fa131ba22aa862f8386b46c2deb6b23b2a01b3759acc2563077",
+      "experiment_fingerprint": "6988eb26fdb3c431b3140e11f654883c2745fcd25c75cdbfc9ed381717695868",
+      "experiment_id": "opening-drive-current-basket-discovery__iwm_short-prospective-v2",
+      "run_id": "auto-shadow-iwm_short-v2-6988eb26",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "opening-drive-current-basket-discovery__iwm_short",
+      "symbol": "IWM"
     },
     {
       "allowed_authorization_modes": [
@@ -114,24 +824,24 @@
       "allowed_authorization_modes": [
         "shadow"
       ],
-      "artifact_sha256": "c9ecda85c23f6459b7da4b69d7eccb5e204e916db247ab893cc7766492a7ba09",
-      "artifact_uri": "mala-evidence://sha256/ca02ec32b91cfcab0cca613eee7fd42d4507da2b84967fc2b5af5afd4b11057d/PROVIDER.json",
-      "binding_sha256": "3942847024fab4e983893e7632785ad1ab75e30b533f7df79ec087cae56a67aa",
-      "cohort_contract_sha256": "14fcbdced8664ca5c6bd12c98b470cc408b47993be73128037d4be7e8972fbd1",
-      "cohort_id": "qqq_market_impulse_short_v1-next20-or-28d-v1",
+      "artifact_sha256": "882cd1103325348e7f0ad4b46997e7934b4ff2129e45ededa02405562312968f",
+      "artifact_uri": "mala-evidence://sha256/18f8ac0180a9eeb5a8084c838a6d815a6ea8819b0feadafc55665f2248186c49/PROVIDER.json",
+      "binding_sha256": "b3e6b1b861b07077ca95dec9e1cdfc7c277ed473f7c1569b5c8bac5f29ce04b5",
+      "cohort_contract_sha256": "a19abcc0f1dac91ec1c411e8583c3c24ee4f60bda6adf600674872a4a957805d",
+      "cohort_id": "iwm_short-next20-or-28d-v1",
       "declared_option_selection_contract": {
-        "contract_id": "qqq_market_impulse_short_v1-option-v1",
-        "contract_sha256": "5461cc6c029cbe1786bbf6d78dd0f33bba365e02a1d11b8fddf0e58572968549",
+        "contract_id": "spy-iwm-elastic-band-overextension-flash-drop-20260511-iwm_short",
+        "contract_sha256": "8b110de9990ad273e191730c0a315e5b29fa61c770b48b8504a38b08686df23d",
         "parameters": {
           "dte_fallback_policy": "strict",
-          "dte_max": 7,
+          "dte_max": 3,
           "dte_min": 3,
           "long_signal_contract_type": "CALL",
           "max_bid_ask_spread_pct": 0.2,
           "min_open_interest": 100,
           "short_signal_contract_type": "PUT",
-          "target_abs_delta_max": 0.4,
-          "target_abs_delta_min": 0.2
+          "target_abs_delta_max": 0.35,
+          "target_abs_delta_min": 0.15
         },
         "schema_version": "mala.option_selection_contract.v1",
         "selector_family": "single_leg_long_premium",
@@ -139,37 +849,73 @@
         "selector_version": "1"
       },
       "direction": "short",
-      "evidence_packet_id": "ca02ec32b91cfcab0cca613eee7fd42d4507da2b84967fc2b5af5afd4b11057d",
-      "exit_policy_hash": null,
-      "experiment_fingerprint": "10e706049a9eab393914fe9fdcb27bcf435e113e9b064073ee17af9e362e77f0",
-      "experiment_id": "qqq_market_impulse_short_v1-prospective-v1",
-      "run_id": "auto-shadow-qqq_market_i-v1-10e70604",
+      "evidence_packet_id": "18f8ac0180a9eeb5a8084c838a6d815a6ea8819b0feadafc55665f2248186c49",
+      "experiment_id": "spy-iwm-elastic-band-overextension-flash-drop-20260511__iwm_shor",
+      "run_id": "auto-shadow-iwm_short-20260808",
       "schema_version": "bhiksha.evidence_binding.v1",
-      "strategy_id": "qqq_market_impulse_short_v1",
-      "symbol": "QQQ"
+      "strategy_id": "spy-iwm-elastic-band-overextension-flash-drop-20260511__iwm_short",
+      "symbol": "IWM"
     },
     {
       "allowed_authorization_modes": [
         "shadow"
       ],
-      "artifact_sha256": "e733cc4ba685d8ebd37164c484ad99e42ce85ac3c5e8eb5d3d07056f5dab2ee8",
-      "artifact_uri": "mala-evidence://sha256/0592903b2eb6075ddc456c76614b2241d7f7fc3dd842eef37b6625f9609da43a/PROVIDER.json",
-      "binding_sha256": "a0b165caf8d6d6f3f71e0bacd189a711a422f3b57af64eb244210cfb7d1c8872",
-      "cohort_contract_sha256": "9ea9f9e9e11d09a062d0788c47ca5891b29f3e87029f79585abdc549cdfe6e2c",
-      "cohort_id": "spy_jerk_pivot_short_v1-next20-or-28d-v1",
+      "artifact_sha256": "ee904931b715844111dbd457b06a109b9acb25a249ef41cf7751fd4471bfba4e",
+      "artifact_uri": "mala-evidence://sha256/feb36826adfe6095d0969fae44ca48c2bfec012866e4750e70deea6327156b51/PROVIDER.json",
+      "binding_sha256": "67d0443b88f148ffe19d24f2cbbd9e5ac04157e00c37ecd3672205968306abc4",
+      "cohort_contract_sha256": "0b546fdf95d9aa7a7f0309f1034c5575300a625e80f6edfb21fb9df834a61088",
+      "cohort_id": "ba_long-next20-or-28d-v1",
       "declared_option_selection_contract": {
-        "contract_id": "spy_jerk_pivot_short_v1-option-v1",
-        "contract_sha256": "6173ddaf85493242c77ab236b9f2fa48f79222a48d8f1d6f871df9bbc3047677",
+        "contract_id": "triage-elastic_band-BA-ba_long-option-v1",
+        "contract_sha256": "81014b0f2abb69913cd6d4d9bf0ae69383f8a0602b56eeab7b31f0baf80d626a",
         "parameters": {
           "dte_fallback_policy": "strict",
-          "dte_max": 7,
-          "dte_min": 3,
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 50,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "feb36826adfe6095d0969fae44ca48c2bfec012866e4750e70deea6327156b51",
+      "exit_policy_hash": "bd5880b60c8c8453434901b1613eef3eeb55f8e191d8b3f83046aead1245f191",
+      "experiment_fingerprint": "547dce66322a7f54110eae29a076edeff43eeab8fc6e6285340c6e1e45922b69",
+      "experiment_id": "triage-elastic_band-BA__ba_long-prospective-v2",
+      "run_id": "auto-shadow-ba_long-v2-547dce66",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "triage-elastic_band-BA__ba_long",
+      "symbol": "BA"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "3e8de8618053179ae4edc24c45a174e7496adab84712b41ebd1b857c31eb9831",
+      "artifact_uri": "mala-evidence://sha256/263fc62a8948bb3d22934fd2a945e1da0aa18fa651627d888421e5cd63b43fdc/PROVIDER.json",
+      "binding_sha256": "b0c4be9f22934464ca4da263480a06bd8566113501e8f2d09222150687096795",
+      "cohort_contract_sha256": "9743c5bf4e3870cf85b520ebd44ffb709b041fe3dd849763f21d549a543c09c0",
+      "cohort_id": "snow_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "triage-elastic_band-SNOW-snow_short-option-v1",
+        "contract_sha256": "7ef4caefc46ac7c6345740086ac80786ff024cfe7141a08b248e66d36975d3b9",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 14,
+          "dte_min": 7,
           "long_signal_contract_type": "CALL",
           "max_bid_ask_spread_pct": 0.2,
-          "min_open_interest": 100,
+          "min_open_interest": 50,
           "short_signal_contract_type": "PUT",
-          "target_abs_delta_max": 0.4,
-          "target_abs_delta_min": 0.2
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
         },
         "schema_version": "mala.option_selection_contract.v1",
         "selector_family": "single_leg_long_premium",
@@ -177,14 +923,52 @@
         "selector_version": "1"
       },
       "direction": "short",
-      "evidence_packet_id": "0592903b2eb6075ddc456c76614b2241d7f7fc3dd842eef37b6625f9609da43a",
-      "exit_policy_hash": "a043eb1139049c361d3a160ff9b3b5ef085246780d59f81391f22810b41d0434",
-      "experiment_fingerprint": "44259edecd43373d5c79c05b794bb371d947bb7af401bb14c4d4da8ef2ab1e30",
-      "experiment_id": "spy_jerk_pivot_short_v1-prospective-v3",
-      "run_id": "auto-shadow-spy_jerk_piv-v3-44259ede",
+      "evidence_packet_id": "263fc62a8948bb3d22934fd2a945e1da0aa18fa651627d888421e5cd63b43fdc",
+      "exit_policy_hash": "8fd265f42ca348c9deff18eb994479acc6d9abfe89052da066816112b56c71dc",
+      "experiment_fingerprint": "23da676aab84529dbad661daa60b35dd41de6bae93a7f1393c94e0d4ee0c49d7",
+      "experiment_id": "triage-elastic_band-SNOW__snow_short-prospective-v2",
+      "run_id": "auto-shadow-snow_short-v2-23da676a",
       "schema_version": "bhiksha.evidence_binding.v1",
-      "strategy_id": "spy_jerk_pivot_short_v1",
-      "symbol": "SPY"
+      "strategy_id": "triage-elastic_band-SNOW__snow_short",
+      "symbol": "SNOW"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "d5fe4bae6890af15330f92dce3c8f5e5f561fc1ac38b1044904c1b4d994b0032",
+      "artifact_uri": "mala-evidence://sha256/dc14f3ade296dab7a65930cabdd7909d1ba8811b88631586007b325e28734670/PROVIDER.json",
+      "binding_sha256": "cba881059381c3f32fc12b67ebd54c21382265d02d708097f5a133b22bccf566",
+      "cohort_contract_sha256": "e51d68fa43a24c91d808fa9d302ebbbcea3cd0c43ecc0b67120c585573895d47",
+      "cohort_id": "axp_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "triage-market_impulse-AXP-axp_long-option-v1",
+        "contract_sha256": "ecca888bcd59205dd8b3adb7690b2ed54c71b3027bfb827c91d06137048666b3",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 50,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "dc14f3ade296dab7a65930cabdd7909d1ba8811b88631586007b325e28734670",
+      "exit_policy_hash": "fe609a8d63d839c2efb47e1b9961e79d6abe19dc9509f628c0c978b79cfe5fa5",
+      "experiment_fingerprint": "a81a072480c535cf1357101f18157d45de9a0afc319e3247d41766a583a1d094",
+      "experiment_id": "triage-market_impulse-AXP__axp_long-prospective-v2",
+      "run_id": "auto-shadow-axp_long-v2-a81a0724",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "triage-market_impulse-AXP__axp_long",
+      "symbol": "AXP"
     },
     {
       "allowed_authorization_modes": [
@@ -221,8 +1005,198 @@
       "schema_version": "bhiksha.evidence_binding.v1",
       "strategy_id": "triage-market_impulse-PDD__pdd_long",
       "symbol": "PDD"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "f6f30e1342d261a9ef726fb653050910e03cbe98e03ad1563ccccfcf79eb5610",
+      "artifact_uri": "mala-evidence://sha256/320ed96f5c4d887a3557436ab1d4581f1aadbb571b7c439fb447ca0ce417315e/PROVIDER.json",
+      "binding_sha256": "f713aa88a5fd3fb2d39e291c778a1c764f4f6b19627c89e340ce2a3152c27885",
+      "cohort_contract_sha256": "f0c7e1bb3e02471ef576d3d81019079d74c523864e851d86d0be9c643e05d1c3",
+      "cohort_id": "rblx_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "triage-market_impulse-RBLX-rblx_long-option-v1",
+        "contract_sha256": "a5411a43acf85535fb0bf2605a9bf80ae5518cecce61c1027ce02f030d60279e",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 7,
+          "dte_min": 3,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 50,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "320ed96f5c4d887a3557436ab1d4581f1aadbb571b7c439fb447ca0ce417315e",
+      "exit_policy_hash": "0ff0e37c4c29a9fc777c17b24abba2ede64f087549321d8dac4d32f5f4dc1732",
+      "experiment_fingerprint": "951e3046a6b9639d78a318748b23da6b08f3e0273ad6a0ff14d1605cb2bd8078",
+      "experiment_id": "triage-market_impulse-RBLX__rblx_long-prospective-v2",
+      "run_id": "auto-shadow-rblx_long-v2-951e3046",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "triage-market_impulse-RBLX__rblx_long",
+      "symbol": "RBLX"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "f41205000a2de75077e9b5012c1126a1e19d058db46bda8bae8984a1e150b3c2",
+      "artifact_uri": "mala-evidence://sha256/d19a3b9e400e79afe5fa3dc5c2d0903ed08087ca58ffefe6e4f330fe0dcb665a/PROVIDER.json",
+      "binding_sha256": "eb74a1be6e6255057743f0660d47fab9b9a1b9dcb748f6c6b5efe871915d3869",
+      "cohort_contract_sha256": "f51065ba126a96f599fdb809cdc82113cdbc6ea059e4897c9abf585d9d025d4a",
+      "cohort_id": "wfc_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "triage-market_impulse-WFC-wfc_long-option-v1",
+        "contract_sha256": "1b6dddb3c3ea56b316b04d858b027dede01edc5ff0cb4d3731ec880d1dea99f7",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 3,
+          "dte_min": 0,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 50,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "d19a3b9e400e79afe5fa3dc5c2d0903ed08087ca58ffefe6e4f330fe0dcb665a",
+      "exit_policy_hash": "b963cfb8686880d642479d9dbad66c69305ef0270daad8e6bc81ab84b9710750",
+      "experiment_fingerprint": "feffcb23f4e35dbf632e029d31b5874bbf943e3a164356d5d543c0ba1dc9d60a",
+      "experiment_id": "triage-market_impulse-WFC__wfc_long-prospective-v2",
+      "run_id": "auto-shadow-wfc_long-v2-feffcb23",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "triage-market_impulse-WFC__wfc_long",
+      "symbol": "WFC"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "c58ecbf71f392b78e28d8236b0b2c76781d6cd14158132800fb53021b17a7da6",
+      "artifact_uri": "mala-evidence://sha256/845153429718298473d03b56f4f00f9eeba6746309de9c153a6a79dd57e43c15/PROVIDER.json",
+      "binding_sha256": "655f94f847bf39039ebab6adc22783741b7f6aa273f74b150cacdf6a82eb6240",
+      "cohort_contract_sha256": "594477b1701137ebc6aea0af9880aaa841fb35821a12c48b5b7174c6dc20a280",
+      "cohort_id": "xom_long-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "triage-market_impulse-XOM-xom_long-option-v1",
+        "contract_sha256": "cb0c111677db667efa92ea6cb4ecccb2c2c4d9dd6506cdf1a4d097966eabd63a",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 14,
+          "dte_min": 7,
+          "long_signal_contract_type": "PUT",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 50,
+          "short_signal_contract_type": "CALL",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "long",
+      "evidence_packet_id": "845153429718298473d03b56f4f00f9eeba6746309de9c153a6a79dd57e43c15",
+      "exit_policy_hash": "613d3112cd89f66898fe1bb0fbd10d0f9bcbc7c88c6ae1120fb26cfad43f962b",
+      "experiment_fingerprint": "7e4d4ebfc84cd6d1fec1dae845ef46be9110e1c2e24f02f19dc0749a31dbb728",
+      "experiment_id": "triage-market_impulse-XOM__xom_long-prospective-v2",
+      "run_id": "auto-shadow-xom_long-v2-7e4d4ebf",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "triage-market_impulse-XOM__xom_long",
+      "symbol": "XOM"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "90dd5d9633b662dacedaa3e31105fa2a209d45ce0769e12786e6c84d9dc06a1a",
+      "artifact_uri": "mala-evidence://sha256/a2dcd513d34c85fb869c3a0fb8f8cdfd6303d7b579eac49d9f7fb6aa4dc6325a/PROVIDER.json",
+      "binding_sha256": "a8012c411111cba5536090d5c51b7a34f3063745a97602fa75db97438d4928b8",
+      "cohort_contract_sha256": "01cc37ddc77e0dbd822db6174bdb9c21cc5a5542add77a03b6a535f42521a29d",
+      "cohort_id": "bac_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "triage-opening_drive-BAC-bac_short-option-v1",
+        "contract_sha256": "eed58d36359e1e1aae5cfee725f886283512294d351b1fe25db8c0780a50da07",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 14,
+          "dte_min": 7,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 50,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "a2dcd513d34c85fb869c3a0fb8f8cdfd6303d7b579eac49d9f7fb6aa4dc6325a",
+      "exit_policy_hash": "8a4d925e24555bccdedfd7ee66e0dc58143b9e32996f21072b1722cccae93c51",
+      "experiment_fingerprint": "a0f71122a6452cb9fdca3643f8a354b8f51a6e3bb653e0ff47ddd51143303227",
+      "experiment_id": "triage-opening_drive-BAC__bac_short-prospective-v2",
+      "run_id": "auto-shadow-bac_short-v2-a0f71122",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "triage-opening_drive-BAC__bac_short",
+      "symbol": "BAC"
+    },
+    {
+      "allowed_authorization_modes": [
+        "shadow"
+      ],
+      "artifact_sha256": "4cd2038681dcbf4a569d057f582c8928e96e44910e9a1b51952b1e1f8d662437",
+      "artifact_uri": "mala-evidence://sha256/613c4bf5fc4db61b7515f0e898d276eb91774520dbcffed90262a91163dc9d71/PROVIDER.json",
+      "binding_sha256": "bdec941dd0ca77930b54e1c6dc06a7f0ae7bd02bc37bd264dd9f7fd6babbf5ef",
+      "cohort_contract_sha256": "9743c5bf4e3870cf85b520ebd44ffb709b041fe3dd849763f21d549a543c09c0",
+      "cohort_id": "snow_short-next20-or-28d-v1",
+      "declared_option_selection_contract": {
+        "contract_id": "triage-opening_drive-SNOW-snow_short-option-v1",
+        "contract_sha256": "76410d857a674efef53f3dbca6b3593b0a1909b09387400efcce1cdb15e641b7",
+        "parameters": {
+          "dte_fallback_policy": "strict",
+          "dte_max": 14,
+          "dte_min": 7,
+          "long_signal_contract_type": "CALL",
+          "max_bid_ask_spread_pct": 0.2,
+          "min_open_interest": 50,
+          "short_signal_contract_type": "PUT",
+          "target_abs_delta_max": null,
+          "target_abs_delta_min": null
+        },
+        "schema_version": "mala.option_selection_contract.v1",
+        "selector_family": "single_leg_long_premium",
+        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
+        "selector_version": "1"
+      },
+      "direction": "short",
+      "evidence_packet_id": "613c4bf5fc4db61b7515f0e898d276eb91774520dbcffed90262a91163dc9d71",
+      "exit_policy_hash": "213841441015bb1427424dcfb45b16c03dec1bc44b2955c5a61df104376aa6ce",
+      "experiment_fingerprint": "132c4ccc66bdedbb3b3e66396a6f39f5f1c6f0c2770f22ed9546f4fbdb045b36",
+      "experiment_id": "triage-opening_drive-SNOW__snow_short-prospective-v2",
+      "run_id": "auto-shadow-snow_short-v2-132c4ccc",
+      "schema_version": "bhiksha.evidence_binding.v1",
+      "strategy_id": "triage-opening_drive-SNOW__snow_short",
+      "symbol": "SNOW"
     }
   ],
-  "registry_sha256": "acb9660064717b87d0f659262287d379b05e0b8ab787dd50c8ec1f4ca9e20f6f",
+  "registry_sha256": "6ca3a13d3a03edfecfff84b38e238ef5c6e86b3d587954d3a604d959d2732ff9",
   "schema_version": "bhiksha.evidence_binding_registry.v1"
 }
