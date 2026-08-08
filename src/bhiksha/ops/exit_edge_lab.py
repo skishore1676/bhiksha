@@ -57,14 +57,18 @@ FILL_MODEL = (
 )
 EVALUATOR_VERSION = "profile-evaluator-v1"
 FILL_MODEL_VERSION = "next-fresh-natural-bid-v2"
-# Generation 3 — current measurement protocol (frozen 2026-08-04).
-# Any change to these four dimensions must create a new generation id.
+# Generation 4 — current measurement protocol (frozen 2026-08-08).
+# Any change to these dimensions must create a new generation id.
+# Includes freshness/sequence/latency which materially affect pairing.
 CURRENT_MEASUREMENT_GENERATION = {
-    "generation_id": "gen3-bounded_retry_v2-2026-08-04",
+    "generation_id": "gen4-freshness5s-bounded_retry_v2-2026-08-08",
     "quote_feed": "order_manager_reused_quote_with_bounded_retry_v2",
     "quote_source": "public_api",
     "fill_model_version": FILL_MODEL_VERSION,
     "evaluator_version": EVALUATOR_VERSION,
+    "max_freshness_ms": 5_000,
+    "max_sequence_gap": 1,
+    "fill_latency_ms": 0,
 }
 LEGACY_RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION = "exit-edge-risk-envelope.v1"
 LEGACY_RISK_ENVELOPE_EXPERIMENT_ID = "trend-continuation-control-a-b.v1"
@@ -2043,14 +2047,37 @@ def _normalized_risk_envelope_experiment(value: Any) -> dict[str, Any]:
 
 
 def classify_measurement_generation(experiment: dict[str, Any]) -> str:
-    """Return 'current' if the experiment matches the frozen Gen3 protocol, else 'legacy'."""
+    """Return 'current' if the experiment matches the frozen Gen4 protocol, else 'legacy'."""
     exp = _normalized_experiment(experiment) if experiment else {}
     cur = CURRENT_MEASUREMENT_GENERATION
+    # Catalog fingerprint — six-arm overlay hashes are part of generation
+    try:
+        from mala_bhiksha_kernel import load_protective_floor_conformance_vectors
+        vectors = load_protective_floor_conformance_vectors()
+        expected_hash = vectors.get("expected_experiment_hash")
+        expected_core = vectors.get("expected_shared_core_hash")
+        exp_catalog = (exp.get("risk_envelope") or {}).get("canonical_experiment_hash")
+        exp_core = (exp.get("risk_envelope") or {}).get("shared_core_hash")
+        catalog_ok = (exp_catalog in (None, "", expected_hash)) or (exp_catalog == expected_hash)
+        core_ok = (exp_core in (None, "", expected_core)) or (exp_core == expected_core)
+        # For legacy cohorts without risk_envelope canonical hash, fall back to hash presence
+        if exp.get("risk_envelope") and not catalog_ok:
+            return "legacy"
+        if exp.get("risk_envelope") and not core_ok:
+            return "legacy"
+    except Exception:
+        catalog_ok = True
+        core_ok = True
     if (
         exp.get("quote_feed") == cur["quote_feed"]
         and exp.get("quote_source") == cur["quote_source"]
         and exp.get("fill_model_version") == cur["fill_model_version"]
         and exp.get("evaluator_version") == cur["evaluator_version"]
+        and int(exp.get("max_freshness_ms", cur["max_freshness_ms"])) == int(cur["max_freshness_ms"])
+        and int(exp.get("max_sequence_gap", cur["max_sequence_gap"])) == int(cur["max_sequence_gap"])
+        and int(exp.get("fill_latency_ms", cur["fill_latency_ms"])) == int(cur["fill_latency_ms"])
+        and catalog_ok
+        and core_ok
     ):
         return "current"
     return "legacy"
