@@ -16,7 +16,11 @@ import json
 from pathlib import Path
 
 from bhiksha.config.models import DeploymentManifest
-from bhiksha.experiments.auto_shadow import compute_deployment_experiment_fingerprint, reconcile_shadow_experiments
+from bhiksha.experiments.auto_shadow import (
+    compute_deployment_experiment_fingerprint,
+    reconcile_shadow_experiments,
+    resolve_mala_packet_root,
+)
 from bhiksha.active_plan.compiler import ActivePlanSheetRow, compile_active_plan_from_rows
 from bhiksha.config.loader import load_strategy_catalog  # for catalog helpers
 
@@ -130,6 +134,27 @@ def test_old_packet_preserved_and_new_versioned(tmp_path: Path):
     assert len(res2["created"]) == 0
     assert "market_impulse__smh_short" in res2["reused"]
 
+    # A fingerprint alone is insufficient: a binding whose artifact identity
+    # no longer matches the retained manifest must be repaired, not reused.
+    tampered_payload = json.loads(bindings_path.read_text())
+    tampered_binding = dict(tampered_payload["bindings"][0])
+    tampered_binding["artifact_sha256"] = "0" * 64
+    bindings_path.write_text(
+        json.dumps(build_registry_payload([tampered_binding]), indent=2)
+    )
+    repaired = reconcile_shadow_experiments(
+        packet_root=packet_root,
+        evidence_bindings_path=bindings_path,
+        deployments=[d1],
+        rows_by_id={d1.deployment_id: row1},
+    )
+    assert len(repaired["created"]) == 1
+    repaired_binding = repaired["bindings"]["market_impulse__smh_short"]
+    manifest = json.loads((p1_dir / "manifest.json").read_text())
+    assert repaired_binding["artifact_sha256"] in {
+        artifact["sha256"] for artifact in manifest["artifacts"]
+    }
+
     # Third with DTE change should create v2, preserve old dir
     d2 = _shadow_deployment(dte_min=5, dte_max=10)
     d2.deployment_id = "row-smh-1"
@@ -159,6 +184,69 @@ def test_live_rows_untouched(tmp_path: Path):
     assert len([p for p in packet_root.iterdir() if p.is_dir()]) == 0
 
 
+def test_packet_root_is_derived_from_checkout_with_packet_writer(
+    tmp_path: Path, monkeypatch
+):
+    packet_only = tmp_path / "code" / "mala_v2"
+    (packet_only / "research/results/evidence_packets").mkdir(parents=True)
+    canonical = tmp_path / "Documents" / "mala_v2"
+    (canonical / "src/research").mkdir(parents=True)
+    (canonical / "src/research/experiment_packets.py").write_text("# fixture\n")
+
+    import bhiksha.experiments.auto_shadow as auto
+
+    monkeypatch.setattr(auto, "MALA_ROOT_CANDIDATES", [packet_only, canonical])
+    assert resolve_mala_packet_root() == canonical / "research/results/evidence_packets"
+
+
+def test_missing_canonical_mala_blocks_shadow_but_not_live(tmp_path: Path, monkeypatch):
+    packet_root = tmp_path / "evidence_packets"
+    bindings_path = tmp_path / "evidence_bindings_v1.json"
+    from bhiksha.evidence.bindings import build_registry_payload
+
+    bindings_path.write_text(json.dumps(build_registry_payload([])))
+    shadow = _shadow_deployment()
+    shadow.deployment_id = "row-shadow"
+    live = _shadow_deployment()
+    live.deployment_id = "row-live"
+    shadow_row = ActivePlanSheetRow.model_validate(
+        {
+            "row_id": "row-shadow",
+            "row_type": "strategy",
+            "enabled": True,
+            "authorization_mode": "shadow",
+            "strategy_id": "market_impulse__smh_short",
+            "symbol": "SMH",
+        }
+    )
+    live_row = ActivePlanSheetRow.model_validate(
+        {
+            "row_id": "row-live",
+            "row_type": "strategy",
+            "enabled": True,
+            "authorization_mode": "live",
+            "strategy_id": "market_impulse__smh_live",
+            "symbol": "SMH",
+        }
+    )
+    import bhiksha.experiments.auto_shadow as auto
+
+    monkeypatch.setattr(auto, "MALA_ROOT_CANDIDATES", [tmp_path / "missing"])
+    result = reconcile_shadow_experiments(
+        packet_root=packet_root,
+        evidence_bindings_path=bindings_path,
+        deployments=[shadow, live],
+        rows_by_id={shadow.deployment_id: shadow_row, live.deployment_id: live_row},
+        evidence_bindings={},
+    )
+    assert result["blocked"] == [
+        {
+            "strategy_id": "market_impulse__smh_short",
+            "reason": "canonical mala_v2 checkout not found",
+        }
+    ]
+
+
 def test_compile_includes_overrides_in_fingerprint(tmp_path: Path, monkeypatch):
     # Integration: compile_active_plan_from_rows with execution_overrides should produce different fingerprint
     catalog_root = tmp_path / "strategy_catalog"
@@ -178,17 +266,28 @@ def test_compile_includes_overrides_in_fingerprint(tmp_path: Path, monkeypatch):
     bindings_path = catalog_root.parent / "evidence_bindings_v1.json"
     from bhiksha.evidence.bindings import build_registry_payload
     bindings_path.write_text(json.dumps(build_registry_payload([])))
-    # Patch packet root discovery to tmp so test is isolated and doesn't pollute real packets
+    # Patch packet-root discovery to tmp so the compiler cannot touch real Mala packets.
     packet_root = tmp_path / "evidence_packets"
     packet_root.mkdir()
     import bhiksha.experiments.auto_shadow as auto
+    import bhiksha.active_plan.compiler as compiler
     monkeypatch.setattr(auto, "MALA_ROOT_CANDIDATES", [Path("/Users/suman/code/mala_v2")])
-    # Also ensure compiler finds tmp packet_root via parents logic: create mala_v2 sibling
+    monkeypatch.setattr(compiler, "resolve_mala_packet_root", lambda: packet_root)
     row_base = ActivePlanSheetRow.model_validate({"row_id": "row-1", "row_type": "strategy", "enabled": True, "authorization_mode": "shadow", "strategy_id": "market_impulse__smh_short", "symbol": "SMH"})
     row_overridden = ActivePlanSheetRow.model_validate({"row_id": "row-1", "row_type": "strategy", "enabled": True, "authorization_mode": "shadow", "strategy_id": "market_impulse__smh_short", "symbol": "SMH", "execution_overrides": {"max_bid_ask_spread_pct": 0.15}})
     # Compile both and compare fingerprint (bypass reconcile by passing empty bindings but still fingerprints differ)
-    compiled_base = compile_active_plan_from_rows(rows=[row_base], strategy_catalog_path=catalog_root, evidence_bindings={})
-    compiled_over = compile_active_plan_from_rows(rows=[row_overridden], strategy_catalog_path=catalog_root, evidence_bindings={})
+    compiled_base = compile_active_plan_from_rows(
+        rows=[row_base],
+        strategy_catalog_path=catalog_root,
+        evidence_bindings={},
+        auto_reconcile_shadow_experiments=True,
+    )
+    compiled_over = compile_active_plan_from_rows(
+        rows=[row_overridden],
+        strategy_catalog_path=catalog_root,
+        evidence_bindings={},
+        auto_reconcile_shadow_experiments=True,
+    )
     # Both should have auto-experiment findings but still produce deployments (now with packet)
     assert len(compiled_base.plan.deployments) == 1
     assert len(compiled_over.plan.deployments) == 1

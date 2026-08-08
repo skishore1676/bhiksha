@@ -18,17 +18,29 @@ from typing import Any
 
 MALA_ROOT_CANDIDATES = [
     Path("/Users/suman/code/mala_v2"),
-    Path("/Users/sunny/code/mala_v2"),
     Path("/Users/sunny/Documents/mala_v2"),
-    Path(__file__).resolve().parents[5] / "mala_v2",
     Path(__file__).resolve().parents[4] / "mala_v2",
 ]
 
-def _mala_root() -> Path | None:
+
+def resolve_mala_root() -> Path | None:
+    """Return the canonical Mala checkout, never a packet-only shadow tree."""
     for p in MALA_ROOT_CANDIDATES:
         if (p / "src/research/experiment_packets.py").exists():
             return p
     return None
+
+
+def resolve_mala_packet_root() -> Path | None:
+    mala_root = resolve_mala_root()
+    if mala_root is None:
+        return None
+    return mala_root / "research/results/evidence_packets"
+
+
+# Backward-compatible private name for older tests/importers.
+def _mala_root() -> Path | None:
+    return resolve_mala_root()
 
 
 def _canonical_sha256(value: object) -> str:
@@ -123,6 +135,86 @@ def _existing_binding_fingerprint(binding: dict[str, Any]) -> str | None:
     return None
 
 
+def _eligible_shadow_strategy_ids(
+    deployments: list[Any], rows_by_id: dict[str, Any]
+) -> list[str]:
+    strategy_ids: list[str] = []
+    for deployment in deployments:
+        row = rows_by_id.get(getattr(deployment, "deployment_id", ""))
+        if row is None:
+            continue
+        if getattr(row, "row_type", "strategy") != "strategy":
+            continue
+        if not getattr(row, "enabled", False):
+            continue
+        if str(getattr(row, "authorization_mode", "")).lower() != "shadow":
+            continue
+        strategy_id = str(getattr(row, "strategy_id", "")).strip()
+        if strategy_id:
+            strategy_ids.append(strategy_id)
+    return strategy_ids
+
+
+def _blocked_result(
+    deployments: list[Any], rows_by_id: dict[str, Any], reason: str
+) -> dict[str, Any]:
+    return {
+        "created": [],
+        "reused": [],
+        "blocked": [
+            {"strategy_id": strategy_id, "reason": reason}
+            for strategy_id in _eligible_shadow_strategy_ids(deployments, rows_by_id)
+        ],
+        "error": reason,
+    }
+
+
+def _load_packet_index(packet_root: Path) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    if not packet_root.exists():
+        return index
+    for manifest_path in sorted(packet_root.glob("*/manifest.json")):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        packet_id = str(manifest.get("evidence_packet_id") or "")
+        if packet_id:
+            index.setdefault(packet_id, []).append(manifest)
+    return index
+
+
+def _binding_matches_manifest(
+    binding: dict[str, Any], manifest: dict[str, Any]
+) -> bool:
+    option_contract = manifest.get("declared_option_selection_contract") or {}
+    cohort_contract = manifest.get("cohort_contract") or {}
+    artifacts = manifest.get("artifacts") or []
+    artifact_match = any(
+        artifact.get("sha256") == binding.get("artifact_sha256")
+        and artifact.get("artifact_uri") == binding.get("artifact_uri")
+        for artifact in artifacts
+    )
+    return bool(
+        manifest.get("evidence_packet_id") == binding.get("evidence_packet_id")
+        and manifest.get("run_id") == binding.get("run_id")
+        and manifest.get("experiment_id") == binding.get("experiment_id")
+        and cohort_contract.get("contract_sha256")
+        == binding.get("cohort_contract_sha256")
+        and option_contract.get("contract_sha256")
+        == (binding.get("declared_option_selection_contract") or {}).get(
+            "contract_sha256"
+        )
+        and artifact_match
+    )
+
+
+def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
 # Legacy shim: compile-time caller used ensure_shadow_packets(rows) pre-compile.
 # Keep it but delegate to post-compile path via deployments; if called with rows
 # alone we do nothing and let the post-compile reconciler handle it (avoids
@@ -153,14 +245,14 @@ def reconcile_shadow_experiments(
 
     Caller must reload bindings and apply to returned reconciled bindings dict.
     """
-    mala_root = _mala_root()
+    mala_root = resolve_mala_root()
     if mala_root is None:
-        return {"created": [], "reused": [], "blocked": [], "error": "mala_v2 not found"}
+        return _blocked_result(deployments, rows_by_id, "canonical mala_v2 checkout not found")
     sys.path.insert(0, str(mala_root))
     try:
         from src.research.experiment_packets import build_cohort_contract, build_option_selection_contract, write_experiment_packet, ArtifactInput
     except ImportError as e:
-        return {"created": [], "reused": [], "blocked": [], "error": f"mala import failed: {e}"}
+        return _blocked_result(deployments, rows_by_id, f"mala import failed: {e}")
 
     from bhiksha.evidence.bindings import build_registry_payload
 
@@ -177,6 +269,14 @@ def reconcile_shadow_experiments(
     blocked: list[dict[str, Any]] = []
     # Track bindings after reconcile (for caller to apply)
     reconciled = dict(bindings_by_strategy)
+    try:
+        packet_index = _load_packet_index(packet_root)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return _blocked_result(
+            deployments,
+            rows_by_id,
+            f"canonical packet store is unreadable: {exc}",
+        )
 
     for dep in list(deployments):
         row = rows_by_id.get(getattr(dep, "deployment_id", ""))
@@ -199,7 +299,25 @@ def reconcile_shadow_experiments(
             continue
         existing = reconciled.get(sid)
         existing_fp = _existing_binding_fingerprint(existing) if existing else None
-        if existing is not None and existing_fp == fp:
+        retained_manifests = (
+            packet_index.get(str(existing.get("evidence_packet_id") or ""), [])
+            if existing is not None
+            else []
+        )
+        if len(retained_manifests) > 1:
+            blocked.append(
+                {
+                    "strategy_id": sid,
+                    "reason": "evidence packet resolves more than once in canonical Mala store",
+                }
+            )
+            continue
+        existing_retained = bool(
+            existing is not None
+            and len(retained_manifests) == 1
+            and _binding_matches_manifest(existing, retained_manifests[0])
+        )
+        if existing is not None and existing_fp == fp and existing_retained:
             # Even if fingerprint matches, verify option contract still matches
             # (stale binding with wrong dte/delta from early helper fallback)
             try:
@@ -211,7 +329,7 @@ def reconcile_shadow_experiments(
                 reused.append(sid)
                 continue
         # Need new packet/binding (missing or drift)
-        if existing is not None and existing_fp is None:
+        if existing is not None and existing_fp is None and existing_retained:
             # Legacy binding without fingerprint: compare option contract params
             # If option params + exit hash match, treat as reuse and backfill fingerprint.
             try:
@@ -288,6 +406,7 @@ def reconcile_shadow_experiments(
             )
             man = json.loads(Path(manifest).read_text())
             packet_id = man["evidence_packet_id"]
+            packet_index.setdefault(packet_id, []).append(man)
             new_binding: dict[str, Any] = {
                 "strategy_id": sid,
                 "symbol": str(getattr(dep, "symbol", "")),
@@ -307,7 +426,7 @@ def reconcile_shadow_experiments(
             # Replace binding for this sid, preserve others
             all_bindings = [b for b in all_bindings if b.get("strategy_id") != sid] + [new_binding]
             payload = build_registry_payload(all_bindings)
-            evidence_bindings_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            _atomic_json_write(evidence_bindings_path, payload)
             reg = payload
             # Use normalized binding from payload (adds schema_version + binding_sha256)
             normalized = next(b for b in payload["bindings"] if b.get("strategy_id") == sid)

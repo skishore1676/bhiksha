@@ -23,10 +23,15 @@ from bhiksha.evidence.bindings import apply_evidence_binding, load_evidence_bind
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 
 try:
-    from bhiksha.experiments.auto_shadow import reconcile_shadow_experiments, compute_deployment_experiment_fingerprint
+    from bhiksha.experiments.auto_shadow import (
+        compute_deployment_experiment_fingerprint,
+        reconcile_shadow_experiments,
+        resolve_mala_packet_root,
+    )
 except ImportError:  # auto-shadow optional in tests without Mala
     reconcile_shadow_experiments = None  # type: ignore
     compute_deployment_experiment_fingerprint = None  # type: ignore
+    resolve_mala_packet_root = None  # type: ignore
 # Legacy name kept for old import paths (early hook removed in Option C)
 try:
     from bhiksha.experiments.auto_shadow import ensure_shadow_packets  # noqa: F401
@@ -367,6 +372,7 @@ def compile_active_plan_from_rows(
     risk_demotion_store: DemotionStore | None = None,
     canary_inhibition_store: CanaryInhibitionStore | None = None,
     evidence_bindings: dict[str, dict[str, Any]] | None = None,
+    auto_reconcile_shadow_experiments: bool = False,
 ) -> CompiledActivePlan:
     suppressed_rows = list(suppressed or [])
     if google_strategy_catalog is not None:
@@ -437,30 +443,31 @@ def compile_active_plan_from_rows(
     # BEFORE apply_evidence_binding. Fingerprint = strategy+entry+option+Control exit.
     # Tuesday reuse, DTE/delta/exit change → v2. Live untouched (fail-closed).
     auto_experiment_findings: list[dict[str, Any]] = []
-    if reconcile_shadow_experiments is not None:
+    if auto_reconcile_shadow_experiments and reconcile_shadow_experiments is not None:
+        _reconcile_rows: dict[str, Any] = {}
+        for deployment in deployments:
+            found = next(
+                (
+                    row
+                    for row in rows
+                    if deployment.deployment_id.endswith(row.row_id)
+                    or deployment.deployment_id == row.row_id
+                ),
+                None,
+            )
+            if found is not None:
+                _reconcile_rows[deployment.deployment_id] = found
         try:
-            _repo = Path(strategy_catalog_path).resolve().parents[2] if Path(strategy_catalog_path).is_absolute() else Path.cwd()
-            for _mala in [Path("/Users/suman/code/mala_v2/research/results/evidence_packets"), Path("/Users/sunny/code/mala_v2/research/results/evidence_packets"), _repo.parent / "mala_v2/research/results/evidence_packets"]:
-                if _mala.exists():
-                    _packet_root = _mala
-                    break
-            else:
-                _packet_root = Path("/Users/suman/code/mala_v2/research/results/evidence_packets")
+            _packet_root = (
+                resolve_mala_packet_root()
+                if resolve_mala_packet_root is not None
+                else None
+            )
+            if _packet_root is None:
+                _packet_root = Path("__missing_canonical_mala_packet_root__")
             _bindings_path = Path(strategy_catalog_path).parent / "evidence_bindings_v1.json"
             if not _bindings_path.exists() and Path(strategy_catalog_path).resolve().is_relative_to(Path("/Users/suman/code/bhiksha").resolve()):
                 _bindings_path = Path("/Users/suman/code/bhiksha/config/evidence_bindings_v1.json")
-            # For pytest tmp_path (e.g. /private/var/.../tmp...), keep tmp path even if not exists
-            _reconcile_rows: dict[str, Any] = {}
-            for d in deployments:
-                rid = d.deployment_id
-                found = None
-                for r in rows:
-                    if rid.endswith(r.row_id) or rid == r.row_id:
-                        found = r
-                        break
-                if found is not None:
-                    _reconcile_rows[d.deployment_id] = found
-            # Also include strategy rows not yet deployed? reconcile filters by deployments anyway
             _result = reconcile_shadow_experiments(
                 packet_root=_packet_root,
                 evidence_bindings_path=_bindings_path,
@@ -491,8 +498,26 @@ def compile_active_plan_from_rows(
                 for c in _result.get("created", []):
                     auto_experiment_findings.append({"strategy_id": c.get("strategy_id"), "status": "AUTO_EXPERIMENT_CREATED", "packet_id": c.get("packet_id"), "version": c.get("version")})
         except Exception as exc:
-            # Never fail whole plan on auto-freeze; record finding
-            auto_experiment_findings.append({"status": "AUTO_EXPERIMENT_RECONCILE_FAILED", "reason": str(exc)[:300]})
+            reason = str(exc)[:300]
+            blocked_deployment_ids = {
+                deployment_id
+                for deployment_id, row in _reconcile_rows.items()
+                if str(getattr(row, "authorization_mode", "")).lower() == "shadow"
+            }
+            for deployment_id in blocked_deployment_ids:
+                row = _reconcile_rows[deployment_id]
+                suppressed_rows.append(
+                    _suppressed_row(
+                        reason=f"AUTO_EXPERIMENT_BLOCKED: reconciliation failed: {reason}",
+                        row=row,
+                    )
+                )
+            deployments = [
+                deployment
+                for deployment in deployments
+                if deployment.deployment_id not in blocked_deployment_ids
+            ]
+            auto_experiment_findings.append({"status": "AUTO_EXPERIMENT_RECONCILE_FAILED", "reason": reason})
     bound_deployments: list[DeploymentManifest] = []
     rows_by_id = {row.row_id: row for row in rows}
     for deployment in deployments:
@@ -642,6 +667,7 @@ def compile_active_plan_from_google_sheets(
                 else None
             )
         ),
+        auto_reconcile_shadow_experiments=True,
     )
 
 
