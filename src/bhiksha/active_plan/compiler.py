@@ -373,7 +373,9 @@ def compile_active_plan_from_rows(
     catalog_by_id = {entry.strategy_id: entry for entry in strategy_catalog}
     # Operator-friendly auto-freeze: Sheet row enabled+shadow → ensure Mala packet exists.
     # This makes the Sheet the sole launcher; hashes stay underneath.
-    if ensure_shadow_packets is not None and evidence_bindings is not None:
+    # Runs even when evidence_bindings wasn't passed (google_sheets path), deriving the default
+    # bindings path from strategy_catalog_path so the 07:05 CT sync auto-freezes.
+    if ensure_shadow_packets is not None:
         try:
             # Resolve sibling Mala packet root and bindings path from strategy_catalog_path
             # strategy_catalog_path is .../config/strategy_catalog → repo root is parents[2]
@@ -601,7 +603,11 @@ def compile_active_plan_from_google_sheets(
         evidence_bindings=(
             load_evidence_bindings(evidence_bindings_path)
             if evidence_bindings_path is not None
-            else None
+            else (
+                load_evidence_bindings(Path(strategy_catalog_path).parent / "evidence_bindings_v1.json")
+                if (Path(strategy_catalog_path).parent / "evidence_bindings_v1.json").exists()
+                else None
+            )
         ),
     )
 
