@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,10 @@ from bhiksha.tools.chart_kernel_runtime import (
     capture_kernel_runtime,
     write_runtime_record,
 )
-from bhiksha.tools.chart_scenario_campaign_config import build_campaign_config
+from bhiksha.tools.chart_scenario_campaign_config import (
+    build_campaign_config,
+    capture_runtime_record,
+)
 from bhiksha.tools.chart_scenario_coordinator import (
     _before_prepare_cutoff,
     _campaign_window_preflight,
@@ -890,6 +894,58 @@ def test_campaign_config_builder_binds_canonical_freeze_without_hand_authored_ha
             toolchain=_toolchain(tmp_path),
             output=tmp_path / "campaign-config.json",
         )
+
+
+def test_agent_broker_runtime_capture_uses_checkout_package_layout(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "agent-broker"
+    package = checkout / "agent_broker"
+    package.mkdir(parents=True)
+    (package / "cli.py").write_text("def main(): pass\n", encoding="utf-8")
+    (checkout / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "-c",
+            "user.name=Bhiksha Tests",
+            "-c",
+            "user.email=tests@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    environment = checkout / ".venv"
+    subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+    interpreter = environment / "bin" / "python"
+    launcher = environment / "bin" / "agent-broker"
+    launcher.symlink_to(interpreter)
+    record_path = (
+        tmp_path
+        / "artifacts"
+        / "chart_scenarios"
+        / "runtime"
+        / "agent-broker.json"
+    )
+
+    payload = capture_runtime_record(
+        role="agent_broker",
+        checkout=checkout,
+        launcher=launcher,
+        interpreter=interpreter,
+        record_path=record_path,
+        captured_at="2026-08-10T01:10:00+00:00",
+    )
+
+    assert payload["entrypoint"] == str(package / "cli.py")
+    assert payload["import_root"] == str(package)
+    assert json.loads(record_path.read_text(encoding="utf-8")) == payload
 
 
 def test_campaign_config_builder_rejects_stale_freeze_decision_field(

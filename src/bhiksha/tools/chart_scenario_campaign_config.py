@@ -31,7 +31,7 @@ _ROLE_LAYOUT = {
         "src/market_cartographer",
     ),
     "tradelab": ("scripts/market_context/__main__.py", "scripts/market_context"),
-    "agent_broker": ("src/agent_broker/cli.py", "src/agent_broker"),
+    "agent_broker": ("agent_broker/cli.py", "agent_broker"),
 }
 
 
