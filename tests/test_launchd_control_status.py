@@ -6,9 +6,91 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from bhiksha.ops.launchd_registry import control_lock_dir, latest_status_path
+from bhiksha.ops.launchd_registry import (
+    control_lock_dir,
+    job_by_runner,
+    latest_status_path,
+)
 from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.tools import launchd_control, launchd_job, launchd_status
+
+
+def test_stale_status_uses_central_calendar_at_sunday_utc_rollover() -> None:
+    now = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)  # Sunday 19:00 CT
+    last_at = {
+        "live-start": "2026-08-07T13:20:00+00:00",
+        "live-watchdog": "2026-08-07T20:00:00+00:00",
+        "session-report": "2026-08-07T19:45:00+00:00",
+        "live-stop": "2026-08-07T20:10:00+00:00",
+    }
+
+    for runner in ("live-start", "live-watchdog", "session-report", "live-stop"):
+        spec = job_by_runner(runner)
+        assert spec is not None
+        assert launchd_status._stale_last_run_findings(
+            spec, {"recorded_at": last_at[runner]}, now=now
+        ) == []
+
+
+def test_stale_status_waits_for_monday_schedule_before_flagging() -> None:
+    last_at = {
+        "live-start": "2026-08-07T13:20:00+00:00",
+        "live-watchdog": "2026-08-07T20:00:00+00:00",
+        "session-report": "2026-08-07T19:45:00+00:00",
+        "live-stop": "2026-08-07T20:10:00+00:00",
+    }
+    before_first_fire = datetime(2026, 8, 10, 12, 31, tzinfo=UTC)  # 07:31 CT
+
+    for runner in ("live-start", "live-watchdog", "session-report", "live-stop"):
+        spec = job_by_runner(runner)
+        assert spec is not None
+        assert launchd_status._stale_last_run_findings(
+            spec, {"recorded_at": last_at[runner]}, now=before_first_fire
+        ) == []
+        assert (
+            launchd_status._stale_last_run_findings(
+                spec, None, now=before_first_fire
+            )
+            == []
+        )
+
+    missed_start = datetime(2026, 8, 10, 13, 26, tzinfo=UTC)  # 08:26 CT
+    spec = job_by_runner("live-start")
+    assert spec is not None
+    findings = launchd_status._stale_last_run_findings(
+        spec, {"recorded_at": last_at["live-start"]}, now=missed_start
+    )
+    assert len(findings) == 1
+    assert "scheduled fire due at 2026-08-10T08:20:00-05:00" in findings[0]
+
+
+def test_stale_status_skips_market_holiday_for_trading_day_jobs() -> None:
+    now = datetime(2026, 9, 7, 14, 0, tzinfo=UTC)  # Labor Day, 09:00 CT
+    last = {"recorded_at": "2026-09-04T13:20:00+00:00"}
+    spec = job_by_runner("live-start")
+    assert spec is not None
+
+    assert launchd_status._stale_last_run_findings(spec, last, now=now) == []
+
+
+def test_stale_status_detects_missed_repeating_fire_and_clears_after_receipt() -> None:
+    spec = job_by_runner("live-watchdog")
+    assert spec is not None
+    missed = datetime(2026, 8, 10, 13, 36, tzinfo=UTC)  # 08:36 CT
+
+    findings = launchd_status._stale_last_run_findings(
+        spec,
+        {"recorded_at": "2026-08-07T20:00:00+00:00"},
+        now=missed,
+    )
+    assert len(findings) == 1
+    assert "scheduled fire due at 2026-08-10T08:30:00-05:00" in findings[0]
+
+    assert launchd_status._stale_last_run_findings(
+        spec,
+        {"recorded_at": "2026-08-10T13:30:00+00:00"},
+        now=missed,
+    ) == []
 
 
 def test_launchd_status_distinguishes_domain_and_transport(

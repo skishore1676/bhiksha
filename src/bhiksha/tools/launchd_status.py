@@ -27,6 +27,7 @@ _DEFAULT_BUDGET_SECONDS = 15.0
 _MIN_PROBE_SECONDS = 1.0
 _LAUNCHCTL_PROBE_SECONDS = 5.0
 _RUNTIME_PROBE_SECONDS = 10.0
+_STALE_SCHEDULE_GRACE_MINUTES = 5
 
 
 class _Deadline:
@@ -554,40 +555,80 @@ def _stale_last_run_findings(
     *,
     now: datetime,
 ) -> list[str]:
-    """Detect stale latest_status for jobs that crash before writing it."""
+    """Detect stale latest_status after a scheduled fire is actually due.
+
+    ``latest_status`` intentionally remains frozen when a launchd job skips a
+    weekend or holiday. Compare it with the latest Central-time scheduled fire,
+    rather than with elapsed wall-clock age from the previous session.
+    """
+    from bhiksha.market_data.trading_calendar import CENTRAL, is_trading_day
+
     last_at_raw = last.get("recorded_at") if isinstance(last, dict) else None
     last_at = _parse_timestamp(last_at_raw) if last_at_raw else None
-    if last_at is None:
-        # No record at all — if the job is enabled, it's stale after install
-        return ["stale_last_run — no successful run recorded"]
-    age_hours = (now.astimezone(UTC) - last_at.astimezone(UTC)).total_seconds() / 3600.0
-    # Thresholds: watchdog/reconciliation every 10m should not be >3h old
-    # on a trading day; daily jobs not >26h across a trading day boundary.
-    runner = getattr(spec, "runner_job", "")
-    if runner in {"live-watchdog", "reconciliation-supervisor"}:
-        threshold = 3.0
-    elif runner in {"live-start", "schwab-refresh"}:
-        threshold = 26.0
-    elif runner in {"session-report"}:
-        threshold = 8.0
-    elif runner == "weekly-trading-decisions":
-        # Weekly Fridays 16:00 CT -> 168h period; allow until next Friday + 12h buffer
-        threshold = 180.0
-    else:
-        threshold = 30.0
-    # Only flag stale on trading days — skip weekends/holidays.
-    try:
-        from bhiksha.market_data.trading_calendar import is_trading_day  # type: ignore
+    local_now = now.astimezone(CENTRAL)
+    skips_non_trading_days = bool(getattr(spec, "skips_non_trading_days", False))
+    if skips_non_trading_days and not is_trading_day(local_now.date()):
+        return []
 
-        if not is_trading_day(now.date()):
-            return []
-        # If last_at was on a prior trading day and now is next trading day
-        # morning, still flag after threshold.
-    except Exception:  # noqa: BLE001
-        pass
-    if age_hours > threshold:
-        return [f"stale_last_run — last ok {last_at_raw} {age_hours:.1f}h ago, expected within {threshold:.0f}h"]
+    schedule = getattr(spec, "schedule", ())
+    due_at = _latest_scheduled_fire(
+        schedule,
+        now=now,
+        skips_non_trading_days=skips_non_trading_days,
+    )
+    if due_at is None or local_now < due_at + timedelta(
+        minutes=_STALE_SCHEDULE_GRACE_MINUTES
+    ):
+        return []
+    if last_at is None and due_at.date() != local_now.date():
+        return []
+    if last_at is not None and last_at.astimezone(CENTRAL) >= due_at:
+        return []
+
+    if last_at is None:
+        return [
+            "stale_last_run — no successful run recorded; "
+            f"expected after {due_at.isoformat()}"
+        ]
+    age_hours = (now.astimezone(UTC) - last_at.astimezone(UTC)).total_seconds() / 3600.0
+    if age_hours >= 0:
+        return [
+            f"stale_last_run — last ok {last_at_raw} {age_hours:.1f}h ago; "
+            f"scheduled fire due at {due_at.isoformat()}"
+        ]
     return []
+
+
+def _latest_scheduled_fire(
+    schedule: Any,
+    *,
+    now: datetime,
+    skips_non_trading_days: bool,
+) -> datetime | None:
+    """Return the latest schedule entry due before ``now``, in Central time."""
+    from bhiksha.market_data.trading_calendar import CENTRAL, is_trading_day
+
+    local_now = now.astimezone(CENTRAL)
+    candidates: list[datetime] = []
+    for offset in range(14):
+        day = local_now.date() - timedelta(days=offset)
+        if skips_non_trading_days and not is_trading_day(day):
+            continue
+        weekday = day.weekday() + 1
+        for entry in schedule or ():
+            if int(entry.get("Weekday", -1)) != weekday:
+                continue
+            candidate = datetime(
+                day.year,
+                day.month,
+                day.day,
+                int(entry.get("Hour", 0)),
+                int(entry.get("Minute", 0)),
+                tzinfo=CENTRAL,
+            )
+            if candidate <= local_now:
+                candidates.append(candidate)
+    return max(candidates) if candidates else None
 
 
 def _job_title(runner_job: str, label: str) -> str:
