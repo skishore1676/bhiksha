@@ -873,6 +873,24 @@ def test_campaign_config_builder_binds_canonical_freeze_without_hand_authored_ha
         {key: value for key, value in payload.items() if key != "content_hash"}
     )
 
+    with pytest.raises(ValueError, match="must be under artifacts/chart_scenarios"):
+        build_campaign_config(
+            experiment_root=experiment_root,
+            campaign_id="campaign-1",
+            birdclaw_checkout=tmp_path / "birdclaw",
+            birdclaw_db=birdclaw_db,
+            market_cartographer_checkout=tmp_path / "market-cartographer",
+            tradelab_checkout=tmp_path / "tradelab",
+            agent_broker_checkout=tmp_path / "agent-broker",
+            agent_broker=tmp_path / "agent-broker/.venv/bin/agent-broker",
+            kernel_src=tmp_path / "kernel/src",
+            cartographer_provider="fixture",
+            cartographer_data_root=None,
+            symbols=["SPY"],
+            toolchain=_toolchain(tmp_path),
+            output=tmp_path / "campaign-config.json",
+        )
+
 
 def test_campaign_config_builder_rejects_stale_freeze_decision_field(
     tmp_path: Path,

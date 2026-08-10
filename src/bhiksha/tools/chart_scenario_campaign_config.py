@@ -12,6 +12,7 @@ from typing import Any
 
 from mala_bhiksha_kernel import canonical_sha256
 
+from bhiksha.chart_scenarios.paths import require_experiment_path
 from bhiksha.ops.chart_scenario_sheet import SPREADSHEET_ID
 from bhiksha.tools.chart_scenario_coordinator import (
     _RUNTIME_RECORD_SCHEMA,
@@ -113,6 +114,7 @@ def capture_runtime_record(
     output = Path(record_path).expanduser()
     if output.is_symlink() or not output.is_absolute():
         raise ValueError("runtime record path must be an absolute non-symlink path")
+    output = require_experiment_path(output, role=f"{role} runtime record")
     body: dict[str, Any] = {
         "schema": _RUNTIME_RECORD_SCHEMA,
         "role": role,
@@ -231,7 +233,8 @@ def build_campaign_config(
     payload = {**body, "content_hash": canonical_sha256(body)}
     validated = _validate_campaign_config(payload)
     persisted = {key: value for key, value in validated.items() if not key.startswith("_")}
-    _write_atomic(Path(output).expanduser(), persisted)
+    target = require_experiment_path(output, role="campaign config")
+    _write_atomic(target, persisted)
     return persisted
 
 
