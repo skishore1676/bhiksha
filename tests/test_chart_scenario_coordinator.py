@@ -21,6 +21,7 @@ from bhiksha.tools.chart_kernel_runtime import (
     capture_kernel_runtime,
     write_runtime_record,
 )
+from bhiksha.tools.chart_scenario_campaign_config import build_campaign_config
 from bhiksha.tools.chart_scenario_coordinator import (
     _before_prepare_cutoff,
     _campaign_window_preflight,
@@ -206,7 +207,7 @@ def _campaign_artifacts(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "ends_on": sessions[-1],
         "checkpoint_after_sessions": 5,
         "max_sessions": 10,
-        "minimum_closed_sessions_for_decision": 10,
+        "minimum_closed_trigger_count": 10,
         "effects": {"broker": False, "orders": False},
     }
     freeze = {
@@ -505,6 +506,10 @@ def test_frozen_toolchain_rejects_dirty_hash_drift_and_symlink_escape(
                 "path": None,
                 "sha256": coordinator._source_tree_sha256(import_root),
             },
+            "installed_environment_identity": {
+                "schema": "fixture.installed-environment.v1",
+                "role": role,
+            },
             "argv_prefix": prefix,
             "captured_at": "2026-08-04T12:00:00Z",
             "record_path": str(record_path),
@@ -527,6 +532,13 @@ def test_frozen_toolchain_rejects_dirty_hash_drift_and_symlink_escape(
         lambda interpreter, *, module, role, config, cwd: Path(
             toolchain[role]["entrypoint"]
         ).resolve(),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_capture_installed_environment_identity",
+        lambda interpreter, *, role, checkout: toolchain[role][
+            "installed_environment_identity"
+        ],
     )
     _verify_frozen_toolchain(config)
 
@@ -763,8 +775,15 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
         )
         return {"status": "succeeded"}
 
-    monkeypatch.setattr(coordinator, "_run_command", fake_run)
-    monkeypatch.setattr(coordinator, "_execute_command", fake_execute)
+    def fake_subprocess(command, *, cwd, env=None):
+        if "market-context-export" in command:
+            fake_run(command, cwd=cwd, env=env)
+            return coordinator.subprocess.CompletedProcess(
+                args=command, returncode=0, stdout="{}", stderr=""
+            )
+        return fake_execute(command, cwd=cwd, env=env)
+
+    monkeypatch.setattr(coordinator, "_execute_command", fake_subprocess)
     monkeypatch.setattr(
         coordinator, "_verify_frozen_toolchain", lambda *args, **kwargs: None
     )
@@ -818,6 +837,78 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
         _validate_campaign_config(config_payload)
 
 
+def test_campaign_config_builder_binds_canonical_freeze_without_hand_authored_hashes(
+    tmp_path: Path,
+) -> None:
+    experiment_root, frozen = _campaign_artifacts(tmp_path)
+    birdclaw_db = tmp_path / "birdclaw.sqlite"
+    birdclaw_db.write_bytes(b"fixture")
+    output = tmp_path / "artifacts/chart_scenarios/campaign-config.json"
+
+    payload = build_campaign_config(
+        experiment_root=experiment_root,
+        campaign_id="campaign-1",
+        birdclaw_checkout=tmp_path / "birdclaw",
+        birdclaw_db=birdclaw_db,
+        market_cartographer_checkout=tmp_path / "market-cartographer",
+        tradelab_checkout=tmp_path / "tradelab",
+        agent_broker_checkout=tmp_path / "agent-broker",
+        agent_broker=tmp_path / "agent-broker/.venv/bin/agent-broker",
+        kernel_src=tmp_path / "kernel/src",
+        cartographer_provider="fixture",
+        cartographer_data_root=None,
+        symbols=["SPY", "IWM", "SPY"],
+        toolchain=_toolchain(tmp_path),
+        output=output,
+    )
+
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    assert payload["symbols"] == ["IWM", "SPY"]
+    assert payload["campaign_freeze_receipt_hash"] == frozen[
+        "campaign_freeze_receipt_hash"
+    ]
+    assert payload["checkpoint_after_sessions"] == 5
+    assert payload["max_sessions"] == 10
+    assert payload["content_hash"] == canonical_sha256(
+        {key: value for key, value in payload.items() if key != "content_hash"}
+    )
+
+
+def test_campaign_config_builder_rejects_stale_freeze_decision_field(
+    tmp_path: Path,
+) -> None:
+    experiment_root, _frozen = _campaign_artifacts(tmp_path)
+    campaign_root = experiment_root / "campaigns" / "campaign-1"
+    freeze_path = campaign_root / "campaign-freeze-receipt.json"
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    freeze.pop("minimum_closed_trigger_count")
+    freeze["minimum_closed_sessions_for_decision"] = 10
+    freeze["content_hash"] = "sha256:" + canonical_sha256(
+        {key: value for key, value in freeze.items() if key != "content_hash"}
+    )
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    birdclaw_db = tmp_path / "birdclaw.sqlite"
+    birdclaw_db.write_bytes(b"fixture")
+
+    with pytest.raises(ValueError, match="campaign boundaries are invalid"):
+        build_campaign_config(
+            experiment_root=experiment_root,
+            campaign_id="campaign-1",
+            birdclaw_checkout=tmp_path / "birdclaw",
+            birdclaw_db=birdclaw_db,
+            market_cartographer_checkout=tmp_path / "market-cartographer",
+            tradelab_checkout=tmp_path / "tradelab",
+            agent_broker_checkout=tmp_path / "agent-broker",
+            agent_broker=tmp_path / "agent-broker/.venv/bin/agent-broker",
+            kernel_src=tmp_path / "kernel/src",
+            cartographer_provider="fixture",
+            cartographer_data_root=None,
+            symbols=["SPY"],
+            toolchain=_toolchain(tmp_path),
+            output=tmp_path / "artifacts/chart_scenarios/campaign-config.json",
+        )
+
+
 def test_coordinator_rejects_generic_commands_and_non_run_scoped_outputs(
     tmp_path: Path,
 ) -> None:
@@ -849,7 +940,19 @@ def test_fixed_tradelab_lifecycle_has_no_caller_authored_output_argv(
         captured.append(command)
         return {"status": "succeeded"}
 
-    monkeypatch.setattr(coordinator, "_run_command", fake_run)
+    monkeypatch.setattr(
+        coordinator,
+        "_execute_command",
+        lambda command, *, cwd, env=None: (
+            captured.append(command)
+            or coordinator.subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout=json.dumps({"status": "succeeded"}),
+                stderr="",
+            )
+        ),
+    )
     monkeypatch.setattr(
         coordinator, "_verify_frozen_toolchain", lambda *args, **kwargs: None
     )
