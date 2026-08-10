@@ -196,14 +196,18 @@ def _main_locked(
         json.loads(contract_path.read_text(encoding="utf-8")),
         contract_path=contract_path,
     )
-    for field in (
-        "campaign_config_hash",
-        "campaign_protocol_hash",
-        "campaign_freeze_receipt_hash",
-        "session_calendar_hash",
+    for contract_field, config_field in (
+        ("campaign_config_hash", "content_hash"),
+        ("campaign_protocol_hash", "campaign_protocol_hash"),
+        ("campaign_freeze_receipt_hash", "campaign_freeze_receipt_hash"),
+        ("session_calendar_hash", "session_calendar_hash"),
     ):
-        if _normalized_hash(contract[field]) != _normalized_hash(config[field]):
-            raise ValueError(f"daily contract {field} differs from campaign freeze")
+        if _normalized_hash(contract[contract_field]) != _normalized_hash(
+            config[config_field]
+        ):
+            raise ValueError(
+                f"daily contract {contract_field} differs from campaign freeze"
+            )
     phase = (
         _phase(now, contract["target_session_window"])
         if args.phase == "auto"

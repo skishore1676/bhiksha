@@ -842,6 +842,55 @@ def test_campaign_config_autonomously_emits_authenticated_daily_contract(
         _validate_campaign_config(config_payload)
 
 
+def test_main_locked_maps_campaign_config_content_hash_to_contract_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = _contract(tmp_path)
+    contract_dir = tmp_path / "artifacts" / "chart_scenarios" / "daily-contracts"
+    contract_dir.mkdir(parents=True)
+    (contract_dir / "2026-08-04.json").write_text(
+        json.dumps(contract), encoding="utf-8"
+    )
+    observed: dict[str, object] = {}
+
+    def fake_run_phase(value: dict[str, object], *, phase: str) -> dict[str, object]:
+        observed["contract"] = value
+        observed["phase"] = phase
+        return {
+            "schema": coordinator.RECEIPT_SCHEMA,
+            "status": "skipped",
+            "phase": phase,
+            "effects": {
+                "broker": False,
+                "orders": False,
+                "authorization": False,
+                "sheet": False,
+            },
+        }
+
+    monkeypatch.setattr(coordinator, "_run_phase", fake_run_phase)
+
+    assert (
+        coordinator._main_locked(
+            SimpleNamespace(phase="intraday", contract_dir=str(contract_dir)),
+            datetime.fromisoformat("2026-08-04T07:45:00-05:00"),
+            config={
+                "content_hash": contract["campaign_config_hash"],
+                "campaign_protocol_hash": contract["campaign_protocol_hash"],
+                "campaign_freeze_receipt_hash": contract[
+                    "campaign_freeze_receipt_hash"
+                ],
+                "session_calendar_hash": contract["session_calendar_hash"],
+            },
+        )
+        == 0
+    )
+    assert observed["phase"] == "intraday"
+    assert observed["contract"]["campaign_config_hash"] == contract[
+        "campaign_config_hash"
+    ]
+
+
 def test_campaign_config_builder_binds_canonical_freeze_without_hand_authored_hashes(
     tmp_path: Path,
 ) -> None:
