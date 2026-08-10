@@ -1354,7 +1354,10 @@ def _verify_launcher_shebang(launcher: Path, *, interpreter: Path) -> None:
     if not first.startswith("#!"):
         raise ValueError("campaign Agent Broker launcher has no shebang")
     tokens = shlex.split(first[2:].strip())
-    if len(tokens) != 1 or Path(tokens[0]).expanduser().resolve() != interpreter:
+    if (
+        len(tokens) != 1
+        or Path(tokens[0]).expanduser().resolve() != interpreter.resolve()
+    ):
         raise ValueError("campaign Agent Broker launcher shebang drift")
 
 

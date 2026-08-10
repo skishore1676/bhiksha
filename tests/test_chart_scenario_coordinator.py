@@ -45,6 +45,7 @@ from bhiksha.tools.chart_scenario_coordinator import (
     _validate_staging_event_partition,
     _verify_frozen_toolchain,
     _verify_kernel_source,
+    _verify_launcher_shebang,
 )
 from tests.test_chart_scenarios import _bundle_payload, _cycle_input, _plan
 
@@ -946,6 +947,21 @@ def test_agent_broker_runtime_capture_uses_checkout_package_layout(
     assert payload["entrypoint"] == str(package / "cli.py")
     assert payload["import_root"] == str(package)
     assert json.loads(record_path.read_text(encoding="utf-8")) == payload
+
+
+def test_agent_broker_launcher_accepts_equivalent_venv_interpreter_links(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    interpreter = bin_dir / "python"
+    shebang_interpreter = bin_dir / "python3"
+    interpreter.symlink_to(sys.executable)
+    shebang_interpreter.symlink_to(sys.executable)
+    launcher = bin_dir / "agent-broker"
+    launcher.write_text(f"#!{shebang_interpreter}\n", encoding="utf-8")
+
+    _verify_launcher_shebang(launcher, interpreter=interpreter)
 
 
 def test_campaign_config_builder_rejects_stale_freeze_decision_field(
