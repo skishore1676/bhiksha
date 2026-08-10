@@ -926,7 +926,7 @@ def _validate_campaign_config(value: Mapping[str, Any]) -> dict[str, Any]:
         or freeze.get("ends_on") != ends_on.isoformat()
         or freeze.get("checkpoint_after_sessions") != 5
         or freeze.get("max_sessions") != 10
-        or freeze.get("minimum_closed_sessions_for_decision") != 10
+        or freeze.get("minimum_closed_trigger_count") != 10
     ):
         raise ValueError("TradeLab freeze receipt campaign boundaries are invalid")
     return {

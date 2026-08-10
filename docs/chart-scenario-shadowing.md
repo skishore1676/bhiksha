@@ -179,6 +179,32 @@ protocol whose inclusive window, 5-session checkpoint, 10-session maximum, or
 authorized dates differ. This preflight happens before any daily producer is
 invoked.
 
+Generate that file and the four exact runtime records with the checked-in builder;
+do not hand-author hashes or copy a fixture config:
+
+```bash
+python -m bhiksha.tools.chart_scenario_campaign_config \
+  --experiment-root /absolute/artifacts/chart_scenarios/tradelab \
+  --campaign-id "$CAMPAIGN_ID" \
+  --birdclaw-checkout /absolute/birdclaw --birdclaw-db /absolute/birdclaw.sqlite \
+  --birdclaw-node /absolute/node \
+  --cartographer-checkout /absolute/market-cartographer \
+  --cartographer-python /absolute/market-cartographer/.venv/bin/python \
+  --tradelab-checkout /absolute/tradelab \
+  --tradelab-python /absolute/tradelab/.venv/bin/python \
+  --agent-broker-checkout /absolute/agent-broker \
+  --agent-broker /absolute/agent-broker/.venv/bin/agent-broker \
+  --kernel-src /absolute/mala-bhiksha-kernel/src \
+  --cartographer-provider mala --cartographer-data-root /absolute/mala/data \
+  --symbols "SPY,QQQ,..." \
+  --runtime-dir /absolute/artifacts/chart_scenarios/runtime \
+  --output /absolute/artifacts/chart_scenarios/campaign-config.json
+```
+
+Every checkout must be clean. Python roles require an isolated checkout-local venv;
+the command records the interpreter, installed environment, import tree, dependency
+identity, and argv before validating the complete config against TradeLab's freeze.
+
 The chart plist never carries `BHIKSHA_ENV_FILE` and the chart process never
 loads the production dotenv. Installation copies only explicit configuration
 paths, the Google credential-file path, and the read-only Schwab token-file path
