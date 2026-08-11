@@ -144,7 +144,13 @@ The dated file records:
 - suppressed row count
 - suppressed row details with sheet name, row id, row index, and reason
 
-Bad rows no longer fail the whole sync. Bhiksha keeps valid rows, suppresses invalid rows, and records the issue in the sync log.
+Diagnostic compilation keeps valid rows, suppresses invalid rows, and records
+the issue in the sync log. Canonical sync is stricter: it atomically replaces
+the installed plan only when every enabled row is accounted for. Named policy
+gates such as `triage_verdict=KILL`, `m7_status=block`, retired, or
+not-runtime-ready are safe suppressions. Invalid input, duplicate row identity,
+unexplained compiler loss, or a shadow observation-binding mismatch preserves
+the previous active plan instead of publishing a partial candidate.
 
 The runtime log now also emits clearer operator-facing lines such as:
 

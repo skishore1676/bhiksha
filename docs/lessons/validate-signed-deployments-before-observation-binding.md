@@ -33,6 +33,20 @@ then attach observational identity to the final effective deployment. Runtime
 attribution prefers `observation_evidence_*`; authorization validation keeps
 using the original signed fields.
 
+Observation bindings are not a second authorization system. If a binding is
+incompatible with a Sheet-authorized live row, the compiler preserves the
+validated live deployment and marks its observation identity
+`evidence_binding_quarantined`; normalized facts then classify that trade as
+`plumbing_invalid` rather than using mismatched evidence. The same mismatch on
+a shadow row suppresses the row, because an unattributable observation has no
+research value.
+
+Canonical plan writers also require a complete coverage ledger. Every enabled
+operator row must be either loaded or excluded by an explicit policy gate.
+Missing rows caused by observation binding, invalid input, duplicate identity,
+or unexplained compiler loss make the candidate diagnostic-only and preserve
+the previously installed plan.
+
 ## When It Applies
 
 Use this split whenever authorization covers a whole deployment and later

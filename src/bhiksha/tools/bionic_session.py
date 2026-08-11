@@ -10,7 +10,11 @@ from pathlib import Path
 import sys
 
 from bhiksha.app.bootstrap import build_runtime
-from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets, write_compiled_active_plan
+from bhiksha.active_plan.compiler import (
+    compile_active_plan_from_google_sheets,
+    require_release_safe_coverage,
+    write_compiled_active_plan,
+)
 from bhiksha.bionic.session_ops import (
     default_active_plan_path,
     default_feedback_export_dir,
@@ -120,6 +124,7 @@ def _prepare(args: argparse.Namespace) -> int:
                 source_name=args.source_name,
                 evidence_bindings_path=repo_root / DEFAULT_EVIDENCE_BINDINGS_PATH,
             )
+            require_release_safe_coverage(compiled.plan.summary)
             active_plan_path.parent.mkdir(parents=True, exist_ok=True)
             active_plan_path.write_text(
                 json.dumps(compiled.plan.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",

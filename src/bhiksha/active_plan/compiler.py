@@ -57,6 +57,10 @@ LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V1 = "pdd-entry-canary.v1"
 LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2 = "pdd-entry-canary.v2"
 
 
+class PolicyGateSuppression(ValueError):
+    """An enabled row was deliberately excluded by a named safety policy."""
+
+
 class StrategyCatalogSheetRow(BaseModel):
     """Read-only metadata row loaded from a Mala catalog/evidence tab."""
 
@@ -338,6 +342,27 @@ class StrategyCatalogValidationResult:
     suppressed: list[dict[str, Any]]
 
 
+def require_release_safe_coverage(summary: dict[str, Any]) -> None:
+    """Reject a candidate that cannot account for every enabled operator row."""
+
+    coverage = summary.get("coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError(
+            "active-plan candidate is missing the required coverage invariant"
+        )
+    observation_loss = int(
+        coverage.get("observation_binding_suppression_count") or 0
+    )
+    unexpected_loss = int(coverage.get("unexpected_coverage_loss_count") or 0)
+    if coverage.get("release_safe") is not True or observation_loss or unexpected_loss:
+        raise ValueError(
+            "active-plan candidate failed coverage gate: "
+            f"observation_binding_suppression_count={observation_loss}, "
+            f"unexpected_coverage_loss_count={unexpected_loss}; "
+            "previous active plan preserved"
+        )
+
+
 def compile_active_plan_from_sheet(
     *,
     sheet_path: str | Path,
@@ -347,6 +372,13 @@ def compile_active_plan_from_sheet(
     source_name: str = "google_sheet_integration",
 ) -> CompiledActivePlan:
     validation = load_sheet_rows_with_report(sheet_path)
+    expected_enabled_row_ids = [
+        row.row_id for row in validation.rows if row.enabled
+    ] + [
+        str(item["row_id"])
+        for item in validation.suppressed
+        if item.get("row_id")
+    ]
     return compile_active_plan_from_rows(
         rows=validation.rows,
         strategy_catalog_path=strategy_catalog_path,
@@ -355,6 +387,7 @@ def compile_active_plan_from_sheet(
         source_name=source_name,
         source_details={"sheet_path": str(Path(sheet_path).resolve())},
         suppressed=list(validation.suppressed),
+        expected_enabled_row_ids_override=expected_enabled_row_ids,
     )
 
 
@@ -373,8 +406,29 @@ def compile_active_plan_from_rows(
     canary_inhibition_store: CanaryInhibitionStore | None = None,
     evidence_bindings: dict[str, dict[str, Any]] | None = None,
     auto_reconcile_shadow_experiments: bool = False,
+    auto_experiment_packet_root: str | Path | None = None,
+    auto_experiment_bindings_path: str | Path | None = None,
+    expected_enabled_row_ids_override: list[str] | None = None,
 ) -> CompiledActivePlan:
+    if auto_reconcile_shadow_experiments and (
+        auto_experiment_packet_root is None
+        or auto_experiment_bindings_path is None
+    ):
+        raise ValueError(
+            "auto-experiment reconciliation requires explicit staged packet and binding paths"
+        )
+    if (auto_experiment_packet_root is None) != (
+        auto_experiment_bindings_path is None
+    ):
+        raise ValueError(
+            "auto-experiment packet and binding output paths must be overridden together"
+        )
     suppressed_rows = list(suppressed or [])
+    expected_enabled_row_ids = list(
+        expected_enabled_row_ids_override
+        if expected_enabled_row_ids_override is not None
+        else [row.row_id for row in rows if row.enabled]
+    )
     if google_strategy_catalog is not None:
         sync_google_strategy_catalog(
             strategy_catalog_path=strategy_catalog_path,
@@ -417,6 +471,15 @@ def compile_active_plan_from_rows(
             )
         try:
             deployment = _compile_row(row, catalog_by_id, google_catalog_by_id, enforce_google_catalog)
+        except PolicyGateSuppression as exc:
+            suppressed_rows.append(
+                _suppressed_row(
+                    reason=str(exc),
+                    row=row,
+                    suppression_class="policy_gate",
+                )
+            )
+            continue
         except (ValidationError, ValueError) as exc:
             suppressed_rows.append(_suppressed_row(reason=str(exc), row=row))
             continue
@@ -439,34 +502,55 @@ def compile_active_plan_from_rows(
         deployments,
         inhibition_store=canary_inhibition_store,
     )
+    pre_observation_deployment_ids = {
+        deployment.deployment_id for deployment in deployments if deployment.enabled
+    }
+    observation_binding_suppressed_ids: set[str] = set()
+    live_evidence_quarantine_warnings: list[dict[str, Any]] = []
+    missing_before_observation_ids = set(expected_enabled_row_ids) - pre_observation_deployment_ids
+    policy_gate_row_ids = {
+        str(item.get("row_id") or "")
+        for item in suppressed_rows
+        if item.get("row_id") and item.get("suppression_class") == "policy_gate"
+    }
+    intentional_pre_observation_suppression_ids = {
+        row_id
+        for row_id in missing_before_observation_ids
+        if row_id in policy_gate_row_ids
+    }
+    unexpected_pre_observation_loss_ids = (
+        missing_before_observation_ids
+        - intentional_pre_observation_suppression_ids
+    )
     # Option C: reconcile shadow experiments AFTER final effective deployment is known,
     # BEFORE apply_evidence_binding. Fingerprint = strategy+entry+option+Control exit.
     # Tuesday reuse, DTE/delta/exit change → v2. Live untouched (fail-closed).
     auto_experiment_findings: list[dict[str, Any]] = []
     if auto_reconcile_shadow_experiments and reconcile_shadow_experiments is not None:
+        rows_by_exact_id = {row.row_id: row for row in rows}
         _reconcile_rows: dict[str, Any] = {}
         for deployment in deployments:
-            found = next(
-                (
-                    row
-                    for row in rows
-                    if deployment.deployment_id.endswith(row.row_id)
-                    or deployment.deployment_id == row.row_id
-                ),
-                None,
-            )
+            found = rows_by_exact_id.get(deployment.deployment_id)
             if found is not None:
                 _reconcile_rows[deployment.deployment_id] = found
         try:
             _packet_root = (
-                resolve_mala_packet_root()
-                if resolve_mala_packet_root is not None
-                else None
+                Path(auto_experiment_packet_root)
+                if auto_experiment_packet_root is not None
+                else (
+                    resolve_mala_packet_root()
+                    if resolve_mala_packet_root is not None
+                    else None
+                )
             )
             if _packet_root is None:
                 _packet_root = Path("__missing_canonical_mala_packet_root__")
-            _bindings_path = Path(strategy_catalog_path).parent / "evidence_bindings_v1.json"
-            if not _bindings_path.exists() and Path(strategy_catalog_path).resolve().is_relative_to(Path("/Users/suman/code/bhiksha").resolve()):
+            _bindings_path = (
+                Path(auto_experiment_bindings_path)
+                if auto_experiment_bindings_path is not None
+                else Path(strategy_catalog_path).parent / "evidence_bindings_v1.json"
+            )
+            if auto_experiment_bindings_path is None and not _bindings_path.exists() and Path(strategy_catalog_path).resolve().is_relative_to(Path("/Users/suman/code/bhiksha").resolve()):
                 _bindings_path = Path("/Users/suman/code/bhiksha/config/evidence_bindings_v1.json")
             _result = reconcile_shadow_experiments(
                 packet_root=_packet_root,
@@ -492,6 +576,8 @@ def compile_active_plan_from_rows(
                         r = _reconcile_rows.get(dep.deployment_id)
                         if r is not None and str(getattr(r, "strategy_id", "")) == sid:
                             suppressed_rows.append(_suppressed_row(reason=f"AUTO_EXPERIMENT_BLOCKED: {sid} — Mala packet creation failed: {reason}", row=r))
+                            if dep.enabled:
+                                observation_binding_suppressed_ids.add(dep.deployment_id)
                     # Remove blocked deployments from further binding (fail locally)
                     deployments = [d for d in deployments if not (_reconcile_rows.get(d.deployment_id) is not None and str(getattr(_reconcile_rows[d.deployment_id], "strategy_id", "")) == sid)]
                     auto_experiment_findings.append({"strategy_id": sid, "status": "AUTO_EXPERIMENT_BLOCKED", "reason": reason})
@@ -512,6 +598,15 @@ def compile_active_plan_from_rows(
                         row=row,
                     )
                 )
+                if next(
+                    (
+                        deployment.enabled
+                        for deployment in deployments
+                        if deployment.deployment_id == deployment_id
+                    ),
+                    False,
+                ):
+                    observation_binding_suppressed_ids.add(deployment_id)
             deployments = [
                 deployment
                 for deployment in deployments
@@ -533,10 +628,92 @@ def compile_active_plan_from_rows(
         except (ValidationError, ValueError) as exc:
             if row is None:
                 raise
+            if row.authorization_mode == "live":
+                reason = str(exc)
+                metadata = dict(deployment.source.metadata)
+                metadata.update(
+                    {
+                        "authorization_identity_status": "evidence_binding_quarantined",
+                        "observation_evidence_binding_status": "quarantined",
+                        "observation_evidence_binding_strategy_id": row.strategy_id,
+                        "observation_evidence_binding_quarantine_reason": reason,
+                    }
+                )
+                deployment = deployment.model_copy(
+                    update={
+                        "source": deployment.source.model_copy(
+                            update={"metadata": metadata}
+                        )
+                    }
+                )
+                bound_deployments.append(deployment)
+                live_evidence_quarantine_warnings.append(
+                    {
+                        "row_id": row.row_id,
+                        "strategy_id": row.strategy_id,
+                        "status": "EVIDENCE_BINDING_QUARANTINED_LIVE_EXECUTION_PRESERVED",
+                        "reason": reason,
+                    }
+                )
+                continue
             suppressed_rows.append(_suppressed_row(reason=str(exc), row=row))
+            if deployment.enabled:
+                observation_binding_suppressed_ids.add(deployment.deployment_id)
             continue
         bound_deployments.append(deployment)
     deployments = bound_deployments
+    final_loaded_deployment_ids = {
+        deployment.deployment_id for deployment in deployments if deployment.enabled
+    }
+    unexpected_coverage_loss_ids = sorted(
+        unexpected_pre_observation_loss_ids
+        | (
+            pre_observation_deployment_ids
+            - final_loaded_deployment_ids
+            - observation_binding_suppressed_ids
+        )
+    )
+    coverage_accounting_gap = len(expected_enabled_row_ids) - (
+        len(final_loaded_deployment_ids)
+        + len(intentional_pre_observation_suppression_ids)
+        + len(observation_binding_suppressed_ids)
+        + len(unexpected_coverage_loss_ids)
+    )
+    unexpected_coverage_loss_count = len(unexpected_coverage_loss_ids) + abs(
+        coverage_accounting_gap
+    )
+    coverage_summary = {
+        "expected_enabled_row_count": len(expected_enabled_row_ids),
+        "pre_observation_compiled_count": len(pre_observation_deployment_ids),
+        "final_loaded_count": len(final_loaded_deployment_ids),
+        "intentional_pre_observation_suppression_count": len(
+            intentional_pre_observation_suppression_ids
+        ),
+        "policy_gate_suppression_count": len(
+            intentional_pre_observation_suppression_ids
+        ),
+        "observation_binding_suppression_count": len(observation_binding_suppressed_ids),
+        "live_evidence_quarantine_count": len(live_evidence_quarantine_warnings),
+        "unexpected_coverage_loss_count": unexpected_coverage_loss_count,
+        "coverage_accounting_gap": coverage_accounting_gap,
+        "observation_binding_suppressed_deployment_ids": sorted(
+            observation_binding_suppressed_ids
+        ),
+        "intentional_pre_observation_suppressed_row_ids": sorted(
+            intentional_pre_observation_suppression_ids
+        ),
+        "policy_gate_suppressed_row_ids": sorted(
+            intentional_pre_observation_suppression_ids
+        ),
+        "unexpected_coverage_loss_deployment_ids": unexpected_coverage_loss_ids,
+        # A candidate with an observation-layer lane loss is useful as a
+        # diagnostic artifact but must never replace the installed plan.
+        "release_safe": not observation_binding_suppressed_ids
+        and not unexpected_coverage_loss_ids,
+    }
+    coverage_summary["release_safe"] = bool(
+        coverage_summary["release_safe"] and coverage_accounting_gap == 0
+    )
 
     source = {
         "name": source_name,
@@ -567,6 +744,8 @@ def compile_active_plan_from_rows(
                 if deployment.source.metadata.get("evidence_binding_sha256")
             ),
             "auto_experiment_findings": auto_experiment_findings,
+            "live_evidence_quarantine_warnings": live_evidence_quarantine_warnings,
+            "coverage": coverage_summary,
         },
         suppressed=suppressed_rows,
         deployments=deployments,
@@ -592,6 +771,8 @@ def compile_active_plan_from_google_sheets(
     catalog_client: GoogleSheetTableClient | None = None,
     defaults_client: GoogleSheetTableClient | None = None,
     evidence_bindings_path: str | Path | None = None,
+    auto_experiment_packet_root: str | Path | None = None,
+    auto_experiment_bindings_path: str | Path | None = None,
 ) -> CompiledActivePlan:
     if catalog_client is None:
         catalog_client = GoogleSheetTableClient(
@@ -642,6 +823,15 @@ def compile_active_plan_from_google_sheets(
         *strategy_validation.suppressed,
         *manual_validation.suppressed,
     ]
+    expected_enabled_row_ids = [
+        row.row_id
+        for row in [*strategy_validation.rows, *manual_validation.rows]
+        if row.enabled
+    ] + [
+        str(item["row_id"])
+        for item in [*strategy_validation.suppressed, *manual_validation.suppressed]
+        if item.get("row_id")
+    ]
     return compile_active_plan_from_rows(
         rows=[*strategy_validation.rows, *manual_validation.rows],
         strategy_catalog_path=strategy_catalog_path,
@@ -667,7 +857,17 @@ def compile_active_plan_from_google_sheets(
                 else None
             )
         ),
-        auto_reconcile_shadow_experiments=True,
+        # Auto-reconciliation is intentionally write-disabled unless the
+        # caller supplies both sandbox/staging destinations.  Canonical plan
+        # writers use staged outputs and promote only after the coverage gate;
+        # read-only compilers must never dirty tracked config as a side effect.
+        auto_reconcile_shadow_experiments=(
+            auto_experiment_packet_root is not None
+            and auto_experiment_bindings_path is not None
+        ),
+        auto_experiment_packet_root=auto_experiment_packet_root,
+        auto_experiment_bindings_path=auto_experiment_bindings_path,
+        expected_enabled_row_ids_override=expected_enabled_row_ids,
     )
 
 
@@ -687,6 +887,7 @@ def write_compiled_active_plan(
         trading_date=trading_date,
         source_name=source_name,
     )
+    require_release_safe_coverage(compiled.plan.summary)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
@@ -725,9 +926,19 @@ def load_rows_from_sheet_records_with_report(
 ) -> RowValidationResult:
     normalized_rows: list[ActivePlanSheetRow] = []
     suppressed: list[dict[str, Any]] = []
-    for row in rows:
-        payload = _prepare_sheet_row_payload(row, row_type=row_type, sheet_name=sheet_name)
+    for row_index, row in enumerate(rows, start=2):
+        payload = _prepare_sheet_row_payload(
+            row, row_type=row_type, row_index=row_index, sheet_name=sheet_name
+        )
         if _should_skip_prepared_row(payload):
+            if payload.get("enabled") is not False and row_type == "strategy":
+                suppressed.append(
+                    _suppressed_row(
+                        reason="enabled strategy row is missing strategy_id",
+                        payload=payload,
+                        raw=row,
+                    )
+                )
             continue
         try:
             normalized_rows.append(ActivePlanSheetRow.model_validate(payload))
@@ -823,6 +1034,14 @@ def _load_csv_rows_with_report(path: Path) -> RowValidationResult:
                 continue
             payload = _prepare_sheet_row_payload(row, row_index=index, sheet_name=path.name)
             if _should_skip_prepared_row(payload):
+                if payload.get("enabled") is not False and payload.get("row_type") == "strategy":
+                    suppressed.append(
+                        _suppressed_row(
+                            reason="enabled strategy row is missing strategy_id",
+                            payload=payload,
+                            raw=dict(row),
+                        )
+                    )
                 continue
             try:
                 validated_rows.append(ActivePlanSheetRow.model_validate(payload))
@@ -855,6 +1074,14 @@ def _load_json_rows_with_report(path: Path) -> RowValidationResult:
             continue
         prepared = _prepare_sheet_row_payload(item, row_index=index, sheet_name=path.name)
         if _should_skip_prepared_row(prepared):
+            if prepared.get("enabled") is not False and prepared.get("row_type") == "strategy":
+                suppressed.append(
+                    _suppressed_row(
+                        reason="enabled strategy row is missing strategy_id",
+                        payload=prepared,
+                        raw=item,
+                    )
+                )
             continue
         try:
             validated_rows.append(ActivePlanSheetRow.model_validate(prepared))
@@ -2528,33 +2755,33 @@ def _validate_google_catalog_alignment(
             thesis_exit_policy=google_entry.thesis_exit_policy,
         )
         if not capability.supported:
-            raise ValueError(
+            raise PolicyGateSuppression(
                 f"unsupported_strategy_variant: {capability.strategy_key}.{capability.strategy_variant} {capability.reason}"
             )
     if not google_entry.bhiksha_ready:
-        raise ValueError(f"Strategy {strategy_id!r} is not Bhiksha runtime-ready in Mala_Evidence_v1")
+        raise PolicyGateSuppression(f"Strategy {strategy_id!r} is not Bhiksha runtime-ready in Mala_Evidence_v1")
     relaxed_gates: list[str] = []
     if google_entry.mala_evidence_ready is False:
         reason = google_entry.mala_evidence_blocking_checks or "mala_evidence_ready=false"
         if live:
-            raise ValueError(f"Strategy {strategy_id!r} is not mala_evidence_ready in Mala_Evidence_v1: {reason}")
+            raise PolicyGateSuppression(f"Strategy {strategy_id!r} is not mala_evidence_ready in Mala_Evidence_v1: {reason}")
         relaxed_gates.append(f"mala_evidence_ready: {reason}")
     if google_entry.activation_candidate is False:
         reason = google_entry.activation_blocking_checks or google_entry.triage_blocking_checks or "activation_candidate=false"
         if live:
-            raise ValueError(f"Strategy {strategy_id!r} is not activation_candidate in Mala_Evidence_v1: {reason}")
+            raise PolicyGateSuppression(f"Strategy {strategy_id!r} is not activation_candidate in Mala_Evidence_v1: {reason}")
         relaxed_gates.append(f"activation_candidate: {reason}")
     if google_entry.option_trade_ready is False:
         if live:
-            raise ValueError(f"Strategy {strategy_id!r} is not option_trade_ready in Mala_Evidence_v1")
+            raise PolicyGateSuppression(f"Strategy {strategy_id!r} is not option_trade_ready in Mala_Evidence_v1")
         relaxed_gates.append("option_trade_ready: option_trade_ready=false")
     if str(google_entry.m7_status or "").strip().lower() == "block":
-        raise ValueError(f"Strategy {strategy_id!r} has m7_status=block in Mala_Evidence_v1")
+        raise PolicyGateSuppression(f"Strategy {strategy_id!r} has m7_status=block in Mala_Evidence_v1")
     if str(google_entry.triage_verdict or "").strip().lower() == "kill":
         reason = google_entry.triage_verdict_reason or google_entry.triage_blocking_checks or "triage_verdict=KILL"
-        raise ValueError(f"Strategy {strategy_id!r} has triage_verdict=KILL in Mala_Evidence_v1: {reason}")
+        raise PolicyGateSuppression(f"Strategy {strategy_id!r} has triage_verdict=KILL in Mala_Evidence_v1: {reason}")
     if google_entry.lifecycle_status == "retired":
-        raise ValueError(f"Strategy {strategy_id!r} is retired in Google strategy catalog")
+        raise PolicyGateSuppression(f"Strategy {strategy_id!r} is retired in Google strategy catalog")
     if google_entry.symbol and google_entry.symbol != local_entry.symbol:
         raise ValueError(
             f"Google strategy catalog symbol mismatch for {strategy_id!r}: "
@@ -2803,6 +3030,7 @@ def _suppressed_row(
     payload: dict[str, Any] | None = None,
     raw: dict[str, Any] | None = None,
     row_type: str | None = None,
+    suppression_class: str | None = None,
 ) -> dict[str, Any]:
     metadata = dict(
         (row.source_metadata if row is not None else payload.get("source_metadata")) or {}
@@ -2821,6 +3049,8 @@ def _suppressed_row(
         "row_type": effective_row_type,
         "sheet_name": metadata.get("sheet_name"),
     }
+    if suppression_class is not None:
+        entry["suppression_class"] = suppression_class
     if raw is not None:
         entry["raw"] = {str(key): value for key, value in raw.items()}
     return entry

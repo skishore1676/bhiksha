@@ -11,7 +11,9 @@ from bhiksha.tools.sync_active_plan import (
     diff_lane_configs,
     lane_config_snapshot,
     main as sync_active_plan_main,
+    sync_active_plan_once,
 )
+from bhiksha.tools.compile_active_plan import main as compile_active_plan_main
 
 
 def test_sync_active_plan_uses_env_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -422,6 +424,163 @@ def test_sync_active_plan_logs_compile_failures(tmp_path: Path, monkeypatch: pyt
     assert log_entry["error"] == "sheet access failed"
 
 
+def test_sync_coverage_gate_preserves_previous_plan_on_unclassified_lane_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_path = tmp_path / "active_plan.json"
+    previous_bytes = b'{"active_plan_id":"previous","deployments":["a","b"]}\n'
+    output_path.write_bytes(previous_bytes)
+    log_dir = tmp_path / "logs"
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "spreadsheet123")
+    monkeypatch.setenv("GOOGLE_API_CREDENTIALS_PATH", str(tmp_path / "credentials.json"))
+    monkeypatch.setenv("BHIKSHA_ACTIVE_PLAN_LOG_DIR", str(log_dir))
+
+    candidate = _compiled_plan("degraded-candidate")
+    candidate.plan.summary["coverage"] = {
+        "expected_enabled_row_count": 2,
+        "pre_observation_compiled_count": 1,
+        "final_loaded_count": 1,
+        "intentional_pre_observation_suppression_count": 0,
+        "observation_binding_suppression_count": 0,
+        "live_evidence_quarantine_count": 0,
+        "unexpected_coverage_loss_count": 1,
+        "unexpected_coverage_loss_deployment_ids": ["lost-lane"],
+        "release_safe": False,
+    }
+    monkeypatch.setattr(
+        "bhiksha.tools.sync_active_plan.compile_active_plan_from_google_sheets",
+        lambda **kwargs: candidate,
+    )
+
+    with pytest.raises(ValueError, match="failed coverage gate"):
+        sync_active_plan_main(["--out", str(output_path)])
+
+    assert output_path.read_bytes() == previous_bytes
+    log_entry = json.loads(
+        sorted(log_dir.glob("active_plan_sync_*.jsonl"))[0]
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert log_entry["status"] == "error"
+    assert "previous active plan preserved" in log_entry["error"]
+
+
+def test_candidate_only_cannot_target_canonical_active_plan_from_another_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical_output = (
+        Path(__file__).resolve().parents[1]
+        / "artifacts/playbook/active_plan.json"
+    )
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        compile_active_plan_main(
+            [
+                "--candidate-only",
+                "--google-sheet-id",
+                "spreadsheet123",
+                "--credentials-path",
+                "credentials.json",
+                "--out",
+                str(canonical_output),
+            ]
+        )
+
+    assert exc.value.code == 2
+
+
+def test_sync_missing_canonical_packet_root_preserves_plan_and_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_path = tmp_path / "active_plan.json"
+    runtime_registry = tmp_path / "evidence_bindings_v1.json"
+    output_bytes = b'{"active_plan_id":"previous"}\n'
+    registry_bytes = b'{"registry":"previous"}\n'
+    output_path.write_bytes(output_bytes)
+    runtime_registry.write_bytes(registry_bytes)
+    monkeypatch.setattr(
+        "bhiksha.tools.sync_active_plan.resolve_mala_packet_root", lambda: None
+    )
+
+    with pytest.raises(ValueError, match="canonical Mala evidence packet root"):
+        sync_active_plan_once(
+            spreadsheet_id="spreadsheet123",
+            credentials_path="credentials.json",
+            catalog_sheet_name="Mala_Evidence_v1",
+            defaults_sheet_name=None,
+            strategy_sheet_name="active_strategy",
+            manual_sheet_name="manual_entry",
+            strategy_catalog_path=tmp_path / "catalog",
+            output_path=output_path,
+            log_dir=tmp_path / "logs",
+            runtime_capabilities_path=None,
+        )
+
+    assert output_path.read_bytes() == output_bytes
+    assert runtime_registry.read_bytes() == registry_bytes
+
+
+def test_sync_rolls_back_promoted_packets_and_registries_when_plan_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bhiksha.evidence.bindings import build_registry_payload
+    import bhiksha.tools.sync_active_plan as sync_module
+
+    output_path = tmp_path / "active_plan.json"
+    output_path.write_text('{"active_plan_id":"previous"}\n')
+    runtime_registry = tmp_path / "evidence_bindings_v1.json"
+    prior_runtime = json.dumps(build_registry_payload([])) + "\n"
+    runtime_registry.write_text(prior_runtime)
+    packet_root = tmp_path / "canonical_packets"
+    packet_root.mkdir()
+    packet_registry = packet_root / "registry.json"
+    packet_registry.write_text('{"previous":true}\n')
+    monkeypatch.setattr(sync_module, "resolve_mala_packet_root", lambda: packet_root)
+
+    def fake_compile(**kwargs):
+        staged_packet_root = Path(kwargs["auto_experiment_packet_root"])
+        new_dir = staged_packet_root / "new-packet"
+        new_dir.mkdir()
+        (new_dir / "manifest.json").write_text(
+            json.dumps({"evidence_packet_id": "a" * 64})
+        )
+        (staged_packet_root / "registry.json").write_text('{"changed":true}\n')
+        Path(kwargs["auto_experiment_bindings_path"]).write_text(
+            json.dumps(build_registry_payload([]), indent=2) + "\n"
+        )
+        return _compiled_plan("accepted-candidate")
+
+    monkeypatch.setattr(sync_module, "compile_active_plan_from_google_sheets", fake_compile)
+    real_write = sync_module._write_if_changed
+
+    def fail_plan_write(path: Path, payload: str) -> bool:
+        if Path(path) == output_path:
+            raise OSError("simulated plan publish failure")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(sync_module, "_write_if_changed", fail_plan_write)
+
+    with pytest.raises(OSError, match="simulated plan publish failure"):
+        sync_active_plan_once(
+            spreadsheet_id="spreadsheet123",
+            credentials_path="credentials.json",
+            catalog_sheet_name="Mala_Evidence_v1",
+            defaults_sheet_name=None,
+            strategy_sheet_name="active_strategy",
+            manual_sheet_name="manual_entry",
+            strategy_catalog_path=tmp_path / "catalog",
+            output_path=output_path,
+            log_dir=tmp_path / "logs",
+            runtime_capabilities_path=None,
+            evidence_bindings_path=runtime_registry,
+        )
+
+    assert not (packet_root / "new-packet").exists()
+    assert packet_registry.read_text() == '{"previous":true}\n'
+    assert runtime_registry.read_text() == prior_runtime
+    assert output_path.read_text() == '{"active_plan_id":"previous"}\n'
+
+
 def test_write_if_changed_preserves_existing_file_when_temp_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -467,7 +626,19 @@ def _compiled_plan(active_plan_id: str):
                     "trading_date": "2026-04-09",
                     "generated_at": "2026-04-09T14:00:00Z",
                     "source": {"name": "test"},
-                    "summary": {"deployment_count": 1},
+                    "summary": {
+                        "deployment_count": 1,
+                        "coverage": {
+                            "expected_enabled_row_count": 1,
+                            "pre_observation_compiled_count": 1,
+                            "final_loaded_count": 1,
+                            "intentional_pre_observation_suppression_count": 0,
+                            "observation_binding_suppression_count": 0,
+                            "live_evidence_quarantine_count": 0,
+                            "unexpected_coverage_loss_count": 0,
+                            "release_safe": True,
+                        },
+                    },
                     "suppressed": [],
                     "deployments": [
                         {

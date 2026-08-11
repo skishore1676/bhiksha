@@ -15,8 +15,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.experiments.auto_shadow import (
+    _fingerprint_to_option_contract,
     compute_deployment_experiment_fingerprint,
     reconcile_shadow_experiments,
     resolve_mala_packet_root,
@@ -29,6 +32,7 @@ def _shadow_deployment(
     dte_min=3, dte_max=7, delta_min=0.30, delta_max=0.55,
     exit_policy_hash=None, notes="",
     execution_overrides=None, exit_overrides=None,
+    direction="short", option_mapping=None,
 ) -> DeploymentManifest:
     # exit_policy_hash None by default to avoid needing exit_policy_snapshot validation
     exit_spec = {"profile": "test"}
@@ -40,14 +44,14 @@ def _shadow_deployment(
         "deployment_id": "row-smh",
         "enabled": True,
         "symbol": "SMH",
-        "strategy": {"key": "market_impulse", "version": 1, "params": {"direction": "short", "lookback": 20}},
+        "strategy": {"key": "market_impulse", "version": 1, "params": {"direction": direction, "lookback": 20}},
         "execution": {
             "profile": "single_leg_long_premium_v1",
             "dte_min": dte_min, "dte_max": dte_max,
             "dte_fallback_policy": "allow_nearest_after",
             "target_abs_delta_min": delta_min, "target_abs_delta_max": delta_max,
             "min_open_interest": 100, "max_bid_ask_spread_pct": 0.08,
-            "option_mapping": {"long_signal": "CALL", "short_signal": "PUT"},
+            "option_mapping": option_mapping or {"long_signal": "CALL", "short_signal": "PUT"},
             "entry_pricing_mode": "urgent",
         },
         "risk": {"profile": "test", "max_trade_premium_usd": 500},
@@ -65,6 +69,36 @@ def test_same_config_reuses_identity():
     d1 = _shadow_deployment()
     d2 = _shadow_deployment()
     assert compute_deployment_experiment_fingerprint(d1) == compute_deployment_experiment_fingerprint(d2)
+
+
+def test_auto_reconcile_requires_explicit_staging_paths(tmp_path: Path):
+    with pytest.raises(ValueError, match="requires explicit staged"):
+        compile_active_plan_from_rows(
+            rows=[],
+            strategy_catalog_path=tmp_path,
+            auto_reconcile_shadow_experiments=True,
+        )
+
+
+def test_declared_option_contract_comes_from_execution_mapping_for_long_strategy():
+    deployment = _shadow_deployment(direction="long")
+
+    parameters = _fingerprint_to_option_contract(deployment)
+
+    assert parameters["long_signal_contract_type"] == "CALL"
+    assert parameters["short_signal_contract_type"] == "PUT"
+
+
+def test_declared_option_contract_preserves_custom_execution_mapping():
+    deployment = _shadow_deployment(
+        direction="long",
+        option_mapping={"long_signal": "PUT", "short_signal": "CALL"},
+    )
+
+    parameters = _fingerprint_to_option_contract(deployment)
+
+    assert parameters["long_signal_contract_type"] == "PUT"
+    assert parameters["short_signal_contract_type"] == "CALL"
 
 
 def test_dte_change_creates_v2():
@@ -166,6 +200,65 @@ def test_old_packet_preserved_and_new_versioned(tmp_path: Path):
     assert Path(res3["created"][0]["packet_dir"]) != p1_dir
 
 
+def test_long_candidate_ids_with_same_prefix_get_unique_bounded_identities(
+    tmp_path: Path,
+):
+    packet_root = tmp_path / "evidence_packets"
+    packet_root.mkdir()
+    bindings_path = tmp_path / "evidence_bindings_v1.json"
+    from bhiksha.evidence.bindings import build_registry_payload
+
+    bindings_path.write_text(json.dumps(build_registry_payload([]), indent=2))
+    shared = "market_impulse__" + "same-prefix-" * 7
+    strategy_ids = [shared + "alpha", shared + "beta"]
+    deployments = []
+    rows = {}
+    for index, strategy_id in enumerate(strategy_ids):
+        deployment = _shadow_deployment(direction="long")
+        deployment.deployment_id = f"row-long-{index}"
+        deployments.append(deployment)
+        rows[deployment.deployment_id] = ActivePlanSheetRow.model_validate(
+            {
+                "row_id": deployment.deployment_id,
+                "row_type": "strategy",
+                "enabled": True,
+                "authorization_mode": "shadow",
+                "strategy_id": strategy_id,
+                "symbol": "SMH",
+            }
+        )
+
+    result = reconcile_shadow_experiments(
+        packet_root=packet_root,
+        evidence_bindings_path=bindings_path,
+        deployments=deployments,
+        rows_by_id=rows,
+        evidence_bindings={},
+    )
+
+    assert len(result["created"]) == 2
+    manifests = [
+        json.loads((Path(item["packet_dir"]) / "manifest.json").read_text())
+        for item in result["created"]
+    ]
+    assert len({item["experiment_id"] for item in manifests}) == 2
+    assert len({item["run_id"] for item in manifests}) == 2
+    assert len({Path(item["packet_dir"]).name for item in result["created"]}) == 2
+    assert all(len(item["experiment_id"]) <= 64 for item in manifests)
+    assert all(len(item["run_id"]) <= 64 for item in manifests)
+    assert all(len(Path(item["packet_dir"]).name) <= 64 for item in result["created"])
+
+    changed = _shadow_deployment(dte_min=5, dte_max=10, direction="long")
+    changed.deployment_id = deployments[0].deployment_id
+    versioned = reconcile_shadow_experiments(
+        packet_root=packet_root,
+        evidence_bindings_path=bindings_path,
+        deployments=[changed],
+        rows_by_id={changed.deployment_id: rows[changed.deployment_id]},
+    )
+    assert versioned["created"][0]["version"] == 2
+
+
 def test_live_rows_untouched(tmp_path: Path):
     packet_root = tmp_path / "evidence_packets"
     packet_root.mkdir()
@@ -182,6 +275,108 @@ def test_live_rows_untouched(tmp_path: Path):
     assert len(res["created"]) == 0
     assert len(res["reused"]) == 0
     assert len([p for p in packet_root.iterdir() if p.is_dir()]) == 0
+
+
+def test_live_row_with_shadow_only_observation_binding_keeps_execution_and_quarantines_evidence(
+    tmp_path: Path,
+):
+    import yaml
+    from bhiksha.evidence.bindings import build_registry_payload
+
+    packet_root = tmp_path / "evidence_packets"
+    packet_root.mkdir()
+    bindings_path = tmp_path / "evidence_bindings_v1.json"
+    bindings_path.write_text(json.dumps(build_registry_payload([])))
+    strategy_id = "market_impulse__smh_live"
+    effective = _shadow_deployment(
+        direction="long",
+        delta_min=0.25,
+        delta_max=0.50,
+        exit_policy_hash="exit-policy-hash-v1",
+        execution_overrides={
+            "entry_window_start_et": "09:40",
+            "entry_window_end_et": "11:15",
+        },
+    )
+    effective.deployment_id = "row-shadow-seed"
+    shadow_row = ActivePlanSheetRow.model_validate(
+        {
+            "row_id": effective.deployment_id,
+            "row_type": "strategy",
+            "enabled": True,
+            "authorization_mode": "shadow",
+            "strategy_id": strategy_id,
+            "symbol": "SMH",
+        }
+    )
+    seeded = reconcile_shadow_experiments(
+        packet_root=packet_root,
+        evidence_bindings_path=bindings_path,
+        deployments=[effective],
+        rows_by_id={effective.deployment_id: shadow_row},
+        evidence_bindings={},
+    )
+    binding = seeded["bindings"][strategy_id]
+    assert binding["allowed_authorization_modes"] == ["shadow"]
+
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    (catalog_root / f"{strategy_id}.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "strategy_id": strategy_id,
+                "symbol": effective.symbol,
+                "enabled": True,
+                "approval_status": "approved",
+                "strategy": effective.strategy.model_dump(mode="json"),
+                "execution": effective.execution.model_dump(mode="json"),
+                "risk": effective.risk.model_dump(mode="json"),
+                "exit": effective.exit.model_dump(mode="json"),
+                "source": {"origin": "test", "metadata": {}},
+            }
+        )
+    )
+    live_row = ActivePlanSheetRow.model_validate(
+        {
+            "row_id": "row-live",
+            "row_type": "strategy",
+            "enabled": True,
+            "authorization_mode": "live",
+            "strategy_id": strategy_id,
+            "symbol": "SMH",
+        }
+    )
+
+    compiled = compile_active_plan_from_rows(
+        rows=[live_row],
+        strategy_catalog_path=catalog_root,
+        evidence_bindings={strategy_id: binding},
+    )
+
+    assert len(compiled.plan.deployments) == 1
+    live = compiled.plan.deployments[0]
+    assert live.execution.shadow_only is False
+    assert live.strategy.params == effective.strategy.params
+    assert live.execution.option_mapping == effective.execution.option_mapping
+    assert live.execution.target_abs_delta_min == 0.25
+    assert live.execution.target_abs_delta_max == 0.50
+    assert live.execution.entry_window_start_et == "09:40"
+    assert live.execution.entry_window_end_et == "11:15"
+    assert live.exit.exit_policy_hash == "exit-policy-hash-v1"
+    assert (
+        live.source.metadata["observation_evidence_binding_status"]
+        == "quarantined"
+    )
+    assert (
+        live.source.metadata["authorization_identity_status"]
+        == "evidence_binding_quarantined"
+    )
+    assert compiled.plan.summary["coverage"]["final_loaded_count"] == 1
+    assert compiled.plan.summary["coverage"]["release_safe"] is True
+    warnings = compiled.plan.summary["live_evidence_quarantine_warnings"]
+    assert warnings[0]["status"] == (
+        "EVIDENCE_BINDING_QUARANTINED_LIVE_EXECUTION_PRESERVED"
+    )
 
 
 def test_packet_root_is_derived_from_checkout_with_packet_writer(
@@ -281,12 +476,16 @@ def test_compile_includes_overrides_in_fingerprint(tmp_path: Path, monkeypatch):
         strategy_catalog_path=catalog_root,
         evidence_bindings={},
         auto_reconcile_shadow_experiments=True,
+        auto_experiment_packet_root=packet_root,
+        auto_experiment_bindings_path=bindings_path,
     )
     compiled_over = compile_active_plan_from_rows(
         rows=[row_overridden],
         strategy_catalog_path=catalog_root,
         evidence_bindings={},
         auto_reconcile_shadow_experiments=True,
+        auto_experiment_packet_root=packet_root,
+        auto_experiment_bindings_path=bindings_path,
     )
     # Both should have auto-experiment findings but still produce deployments (now with packet)
     assert len(compiled_base.plan.deployments) == 1
@@ -294,3 +493,77 @@ def test_compile_includes_overrides_in_fingerprint(tmp_path: Path, monkeypatch):
     fp_base = compute_deployment_experiment_fingerprint(compiled_base.plan.deployments[0])
     fp_over = compute_deployment_experiment_fingerprint(compiled_over.plan.deployments[0])
     assert fp_base != fp_over
+
+
+def test_long_direction_round_trip_compile_keeps_lane_and_exact_option_mapping(
+    tmp_path: Path,
+):
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    import yaml
+    from bhiksha.evidence.bindings import build_registry_payload
+
+    strategy_id = "market_impulse__smh_long"
+    (catalog_root / f"{strategy_id}.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "strategy_id": strategy_id,
+                "symbol": "SMH",
+                "enabled": True,
+                "approval_status": "approved",
+                "strategy": {
+                    "key": "market_impulse",
+                    "version": 1,
+                    "params": {"direction": "long"},
+                },
+                "execution": {
+                    "profile": "single_leg_long_premium_v1",
+                    "dte_min": 3,
+                    "dte_max": 7,
+                    "dte_fallback_policy": "allow_nearest_after",
+                    "target_abs_delta_min": 0.30,
+                    "target_abs_delta_max": 0.55,
+                    "min_open_interest": 100,
+                    "max_bid_ask_spread_pct": 0.08,
+                    "option_mapping": {
+                        "long_signal": "CALL",
+                        "short_signal": "PUT",
+                    },
+                },
+                "risk": {"profile": "test"},
+                "exit": {"profile": "test"},
+            }
+        )
+    )
+    bindings_path = tmp_path / "sandbox" / "evidence_bindings_v1.json"
+    bindings_path.parent.mkdir()
+    bindings_path.write_text(json.dumps(build_registry_payload([])))
+    packet_root = tmp_path / "sandbox" / "evidence_packets"
+    packet_root.mkdir()
+    row = ActivePlanSheetRow.model_validate(
+        {
+            "row_id": "row-long",
+            "row_type": "strategy",
+            "enabled": True,
+            "authorization_mode": "shadow",
+            "strategy_id": strategy_id,
+            "symbol": "SMH",
+        }
+    )
+
+    compiled = compile_active_plan_from_rows(
+        rows=[row],
+        strategy_catalog_path=catalog_root,
+        evidence_bindings={},
+        auto_reconcile_shadow_experiments=True,
+        auto_experiment_packet_root=packet_root,
+        auto_experiment_bindings_path=bindings_path,
+    )
+
+    assert [item.deployment_id for item in compiled.plan.deployments] == ["row-long"]
+    metadata = compiled.plan.deployments[0].source.metadata
+    assert metadata["declared_option_selection_contract"]["parameters"][
+        "long_signal_contract_type"
+    ] == "CALL"
+    assert compiled.plan.summary["coverage"]["release_safe"] is True
+    assert compiled.plan.summary["coverage"]["final_loaded_count"] == 1

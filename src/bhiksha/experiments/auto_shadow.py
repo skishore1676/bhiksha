@@ -110,9 +110,8 @@ def _fingerprint_to_option_contract(deployment: Any) -> dict[str, Any]:
     # Build parameters that exactly match deployment.execution model_dump + contract types
     # so apply_evidence_binding drift check passes when we just created the packet.
     e = deployment.execution
-    s = deployment.strategy
-    direction = str(s.params.get("direction", "short")).lower()
     actual = e.model_dump(mode="json")
+    option_mapping = dict(actual.get("option_mapping") or {})
     return {
         "dte_min": actual.get("dte_min"),
         "dte_max": actual.get("dte_max"),
@@ -121,9 +120,64 @@ def _fingerprint_to_option_contract(deployment: Any) -> dict[str, Any]:
         "dte_fallback_policy": actual.get("dte_fallback_policy"),
         "max_bid_ask_spread_pct": actual.get("max_bid_ask_spread_pct"),
         "min_open_interest": actual.get("min_open_interest"),
-        "short_signal_contract_type": "PUT" if direction == "short" else "CALL",
-        "long_signal_contract_type": "CALL" if direction == "short" else "PUT",
+        # This is an execution contract, not a directional hypothesis.  The
+        # deployment's canonical option_mapping is the only authority here.
+        # Reconstructing it from strategy direction inverted long strategies
+        # and caused valid shadow lanes to disappear at observation binding.
+        "short_signal_contract_type": option_mapping.get("short_signal", "PUT"),
+        "long_signal_contract_type": option_mapping.get("long_signal", "CALL"),
     }
+
+
+_IDENTITY_LIMIT = 64
+
+
+def _identity_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.replace("__", "-"))
+    return slug.strip("-._") or "experiment"
+
+
+def _versioned_identity(
+    *, namespace: str, candidate_id: str, version: int, fingerprint: str
+) -> str:
+    """Return a readable, collision-resistant identity within the 64-char cap.
+
+    The fingerprint and candidate digest are kept at the *end*, where truncation
+    cannot erase them.  This prevents two long strategy ids with the same prefix
+    from receiving the same run, experiment, or packet-directory name.
+    """
+
+    candidate_slug = _identity_slug(candidate_id)
+    candidate_digest = _canonical_sha256(candidate_id)[:10]
+    suffix = f"-v{version}-{candidate_digest}-{fingerprint[:12]}"
+    prefix = _identity_slug(f"{namespace}-{candidate_slug}")
+    room = _IDENTITY_LIMIT - len(suffix)
+    if room <= 0:  # pragma: no cover - fixed suffix is deliberately bounded
+        raise ValueError("identity suffix exceeds maximum length")
+    return f"{prefix[:room].rstrip('-._')}{suffix}"
+
+
+def _manifest_version(manifest: dict[str, Any]) -> int | None:
+    for field in ("experiment_id", "run_id"):
+        match = re.search(r"(?:^|-)v(\d+)(?:-|$)", str(manifest.get(field) or ""))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _next_candidate_version(
+    packet_index: dict[str, list[dict[str, Any]]], candidate_id: str
+) -> int:
+    retained = [
+        manifest
+        for manifests in packet_index.values()
+        for manifest in manifests
+        if str(manifest.get("candidate_id") or "") == candidate_id
+    ]
+    parsed = [version for manifest in retained if (version := _manifest_version(manifest))]
+    # Legacy long identities could have their vN suffix truncated.  Counting
+    # retained candidate manifests keeps their history in the version sequence.
+    return max([len(retained), *parsed], default=0) + 1
 
 
 def _existing_binding_fingerprint(binding: dict[str, Any]) -> str | None:
@@ -356,8 +410,11 @@ def reconcile_shadow_experiments(
         try:
             entry = dep  # effective deployment already has final overrides
             opt_params = _fingerprint_to_option_contract(dep)
+            ver = _next_candidate_version(packet_index, sid)
             opt = build_option_selection_contract(
-                contract_id=f"{sid.replace('__', '-').replace('/', '-')}-option-v1"[:64],
+                contract_id=_versioned_identity(
+                    namespace="option", candidate_id=sid, version=ver, fingerprint=fp
+                ),
                 selector_family="single_leg_long_premium",
                 selector_implementation="bhiksha.options.selectors.SingleLegOptionSelector",
                 selector_version="1",
@@ -382,23 +439,26 @@ def reconcile_shadow_experiments(
                 commit = subprocess.check_output(["git", "-C", str(mala_root), "rev-parse", "HEAD"], text=True).strip()
             except Exception:
                 commit = "auto-shadow-ensemble"
-            # Versioned packet dir: safe + fingerprint suffix so old packet preserved
-            safe = sid.replace("__", "_").replace("/", "_")[:48]
-            suffix = fp[:8]
-            # Determine next version
-            existing_versions = [p for p in (packet_root.glob(f"{safe}*")) if p.is_dir()] if packet_root.exists() else []
-            ver = len([p for p in existing_versions if p.name.startswith(safe)]) + 1
-            pdir = packet_root / f"{safe}-{suffix}-v{ver}"
+            # Version is derived from retained manifests for this exact
+            # candidate, never from similarly prefixed directory names.
+            packet_name = _versioned_identity(
+                namespace="packet", candidate_id=sid, version=ver, fingerprint=fp
+            )
+            pdir = packet_root / packet_name
             if pdir.exists():
-                # Reuse if same fingerprint dir already exists
-                reused.append(sid)
-                continue
+                raise ValueError(
+                    f"candidate packet identity collision for {sid!r}: {packet_name}"
+                )
             manifest = write_experiment_packet(
                 packet_dir=pdir,
-                run_id=f"auto-shadow-{short[:12]}-v{ver}-{suffix}",
+                run_id=_versioned_identity(
+                    namespace="auto-shadow", candidate_id=sid, version=ver, fingerprint=fp
+                ),
                 hypothesis_id=sid.split("__")[0][:64] if "__" in sid else sid[:64],
                 candidate_id=sid,
-                experiment_id=f"{sid}-prospective-v{ver}"[:64],
+                experiment_id=_versioned_identity(
+                    namespace="prospective", candidate_id=sid, version=ver, fingerprint=fp
+                ),
                 research_source_commit=commit,
                 option_selection_contract=opt,
                 cohort_contract=cohort,

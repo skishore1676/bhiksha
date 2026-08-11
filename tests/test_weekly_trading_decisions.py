@@ -82,6 +82,16 @@ def test_evidence_status_quarantines_snapshot_without_selected_contract() -> Non
     assert issues == ["option_selection_selected_contract_not_persisted"]
 
 
+def test_evidence_status_quarantines_live_trade_with_incompatible_observation_binding() -> None:
+    status, issues = _decision_evidence_status(
+        {"authorization_identity_status": "evidence_binding_quarantined"},
+        {"exit_attribution": "profile:no_progress"},
+    )
+
+    assert status == "plumbing_invalid"
+    assert issues == ["observation_evidence_binding_quarantined"]
+
+
 def test_snapshot_consistency_requires_attempt_and_selected_row() -> None:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

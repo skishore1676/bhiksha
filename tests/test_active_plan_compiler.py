@@ -644,6 +644,13 @@ def test_compile_active_plan_suppresses_unknown_strategy_id(tmp_path: Path) -> N
     assert compiled.plan.deployments == []
     assert compiled.plan.summary["suppressed_count"] == 1
     assert "Unknown strategy_id" in compiled.plan.suppressed[0]["reason"]
+    coverage = compiled.plan.summary["coverage"]
+    assert coverage["intentional_pre_observation_suppression_count"] == 0
+    assert coverage["unexpected_coverage_loss_count"] == 1
+    assert coverage["unexpected_coverage_loss_deployment_ids"] == [
+        "unknown_strategy_lane"
+    ]
+    assert coverage["release_safe"] is False
 
 
 def test_compile_active_plan_cli_writes_active_plan_json(tmp_path: Path) -> None:
@@ -2728,11 +2735,122 @@ def test_shadow_row_still_suppressed_on_safety_gates(tmp_path: Path) -> None:
     )
     assert kill.plan.deployments == []
     assert "triage_verdict=KILL" in kill.plan.suppressed[0]["reason"]
+    assert kill.plan.summary["coverage"][
+        "intentional_pre_observation_suppression_count"
+    ] == 1
+    assert kill.plan.summary["coverage"]["unexpected_coverage_loss_count"] == 0
+    assert kill.plan.summary["coverage"]["release_safe"] is True
 
     blocked = _compile_single_evidence_gate_row(tmp_path, catalog_overrides={"m7_status": "block"})
     assert blocked.plan.deployments == []
     assert "m7_status=block" in blocked.plan.suppressed[0]["reason"]
+    assert blocked.plan.suppressed[0]["suppression_class"] == "policy_gate"
+    assert blocked.plan.summary["coverage"]["policy_gate_suppression_count"] == 1
+    assert blocked.plan.summary["coverage"]["unexpected_coverage_loss_count"] == 0
+    assert blocked.plan.summary["coverage"]["release_safe"] is True
 
     not_ready = _compile_single_evidence_gate_row(tmp_path, catalog_overrides={"bhiksha_ready": "FALSE"})
     assert not_ready.plan.deployments == []
     assert "not Bhiksha runtime-ready" in not_ready.plan.suppressed[0]["reason"]
+    assert not_ready.plan.suppressed[0]["suppression_class"] == "policy_gate"
+    assert not_ready.plan.summary["coverage"]["policy_gate_suppression_count"] == 1
+    assert not_ready.plan.summary["coverage"]["unexpected_coverage_loss_count"] == 0
+    assert not_ready.plan.summary["coverage"]["release_safe"] is True
+
+
+def test_enabled_google_strategy_row_missing_strategy_id_is_unsafe_coverage_loss(
+    tmp_path: Path,
+) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    compiled = compile_active_plan_from_google_sheets(
+        spreadsheet_id="spreadsheet123",
+        credentials_path=tmp_path / "credentials.json",
+        catalog_sheet_name="Mala_Evidence_v1",
+        strategy_sheet_name="active_strategy",
+        manual_sheet_name="manual_entry",
+        strategy_catalog_path=catalog_root,
+        catalog_client=_FakeSheetClient(
+            spreadsheet_id="spreadsheet123",
+            sheet_name="Mala_Evidence_v1",
+            rows=[],
+        ),
+        strategy_client=_FakeSheetClient(
+            spreadsheet_id="spreadsheet123",
+            sheet_name="active_strategy",
+            rows=[{"enabled": True, "mode": "shadow", "symbol": "SMH"}],
+        ),
+        manual_client=_FakeSheetClient(
+            spreadsheet_id="spreadsheet123",
+            sheet_name="manual_entry",
+            rows=[],
+        ),
+    )
+
+    assert compiled.plan.deployments == []
+    assert "missing strategy_id" in compiled.plan.suppressed[0]["reason"]
+    coverage = compiled.plan.summary["coverage"]
+    assert coverage["expected_enabled_row_count"] == 1
+    assert coverage["unexpected_coverage_loss_count"] == 1
+    assert coverage["release_safe"] is False
+
+
+def test_auto_reconcile_uses_exact_row_ids_not_suffix_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bhiksha.evidence.bindings import build_registry_payload
+    import bhiksha.active_plan.compiler as compiler_module
+
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+    _write_catalog_entry(
+        catalog_root / "short.yaml", strategy_id="strategy-short", symbol="SPY"
+    )
+    _write_catalog_entry(
+        catalog_root / "long.yaml", strategy_id="strategy-long", symbol="QQQ"
+    )
+    rows = [
+        ActivePlanSheetRow.model_validate(
+            {
+                "row_id": "row",
+                "row_type": "strategy",
+                "strategy_id": "strategy-short",
+                "symbol": "SPY",
+            }
+        ),
+        ActivePlanSheetRow.model_validate(
+            {
+                "row_id": "prefix-row",
+                "row_type": "strategy",
+                "strategy_id": "strategy-long",
+                "symbol": "QQQ",
+            }
+        ),
+    ]
+    bindings_path = tmp_path / "bindings.json"
+    bindings_path.write_text(json.dumps(build_registry_payload([])))
+    packet_root = tmp_path / "packets"
+    packet_root.mkdir()
+
+    def fake_reconcile(**kwargs):
+        mapped = kwargs["rows_by_id"]
+        assert mapped["row"].strategy_id == "strategy-short"
+        assert mapped["prefix-row"].strategy_id == "strategy-long"
+        return {"created": [], "reused": [], "blocked": [], "bindings": {}}
+
+    monkeypatch.setattr(compiler_module, "reconcile_shadow_experiments", fake_reconcile)
+
+    compiled = compile_active_plan_from_rows(
+        rows=rows,
+        strategy_catalog_path=catalog_root,
+        evidence_bindings={},
+        auto_reconcile_shadow_experiments=True,
+        auto_experiment_packet_root=packet_root,
+        auto_experiment_bindings_path=bindings_path,
+    )
+
+    assert {item.deployment_id for item in compiled.plan.deployments} == {
+        "row",
+        "prefix-row",
+    }
+    assert compiled.plan.summary["coverage"]["release_safe"] is True

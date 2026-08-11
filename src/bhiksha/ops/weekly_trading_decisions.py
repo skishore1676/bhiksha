@@ -857,6 +857,8 @@ def _decision_evidence_status(
 ) -> tuple[str, list[str]]:
     """Classify a closed trade without upgrading incomplete plumbing to evidence."""
 
+    if row.get("authorization_identity_status") == "evidence_binding_quarantined":
+        return "plumbing_invalid", ["observation_evidence_binding_quarantined"]
     if not row.get("evidence_packet_id"):
         return "legacy_unbound", ["missing_evidence_packet_id"]
     required = (

@@ -7,7 +7,11 @@ import json
 import os
 from pathlib import Path
 
-from bhiksha.active_plan.compiler import compile_active_plan_from_google_sheets, write_compiled_active_plan
+from bhiksha.active_plan.compiler import (
+    compile_active_plan_from_google_sheets,
+    require_release_safe_coverage,
+    write_compiled_active_plan,
+)
 from bhiksha.config.environment import get_mala_evidence_sheet_name, get_operator_defaults_sheet_name, load_dotenv
 from bhiksha.evidence.bindings import DEFAULT_EVIDENCE_BINDINGS_PATH
 
@@ -44,6 +48,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Immutable experiment-to-deployment binding registry",
     )
     parser.add_argument(
+        "--auto-experiment-packet-root",
+        default=None,
+        help=(
+            "Sandbox packet root for a non-canonical dry compile; must be used "
+            "with --auto-experiment-bindings-output"
+        ),
+    )
+    parser.add_argument(
+        "--auto-experiment-bindings-output",
+        default=None,
+        help=(
+            "Sandbox mutable binding registry for a non-canonical dry compile; "
+            "must be used with --auto-experiment-packet-root"
+        ),
+    )
+    parser.add_argument(
         "--out",
         default="artifacts/playbook/active_plan.json",
         help="Where to write the compiled active plan JSON",
@@ -51,7 +71,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--active-plan-id", default=None, help="Optional explicit active_plan_id")
     parser.add_argument("--trading-date", default=None, help="Optional trading date in YYYY-MM-DD format")
     parser.add_argument("--source-name", default="google_sheet_integration", help="Recorded source.name for this plan")
+    parser.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="Write an explicitly diagnostic candidate even when coverage is unsafe",
+    )
     args = parser.parse_args(argv)
+    if args.candidate_only:
+        candidate_output = Path(args.out).resolve()
+        canonical_output_root = (
+            Path(__file__).resolve().parents[3] / "artifacts/playbook"
+        )
+        if candidate_output.is_relative_to(canonical_output_root):
+            parser.error(
+                "--candidate-only requires an explicit --out outside artifacts/playbook"
+            )
+    if bool(args.auto_experiment_packet_root) != bool(
+        args.auto_experiment_bindings_output
+    ):
+        parser.error(
+            "--auto-experiment-packet-root and "
+            "--auto-experiment-bindings-output must be provided together"
+        )
     google_sheet_id = args.google_sheet_id if args.google_sheet_id is not None else (None if args.sheet else default_google_sheet_id)
 
     if google_sheet_id:
@@ -69,7 +110,11 @@ def main(argv: list[str] | None = None) -> int:
             trading_date=args.trading_date,
             source_name=args.source_name,
             evidence_bindings_path=args.evidence_bindings,
+            auto_experiment_packet_root=args.auto_experiment_packet_root,
+            auto_experiment_bindings_path=args.auto_experiment_bindings_output,
         )
+        if not args.candidate_only:
+            require_release_safe_coverage(compiled.plan.summary)
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(
             json.dumps(compiled.plan.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",

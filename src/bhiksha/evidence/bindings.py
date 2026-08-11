@@ -1,8 +1,12 @@
 """Bind immutable Mala experiment packets to exact compiled deployments.
 
-Bindings are observational metadata.  They never change a row's authorization
-mode, risk, strategy, execution, or exit settings.  Any mismatch suppresses the
-row instead of silently relabeling a different experiment.
+Bindings are observational metadata. They never grant, revoke, or change a
+row's authorization mode, risk, strategy, execution, or exit settings. A
+shadow row with an incompatible binding is suppressed because running an
+unattributable observation has no evidentiary value. A live row remains owned
+by the operator Sheet and its execution contract; the compiler preserves that
+authorization while quarantining the incompatible observation identity so it
+cannot enter decision-grade reporting.
 """
 
 from __future__ import annotations
