@@ -42,10 +42,15 @@ class LaunchdJobSpec:
         return [self.runner_job]
 
     def stdout_log(self, repo_root: Path) -> Path:
-        return _log_dir(repo_root) / f"{self.label}.out.log"
+        return self.log_dir(repo_root) / f"{self.label}.out.log"
 
     def stderr_log(self, repo_root: Path) -> Path:
-        return _log_dir(repo_root) / f"{self.label}.err.log"
+        return self.log_dir(repo_root) / f"{self.label}.err.log"
+
+    def log_dir(self, repo_root: Path) -> Path:
+        if self.runner_job == "chart-scenario-shadow":
+            return repo_root / "artifacts" / "chart_scenarios" / "launchd" / "logs"
+        return _log_dir(repo_root)
 
     def to_dict(self, *, repo_root: Path | None = None) -> dict[str, Any]:
         payload = asdict(self)

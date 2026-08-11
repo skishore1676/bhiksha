@@ -667,6 +667,62 @@ def test_chart_launchd_status_is_isolated_and_rejects_symlink_escape(
     assert not (escaped_root / "launchd/latest_status.json").exists()
 
 
+def test_status_snapshot_reads_isolated_chart_receipt_and_marker(
+    tmp_path, monkeypatch
+) -> None:
+    chart_launchd = tmp_path / "artifacts" / "chart_scenarios" / "launchd"
+    chart_logs = chart_launchd / "logs"
+    chart_logs.mkdir(parents=True)
+    (chart_launchd / "chart_scenario_shadow.enabled").write_text("", encoding="utf-8")
+    (chart_launchd / "latest_status.json").write_text(
+        json.dumps(
+            {
+                "schema": "bhiksha.chart-scenario-launchd-status.v1",
+                "recorded_at": "2026-08-11T08:08:09-05:00",
+                "payload": {
+                    "job": "chart-scenario-shadow",
+                    "status": "ok",
+                    "coordinator_status": "succeeded",
+                    "reason": "authenticated_no_plan",
+                    "return_code": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": True}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 8, 11, 13, 9, tzinfo=UTC),
+    )
+    chart_job = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "chart-scenario-shadow"
+    )
+
+    assert chart_job["declared_enabled"] is True
+    assert chart_job["last_run_status"] == "ok"
+    assert chart_job["last_run_at"] == "2026-08-11T08:08:09-05:00"
+    assert chart_job["last"]["domain"] == {
+        "ok": True,
+        "reason": "authenticated_no_plan",
+        "status": "ok",
+    }
+    assert chart_job["logs"] == {
+        "stdout": str(chart_logs / "com.bhiksha.chart-scenario-shadow.out.log"),
+        "stderr": str(chart_logs / "com.bhiksha.chart-scenario-shadow.err.log"),
+        "stdout_exists": False,
+        "stderr_exists": False,
+    }
+
+
 def test_weekly_preview_cannot_replace_passing_report(tmp_path) -> None:
     artifacts = tmp_path / "artifacts" / "playbook"
 
