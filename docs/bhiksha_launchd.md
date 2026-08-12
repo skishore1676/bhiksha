@@ -113,20 +113,25 @@ scripts/launchd/run_bhiksha_job.sh session-report --report-label manual
 scripts/launchd/run_bhiksha_job.sh weekly-trading-decisions --weekly-review-mode off
 ```
 
-The research observer is not a second chart-specific scheduler. It is installed
-as one generic app-owned launch agent with an app-input path and run-record path:
+The former generic research observer was an interim replacement for the retired
+Market Context path. It is disabled and unloaded on oldmac, its source and launchd
+registration are retired, and it is not part of the current Bhiksha architecture.
+Historical receipts may mention that path; they do not authorize restoring it.
 
-```text
-artifacts/research_observer/app-input.json
-artifacts/research_observer/events.jsonl
-artifacts/research_observer/run-record.json
+The current experiment path is Bhiksha's existing Sheet -> active plan -> ordinary
+shadow execution -> app-owned reporting flow, exposed to TradeLab through the
+read-only `tradelab.app_experiment_status.v1` command:
+
+```bash
+python -m bhiksha.tools.experiment_status \
+  --active-plan artifacts/active_plan.json \
+  --db-path bhiksha.db \
+  --format json
 ```
 
-The observer consumes only app-owned shadow facts, records synthetic observations,
-and reports zero broker/order/auth/schedule/external-send effects. A missing input is
-a healthy `no_data` receipt; it does not trigger a producer, Sheet projection, model
-hire, or live-plan change. Its launchd plist is maintained at the deployment boundary
-and is intentionally separate from the live trading job registry.
+This command reads an already-compiled plan and existing facts only. It does not
+compile a plan, write the Sheet, change a stage, start a runtime, authenticate, or
+touch the broker/order path.
 
 The weekly decision job writes normalized facts, a content-digested weekly
 packet, governance evidence, and
