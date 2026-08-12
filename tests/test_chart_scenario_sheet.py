@@ -109,6 +109,19 @@ class _SheetClient:
             self.rows.append(payload)
 
 
+class _FormattedSheetClient(_SheetClient):
+    def update_exact_rows(self, *, headers, rows):
+        super().update_exact_rows(headers=headers, rows=rows)
+        for row in self.rows:
+            for key, value in tuple(row.items()):
+                if key == "row_index":
+                    continue
+                if isinstance(value, bool):
+                    row[key] = "TRUE" if value else "FALSE"
+                elif isinstance(value, (int, float)):
+                    row[key] = str(value)
+
+
 def test_sheet_projection_uses_key_occupancy_and_exact_reread(tmp_path: Path) -> None:
     client = _SheetClient()
     request = _request(_row())
@@ -136,6 +149,26 @@ def test_sheet_projection_uses_key_occupancy_and_exact_reread(tmp_path: Path) ->
     assert second["exact_reread"] is True
     assert second["effects"]["sheet_tab"] == SHEET_NAME
     assert receipt_path.is_file()
+
+
+def test_sheet_projection_accepts_google_formatted_numeric_and_boolean_reread(
+    tmp_path: Path,
+) -> None:
+    client = _FormattedSheetClient()
+    receipt = project_sheet_upsert_request(
+        _request(_row()),
+        client=client,  # type: ignore[arg-type]
+        receipt_path=(
+            tmp_path
+            / "artifacts"
+            / "chart_scenarios"
+            / "formatted-projection.receipt.json"
+        ),
+        plan=_plan(),
+    )
+
+    assert receipt["status"] == "succeeded"
+    assert receipt["exact_reread"] is True
 
 
 def test_sheet_projector_uses_existing_canonical_credentials_fallback(

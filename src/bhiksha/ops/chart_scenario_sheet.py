@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -288,7 +289,17 @@ def _row_key(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
 def _normalize_cell(value: Any) -> Any:
     if value is None:
         return ""
-    return value
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    rendered = str(value)
+    if rendered.upper() in {"TRUE", "FALSE"}:
+        return rendered.upper()
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", rendered):
+        integer, dot, fraction = rendered.partition(".")
+        if dot:
+            fraction = fraction.rstrip("0")
+            return integer if not fraction else f"{integer}.{fraction}"
+    return rendered
 
 
 def _write_atomic(path: Path, payload: Mapping[str, Any]) -> None:
