@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .market_data import HistoricalResearchMarketData, ResearchMarketData
+
 APP_INPUT_SCHEMA = "research.app_input.v1"
 RUN_RECORD_SCHEMA = "research.run.v1"
 ZERO_EFFECTS = {
@@ -158,6 +160,13 @@ def validate_app_input(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid research app input schema")
     if payload.get("mode") != "shadow":
         raise ValueError("research observer accepts only mode=shadow")
+    for field in ("experiment_id", "experiment_version", "run_id", "input_hash"):
+        if field in {"experiment_id", "run_id"} and (
+            not isinstance(payload.get(field), str) or not payload[field]
+        ):
+            raise ValueError(f"app input {field} must be non-empty")
+    if not isinstance(payload.get("experiment_version"), int) or payload["experiment_version"] < 1:
+        raise ValueError("app input experiment_version must be positive")
     if any(key in payload for key in ("campaign", "campaign_manifest", "runtime_attestation")):
         raise ValueError("research app input cannot carry campaign or runtime manifests")
     candidates = payload.get("frozen_candidates")
@@ -180,6 +189,8 @@ def validate_app_input(raw: Mapping[str, Any]) -> dict[str, Any]:
     for arm_name, raw_arm in arms.items():
         if not isinstance(raw_arm, Mapping):
             raise ValueError(f"{arm_name} arm must be an object")
+        if not isinstance(raw_arm.get("selector"), str) or not raw_arm["selector"]:
+            raise ValueError(f"{arm_name} arm selector must be non-empty")
         selected = raw_arm.get("candidate_ids")
         if not isinstance(selected, list) or not selected:
             raise ValueError(f"{arm_name} arm must select candidates")
@@ -187,6 +198,12 @@ def validate_app_input(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{arm_name} arm invented a candidate")
         if len(selected) != len(set(selected)):
             raise ValueError(f"{arm_name} arm contains duplicate candidates")
+        ranks = raw_arm.get("rank_by_candidate")
+        if ranks is not None:
+            if not isinstance(ranks, Mapping) or set(ranks) != set(selected):
+                raise ValueError(f"{arm_name} arm rank map must cover selected candidates")
+            if list(ranks.values()) != list(range(1, len(selected) + 1)):
+                raise ValueError(f"{arm_name} arm ranks must preserve ordered positions")
     treatment_agent = arms["treatment"].get("realized_agent")
     if not isinstance(treatment_agent, Mapping):
         raise ValueError("treatment arm must include realized agent metadata")
@@ -197,20 +214,19 @@ def validate_app_input(raw: Mapping[str, Any]) -> dict[str, Any]:
     observation = payload.get("observation")
     if not isinstance(observation, Mapping):
         raise ValueError("app input observation must be an object")
+    data_mode = observation.get("data_mode", "fixture")
+    if data_mode not in {"fixture", "prospective"}:
+        raise ValueError("observation data_mode must be fixture or prospective")
+    if observation.get("metric", "net_r") != "net_r":
+        raise ValueError("research observer currently supports only metric=net_r")
     scenarios = observation.get("scenarios")
     if not isinstance(scenarios, Mapping) or set(scenarios) != candidate_ids:
         raise ValueError("app input scenarios must exactly cover frozen candidates")
     for candidate_id, raw_scenario in scenarios.items():
         if not isinstance(raw_scenario, Mapping):
             raise ValueError(f"scenario must be an object: {candidate_id}")
-        bars = raw_scenario.get("bars")
-        quotes = raw_scenario.get("quotes")
         condition = raw_scenario.get("entry_condition")
         exit_config = raw_scenario.get("exit")
-        if not isinstance(bars, list) or not bars:
-            raise ValueError(f"scenario bars must be non-empty: {candidate_id}")
-        if not isinstance(quotes, list):
-            raise ValueError(f"scenario quotes must be a list: {candidate_id}")
         if not isinstance(condition, Mapping):
             raise ValueError(f"scenario entry_condition must be an object: {candidate_id}")
         _validate_condition(condition)
@@ -220,15 +236,33 @@ def validate_app_input(raw: Mapping[str, Any]) -> dict[str, Any]:
         _number(exit_config.get("target_r"), "exit.target_r")
         _number(exit_config.get("stop_r"), "exit.stop_r")
         _number(exit_config.get("cost_r", 0.0), "exit.cost_r")
-        normalized_bars = [_bar(item) for item in bars if isinstance(item, Mapping)]
-        if len(normalized_bars) != len(bars):
-            raise ValueError(f"scenario bars must contain objects: {candidate_id}")
-        if normalized_bars != sorted(normalized_bars, key=lambda item: item["timestamp"]):
-            raise ValueError(f"scenario bars must be ordered: {candidate_id}")
-        for item in quotes:
-            if not isinstance(item, Mapping):
-                raise ValueError(f"scenario quotes must contain objects: {candidate_id}")
-            _quote(item)
+        if data_mode == "fixture":
+            bars = raw_scenario.get("bars")
+            quotes = raw_scenario.get("quotes")
+            if not isinstance(bars, list) or not bars:
+                raise ValueError(f"scenario bars must be non-empty: {candidate_id}")
+            if not isinstance(quotes, list):
+                raise ValueError(f"scenario quotes must be a list: {candidate_id}")
+            normalized_bars = [_bar(item) for item in bars if isinstance(item, Mapping)]
+            if len(normalized_bars) != len(bars):
+                raise ValueError(f"scenario bars must contain objects: {candidate_id}")
+            if normalized_bars != sorted(normalized_bars, key=lambda item: item["timestamp"]):
+                raise ValueError(f"scenario bars must be ordered: {candidate_id}")
+            for item in quotes:
+                if not isinstance(item, Mapping):
+                    raise ValueError(f"scenario quotes must contain objects: {candidate_id}")
+                _quote(item)
+        else:
+            future_fields = {
+                "bars",
+                "quotes",
+                "fills",
+                "exit_observation",
+                "outcome",
+                "result",
+            }
+            if future_fields.intersection(raw_scenario):
+                raise ValueError(f"prospective scenario contains future observation facts: {candidate_id}")
         policy = raw_scenario.get("quote_policy")
         if not isinstance(policy, Mapping):
             raise ValueError(f"scenario quote_policy must be an object: {candidate_id}")
@@ -436,6 +470,119 @@ def _observe_candidate(
     }
 
 
+def _missing_data_result(
+    run_id: str,
+    candidate_id: str,
+    candidate: Mapping[str, Any],
+    input_hash: str,
+    reason: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    result = {
+        "candidate_id": candidate_id,
+        "symbol": candidate["symbol"],
+        "status": "missing_data",
+        "triggered": False,
+        "closed": False,
+        "gross_r": None,
+        "net_r": None,
+        "reason": reason,
+    }
+    return result, {
+        "event_id": f"{run_id}:{candidate_id}",
+        "run_id": run_id,
+        "input_hash": input_hash,
+        "candidate_id": candidate_id,
+        "symbol": candidate["symbol"],
+        "status": result["status"],
+        "triggered": False,
+        "trigger_at": None,
+        "trigger_reason": reason,
+        "mark_type": "counterfactual_mark_not_fill",
+        "limitation": reason,
+    }
+
+
+def _arm_metric(
+    arm_name: str,
+    arm: Mapping[str, Any],
+    results: Mapping[str, Mapping[str, Any]],
+    metric_name: str,
+) -> dict[str, Any]:
+    candidate_ids = [str(candidate_id) for candidate_id in arm["candidate_ids"]]
+    selected = [results[candidate_id] for candidate_id in candidate_ids]
+    values = [float(item[metric_name]) for item in selected if item.get("closed") and item.get(metric_name) is not None]
+    unresolved = [
+        str(item["candidate_id"])
+        for item in selected
+        if item.get("status") not in {"closed", "not_triggered"}
+    ]
+    not_triggered = [
+        str(item["candidate_id"])
+        for item in selected
+        if item.get("status") == "not_triggered"
+    ]
+    if unresolved:
+        status = "partial" if values else "unavailable"
+        reason = "candidate_outcomes_incomplete"
+    elif not values:
+        status = "unavailable"
+        reason = "no_closed_candidate_outcomes"
+    else:
+        status = "complete"
+        reason = None
+    return {
+        "arm": arm_name,
+        "selector": arm.get("selector"),
+        "candidate_ids": candidate_ids,
+        "rank_by_candidate": dict(arm.get("rank_by_candidate", {})),
+        "metric": metric_name,
+        "value": sum(values) / len(values) if values and status != "unavailable" else None,
+        "status": status,
+        "candidate_count": len(candidate_ids),
+        "closed_count": len(values),
+        "not_triggered_count": len(not_triggered),
+        "unavailable_candidate_ids": unresolved,
+        "reason": reason,
+    }
+
+
+def _comparison(
+    control: Mapping[str, Any],
+    treatment: Mapping[str, Any],
+    metric_name: str,
+) -> dict[str, Any]:
+    if control.get("status") == "complete" and treatment.get("status") == "complete":
+        difference = float(treatment["value"]) - float(control["value"])
+        return {
+            "metric": metric_name,
+            "status": "interpretable",
+            "control_value": control["value"],
+            "treatment_value": treatment["value"],
+            "difference": difference,
+            "direction": "treatment_minus_control",
+            "reason": None,
+        }
+    if control.get("value") is not None and treatment.get("value") is not None:
+        return {
+            "metric": metric_name,
+            "status": "partial",
+            "control_value": control["value"],
+            "treatment_value": treatment["value"],
+            "difference": None,
+            "direction": "treatment_minus_control",
+            "reason": "one_or_both_arm_metrics_are_partial",
+        }
+    return {
+        "metric": metric_name,
+        "status": "unavailable",
+        "control_value": control.get("value"),
+        "treatment_value": treatment.get("value"),
+        "difference": None,
+        "direction": "treatment_minus_control",
+        "reason": "arm_metric_unavailable",
+    }
+
+
 def _append_events(path: Path, events: Sequence[Mapping[str, Any]]) -> int:
     existing: dict[str, str] = {}
     if path.exists():
@@ -469,33 +616,94 @@ def observe_app_input(
     *,
     events_path: str | Path,
     output_path: str | Path | None = None,
+    market_data: ResearchMarketData | None = None,
 ) -> dict[str, Any]:
     payload = validate_app_input(raw)
     frozen = payload["frozen_candidates"]
-    scenarios = payload["observation"]["scenarios"]
+    observation_config = payload["observation"]
+    data_mode = observation_config.get("data_mode", "fixture")
+    metric_name = str(observation_config.get("metric", "net_r"))
+    if metric_name != "net_r":
+        raise ValueError(f"unsupported research metric: {metric_name}")
+    scenarios = observation_config["scenarios"]
     candidate_ids = list(frozen)
     results: dict[str, dict[str, Any]] = {}
     events: list[dict[str, Any]] = []
     for candidate_id in candidate_ids:
-        result, event = _observe_candidate(
-            str(payload["run_id"]),
-            candidate_id,
-            frozen[candidate_id],
-            scenarios[candidate_id],
-            str(payload["input_hash"]),
-        )
+        if data_mode == "prospective":
+            if market_data is None:
+                result, event = _missing_data_result(
+                    str(payload["run_id"]),
+                    candidate_id,
+                    frozen[candidate_id],
+                    str(payload["input_hash"]),
+                    "market_data_adapter_unavailable",
+                )
+            else:
+                bars = list(
+                    market_data.completed_bars(
+                        candidate_id,
+                        str(frozen[candidate_id]["symbol"]),
+                    )
+                )
+                if not bars:
+                    result, event = _missing_data_result(
+                        str(payload["run_id"]),
+                        candidate_id,
+                        frozen[candidate_id],
+                        str(payload["input_hash"]),
+                        "completed_bars_unavailable",
+                    )
+                else:
+                    scenario = {
+                        **dict(scenarios[candidate_id]),
+                        "bars": bars,
+                        "quotes": list(
+                            market_data.quotes(
+                                candidate_id,
+                                str(frozen[candidate_id]["symbol"]),
+                            )
+                        ),
+                    }
+                    result, event = _observe_candidate(
+                        str(payload["run_id"]),
+                        candidate_id,
+                        frozen[candidate_id],
+                        scenario,
+                        str(payload["input_hash"]),
+                    )
+        else:
+            result, event = _observe_candidate(
+                str(payload["run_id"]),
+                candidate_id,
+                frozen[candidate_id],
+                scenarios[candidate_id],
+                str(payload["input_hash"]),
+            )
         results[candidate_id] = result
         events.append(event)
     _append_events(Path(events_path).expanduser().resolve(), events)
     closed = [item for item in results.values() if item["closed"]]
     triggered = [item for item in results.values() if item["triggered"]]
-    metric_values = [float(item["net_r"]) for item in closed]
+    arm_metrics = {
+        name: _arm_metric(name, arm, results, metric_name)
+        for name, arm in payload["arms"].items()
+    }
+    comparison = _comparison(arm_metrics["control"], arm_metrics["treatment"], metric_name)
     limitations = list(payload.get("limitations", []))
     limitations.extend(
         f"{item['candidate_id']}:{item['reason']}"
         for item in results.values()
-        if item["reason"] in {"entry_quote_missing_or_ineligible", "exit_quote_missing_or_terminal_rule_not_hit"}
+        if item["status"] in {"missing_data", "open"}
     )
+    candidate_statuses = {item["status"] for item in results.values()}
+    unresolved = candidate_statuses - {"closed", "not_triggered"}
+    if unresolved:
+        status = "partial" if candidate_statuses & {"closed", "not_triggered"} else "inconclusive"
+    elif comparison["status"] == "interpretable":
+        status = "succeeded"
+    else:
+        status = "inconclusive"
     body: dict[str, Any] = {
         "schema": RUN_RECORD_SCHEMA,
         "experiment_id": payload["experiment_id"],
@@ -506,8 +714,13 @@ def observe_app_input(
         "inputs": {
             "candidate_pool_hash": payload["source"]["pool_hash"],
             "frozen_candidate_ids": candidate_ids,
+            "data_mode": data_mode,
             "arm_candidate_ids": {
                 name: list(arm["candidate_ids"]) for name, arm in payload["arms"].items()
+            },
+            "arm_ranks": {
+                name: dict(arm.get("rank_by_candidate", {}))
+                for name, arm in payload["arms"].items()
             },
         },
         "outputs": {
@@ -518,17 +731,14 @@ def observe_app_input(
         "observation": {
             "triggered": len(triggered),
             "closed": len(closed),
-            "primary_metric": sum(metric_values) / len(metric_values) if metric_values else None,
+            "metric": metric_name,
+            "primary_metric": comparison["difference"] if comparison["status"] == "interpretable" else None,
+            "arm_metrics": arm_metrics,
+            "comparison": comparison,
             "candidate_results": list(results.values()),
         },
-        "effects": {
-            "broker": 0,
-            "orders": 0,
-            "auth": 0,
-            "schedule": 0,
-            "external_send": 0,
-        },
-        "status": "succeeded" if not limitations[1:] else "partial",
+        "effects": dict(ZERO_EFFECTS),
+        "status": status,
         "limitations": limitations,
         "event_count": len(events),
     }
@@ -585,16 +795,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--events", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--historical-data",
+        type=Path,
+        help="optional local replay artifact for prospective inputs; never a broker adapter",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    market_data = (
+        HistoricalResearchMarketData.from_path(args.historical_data)
+        if args.historical_data is not None
+        else None
+    )
     try:
         run = observe_app_input(
             _read_json(args.input),
             events_path=args.events,
             output_path=args.output,
+            market_data=market_data,
         )
     except FileNotFoundError:
         run = _no_data_run(args.output, reason="app_input_missing")
