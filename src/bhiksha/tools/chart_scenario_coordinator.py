@@ -26,6 +26,7 @@ from bhiksha.chart_scenarios.cycle import (
     CYCLE_RECEIPT_SCHEMA,
     validate_cycle_input,
 )
+from bhiksha.chart_scenarios.observer import BrokerInertScenarioObserver
 from bhiksha.chart_scenarios.paths import require_experiment_path, run_artifact_paths
 from bhiksha.chart_scenarios.repository import (
     ScenarioEventRepository,
@@ -2666,22 +2667,27 @@ def _install_or_verify_plan(contract: Mapping[str, Any], paths: Any) -> dict[str
             or receipt.get("receipt_hash") != receipt_hash
         ):
             raise ValueError("existing run is not an exact idempotent plan replay")
-        return {
+        result = {
             "action": "install_shadow_plan",
             "status": "skipped",
             "reason": "exact_idempotent_replay",
             "receipt_hash": receipt_hash,
         }
-    install = install_shadow_plan(
-        source_payload,
-        output_path=paths.plan,
-        receipt_path=paths.install_receipt,
-    )
-    return {
-        "action": "install_shadow_plan",
-        "status": "succeeded",
-        "receipt_hash": install["receipt_hash"],
-    }
+    else:
+        install = install_shadow_plan(
+            source_payload,
+            output_path=paths.plan,
+            receipt_path=paths.install_receipt,
+        )
+        result = {
+            "action": "install_shadow_plan",
+            "status": "succeeded",
+            "receipt_hash": install["receipt_hash"],
+        }
+    installed_events = BrokerInertScenarioObserver(
+        ScenarioEventRepository(paths.database), plan=source_plan
+    ).install_plan()
+    return {**result, "installed_event_count": len(installed_events)}
 
 
 def _completed_phase_receipt(

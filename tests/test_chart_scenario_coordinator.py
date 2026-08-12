@@ -31,6 +31,7 @@ from bhiksha.tools.chart_scenario_coordinator import (
     _campaign_window_preflight,
     _completed_cycle_slot,
     _export_events,
+    _install_or_verify_plan,
     _phase,
     _prepare_daily_contract,
     _require_preopen_completion,
@@ -1415,6 +1416,47 @@ def test_bhiksha_stages_exact_contiguous_cycle_receipts_for_tradelab(
     escaped_generation.symlink_to(outside_generation)
     with pytest.raises(ValueError, match="not an immutable directory"):
         _validate_existing_staging_generation(escaped_generation, expected={})
+
+
+def test_plan_install_initializes_exact_idempotent_install_events(
+    tmp_path: Path,
+) -> None:
+    value = _contract(tmp_path)
+    plan = _plan()
+    value["run_id"] = plan.run_manifest["run_id"]
+    value["target_session_window"] = dict(
+        plan.cartographer_receipt["target_session_window"]
+    )
+    value["target_session_window_hash"] = plan.target_session_window_hash.removeprefix(
+        "sha256:"
+    )
+    value["plan_source"] = str(
+        Path(str(value["tradelab_experiment_root"]))
+        / "campaigns/campaign-1/runs/run-1/outputs/shadow-plan.json"
+    )
+    contract = value
+    plan_source = Path(str(contract["plan_source"]))
+    plan_source.parent.mkdir(parents=True)
+    plan_source.write_text(json.dumps(_bundle_payload()), encoding="utf-8")
+    root = tmp_path / "artifacts/chart_scenarios/runs/campaign-1/run-1"
+    paths = SimpleNamespace(
+        root=root,
+        plan=root / "active_shadow_plan.json",
+        install_receipt=root / "install.receipt.json",
+        database=root / "events.sqlite3",
+    )
+
+    first = _install_or_verify_plan(contract, paths)
+    second = _install_or_verify_plan(contract, paths)
+    events = ScenarioEventRepository(paths.database).events()
+
+    assert first["status"] == "succeeded"
+    assert first["installed_event_count"] == len(_plan().scenarios)
+    assert second["status"] == "skipped"
+    assert second["reason"] == "exact_idempotent_replay"
+    assert second["installed_event_count"] == 0
+    assert len(events) == len(_plan().scenarios)
+    assert all(event.event_type.value == "installed" for event in events)
 
 
 def test_failed_cycle_receipt_never_advances_completed_slot(tmp_path: Path) -> None:

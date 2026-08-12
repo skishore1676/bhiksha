@@ -80,6 +80,7 @@ class BrokerInertScenarioObserver:
             raise ValueError(f"unsupported trigger version: {trigger_version!r}")
         self.repository = repository
         sealed_plan = validate_bundle(plan.model_dump(mode="json"))
+        self.scenarios = tuple(sealed_plan.scenarios)
         sealed_source = ensure_read_only_quote_source(quote_source)
         self.quote_snapshots = (
             tuple(sealed_source.snapshots) if sealed_source is not None else ()
@@ -134,7 +135,42 @@ class BrokerInertScenarioObserver:
             }
         )
         self.trigger_version = trigger_version
+        self.market_facts_hash: str | None = None
         self.market_fact_proof: dict[str, Any] | None = None
+
+    def install_plan(self) -> tuple[Any, ...]:
+        """Persist the broker-inert installed lifecycle before observation."""
+
+        new_events: list[Any] = []
+        for scenario in self.scenarios:
+            self._validate_scenario_policies(scenario)
+            self._install_scenario(new_events, scenario)
+        return tuple(new_events)
+
+    def _install_scenario(
+        self, events: list[Any], scenario: ChartScenarioSpec
+    ) -> None:
+        is_new = self.repository.register_scenario(
+            scenario,
+            self.trigger_version,
+            plan_hash=self.plan_hash,
+            policy_registry_hash=self.policy_registry_hash,
+            treatment_hash=self.treatment_hash,
+        )
+        if is_new:
+            self._record(
+                events,
+                scenario,
+                ShadowEventType.INSTALLED,
+                event_time=scenario.observation_window.start_at,
+                market_observation_id="install-" + scenario.scenario_hash[:24],
+                role="installed",
+                details=self._details(
+                    scenario,
+                    {"status": "installed", "reason": "validated_shadow_plan"},
+                ),
+                state_updates={"status": "installed"},
+            )
 
     def observe_one(
         self,
@@ -331,27 +367,7 @@ class BrokerInertScenarioObserver:
                 evaluated_at=timestamp_json(now),
             )
             observation_id = str(self.market_fact_proof["slot_id"])
-            is_new = self.repository.register_scenario(
-                scenario,
-                self.trigger_version,
-                plan_hash=self.plan_hash,
-                policy_registry_hash=self.policy_registry_hash,
-                treatment_hash=self.treatment_hash,
-            )
-            if is_new:
-                self._record(
-                    new_events,
-                    scenario,
-                    ShadowEventType.INSTALLED,
-                    event_time=scenario.observation_window.start_at,
-                    market_observation_id="install-" + scenario.scenario_hash[:24],
-                    role="installed",
-                    details=self._details(
-                        scenario,
-                        {"status": "installed", "reason": "validated_shadow_plan"},
-                    ),
-                    state_updates={"status": "installed"},
-                )
+            self._install_scenario(new_events, scenario)
 
             state = self.repository.get_state(scenario, self.trigger_version)
             if state is None:

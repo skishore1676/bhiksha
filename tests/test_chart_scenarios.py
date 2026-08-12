@@ -766,6 +766,33 @@ def test_run_artifact_paths_never_pool_two_daily_event_chains(tmp_path: Path) ->
     assert ScenarioEventRepository(second.database).events() == []
 
 
+def test_plan_installation_records_lifecycle_before_first_observation(
+    tmp_path: Path,
+) -> None:
+    database = (
+        tmp_path
+        / "artifacts"
+        / "chart_scenarios"
+        / "runs"
+        / "campaign-1"
+        / "run-2026-08-04"
+        / "events.sqlite3"
+    )
+    repository = ScenarioEventRepository(database)
+    observer = _observer(repository)
+
+    created = observer.install_plan()
+
+    assert len(created) == len(_plan().scenarios)
+    assert [event.event_type.value for event in created] == [
+        "installed"
+    ] * len(created)
+    assert all(event.broker_effect_count == 0 for event in created)
+    assert all(event.details["reason"] == "validated_shadow_plan" for event in created)
+    assert observer.install_plan() == ()
+    assert repository.event_count() == len(_plan().scenarios)
+
+
 def test_frozen_option_policy_drives_canonical_short_put_selection() -> None:
     policy = _option_selection_policy()
     request = OptionSelectionRequest(
