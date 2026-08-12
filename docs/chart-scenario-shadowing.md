@@ -154,9 +154,11 @@ proofs rather than an invented current-slot market proof.
 The experiment is one governed campaign with a new immutable run each target
 session. Daily Chartographer/TradeLab inputs are executions of that experiment;
 they are not automatically new experiment versions. A treatment change—such as
-a changed chart reader, ranker prompt/model, frozen exit profile, cost model, or
-narrative influence—requires a new campaign/version rather than silently
-changing a daily run.
+a changed chart reader, ranker prompt or execution contract, frozen exit
+profile, cost model, or narrative influence—requires a new campaign/version
+rather than silently changing a daily run. The ranker treatment freezes the governed Agent Broker
+hire, prompt, tool boundary, and output contract—not one provider/model. The
+realized route and fallback state remain receipt evidence.
 
 Bhiksha owns one opt-in launchd job, `com.bhiksha.chart-scenario-shadow`. It is
 disabled unless the installer is run with

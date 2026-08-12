@@ -357,6 +357,78 @@ def _plan():
     return validate_bundle(_bundle_payload())
 
 
+def test_governed_arm_b_accepts_realized_agent_broker_fallback() -> None:
+    payload = _bundle_payload()
+    treatment = dict(payload["treatment_manifest"])
+    treatment.pop("content_hash")
+    treatment["treatment_version"] = "fixture-v2"
+    treatment["ranker"] = {
+        "routing_contract": "agent_broker_governed",
+        "lane_id": "market_context_ranker",
+        "actor": "actors.market_context_ranker",
+        "prompt_contract_path": "fixture",
+        "prompt_contract_sha256": "a" * 64,
+        "maximum": 10,
+    }
+    treatment = {
+        **treatment,
+        "content_hash": "sha256:" + canonical_sha256(treatment),
+    }
+    payload["treatment_manifest"] = treatment
+    payload["treatment_manifest_hash"] = treatment["content_hash"]
+
+    campaign = dict(payload["campaign_manifest"])
+    campaign.pop("content_hash")
+    campaign["treatment_manifest"] = treatment
+    campaign["treatment_manifest_hash"] = treatment["content_hash"]
+    campaign = {
+        **campaign,
+        "content_hash": "sha256:" + canonical_sha256(campaign),
+    }
+    payload["campaign_manifest"] = campaign
+    payload["campaign_manifest_hash"] = campaign["content_hash"]
+
+    run = dict(payload["run_manifest"])
+    run.pop("content_hash")
+    run["treatment_manifest_hash"] = treatment["content_hash"]
+    run = {**run, "content_hash": "sha256:" + canonical_sha256(run)}
+    payload["run_manifest"] = run
+    payload["run_manifest_hash"] = run["content_hash"]
+
+    broker_receipt = {
+        "status": "succeeded",
+        "provider_id": "claude",
+        "usage": {"model": "sonnet"},
+        "degraded": True,
+    }
+    selector = dict(payload["arm_b_selector_receipt"])
+    selector.pop("content_hash")
+    selector.update(
+        {
+            "status": "succeeded",
+            "execution_mode": "agent_broker",
+            "provider_id": "claude",
+            "model_id": "sonnet",
+            "agent_broker_receipt": broker_receipt,
+            "agent_broker_receipt_hash": "sha256:"
+            + canonical_sha256(broker_receipt),
+            "run_comparable": True,
+            "non_comparable_reason": None,
+        }
+    )
+    selector = {
+        **selector,
+        "content_hash": "sha256:" + canonical_sha256(selector),
+    }
+    payload["arm_b_selector_receipt"] = selector
+    payload["arm_b_selector_receipt_hash"] = selector["content_hash"]
+
+    plan = validate_bundle(payload)
+    assert plan.arm_b_selector_receipt["provider_id"] == "claude"
+    assert plan.arm_b_selector_receipt["model_id"] == "sonnet"
+    assert plan.arm_b_selector_receipt["run_comparable"] is True
+
+
 def _cycle_input(plan=None, *, slot: int = 1) -> dict:
     active_plan = plan or _plan()
     candidates = []

@@ -627,11 +627,14 @@ class ShadowPlan(BaseModel):
             != arm_b.selection_hash
             or any(
                 selector_receipt.get(field) != frozen_ranker.get(field)
-                for field in (
-                    "provider_id",
-                    "model_id",
-                    "prompt_contract_sha256",
-                    "maximum",
+                for field in ("prompt_contract_sha256", "maximum")
+            )
+            or (
+                frozen_ranker.get("routing_contract")
+                != "agent_broker_governed"
+                and any(
+                    selector_receipt.get(field) != frozen_ranker.get(field)
+                    for field in ("provider_id", "model_id")
                 )
             )
         ):
@@ -640,6 +643,30 @@ class ShadowPlan(BaseModel):
         broker_receipt = selector_receipt.get("agent_broker_receipt")
         broker_receipt_hash = selector_receipt.get("agent_broker_receipt_hash")
         if execution_mode == "agent_broker":
+            usage = (
+                broker_receipt.get("usage")
+                if isinstance(broker_receipt, Mapping)
+                else None
+            )
+            outputs = (
+                broker_receipt.get("outputs")
+                if isinstance(broker_receipt, Mapping)
+                else None
+            )
+            realized_model = (
+                broker_receipt.get("model")
+                if isinstance(broker_receipt, Mapping)
+                else None
+            )
+            if realized_model is None and isinstance(usage, Mapping):
+                realized_model = usage.get("model")
+            if realized_model is None and isinstance(outputs, Mapping):
+                realized_model = outputs.get("model")
+            realized_provider = (
+                broker_receipt.get("provider_id")
+                if isinstance(broker_receipt, Mapping)
+                else None
+            )
             if (
                 selector_receipt.get("status") != "succeeded"
                 or selector_receipt.get("run_comparable") is not True
@@ -647,6 +674,12 @@ class ShadowPlan(BaseModel):
                 or not isinstance(broker_receipt, Mapping)
                 or str(broker_receipt_hash).removeprefix("sha256:")
                 != canonical_sha256(broker_receipt)
+                or not isinstance(realized_provider, str)
+                or not realized_provider.strip()
+                or not isinstance(realized_model, str)
+                or not realized_model.strip()
+                or selector_receipt.get("provider_id") != realized_provider
+                or selector_receipt.get("model_id") != realized_model
             ):
                 raise BundleValidationError("invalid comparable Arm B selector receipt")
         elif execution_mode == "deterministic_plumbing_canary":
