@@ -122,7 +122,10 @@ def test_send_lathi_alert_passes_telegram_presentation_flags(monkeypatch) -> Non
 
 
 def test_send_lathi_alert_live_mode_requires_network_call(monkeypatch) -> None:
+    calls = []
+
     def fake_run(args, **kwargs):
+        calls.append(args)
         return subprocess.CompletedProcess(
             args,
             0,
@@ -142,6 +145,72 @@ def test_send_lathi_alert_live_mode_requires_network_call(monkeypatch) -> None:
     assert result.ok is False
     assert result.return_code == 0
     assert result.network_call_performed is False
+    assert result.failure_stage == "live_delivery_unconfirmed"
+    assert result.transport_status == "degraded"
+    assert result.attempt_count == 1
+    assert len(calls) == 1
+
+
+def test_send_lathi_alert_recovers_after_transient_timeout(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout='{"live_send_requested": true, "network_call_performed": true}',
+            stderr="",
+        )
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = send_lathi_alert(
+        title="Session report",
+        body="GREEN",
+        mode="live",
+        command=["lathi-bus"],
+        max_attempts=3,
+        retry_delay_seconds=0,
+    )
+
+    assert result.ok is True
+    assert result.transport_status == "recovered"
+    assert result.recovered_after_retry is True
+    assert result.attempt_count == 2
+    assert result.max_attempts == 3
+    assert len(calls) == 2
+    assert calls[0][calls[0].index("--message-id") + 1] == calls[1][
+        calls[1].index("--message-id") + 1
+    ]
+
+
+def test_send_lathi_alert_calls_out_retry_exhaustion(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr("bhiksha.ops.alerts.subprocess.run", fake_run)
+
+    result = send_lathi_alert(
+        title="Session report",
+        body="GREEN",
+        mode="live",
+        command=["lathi-bus"],
+        max_attempts=3,
+        retry_delay_seconds=0,
+    )
+
+    assert result.ok is False
+    assert result.transport_status == "degraded"
+    assert result.retry_exhausted is True
+    assert result.failure_stage == "transport_timeout"
+    assert result.attempt_count == 3
+    assert len(calls) == 3
 
 
 def test_default_lathi_invocation_prefers_checkout_venv(monkeypatch, tmp_path) -> None:

@@ -89,6 +89,16 @@ and a pointer to the full markdown report. The markdown artifact remains the
 long-form source for full strategy evidence, raw relaxed-gate details, lifecycle
 events, and risk-rail audit lines.
 
+All Bhiksha-owned Lathi alerts use the shared `send_lathi_alert` boundary. Live
+delivery gets three bounded attempts by default, with a stable message ID across
+those attempts and a caller timeout longer than Lathi Bus's network timeout.
+Receipts distinguish `delivered`, `recovered`, and `degraded`, and record the
+attempt count plus the failing stage. A generated session report remains domain
+`GREEN`/`YELLOW`/`RED` even if alert delivery is degraded; exhausted retries or
+a non-retryable transport error create a separate Control Tower finding. This
+prevents a transient Telegram timeout from masquerading as a trading-engine
+failure while still making final delivery failure explicit.
+
 ## Manual Runs
 
 All labels use one runner:

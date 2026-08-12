@@ -146,6 +146,110 @@ def test_launchd_status_distinguishes_domain_and_transport(
     assert snapshot["transport"]["status"] == "degraded"
 
 
+def test_launchd_status_names_exhausted_transport_recovery(
+    monkeypatch, tmp_path
+) -> None:
+    write_latest_status(
+        tmp_path,
+        {
+            "job": "session-report",
+            "status": "ok",
+            "report_status": {"level": "GREEN", "reason": "ok"},
+            "alert": {
+                "attempted": True,
+                "ok": False,
+                "mode": "live",
+                "transport_status": "degraded",
+                "attempt_count": 3,
+                "max_attempts": 3,
+                "retry_exhausted": True,
+                "failure_stage": "transport_timeout",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state",
+        lambda **kwargs: {
+            "com.bhiksha.session-report": {"available": True, "loaded": True}
+        },
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._stale_last_run_findings",
+        lambda *args, **kwargs: [],
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 8, 12, 16, 0, tzinfo=UTC),
+    )
+    session_job = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "session-report"
+    )
+
+    assert session_job["last"]["domain"]["ok"] is True
+    assert session_job["last"]["transport"]["retry_exhausted"] is True
+    assert session_job["lifecycle"] == "stuck"
+    assert session_job["findings"] == [
+        "Alert transport retries exhausted after 3 attempts at transport_timeout; "
+        "the Bhiksha domain result is unchanged."
+    ]
+
+
+def test_launchd_status_records_transport_recovered_after_retry(
+    monkeypatch, tmp_path
+) -> None:
+    write_latest_status(
+        tmp_path,
+        {
+            "job": "session-report",
+            "status": "ok",
+            "report_status": {"level": "GREEN", "reason": "ok"},
+            "alert": {
+                "attempted": True,
+                "ok": True,
+                "mode": "live",
+                "transport_status": "recovered",
+                "attempt_count": 2,
+                "max_attempts": 3,
+                "recovered_after_retry": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state",
+        lambda **kwargs: {
+            "com.bhiksha.session-report": {"available": True, "loaded": True}
+        },
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._stale_last_run_findings",
+        lambda *args, **kwargs: [],
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 8, 12, 16, 0, tzinfo=UTC),
+    )
+    session_job = next(
+        job for job in snapshot["jobs"] if job["runner_job"] == "session-report"
+    )
+
+    assert session_job["last"]["transport"]["status"] == "recovered"
+    assert session_job["last"]["transport"]["attempt_count"] == 2
+    assert session_job["findings"] == []
+    assert session_job["lifecycle"] == "armed"
+
+
 def test_yellow_session_report_without_operator_gate_stays_out_of_attention(
     monkeypatch, tmp_path
 ) -> None:
@@ -516,7 +620,14 @@ def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery
     latest_status_path(tmp_path).parent.mkdir(parents=True)
     latest_status_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(
-        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+        "bhiksha.tools.launchd_status._launchd_state",
+        lambda **kwargs: {
+            "com.bhiksha.live-start": {
+                "available": True,
+                "loaded": True,
+                "last_exit_code": "2",
+            }
+        },
     )
     monkeypatch.setattr(
         "bhiksha.tools.launchd_status._runtime_status",
@@ -540,8 +651,9 @@ def test_launchd_status_keeps_failed_start_stuck_without_later_watchdog_recovery
         job for job in snapshot["jobs"] if job["runner_job"] == "live-start"
     )
 
-    assert live_start["lifecycle"] is None
-    assert live_start["findings"] == ["Domain health failed: failed"]
+    assert live_start["lifecycle"] == "stuck"
+    assert live_start["findings"][0] == "Domain health failed: failed"
+    assert any("launchd job failed" in finding for finding in live_start["findings"])
     assert "summary" not in live_start
     assert "details" not in live_start
 

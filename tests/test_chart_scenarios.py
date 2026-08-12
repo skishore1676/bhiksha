@@ -2639,11 +2639,13 @@ def test_new_package_import_graph_has_no_money_path_imports() -> None:
 def test_cli_install_observe_and_status_are_read_only_fixture_commands(
     tmp_path: Path,
 ) -> None:
+    import mala_bhiksha_kernel
+
     root = Path(__file__).parents[1]
-    kernel = root.parent / "kernel-market-context"
+    kernel_src = Path(mala_bhiksha_kernel.__file__).resolve().parents[1]
     env = {
         **dict(__import__("os").environ),
-        "PYTHONPATH": f"{root / 'src'}:{kernel / 'src'}",
+        "PYTHONPATH": f"{root / 'src'}:{kernel_src}",
     }
     bundle_path = tmp_path / "bundle.json"
     plan_path = tmp_path / "artifacts" / "chart_scenarios" / "active_shadow_plan.json"

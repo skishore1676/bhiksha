@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
+from bhiksha.ops.alerts import AlertResult
+from bhiksha.ops.daily_report import DailyReportWriteResult
 from bhiksha.tools import launchd_job
 
 
@@ -29,6 +31,79 @@ def test_report_attention_uses_error_level() -> None:
             }
         }
     ) == "error"
+
+
+def test_session_report_keeps_green_domain_when_delivery_retries_exhausted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    payloads: list[dict] = []
+    pid_path = tmp_path / "runtime" / "bhiksha.pid"
+    runtime_status = {
+        "action": "status",
+        "running": True,
+        "live": True,
+        "pid": 4321,
+        "pid_path": str(pid_path),
+    }
+    observed_pid_paths: list[Path] = []
+    report_result = DailyReportWriteResult(
+        report={
+            "trading_date": "2026-08-12",
+            "status": {"level": "GREEN", "reason": "ok", "attention_required": False},
+        },
+        json_path=tmp_path / "report.json",
+        markdown_path=tmp_path / "report.md",
+    )
+    runtime = SimpleNamespace(
+        app_config=SimpleNamespace(
+            sqlite_path=str(tmp_path / "bhiksha.db"),
+            playbook_artifacts_dir=str(tmp_path / "artifacts"),
+        ),
+        deployments=[],
+    )
+
+    monkeypatch.setenv("BHIKSHA_RUNTIME_PID_PATH", str(pid_path))
+    monkeypatch.setattr(launchd_job, "build_runtime", lambda **kwargs: runtime)
+    monkeypatch.setattr(
+        "bhiksha.tools.server_session._runtime_status",
+        lambda path: observed_pid_paths.append(path) or runtime_status,
+    )
+    monkeypatch.setattr(launchd_job, "write_daily_report", lambda *args, **kwargs: report_result)
+    monkeypatch.setattr(launchd_job, "render_daily_report_ryg_telegram_html", lambda *args, **kwargs: "GREEN")
+    monkeypatch.setattr(
+        launchd_job,
+        "send_lathi_alert",
+        lambda **kwargs: AlertResult(
+            attempted=True,
+            ok=False,
+            mode="live",
+            transport_status="degraded",
+            attempt_count=3,
+            max_attempts=3,
+            retry_exhausted=True,
+            failure_stage="transport_timeout",
+        ),
+    )
+    monkeypatch.setattr(launchd_job, "_publish_session_report_review", lambda *args: None)
+    monkeypatch.setattr(launchd_job, "_print_result", payloads.append)
+
+    result = launchd_job._session_report_job(
+        SimpleNamespace(
+            job="session-report",
+            report_label="close",
+            active_plan="active-plan.json",
+            alert_mode="live",
+            alert_profile="bhiksha-northstar",
+        )
+    )
+
+    assert result == 0
+    assert observed_pid_paths == [pid_path]
+    assert payloads[0]["status"] == "ok"
+    assert payloads[0]["report_status"]["level"] == "GREEN"
+    assert payloads[0]["transport_status"] == "degraded"
+    assert payloads[0]["alert"]["retry_exhausted"] is True
+    assert payloads[0]["app_status"] == runtime_status
 
 
 def test_live_watchdog_requests_fresh_plan_before_recovery_start(

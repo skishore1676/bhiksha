@@ -38,6 +38,27 @@ def _minimal_deployment(deployment_id: str, symbol: str, *, metadata: dict | Non
     )
 
 
+def test_write_daily_report_persists_runtime_probe_in_canonical_json(tmp_path) -> None:
+    app_status = {
+        "action": "status",
+        "running": True,
+        "live": True,
+        "pid": 4321,
+        "pid_path": str(tmp_path / "bhiksha.pid"),
+    }
+
+    result = write_daily_report(
+        tmp_path / "missing.db",
+        output_dir=tmp_path / "reports",
+        trading_date="2026-08-12",
+        app_status=app_status,
+    )
+
+    persisted = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert result.report["app_status"] == app_status
+    assert persisted["app_status"] == app_status
+
+
 def test_daily_report_summarizes_trades_provider_health_and_data_quality(tmp_path) -> None:
     db_path = tmp_path / "bhiksha.db"
     backend = SQLiteBackend(str(db_path))

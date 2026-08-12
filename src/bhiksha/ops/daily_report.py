@@ -61,6 +61,10 @@ def write_daily_report(
     schwab_status: dict[str, Any] | None = None,
 ) -> DailyReportWriteResult:
     report = build_daily_report(db_path, trading_date=trading_date, deployments=deployments)
+    # Keep the exact best-effort runtime probe in the canonical JSON. The RYG
+    # renderer is only a projection; without this field a later investigation
+    # cannot distinguish stopped, running, and probe-failed states.
+    report["app_status"] = dict(app_status) if isinstance(app_status, dict) else None
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     day = report["trading_date"]
@@ -1554,6 +1558,8 @@ def _signal_funnel_by_lane(report: dict[str, Any]) -> dict[str, dict[str, int]]:
 def _app_running_row(report: dict[str, Any], *, app_status: dict[str, Any] | None = None) -> tuple[str, str, str, str]:
     if app_status is None:
         return ("App running", "unknown", _ryg("NO_DATA"), "no runtime probe")
+    if app_status.get("running") is None or app_status.get("detail") == "runtime_probe_failed":
+        return ("App running", "unknown", _ryg("RED"), "runtime probe failed")
     running = bool(app_status.get("running"))
     live = bool(app_status.get("live"))
     pid = app_status.get("pid")

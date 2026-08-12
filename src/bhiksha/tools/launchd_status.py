@@ -158,7 +158,13 @@ def build_status_snapshot(
                     else "armed"
                     if not spec.install_enabled() or not bool(launchd.get(spec.label, {}).get("loaded"))
                     else "stuck"
-                    if findings and any("launchd job failed" in f or "stale_last_run" in f for f in findings)
+                    if findings
+                    and any(
+                        "launchd job failed" in f
+                        or "stale_last_run" in f
+                        or "alert transport" in f.lower()
+                        for f in findings
+                    )
                     else "waiting_you"
                     if findings
                     else None
@@ -513,11 +519,29 @@ def _action_requirements(actions: tuple[str, ...]) -> dict[str, dict[str, Any]]:
 def _job_findings(last: dict[str, Any] | None) -> list[str]:
     if not isinstance(last, dict):
         return []
+    findings: list[str] = []
+    alert = last.get("alert") if isinstance(last.get("alert"), dict) else {}
+    if alert.get("retry_exhausted") is True:
+        attempts = alert.get("attempt_count")
+        stage = alert.get("failure_stage") or "transport"
+        findings.append(
+            f"Alert transport retries exhausted after {attempts or 'all'} attempts at {stage}; "
+            "the Bhiksha domain result is unchanged."
+        )
+    elif (
+        alert.get("attempted") is True
+        and alert.get("ok") is False
+        and alert.get("failure_stage")
+    ):
+        findings.append(
+            f"Alert transport failed at {alert['failure_stage']}; "
+            "the Bhiksha domain result is unchanged."
+        )
     domain = last.get("domain") if isinstance(last.get("domain"), dict) else {}
     if domain.get("attention_required") is False:
-        return []
+        return findings
     if domain.get("ok") is not False:
-        return []
+        return findings
     failure_kind = str(domain.get("failure_kind") or "")
     status = str(domain.get("status") or "unknown")
     messages = {
@@ -528,14 +552,17 @@ def _job_findings(last: dict[str, Any] | None) -> list[str]:
         "schwab_access_refresh_failed": "Schwab access-token refresh failed.",
     }
     if failure_kind in messages:
-        return [messages[failure_kind]]
+        return [*findings, messages[failure_kind]]
     if status == "refresh_token_expired":
-        return ["Schwab authentication expired; renewal is required."]
+        return [*findings, "Schwab authentication expired; renewal is required."]
     if status == "refresh_token_near_expiry":
-        return ["Schwab authentication will not survive the next trading session."]
+        return [*findings, "Schwab authentication will not survive the next trading session."]
     if status == "needs_human":
-        return ["Entry reconciliation could not finish safely; the affected deployment remains blocked."]
-    return [f"Domain health failed: {status}"]
+        return [
+            *findings,
+            "Entry reconciliation could not finish safely; the affected deployment remains blocked.",
+        ]
+    return [*findings, f"Domain health failed: {status}"]
 
 
 def _launchd_exit_findings(
@@ -805,7 +832,11 @@ def _transport_health(alert: dict[str, Any] | None) -> dict[str, Any]:
     if not attempted:
         status = "not_attempted"
     elif ok is True:
-        status = "delivered"
+        status = (
+            "recovered"
+            if alert.get("recovered_after_retry") is True
+            else "delivered"
+        )
     else:
         status = "degraded"
     return {
@@ -815,6 +846,11 @@ def _transport_health(alert: dict[str, Any] | None) -> dict[str, Any]:
         "mode": alert.get("mode"),
         "network_call_performed": alert.get("network_call_performed"),
         "return_code": alert.get("return_code"),
+        "attempt_count": alert.get("attempt_count"),
+        "max_attempts": alert.get("max_attempts"),
+        "recovered_after_retry": alert.get("recovered_after_retry"),
+        "retry_exhausted": alert.get("retry_exhausted"),
+        "failure_stage": alert.get("failure_stage"),
     }
 
 
@@ -838,6 +874,13 @@ def _alert_summary(alert: dict[str, Any] | None) -> dict[str, Any] | None:
         "return_code": alert.get("return_code"),
         "live_send_requested": alert.get("live_send_requested"),
         "network_call_performed": alert.get("network_call_performed"),
+        "transport_status": alert.get("transport_status"),
+        "attempt_count": alert.get("attempt_count"),
+        "max_attempts": alert.get("max_attempts"),
+        "recovered_after_retry": alert.get("recovered_after_retry"),
+        "retry_exhausted": alert.get("retry_exhausted"),
+        "failure_stage": alert.get("failure_stage"),
+        "message_id": alert.get("message_id"),
         "error": alert.get("error"),
     }
 

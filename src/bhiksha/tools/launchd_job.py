@@ -274,27 +274,24 @@ def _session_report_job(args: argparse.Namespace) -> int:
     schwab_status: dict[str, Any] | None = None
     try:
         from bhiksha.tools.server_session import _runtime_status as _get_runtime_status
-        import json as _json
 
-        raw = _get_runtime_status(runtime.app_config.sqlite_path)  # fallback path
-        # _runtime_status expects repo_root; try direct probe via server_session tool
-        import subprocess as _sp
-        import sys as _sys
-
-        repo_root = Path(__file__).resolve().parents[2]
-        py = str(repo_root / ".venv" / "bin" / "python") if (repo_root / ".venv" / "bin" / "python").exists() else _sys.executable
-        cp = _sp.run(
-            [py, "-m", "bhiksha.tools.server_session", "status"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-        for line in cp.stdout.splitlines():
-            if line.startswith("RUNTIME_STATUS="):
-                app_status = _json.loads(line.split("=", 1)[1])
-                break
-    except Exception:
-        app_status = None
+        repo_root = Path(__file__).resolve().parents[3]
+        pid_path = Path(
+            os.getenv(
+                "BHIKSHA_RUNTIME_PID_PATH",
+                "artifacts/playbook/runtime/bhiksha.pid",
+            )
+        ).expanduser()
+        if not pid_path.is_absolute():
+            pid_path = repo_root / pid_path
+        app_status = _get_runtime_status(pid_path)
+    except Exception as exc:  # noqa: BLE001 - report remains available with explicit probe failure.
+        app_status = {
+            "action": "status",
+            "running": None,
+            "detail": "runtime_probe_failed",
+            "error": str(exc),
+        }
     try:
         schwab_path = Path(runtime.app_config.playbook_artifacts_dir) / "schwab_token_guard" / "latest.json"
         if schwab_path.is_file():
@@ -326,22 +323,29 @@ def _session_report_job(args: argparse.Namespace) -> int:
         profile=args.alert_profile,
         template="status",
         link_preview="disabled",
+        message_id=(
+            f"bhiksha-session-report-{result.report.get('trading_date')}-{report_label}"
+        ),
     )
     review = _publish_session_report_review(args, result, report_label)
-    ok = alert.ok or args.alert_mode == "off"
     payload: dict = {
         "job": args.job,
-        "status": "ok" if ok else "failed",
+        # Report generation and transport delivery are separate contracts. A
+        # degraded Telegram delivery must not rewrite a valid domain report as
+        # a failed Bhiksha job; Control Tower reads the alert receipt below.
+        "status": "ok",
         "report_label": report_label,
         "report_json": str(result.json_path),
         "report_markdown": str(result.markdown_path),
         "report_status": result.report.get("status"),
+        "app_status": app_status,
+        "transport_status": alert.transport_status,
         "alert": alert.to_dict(),
     }
     if review is not None:
         payload["obsidian_review"] = review.to_dict()
     _print_result(payload)
-    return 0 if ok else 2
+    return 0
 
 
 def _reconciliation_supervisor_job(args: argparse.Namespace, *, repo_root: Path) -> int:

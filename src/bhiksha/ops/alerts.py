@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any, Literal
 
 AlertMode = Literal["off", "spool", "live"]
@@ -35,6 +37,13 @@ class AlertResult:
     stdout_tail: str = ""
     stderr_tail: str = ""
     error: str | None = None
+    transport_status: str = "not_attempted"
+    attempt_count: int = 0
+    max_attempts: int = 0
+    recovered_after_retry: bool = False
+    retry_exhausted: bool = False
+    failure_stage: str | None = None
+    message_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -78,6 +87,9 @@ def send_lathi_alert(
     command: list[str] | None = None,
     cwd: str | Path | None = None,
     timeout_seconds: float | None = None,
+    max_attempts: int | None = None,
+    retry_delay_seconds: float | None = None,
+    message_id: str | None = None,
 ) -> AlertResult:
     """Send a short operator alert through Lathi Bus.
 
@@ -86,23 +98,33 @@ def send_lathi_alert(
     notice that Bhiksha could not make progress.
     """
     if mode == "off":
-        return AlertResult(mode="off")
+        return AlertResult(mode="off", transport_status="off")
 
     profile = profile or os.getenv("BHIKSHA_LATHI_PROFILE", "bhiksha-northstar")
     if command is None:
         command, cwd = _default_lathi_invocation(cwd)
     cwd_path = Path(cwd).expanduser() if cwd else None
+    decorated_title = _decorate_title(title, level)
+    decorated_body = _redact(_decorate_body(body, level))
+    resolved_message_id = message_id or _alert_message_id(
+        title=decorated_title,
+        body=decorated_body,
+        level=level,
+        profile=profile,
+    )
     args = [
         *command,
         "telegram-notify",
         "--profile",
         profile,
         "--title",
-        _decorate_title(title, level),
+        decorated_title,
         "--body",
-        _redact(_decorate_body(body, level)),
+        decorated_body,
         "--level",
         level,
+        "--message-id",
+        resolved_message_id,
     ]
     if template:
         args.extend(["--template", template])
@@ -113,48 +135,114 @@ def send_lathi_alert(
     if mode == "live":
         args.append("--live")
 
-    try:
-        env = os.environ.copy()
-        _populate_secret_fallbacks(env)
-        completed = subprocess.run(  # noqa: S603
-            args,
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(cwd_path) if cwd_path else None,
-            env=env,
-            timeout=timeout_seconds or float(os.getenv("BHIKSHA_ALERT_TIMEOUT_SECONDS", "30")),
+    env = os.environ.copy()
+    _populate_secret_fallbacks(env)
+    resolved_max_attempts = _alert_max_attempts(mode, max_attempts)
+    resolved_timeout = timeout_seconds or float(
+        os.getenv("BHIKSHA_ALERT_TIMEOUT_SECONDS", "80")
+    )
+    resolved_retry_delay = (
+        retry_delay_seconds
+        if retry_delay_seconds is not None
+        else float(os.getenv("BHIKSHA_ALERT_RETRY_DELAY_SECONDS", "2"))
+    )
+    last_result = AlertResult(
+        attempted=True,
+        ok=False,
+        mode=mode,
+        command=args,
+        cwd=str(cwd_path) if cwd_path else None,
+        transport_status="degraded",
+        max_attempts=resolved_max_attempts,
+        message_id=resolved_message_id,
+    )
+    for attempt in range(1, resolved_max_attempts + 1):
+        try:
+            completed = subprocess.run(  # noqa: S603
+                args,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(cwd_path) if cwd_path else None,
+                env=env,
+                timeout=resolved_timeout,
+            )
+        except Exception as exc:
+            retryable = _retryable_alert_exception(exc)
+            last_result = AlertResult(
+                attempted=True,
+                ok=False,
+                mode=mode,
+                command=args,
+                cwd=str(cwd_path) if cwd_path else None,
+                error=_redact(str(exc)),
+                transport_status="retrying" if retryable and attempt < resolved_max_attempts else "degraded",
+                attempt_count=attempt,
+                max_attempts=resolved_max_attempts,
+                retry_exhausted=retryable and attempt >= resolved_max_attempts,
+                failure_stage="transport_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "transport_invocation",
+                message_id=resolved_message_id,
+            )
+            if not retryable or attempt >= resolved_max_attempts:
+                return last_result
+            _sleep_before_alert_retry(resolved_retry_delay, attempt)
+            continue
+
+        receipt = _parse_lathi_receipt(completed.stdout)
+        live_send_requested = _optional_bool(receipt.get("live_send_requested"))
+        network_call_performed = _optional_bool(receipt.get("network_call_performed"))
+        ok = completed.returncode == 0
+        if mode == "live":
+            ok = ok and network_call_performed is True
+        if ok:
+            return AlertResult(
+                attempted=True,
+                ok=True,
+                mode=mode,
+                command=args,
+                cwd=str(cwd_path) if cwd_path else None,
+                return_code=completed.returncode,
+                live_send_requested=live_send_requested,
+                network_call_performed=network_call_performed,
+                stdout_tail=_tail(_redact(completed.stdout)),
+                stderr_tail=_tail(_redact(completed.stderr)),
+                transport_status="recovered" if attempt > 1 else "delivered",
+                attempt_count=attempt,
+                max_attempts=resolved_max_attempts,
+                recovered_after_retry=attempt > 1,
+                message_id=resolved_message_id,
+            )
+
+        retryable = _retryable_alert_process_failure(completed)
+        failure_stage = (
+            "live_delivery_unconfirmed"
+            if completed.returncode == 0 and mode == "live"
+            else "transport_process"
         )
-    except Exception as exc:
-        return AlertResult(
+        last_result = AlertResult(
             attempted=True,
             ok=False,
             mode=mode,
             command=args,
             cwd=str(cwd_path) if cwd_path else None,
-            error=_redact(str(exc)),
+            return_code=completed.returncode,
+            live_send_requested=live_send_requested,
+            network_call_performed=network_call_performed,
+            stdout_tail=_tail(_redact(completed.stdout)),
+            stderr_tail=_tail(_redact(completed.stderr)),
+            error=_alert_process_error(completed, mode=mode),
+            transport_status="retrying" if retryable and attempt < resolved_max_attempts else "degraded",
+            attempt_count=attempt,
+            max_attempts=resolved_max_attempts,
+            retry_exhausted=retryable and attempt >= resolved_max_attempts,
+            failure_stage=failure_stage,
+            message_id=resolved_message_id,
         )
-
-    receipt = _parse_lathi_receipt(completed.stdout)
-    live_send_requested = _optional_bool(receipt.get("live_send_requested"))
-    network_call_performed = _optional_bool(receipt.get("network_call_performed"))
-    ok = completed.returncode == 0
-    if mode == "live":
-        ok = ok and network_call_performed is True
-
-    return AlertResult(
-        attempted=True,
-        ok=ok,
-        mode=mode,
-        command=args,
-        cwd=str(cwd_path) if cwd_path else None,
-        return_code=completed.returncode,
-        live_send_requested=live_send_requested,
-        network_call_performed=network_call_performed,
-        stdout_tail=_tail(_redact(completed.stdout)),
-        stderr_tail=_tail(_redact(completed.stderr)),
-    )
+        if not retryable or attempt >= resolved_max_attempts:
+            return last_result
+        _sleep_before_alert_retry(resolved_retry_delay, attempt)
+    return last_result
 
 
 def publish_lathi_review(
@@ -336,6 +424,67 @@ def _parse_lathi_receipt(text: str) -> dict[str, Any]:
 
 def _optional_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _alert_message_id(*, title: str, body: str, level: str, profile: str) -> str:
+    """Stable identity for retries of one exact notification payload."""
+
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "title": title,
+                "body": body,
+                "level": level,
+                "profile": profile,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    label = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
+    return f"bhiksha-{label or 'alert'}-{digest}"
+
+
+def _alert_max_attempts(mode: AlertMode, requested: int | None) -> int:
+    if requested is None:
+        requested = int(os.getenv("BHIKSHA_ALERT_MAX_ATTEMPTS", "3" if mode == "live" else "1"))
+    return max(1, min(int(requested), 5))
+
+
+def _retryable_alert_exception(exc: Exception) -> bool:
+    return isinstance(exc, (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError))
+
+
+_RETRYABLE_TRANSPORT_RE = re.compile(
+    r"timed?\s*out|timeout|temporar(?:y|ily)|connection (?:reset|refused|aborted)|"
+    r"name or service not known|network is unreachable|telegram transport failed|"
+    r"http(?: error)?\s*(?:429|5\d\d)\b",
+    re.IGNORECASE,
+)
+
+
+def _retryable_alert_process_failure(completed: subprocess.CompletedProcess[str]) -> bool:
+    if completed.returncode == 0:
+        return False
+    detail = f"{completed.stdout}\n{completed.stderr}"
+    return bool(_RETRYABLE_TRANSPORT_RE.search(detail))
+
+
+def _alert_process_error(
+    completed: subprocess.CompletedProcess[str], *, mode: AlertMode
+) -> str:
+    if completed.returncode == 0 and mode == "live":
+        return "Lathi Bus returned without proof of a live network delivery"
+    detail = _tail(_redact(completed.stderr)).strip()
+    if detail:
+        return detail
+    return f"Lathi Bus exited with code {completed.returncode}"
+
+
+def _sleep_before_alert_retry(base_delay_seconds: float, attempt: int) -> None:
+    delay = max(0.0, base_delay_seconds) * (2 ** max(0, attempt - 1))
+    if delay:
+        time.sleep(min(delay, 30.0))
 
 
 def _format_fields(fields: dict[str, Any] | list[tuple[str, Any]] | None) -> list[str]:
