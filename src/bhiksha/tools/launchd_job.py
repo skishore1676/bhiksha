@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -43,9 +42,7 @@ CENTRAL = ZoneInfo("America/Chicago")
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    chart_job = "chart-scenario-shadow" in raw_argv
-    if not chart_job:
-        load_dotenv()
+    load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "job",
@@ -57,7 +54,6 @@ def main(argv: list[str] | None = None) -> int:
             "schwab-refresh",
             "session-report",
             "weekly-trading-decisions",
-            "chart-scenario-shadow",
         ],
     )
     parser.add_argument(
@@ -171,8 +167,6 @@ def main(argv: list[str] | None = None) -> int:
             return _session_report_job(args)
         if args.job == "weekly-trading-decisions":
             return _weekly_trading_decisions_job(args, repo_root=repo_root)
-        if args.job == "chart-scenario-shadow":
-            return _chart_scenario_shadow_job(args, repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
         alert = _send_failure_alert(
             args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc)
@@ -465,31 +459,6 @@ def _weekly_report_output_dir(
     return reports
 
 
-def _chart_scenario_shadow_job(args: argparse.Namespace, *, repo_root: Path) -> int:
-    completed = _run_python_module(
-        ["bhiksha.tools.chart_scenario_coordinator", "--phase", "auto"],
-        repo_root=repo_root,
-        env=_chart_subprocess_env(repo_root),
-    )
-    payload = _last_json_object(completed.stdout)
-    status = str(payload.get("status") or "failed")
-    ok = completed.returncode == 0 and status in {"succeeded", "skipped"}
-    _print_result(
-        {
-            "job": args.job,
-            "status": "ok" if ok else "failed",
-            "coordinator_status": status,
-            "phase": payload.get("phase"),
-            "receipt_hash": payload.get("content_hash"),
-            "reason": payload.get("reason"),
-            "return_code": completed.returncode,
-            "stdout_tail": _tail(completed.stdout),
-            "stderr_tail": _tail(completed.stderr),
-        }
-    )
-    return 0 if ok else 2
-
-
 def _update_trading_decision_ledger(
     args: argparse.Namespace,
     facts_path: Path,
@@ -615,47 +584,6 @@ def _run_python_module(
         capture_output=True,
         timeout=float(os.getenv("BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS", "600")),
     )
-
-
-def _chart_subprocess_env(repo_root: Path) -> dict[str, str]:
-    """Return the exact first-hop environment for the chart coordinator."""
-
-    allowed = {
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE",
-        "TMPDIR",
-        "BHIKSHA_KERNEL_SRC",
-        "BHIKSHA_CHART_KERNEL_RUNTIME_RECORD",
-        "BHIKSHA_CHART_KERNEL_RUNTIME_HASH",
-        "BHIKSHA_CHART_SCENARIO_SHADOW_ENABLED",
-        "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT",
-        "BHIKSHA_CHART_SCENARIO_CAMPAIGN_CONFIG",
-        "BHIKSHA_CHART_SCENARIO_DAILY_CONTRACT_DIR",
-        "BHIKSHA_GOOGLE_SHEETS_CREDENTIALS_PATH",
-        "SCHWAB_TOKEN_FILE",
-        "SCHWAB_API_BASE_URL",
-        "SCHWAB_TIMEOUT_SECONDS",
-        "BHIKSHA_CHART_SCENARIO_COMMAND_TIMEOUT_SECONDS",
-        "BHIKSHA_LAUNCHD_JOB_TIMEOUT_SECONDS",
-    }
-    child = {key: value for key, value in os.environ.items() if key in allowed}
-    child["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    child["PYTHONPATH"] = os.pathsep.join(
-        item
-        for item in (
-            str(repo_root / "src"),
-            child.get("BHIKSHA_KERNEL_SRC", "").strip(),
-        )
-        if item
-    )
-    child["PYTHONUNBUFFERED"] = "1"
-    child["PYTHONDONTWRITEBYTECODE"] = "1"
-    child["BHIKSHA_SANITIZED_SUBPROCESS"] = "1"
-    return child
 
 
 def _send_failure_alert(args: argparse.Namespace, *, title: str, detail: str):
@@ -796,54 +724,6 @@ def _print_result(payload: dict) -> None:
 
 def _write_latest_status(payload: dict) -> None:
     try:
-        if payload.get("job") == "chart-scenario-shadow":
-            # Imported lazily — only chart jobs need the kernel.
-            from bhiksha.chart_scenarios.paths import require_experiment_path  # noqa: WPS433
-            chart_root = Path(
-                os.getenv(
-                    "BHIKSHA_CHART_SCENARIO_ARTIFACT_ROOT",
-                    str(Path.cwd() / "artifacts" / "chart_scenarios"),
-                )
-            )
-            if not chart_root.is_absolute():
-                raise ValueError("chart launchd artifact root must be absolute")
-            requested = chart_root / "launchd" / "latest_status.json"
-            path = require_experiment_path(requested, role="launchd status receipt")
-            if any(
-                parent.is_symlink() for parent in requested.parents if parent.exists()
-            ):
-                raise ValueError("chart launchd status parent cannot be a symlink")
-            if requested.is_symlink():
-                raise ValueError("chart launchd status target cannot be a symlink")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", dir=path.parent
-            )
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    handle.write(
-                        json.dumps(
-                            {
-                                "schema": "bhiksha.chart-scenario-launchd-status.v1",
-                                "recorded_at": datetime.now(CENTRAL).isoformat(),
-                                "payload": payload,
-                            },
-                            indent=2,
-                            sort_keys=True,
-                            default=str,
-                        )
-                        + "\n"
-                    )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary_name, path)
-            except Exception:
-                try:
-                    os.unlink(temporary_name)
-                except FileNotFoundError:
-                    pass
-                raise
-            return
         write_latest_status(Path.cwd(), payload)
     except (OSError, TypeError, ValueError):
         # Status snapshots are observational. They must never turn a successful

@@ -382,14 +382,6 @@ def _parse_launchctl_field(text: str, key: str) -> str | None:
 def _declared_enabled(spec: Any, *, repo_root: Path) -> bool:
     if spec.install_opt_in_env is None:
         return True
-    if spec.runner_job == "chart-scenario-shadow":
-        return (
-            repo_root
-            / "artifacts"
-            / "playbook"
-            / "runtime_flags"
-            / "chart_scenario_shadow.enabled"
-        ).is_file()
     return spec.install_enabled()
 
 

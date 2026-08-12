@@ -48,8 +48,6 @@ class LaunchdJobSpec:
         return self.log_dir(repo_root) / f"{self.label}.err.log"
 
     def log_dir(self, repo_root: Path) -> Path:
-        if self.runner_job == "chart-scenario-shadow":
-            return repo_root / "artifacts" / "chart_scenarios" / "launchd" / "logs"
         return _log_dir(repo_root)
 
     def to_dict(self, *, repo_root: Path | None = None) -> dict[str, Any]:
@@ -83,29 +81,6 @@ def every_10_minutes(start_hour: int, start_minute: int, end_hour: int, end_minu
 
 
 ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
-    LaunchdJobSpec(
-        label="com.bhiksha.chart-scenario-shadow",
-        runner_job="chart-scenario-shadow",
-        schedule=(
-            *weekdays(7, 45),
-            *weekdays(7, 55),
-            *weekdays(8, 5),
-            *weekdays(8, 15),
-            *every_10_minutes(8, 30, 15, 0),
-            *weekdays(15, 15),
-        ),
-        schedule_label=(
-            "Trading days prepare/retry 07:45, 07:55, 08:05, 08:15 CT; every "
-            "10 minutes 08:30-15:00 CT; 15:15 CT terminal evaluation"
-        ),
-        purpose=(
-            "Coordinate the run-scoped chart-scenario shadow experiment and "
-            "project only Chart_Scenarios_v1."
-        ),
-        skips_non_trading_days=True,
-        risk_class="broker_inert_experiment",
-        install_opt_in_env="BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED",
-    ),
     LaunchdJobSpec(
         label="com.bhiksha.live-start",
         runner_job="live-start",

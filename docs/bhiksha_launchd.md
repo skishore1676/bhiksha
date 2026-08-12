@@ -113,33 +113,20 @@ scripts/launchd/run_bhiksha_job.sh session-report --report-label manual
 scripts/launchd/run_bhiksha_job.sh weekly-trading-decisions --weekly-review-mode off
 ```
 
-The chart-scenario shadow coordinator is a separately opt-in, broker-inert job:
+The research observer is not a second chart-specific scheduler. It is installed
+as one generic app-owned launch agent with an app-input path and run-record path:
 
-```bash
-BHIKSHA_INSTALL_CHART_SCENARIO_SHADOW_ENABLED=true \
-BHIKSHA_KERNEL_SRC=/absolute/reviewed/kernel/src \
-BHIKSHA_PYTHON=/absolute/isolated/bhiksha/.venv/bin/python \
-  scripts/launchd/install_bhiksha_launchd.sh install-chart-scenario-shadow
-scripts/launchd/run_bhiksha_job.sh chart-scenario-shadow
+```text
+artifacts/research_observer/app-input.json
+artifacts/research_observer/events.jsonl
+artifacts/research_observer/run-record.json
 ```
 
-Rollback is equally scoped:
-
-```bash
-scripts/launchd/install_bhiksha_launchd.sh uninstall-chart-scenario-shadow
-```
-
-It unloads/removes only `com.bhiksha.chart-scenario-shadow` and clears the
-chart-scenario opt-in marker. It does not rewrite, unload, or reload live jobs.
-
-The installer persists only a non-secret enable marker. The runner uses the
-campaign-static configuration to prepare/retry at 07:45, 07:55, 08:05, and
-08:15 CT, then selects the current target date's immutable contract from
-`artifacts/chart_scenarios/daily-contracts/`; it does not carry a static run ID.
-Missing daily input after the cutoff becomes an alerted non-comparable run, not
-a request for a human to create a file. See `docs/chart-scenario-shadowing.md`
-for the preparation contract, session-aware phase logic, and zero-order
-boundary.
+The observer consumes only app-owned shadow facts, records synthetic observations,
+and reports zero broker/order/auth/schedule/external-send effects. A missing input is
+a healthy `no_data` receipt; it does not trigger a producer, Sheet projection, model
+hire, or live-plan change. Its launchd plist is maintained at the deployment boundary
+and is intentionally separate from the live trading job registry.
 
 The weekly decision job writes normalized facts, a content-digested weekly
 packet, governance evidence, and
