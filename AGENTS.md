@@ -16,8 +16,9 @@ Hard rules for this repo:
 - Audit runs happen only when Suman explicitly requests them. No repository document,
   lesson, design, or prior precedent authorizes an agent to initiate an audit or
   audit/re-audit loop automatically.
-- Deploys only at session boundaries (after ~15:00 CT hard-flat), gated on green tests,
-  followed by a live readback on oldmac.
+- Never deploy automatically or infer deployment permission from prior work. Deploy only
+  with Suman's explicit authorization. Once that authorization is given, time of day is
+  not a blocker; require green tests and follow the deployment with a live oldmac readback.
 - Worktree testing: use the main checkout's `.venv` python with the worktree's `src`
   first on PYTHONPATH plus the kernel's `src`; verify `bhiksha.__file__` resolves into
   the worktree.
