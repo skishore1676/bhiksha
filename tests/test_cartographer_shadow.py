@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import inspect
+import plistlib
+from pathlib import Path
 
 import pytest
 
@@ -87,3 +89,15 @@ def test_observer_module_has_no_money_path_imports() -> None:
         "bhiksha.options",
     ):
         assert forbidden not in source
+
+
+def test_observer_runs_after_cartographer_retry_window() -> None:
+    payload = plistlib.loads(
+        Path("scripts/launchd/com.bhiksha.cartographer-shadow.plist.template").read_bytes()
+    )
+    times = {
+        (item["Hour"], item["Minute"]) for item in payload["StartCalendarInterval"]
+    }
+
+    assert times == {(7, 30)}
+    assert len(payload["StartCalendarInterval"]) == 5
