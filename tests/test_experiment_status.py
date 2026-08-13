@@ -239,6 +239,60 @@ def test_collect_read_only_facts_respects_cutoff_and_hides_future_close(tmp_path
     assert facts["sheet-row-shadow"]["closed"] == 1
     assert facts["sheet-row-shadow"]["realized_pnl_usd"] == 50.0
 
+    status = build_app_experiment_status(
+        _plan(), facts_by_deployment=facts, as_of="2026-08-07"
+    )
+    assert status["experiments"][0]["metrics"]["realized_pnl_usd"] == 50.0
+
+
+def test_trade_session_pnl_overrides_empty_shadow_event_placeholder(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "facts.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, created_at TEXT, event_type TEXT, payload TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE trade_sessions (trade_id TEXT, deployment_id TEXT, status TEXT, entry_timestamp TEXT, exit_filled_at TEXT, entry_price REAL, exit_price REAL, exit_filled_quantity INTEGER, quantity INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO events VALUES (1, ?, ?, ?)",
+            (
+                "2026-08-07T14:30:00+00:00",
+                "shadow_mark",
+                json.dumps(
+                    {
+                        "deployment_id": "sheet-row-shadow",
+                        "trade_id": "live-trade",
+                        "mark_price": 1.25,
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO trade_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "live-trade",
+                "sheet-row-shadow",
+                "closed",
+                "2026-08-07T14:00:00+00:00",
+                "2026-08-07T15:00:00+00:00",
+                1.0,
+                1.5,
+                1,
+                1,
+            ),
+        )
+        connection.commit()
+
+    facts, _ = collect_read_only_facts(db_path, through="2026-08-07")
+    status = build_app_experiment_status(
+        _plan(), facts_by_deployment=facts, as_of="2026-08-07"
+    )
+
+    assert status["experiments"][0]["metrics"]["realized_pnl_usd"] == 50.0
+
 
 def test_status_adapter_source_has_no_runtime_or_writer_imports() -> None:
     source = Path(__file__).parents[1] / "src/bhiksha/ops/experiment_status.py"

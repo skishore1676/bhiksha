@@ -365,7 +365,10 @@ def _metrics(facts: Mapping[str, Any]) -> dict[str, Any]:
         "win_rate",
         "wins",
     ):
-        if key in facts and key not in result:
+        # A scalar computed directly from trade_sessions is the authoritative
+        # value for this read.  In particular, do not let the shadow-event
+        # aggregator's honest 0.0 placeholder mask real live-trade economics.
+        if key in facts:
             result[key] = facts[key]
     return result
 
