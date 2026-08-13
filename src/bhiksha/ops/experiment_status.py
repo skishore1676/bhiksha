@@ -27,6 +27,13 @@ STATUS_SCHEMA = "tradelab.app_experiment_status.v1"
 SOURCE_STATUSES = frozenset({"ok", "partial", "stale", "unavailable"})
 HEALTH_STATES = frozenset({"collecting", "inconclusive", "ready_for_review"})
 EFFECT_KEYS = ("sheet_write", "stage_change", "broker_action", "order_action")
+STATUS_EVENT_TYPES = (
+    "shadow_entry_assumed",
+    "shadow_mark",
+    "shadow_exit_assumed",
+    "signal_decision",
+    "trade_plan",
+)
 
 
 class ExperimentStatusError(ValueError):
@@ -271,9 +278,17 @@ def _experiment_row(
             "end": observation_window.get("end"),
         }
 
-    return {
+    strategy_name = _strategy_name(metadata)
+    row = {
         "experiment_id": deployment_id,
+        "display_name": _display_name(metadata, strategy_name=strategy_name),
+        "strategy_name": strategy_name,
         "stage": stage,
+        "paper_live": (
+            "paper"
+            if execution.get("shadow_only") or stage.lower() in {"shadow", "paper"}
+            else "live"
+        ),
         "configuration_identity": _configuration_identity(deployment, metadata),
         "observation_window": observation_window,
         "observations": counts["observations"],
@@ -289,6 +304,33 @@ def _experiment_row(
             "source_origin": _nested_mapping(deployment, "source").get("origin"),
         },
     }
+    return {key: value for key, value in row.items() if value is not None}
+
+
+def _strategy_name(metadata: Mapping[str, Any]) -> str | None:
+    direct = metadata.get("strategy_name")
+    if direct:
+        return str(direct)
+    summary = metadata.get("playbook_summary")
+    if isinstance(summary, Mapping):
+        mala_evidence = summary.get("mala_evidence")
+        if isinstance(mala_evidence, Mapping) and mala_evidence.get("strategy_name"):
+            return str(mala_evidence["strategy_name"])
+    return None
+
+
+def _display_name(
+    metadata: Mapping[str, Any], *, strategy_name: str | None
+) -> str | None:
+    for key in ("display_name", "playbook_name", "name"):
+        if metadata.get(key):
+            return str(metadata[key])
+    symbol = str(metadata.get("catalog_symbol") or "").strip().upper()
+    direction = str(metadata.get("direction") or "").strip().title()
+    prefix = " ".join(part for part in (symbol, direction) if part)
+    if strategy_name and prefix:
+        return f"{prefix} — {strategy_name}"
+    return strategy_name or prefix or None
 
 
 def _counts(facts: Mapping[str, Any]) -> dict[str, int]:
@@ -370,17 +412,19 @@ def _merge_db_facts(
                 ).fetchall()
             }
             if "events" in tables:
-                event_query = "SELECT created_at, event_type, payload FROM events"
-                event_params: tuple[str, ...] = ()
+                placeholders = ", ".join("?" for _ in STATUS_EVENT_TYPES)
+                event_query = (
+                    "SELECT created_at, event_type, payload FROM events "
+                    f"WHERE event_type IN ({placeholders})"
+                )
+                event_params: tuple[str, ...] = STATUS_EVENT_TYPES
                 if through is not None:
-                    event_query += (
-                        " WHERE substr(replace(COALESCE(created_at, ''), ' ', 'T'), 1, 10) <= ?"
-                    )
-                    event_params = (through,)
+                    event_query += " AND created_at < ?"
+                    event_params = (*event_params, f"{through}T23:59:59.999999+00:00")
                 event_query += " ORDER BY id"
                 for created_at, event_type, payload_text in connection.execute(
                     event_query, event_params
-                ).fetchall():
+                ):
                     try:
                         payload = json.loads(payload_text)
                     except (TypeError, json.JSONDecodeError):

@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         observation_reports=observation_reports,
         scorecards=scorecards,
         weekly_decisions=weekly_decisions,
+        through=args.as_of,
     )
     envelope = build_app_experiment_status(
         active_plan,
