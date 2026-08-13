@@ -378,6 +378,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
         output_dir=output_dir,
         week_end=args.week_end,
         deployments=runtime.deployments,
+        active_plan=runtime.active_plan,
         exit_edge_db_path=runtime.app_config.exit_edge_live_shadow_db_path,
         exit_edge_status_path=runtime.app_config.exit_edge_live_shadow_status_path,
         exit_edge_collector_configured=(
@@ -398,6 +399,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
                 "report_markdown": str(result.markdown_path),
                 "facts_export": str(result.facts_path),
                 "governance_evidence": str(result.governance_path),
+                "experiment_status": str(result.experiment_status_path),
                 "exit_edge_evidence": str(result.exit_edge_path),
                 "telegram_sent": False,
             }
@@ -438,6 +440,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             "report_markdown": str(result.markdown_path),
             "facts_export": str(result.facts_path),
             "governance_evidence": str(result.governance_path),
+            "experiment_status": str(result.experiment_status_path),
             "exit_edge_evidence": str(result.exit_edge_path),
             "workbook_update": workbook,
             "obsidian_review": review.to_dict() if review else None,

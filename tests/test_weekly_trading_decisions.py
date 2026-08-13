@@ -186,6 +186,11 @@ def test_weekly_decision_writer_emits_normalized_fact_receipt(tmp_path) -> None:
     assert result.report["exit_policy_evidence"] == {
         "bhiksha": str(result.exit_edge_path)
     }
+    status = json.loads(result.experiment_status_path.read_text(encoding="utf-8"))
+    assert result.experiment_status_path.name == "bhiksha_experiment_status_2026-07-10.json"
+    assert status["schema"] == "tradelab.app_experiment_status.v1"
+    assert status["as_of"] == "2026-07-10"
+    assert all(value is False for value in status["effects"].values())
     assert (
         result.report["exit_policy_evidence_receipts"]["bhiksha"]["sha256"]
         == json.loads(result.exit_edge_path.read_text(encoding="utf-8"))["receipt"][

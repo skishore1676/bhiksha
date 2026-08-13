@@ -19,6 +19,10 @@ from typing import Any, TYPE_CHECKING
 
 from bhiksha.ops.daily_report import build_daily_report
 from bhiksha.ops.exit_edge_weekly import write_exit_edge_weekly_evidence
+from bhiksha.ops.experiment_status import (
+    build_app_experiment_status,
+    collect_read_only_facts,
+)
 from bhiksha.ops.shadow_ev_report import build_shadow_ev_report
 from bhiksha.ops.trading_governance_evidence import build_trading_governance_evidence
 from bhiksha.ops.trade_observation import (
@@ -59,6 +63,7 @@ class WeeklyTradingDecisionsWriteResult:
     facts_path: Path
     governance_path: Path
     exit_edge_path: Path
+    experiment_status_path: Path
 
 
 def write_weekly_trading_decisions(
@@ -67,6 +72,7 @@ def write_weekly_trading_decisions(
     output_dir: str | Path,
     week_end: date | str | None = None,
     deployments: list["DeploymentManifest"] | None = None,
+    active_plan: dict[str, Any] | None = None,
     exit_edge_db_path: str | Path = "artifacts/observations/exit_edge_live.sqlite3",
     exit_edge_status_path: str | Path = "artifacts/observations/exit_edge_live_status.json",
     exit_edge_collector_configured: bool = False,
@@ -88,6 +94,22 @@ def write_weekly_trading_decisions(
         deployments=deployments,
         report_dir=target,
     )
+    status_facts, status_source = collect_read_only_facts(
+        db_path,
+        through=end.isoformat(),
+    )
+    status_plan = active_plan or _status_plan_from_deployments(
+        deployments,
+        through=end,
+    )
+    experiment_status = build_app_experiment_status(
+        status_plan,
+        facts_by_deployment=status_facts,
+        source_status=status_source,
+        as_of=end.isoformat(),
+    )
+    experiment_status_path = target / f"bhiksha_experiment_status_{end.isoformat()}.json"
+    _atomic_json(experiment_status_path, experiment_status)
     governance = build_trading_governance_evidence(
         scorecard,
         through=end,
@@ -207,6 +229,9 @@ def write_weekly_trading_decisions(
         "facts_export_receipt": facts["receipt"],
         "governance_evidence": str(governance_path),
         "governance_evidence_receipt": governance["receipt"],
+        "experiment_status": str(experiment_status_path),
+        "experiment_status_schema": experiment_status["schema"],
+        "experiment_status_source_status": experiment_status["source_status"],
         # Canonical cross-desk contract consumed by TradeLab. Keep the legacy
         # singular fields below during the migration because older readers and
         # operator tooling still display them.
@@ -232,6 +257,7 @@ def write_weekly_trading_decisions(
         facts_path,
         governance_path,
         exit_edge.json_path,
+        experiment_status_path,
     )
 
 
@@ -847,6 +873,27 @@ def _coerce_day(value: date | str | None) -> date:
         return date.fromisoformat(str(value))
     now = datetime.now(UTC).date()
     return now - timedelta(days=(now.weekday() - 4) % 7)
+
+
+def _status_plan_from_deployments(
+    deployments: list["DeploymentManifest"] | None,
+    *,
+    through: date,
+) -> dict[str, Any]:
+    """Keep unit callers useful without inventing a second experiment config."""
+
+    serialized = [
+        deployment.model_dump(mode="json")
+        if hasattr(deployment, "model_dump")
+        else dict(deployment)
+        for deployment in (deployments or [])
+    ]
+    return {
+        "active_plan_id": None,
+        "trading_date": through.isoformat(),
+        "generated_at": through.isoformat(),
+        "deployments": serialized,
+    }
 
 
 def _decision_evidence_status(

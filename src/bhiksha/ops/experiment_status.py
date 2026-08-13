@@ -179,6 +179,7 @@ def collect_read_only_facts(
     observation_reports: Iterable[Mapping[str, Any]] = (),
     scorecards: Iterable[Mapping[str, Any]] = (),
     weekly_decisions: Iterable[Mapping[str, Any]] = (),
+    through: str | datetime | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str]:
     """Collect existing app facts without creating or mutating any artifact.
 
@@ -193,7 +194,11 @@ def collect_read_only_facts(
     source_status = "partial"
     if db_path is not None and Path(db_path).expanduser().exists():
         source_seen = True
-        _merge_db_facts(by_deployment, Path(db_path).expanduser())
+        _merge_db_facts(
+            by_deployment,
+            Path(db_path).expanduser(),
+            through=_date_cutoff(through),
+        )
         source_status = "ok"
     for payload in (*observation_reports, *scorecards, *weekly_decisions):
         source_seen = True
@@ -346,7 +351,12 @@ def _configuration_identity(
     )
 
 
-def _merge_db_facts(target: dict[str, dict[str, Any]], db_path: Path) -> None:
+def _merge_db_facts(
+    target: dict[str, dict[str, Any]],
+    db_path: Path,
+    *,
+    through: str | None = None,
+) -> None:
     events: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     try:
@@ -360,8 +370,16 @@ def _merge_db_facts(target: dict[str, dict[str, Any]], db_path: Path) -> None:
                 ).fetchall()
             }
             if "events" in tables:
+                event_query = "SELECT created_at, event_type, payload FROM events"
+                event_params: tuple[str, ...] = ()
+                if through is not None:
+                    event_query += (
+                        " WHERE substr(replace(COALESCE(created_at, ''), ' ', 'T'), 1, 10) <= ?"
+                    )
+                    event_params = (through,)
+                event_query += " ORDER BY id"
                 for created_at, event_type, payload_text in connection.execute(
-                    "SELECT created_at, event_type, payload FROM events ORDER BY id"
+                    event_query, event_params
                 ).fetchall():
                     try:
                         payload = json.loads(payload_text)
@@ -398,7 +416,22 @@ def _merge_db_facts(target: dict[str, dict[str, Any]], db_path: Path) -> None:
                 ]
                 if "deployment_id" in selected:
                     query = f"SELECT {', '.join(selected)} FROM trade_sessions"
-                    cursor = connection.execute(query)
+                    params: tuple[str, ...] = ()
+                    time_columns = [
+                        column
+                        for column in ("entry_timestamp", "exit_filled_at")
+                        if column in selected
+                    ]
+                    if through is not None and time_columns:
+                        time_expression = "COALESCE(" + ", ".join(
+                            f"{column}" for column in time_columns
+                        ) + ", '')"
+                        query += (
+                            " WHERE substr(replace("
+                            f"{time_expression}, ' ', 'T'), 1, 10) <= ?"
+                        )
+                        params = (through,)
+                    cursor = connection.execute(query, params)
                     rows = [dict(zip(selected, row)) for row in cursor.fetchall()]
     except sqlite3.Error:
         # A readable path with an incomplete schema is a partial source, not a
@@ -441,6 +474,13 @@ def _merge_db_facts(target: dict[str, dict[str, Any]], db_path: Path) -> None:
         if created_at:
             event_windows[deployment_id].append(created_at)
     for row in rows:
+        if through is not None and _date_part(row.get("exit_filled_at")) > through:
+            # An entry can be live at the cutoff while its later exit is already
+            # present in the database. Keep the entry, but do not leak that
+            # future close or P&L into the dated status packet.
+            row["status"] = "open"
+            row["exit_filled_quantity"] = None
+            row["exit_price"] = None
         deployment_id = str(row.get("deployment_id") or "").strip()
         if not deployment_id:
             continue
@@ -608,6 +648,21 @@ def _as_mapping(value: Any) -> dict[str, Any]:
         if isinstance(result, Mapping):
             return dict(result)
     raise ExperimentStatusError("expected an active plan or mapping")
+
+
+def _date_cutoff(value: str | datetime | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:10]
+
+
+def _date_part(value: Any) -> str:
+    return str(value or "")[:10]
 
 
 def _nested_mapping(value: Mapping[str, Any], *keys: str) -> dict[str, Any]:
