@@ -92,9 +92,10 @@ class _Table:
 
 
 def test_table_projector_validates_headers_dry_runs_and_readbacks() -> None:
-    table = _Table(MANUAL_ENTRY_HEADERS, [])
+    table = _Table(MANUAL_ENTRY_HEADERS, [{"id": "", "row_index": 2}])
     dry = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
     assert dry["planned_updates"] == 1 and table.writes == []
+    assert dry["preimage"] == [{"row_index": 3, "before": None, "id": _signal()["signal_id"]}]
     applied = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17", apply=True)
     assert applied["status"] == "applied" and len(table.writes) == 1
     assert applied["trading_date"] == "2026-08-17"

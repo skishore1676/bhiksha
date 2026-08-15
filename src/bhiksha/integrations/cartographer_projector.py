@@ -201,6 +201,11 @@ def project_with_table(
     next_index = max((int(record["row_index"]) for record in before), default=1) + 1
     for row in projected:
         row_id = str(row[0])
+        # Formatted legacy Sheet rows can be returned as empty records. They are
+        # neither owned inputs nor append targets; only a non-empty signal ID
+        # can authorize a projector write.
+        if not row_id:
+            continue
         index = indexes.get(row_id)
         if index is None:
             updates.append((next_index, row))
