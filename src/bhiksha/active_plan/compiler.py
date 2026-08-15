@@ -18,6 +18,7 @@ import yaml
 
 from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
+from bhiksha.cartographer_profiles import profile_bundle, validate_profile_bundle
 from bhiksha.execution.pricing import resolve_entry_reprice_max_chase_pct
 from bhiksha.evidence.bindings import apply_evidence_binding, load_evidence_bindings
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
@@ -443,6 +444,7 @@ def compile_active_plan_from_rows(
     }
     enforce_google_catalog = google_strategy_catalog is not None
 
+    effective_trading_date = trading_date or datetime.now(UTC).date().isoformat()
     deployments: list[DeploymentManifest] = []
     row_type_counts: dict[str, int] = {}
     seen_row_ids: set[str] = set()
@@ -470,7 +472,14 @@ def compile_active_plan_from_rows(
                 }
             )
         try:
-            deployment = _compile_row(row, catalog_by_id, google_catalog_by_id, enforce_google_catalog)
+            deployment = _compile_row(
+                row,
+                catalog_by_id,
+                google_catalog_by_id,
+                enforce_google_catalog,
+                operator_defaults=operator_defaults or {},
+                trading_date=effective_trading_date,
+            )
         except PolicyGateSuppression as exc:
             suppressed_rows.append(
                 _suppressed_row(
@@ -489,7 +498,6 @@ def compile_active_plan_from_rows(
     deployments, provider_overlap_warnings = (
         apply_live_triage_provider_overlap_floor(deployments)
     )
-    effective_trading_date = trading_date or datetime.now(UTC).date().isoformat()
     effective_active_plan_id = active_plan_id or f"active_plan_{effective_trading_date}"
     _validate_compiled_live_triage_authority(
         deployments,
@@ -1317,11 +1325,18 @@ def _compile_row(
     catalog_by_id: dict[str, StrategyCatalogEntry],
     google_catalog_by_id: dict[str, StrategyCatalogSheetRow] | None = None,
     enforce_google_catalog: bool = False,
+    *,
+    operator_defaults: dict[str, Any] | None = None,
+    trading_date: str | None = None,
 ) -> DeploymentManifest:
     if row.row_type == "strategy":
         return _compile_strategy_row(row, catalog_by_id, google_catalog_by_id or {}, enforce_google_catalog)
     manual_setup_type = _normalized_manual_setup_type(row.manual_setup_type)
     if manual_setup_type == "manual_trigger":
+        if str(row.source_metadata.get("source_owner") or "") == "market_cartographer":
+            return _compile_cartographer_manual_trigger_row(
+                row, operator_defaults=operator_defaults, trading_date=trading_date
+            )
         return _compile_manual_trigger_row(row)
     return _compile_manual_breakout_row(row)
 
@@ -1658,6 +1673,107 @@ def _parse_authorization_time(value: Any, field_name: str) -> datetime:
             f"live triage canary {field_name} must be timezone-aware"
         )
     return parsed
+
+
+def _cartographer_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0:
+        raise ValueError(f"Cartographer row requires positive {field}")
+    return float(value)
+
+
+def _compile_cartographer_manual_trigger_row(
+    row: ActivePlanSheetRow, *, operator_defaults: dict[str, Any] | None, trading_date: str | None
+) -> DeploymentManifest:
+    """Compile the one frozen Cartographer lane; generic overrides are not authority."""
+
+    if row.authorization_mode != "shadow":
+        raise ValueError("Cartographer rows are shadow-only")
+    metadata = dict(row.source_metadata)
+    required_text = (
+        "signal_id",
+        "signal_hash",
+        "cartographer_version",
+        "run_id",
+        "trading_date",
+        "valid_through",
+        "profile_slug",
+        "bundle_hash",
+    )
+    missing = [key for key in required_text if not str(metadata.get(key) or "").strip()]
+    if missing:
+        raise ValueError(f"Cartographer row missing immutable metadata: {', '.join(missing)}")
+    effective_trading_date = trading_date or datetime.now(UTC).date().isoformat()
+    if str(metadata["trading_date"]) != effective_trading_date:
+        raise ValueError("Cartographer signal is stale for this compilation date")
+    try:
+        valid_through = datetime.fromisoformat(str(metadata["valid_through"]).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Cartographer valid_through must be timezone-aware ISO-8601") from exc
+    if valid_through.tzinfo is None or valid_through.date().isoformat() != effective_trading_date:
+        raise ValueError("Cartographer signal validity does not cover this compilation date")
+    bundle = validate_profile_bundle(profile_bundle(str(metadata["profile_slug"])))
+    if metadata["bundle_hash"] != bundle["bundle_hash"]:
+        raise ValueError("Cartographer profile bundle hash does not match compiler registry")
+    execution = dict(bundle["execution"])
+    requested_execution = dict(row.execution_overrides)
+    if requested_execution != execution:
+        raise ValueError("Cartographer execution specification does not match compiler registry")
+    if row.end_in_days != execution["dte_max"]:
+        raise ValueError("Cartographer end_in_days must mirror the profile DTE maximum")
+    management = dict(bundle["management"])
+    provided_management = dict(row.exit_profile_spec or {})
+    if provided_management != management:
+        raise ValueError("Cartographer management specification does not match compiler registry")
+    requested_risk = dict(row.risk_overrides)
+    requested_premium = _cartographer_number(
+        requested_risk.get("requested_max_trade_premium_usd"), "requested premium ceiling"
+    )
+    if requested_premium != float(bundle["requested_max_trade_premium_usd"]):
+        raise ValueError("Cartographer requested premium ceiling does not match compiler registry")
+    operator_premium = _cartographer_number(
+        (operator_defaults or {}).get("max_trade_premium_usd"), "operator premium ceiling"
+    )
+    effective_premium = min(requested_premium, operator_premium)
+    if requested_risk.get("operator_max_trade_premium_usd") != operator_premium:
+        raise ValueError("Cartographer risk record does not match authoritative operator ceiling")
+    if requested_risk.get("effective_max_trade_premium_usd") != effective_premium:
+        raise ValueError("Cartographer effective premium record is not the stricter ceiling")
+    if set(requested_risk) != {
+        "requested_max_trade_premium_usd",
+        "operator_max_trade_premium_usd",
+        "effective_max_trade_premium_usd",
+    }:
+        raise ValueError("Cartographer risk specification has unknown or missing fields")
+    effective_metadata = {
+        **metadata,
+        "profile_bundle": bundle,
+        "requested_max_trade_premium_usd": requested_premium,
+        "operator_max_trade_premium_usd": operator_premium,
+        "effective_max_trade_premium_usd": effective_premium,
+    }
+    effective_row = row.model_copy(
+        update={
+            "execution_overrides": {
+                key: value
+                for key, value in execution.items()
+                if key not in {"schema", "selection_id", "selection_hash", "max_contracts"}
+            },
+            "risk_overrides": {
+                "max_trade_premium_usd": effective_premium,
+                "max_contracts": execution["max_contracts"],
+            },
+            "exit_profile_spec": {
+                key: value for key, value in management.items() if key != "management_hash"
+            },
+            "source_metadata": effective_metadata,
+        }
+    )
+    deployment = _compile_manual_trigger_row(effective_row)
+    if deployment.execution.dte_min != execution["dte_min"] or deployment.execution.dte_max != execution["dte_max"]:
+        raise ValueError("Cartographer compiled DTE values drifted from the profile bundle")
+    if deployment.risk.max_trade_premium_usd != effective_premium:
+        raise ValueError("Cartographer compiled premium ceiling drifted from the stricter bound")
+    return deployment
 
 
 def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:
