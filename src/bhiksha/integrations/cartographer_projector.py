@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -38,6 +39,15 @@ class ProjectionApplyError(RuntimeError):
 def _sheet_equivalent_value(index: int, value: Any) -> Any:
     """Normalize the date/time coercions produced by USER_ENTERED Sheet writes."""
 
+    if index == 1:
+        if isinstance(value, str) and value.strip().upper() in {"TRUE", "FALSE"}:
+            return value.strip().upper() == "TRUE"
+        return value
+    if index in {6, 10, 16}:
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return value
     if index == 8 and isinstance(value, (int, float)) and not isinstance(value, bool):
         minutes = round(float(value) * 24 * 60) % (24 * 60)
         return f"{minutes // 60:02d}:{minutes % 60:02d}"

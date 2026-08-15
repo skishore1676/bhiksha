@@ -116,8 +116,12 @@ def test_table_projector_accepts_google_date_and_time_coercion() -> None:
             coerced = []
             for row_index, values in rows:
                 values = list(values)
+                values[1] = "TRUE"
+                values[6] = "600.0"
                 values[8] = 0.4409722222222222  # 10:35 ET
                 values[9] = 46251  # 2026-08-17
+                values[10] = "7"
+                values[16] = "590.0"
                 coerced.append((row_index, values))
             super().update_exact_rows(headers=headers, rows=coerced)
 
