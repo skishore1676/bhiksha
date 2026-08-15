@@ -3788,7 +3788,9 @@ class ExecutionSupervisor:
             if updated_position.source == "shadow":
                 await self._emit_shadow_exit_assumed(deployment, updated_position, fill_details, reason=decision.reason)
             await self._record_cartographer_terminal_fact(
-                deployment, updated_position, terminal_reason=decision.reason[0] if decision.reason else "exit_closed"
+                deployment, updated_position,
+                terminal_reason=decision.reason[0] if decision.reason else "exit_closed",
+                fill_details=fill_details,
             )
             plan = ExitPlan(
                 trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
@@ -3843,7 +3845,8 @@ class ExecutionSupervisor:
         return plan
 
     async def _record_cartographer_terminal_fact(
-        self, deployment: DeploymentManifest, position: TrackedPosition, *, terminal_reason: str
+        self, deployment: DeploymentManifest, position: TrackedPosition, *,
+        terminal_reason: str, fill_details: dict[str, Any] | None = None,
     ) -> None:
         """Persist a terminal identity fact at the real close chokepoint.
 
@@ -3861,6 +3864,9 @@ class ExecutionSupervisor:
             terminal_reason=terminal_reason,
             option_excursion={"coverage": "missing"},
             underlying_excursion={"coverage": "missing"},
+            gross_pnl_usd=_premium_pnl(
+                position.entry_price, (fill_details or {}).get("exit_price"), position.quantity
+            ),
         )
         await self.event_repository.append("cartographer_terminal_fact", fact)
 
@@ -5947,7 +5953,10 @@ class ExecutionSupervisor:
             if self.manual_status_writer is not None
             else None,
         )
-        await self._record_cartographer_terminal_fact(deployment, position, terminal_reason=reason)
+        await self._record_cartographer_terminal_fact(
+            deployment, position, terminal_reason=reason,
+            fill_details=_exit_fill_details(payload, status=status),
+        )
         return plan
 
     async def _cancel_exit_order_and_check_fill(
@@ -6715,7 +6724,8 @@ class ExecutionSupervisor:
                 if position.source == "shadow":
                     await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["hard_flat_time_reached"])
                 await self._record_cartographer_terminal_fact(
-                    deployment, position, terminal_reason="hard_flat_time_reached"
+                    deployment, position, terminal_reason="hard_flat_time_reached",
+                    fill_details=fill_details,
                 )
                 await self._record_manual_status(
                     deployment,
@@ -6916,7 +6926,8 @@ class ExecutionSupervisor:
                 if position.source == "shadow":
                     await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["halt_and_flatten_triggered"])
                 await self._record_cartographer_terminal_fact(
-                    deployment, position, terminal_reason="halt_and_flatten_triggered"
+                    deployment, position, terminal_reason="halt_and_flatten_triggered",
+                    fill_details=fill_details,
                 )
                 await self._record_manual_status(
                     deployment,

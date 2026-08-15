@@ -164,8 +164,8 @@ def build_status_snapshot(
             job["last"] = {"domain": semantic, "recorded_at": generated_at.isoformat()}
             job["last_run_status"] = str(semantic["status"])
             job["last_run_at"] = generated_at.isoformat()
-            job["lifecycle"] = "armed" if semantic["status"] == "compile_pending" else "stuck"
-            job["findings"] = [] if semantic["status"] == "compile_pending" else ["cartographer_evidence_blocked"]
+            job["lifecycle"] = "armed" if semantic["status"] in {"healthy", "compile_pending"} else "stuck"
+            job["findings"] = [] if semantic["status"] in {"healthy", "compile_pending"} else ["cartographer_evidence_blocked"]
         details = _job_details(last)
         if details:
             job["details"] = details
@@ -199,6 +199,7 @@ def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
     return cartographer_evidence_status(
         producer_status_path=projection_root / "producer-status.json",
         projection_receipt_path=projection_root / "latest.json",
+        active_plan_path=repo_root / "artifacts/playbook/active_plan.json",
     )
 
 

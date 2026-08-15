@@ -216,6 +216,7 @@ def project_with_table(
         **{key: value for key, value in pure_receipt.items() if key != "receipt_hash"},
         "status": "applied" if apply else pure_receipt["status"],
         "producer_run_id": signal_batch.get("run_id"),
+        "trading_date": trading_date,
         "apply_requested": apply,
         "header_contract": "A:V_exact",
         "planned_updates": len(updates),

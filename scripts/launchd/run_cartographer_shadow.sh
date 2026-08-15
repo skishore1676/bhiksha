@@ -49,7 +49,9 @@ cd "$REPO_ROOT"
 
 # Retained as a diagnostic observer only. It is deliberately after projection,
 # so a projection failure cannot be hidden by a healthy price observation.
-"$PYTHON_BIN" -m bhiksha.tools.cartographer_shadow observe-root \
+if ! "$PYTHON_BIN" -m bhiksha.tools.cartographer_shadow observe-root \
   --recommendation-root "$RECOMMENDATION_ROOT" \
   --mala-data-root "$DATA_ROOT" \
-  --output-root "$OUTPUT_ROOT"
+  --output-root "$OUTPUT_ROOT"; then
+  echo "CARTOGRAPHER_SHADOW_DIAGNOSTIC_DEGRADED reason=price_observer_failed" >&2
+fi

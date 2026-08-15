@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
-from bhiksha.active_plan.compiler import ActivePlanSheetRow, compile_active_plan_from_rows
+import pytest
+
+from bhiksha.active_plan.compiler import (
+    ActivePlanSheetRow,
+    compile_active_plan_from_rows,
+)
 from bhiksha.cartographer_profiles import profile_bundle
+from bhiksha.execution.supervisor import ExecutionSupervisor
+from bhiksha.state.position_tracker import TrackedPosition
+
+
+class _Events:
+    def __init__(self) -> None:
+        self.rows = []
+
+    async def append(self, event_type, payload) -> None:
+        self.rows.append((event_type, payload))
 
 
 def _row() -> ActivePlanSheetRow:
@@ -88,3 +104,24 @@ def test_cartographer_sheet_risk_cannot_raise_operator_ceiling(tmp_path: Path) -
     row.risk_overrides["effective_max_trade_premium_usd"] = 500.0
     compiled = _compile(tmp_path, row)
     assert "authoritative operator ceiling" in compiled.plan.suppressed[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_owner_fact_keeps_valid_shadow_gross_pnl(tmp_path: Path) -> None:
+    deployment = _compile(tmp_path, _row()).plan.deployments[0]
+    events = _Events()
+    supervisor = object.__new__(ExecutionSupervisor)
+    supervisor.event_repository = events
+    position = TrackedPosition(
+        symbol="SPY", deployment_id=deployment.deployment_id, trade_id="trade-1",
+        option_symbol="SPY_CALL", quantity=2, entry_price=1.0,
+        entry_timestamp=datetime(2026, 8, 17, 15, tzinfo=UTC), source="shadow",
+    )
+    await supervisor._record_cartographer_terminal_fact(
+        deployment, position, terminal_reason="profile_exit",
+        fill_details={"exit_price": 1.25},
+    )
+    event_type, fact = events.rows[0]
+    assert event_type == "cartographer_terminal_fact"
+    assert fact["gross_pnl_usd"] == 50.0
+    assert fact["decision_ready"] is False
