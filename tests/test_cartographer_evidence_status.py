@@ -123,6 +123,8 @@ def test_advertised_launchd_job_invokes_real_shadow_runner(tmp_path, monkeypatch
     assert "run_cartographer_shadow.sh" in " ".join(captured.get("stdout_tail", "") or "") or captured["status"] == "ok"
     template = Path("scripts/launchd/com.bhiksha.cartographer-shadow.plist.template").read_text()
     assert "__SHEET_ID__" in template and "__SHEET_CREDENTIALS__" in template
+    installer = Path("scripts/launchd/install_cartographer_shadow_launchd.sh").read_text()
+    assert "mcse-2026w33-v2" in installer
 
 
 def test_fact_graph_keeps_emitted_signal_without_terminal_fact(tmp_path) -> None:

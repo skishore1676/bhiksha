@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CARTOGRAPHER_ROOT="${CARTOGRAPHER_REPO_ROOT:-/Users/sunny/Documents/market-cartographer}"
 RECOMMENDATION_ROOT="${CARTOGRAPHER_ALPHA_OUTPUT_ROOT:-$CARTOGRAPHER_ROOT/artifacts/alpha-lab}"
-DATA_ROOT="${CARTOGRAPHER_MALA_DATA_ROOT:-/Users/sunny/Documents/mala_v2/data}"
+DATA_ROOT="${CARTOGRAPHER_MALA_DATA_ROOT:-/Users/sunny/Documents/mala_v2/research/results/cache_recovery/market_cartographer/mcse-2026w33-v2}"
 OUTPUT_ROOT="${BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT:-$REPO_ROOT/artifacts/cartographer-shadow}"
 LOG_ROOT="${BHIKSHA_CARTOGRAPHER_LOG_ROOT:-$OUTPUT_ROOT/logs}"
 PLIST="$HOME/Library/LaunchAgents/com.bhiksha.cartographer-shadow.plist"
