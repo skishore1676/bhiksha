@@ -143,6 +143,30 @@ def test_bhiksha_launchd_installer_has_three_session_report_times() -> None:
     assert (14, 45) in times
 
 
+def test_cartographer_projector_has_one_bounded_retry_before_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BHIKSHA_ENABLE_CARTOGRAPHER_SHADOW", "true")
+    jobs = {job.runner_job: job for job in active_launchd_jobs()}
+    projector = jobs["cartographer-shadow"]
+    times = {(entry["Hour"], entry["Minute"]) for entry in projector.schedule}
+
+    assert times == {(7, 30), (7, 40)}
+    assert "07:30 and 07:40" in projector.schedule_label
+
+    payload = plistlib.loads(
+        Path(
+            "scripts/launchd/com.bhiksha.cartographer-shadow.plist.template"
+        ).read_bytes()
+    )
+    schedule = payload["StartCalendarInterval"]
+    assert {entry["Weekday"] for entry in schedule} == {1, 2, 3, 4, 5}
+    assert {(entry["Hour"], entry["Minute"]) for entry in schedule} == {
+        (7, 30),
+        (7, 40),
+    }
+
+
 def test_reconciliation_supervisor_runs_independently_every_ten_minutes() -> None:
     jobs = {job.runner_job: job for job in active_launchd_jobs()}
     supervisor = jobs["reconciliation-supervisor"]

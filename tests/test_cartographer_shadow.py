@@ -99,5 +99,5 @@ def test_observer_runs_after_cartographer_retry_window() -> None:
         (item["Hour"], item["Minute"]) for item in payload["StartCalendarInterval"]
     }
 
-    assert times == {(7, 30)}
-    assert len(payload["StartCalendarInterval"]) == 5
+    assert times == {(7, 30), (7, 40)}
+    assert len(payload["StartCalendarInterval"]) == 10
