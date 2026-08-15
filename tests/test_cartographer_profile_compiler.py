@@ -86,6 +86,19 @@ def test_cartographer_bundle_compiles_only_the_registry_values(tmp_path: Path) -
     assert metadata["effective_max_trade_premium_usd"] == 400.0
 
 
+def test_cartographer_accepts_authoritative_google_formatted_ceiling(tmp_path: Path) -> None:
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    compiled = compile_active_plan_from_rows(
+        rows=[_row()],
+        strategy_catalog_path=catalog,
+        trading_date="2026-08-17",
+        operator_defaults={"max_trade_premium_usd": "400"},
+    )
+    assert compiled.plan.suppressed == []
+    assert compiled.plan.deployments[0].risk.max_trade_premium_usd == 400.0
+
+
 def test_cartographer_mismatch_and_stale_rows_fail_closed(tmp_path: Path) -> None:
     mismatch = _row().model_copy(deep=True)
     mismatch.execution_overrides["dte_max"] = 8

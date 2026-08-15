@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import tempfile
@@ -1676,9 +1677,10 @@ def _parse_authorization_time(value: Any, field_name: str) -> datetime:
 
 
 def _cartographer_number(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0:
+    number = None if isinstance(value, bool) else _coerce_float(value)
+    if number is None or not math.isfinite(number) or number <= 0:
         raise ValueError(f"Cartographer row requires positive {field}")
-    return float(value)
+    return number
 
 
 def _compile_cartographer_manual_trigger_row(
