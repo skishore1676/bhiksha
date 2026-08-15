@@ -60,3 +60,20 @@ Before adding metadata to a live deployment, recompute its authorization hash.
 If the hash changes, either validate before the additive projection or issue a
 new authorization. Never weaken the authorization hash by silently excluding
 arbitrary metadata keys.
+
+For a fleet candidate, seed reconciliation from the runtime binding registry beside
+the installed plan (`artifacts/playbook/evidence_bindings_v1.json`), not automatically
+from the tracked fallback (`config/evidence_bindings_v1.json`). The canonical
+`sync_active_plan` path already prefers the runtime registry, stages packets and
+bindings together, checks release-safe coverage, and publishes atomically. A diagnostic
+`compile_active_plan` invocation uses the tracked fallback unless `--evidence-bindings`
+is explicit; that can reproduce obsolete option-selection drift and falsely imply the
+fleet needs new packets or policy changes.
+
+The fastest proof is a temporary compile that supplies the same copied runtime registry
+as both `--evidence-bindings` and `--auto-experiment-bindings-output`. It should produce
+`release_safe=true`, no runtime-binding byte changes, no new packet directories, and no
+economic lane changes. On 2026-08-15 this distinction turned a diagnostic 10-of-39
+candidate into the canonical 32-of-39 plan: 28 existing lanes were unchanged, four
+Cartographer shadow lanes were added, and seven policy-gated rows remained intentionally
+suppressed.
