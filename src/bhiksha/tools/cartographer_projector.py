@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from bhiksha.cartographer_profiles import canonical_hash
-from bhiksha.integrations.cartographer_projector import project_with_table
+from bhiksha.integrations.cartographer_projector import ProjectionApplyError, project_with_table
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 
 
@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         table = GoogleSheetTableClient(args.spreadsheet_id, args.sheet_name, args.credentials)
         receipt = run_projection(table=table, signal_batch=args.signal_batch, trading_date=args.trading_date, premium_ceiling=args.premium_ceiling, apply=args.apply)
     except Exception as exc:
+        apply_failure = isinstance(exc, ProjectionApplyError)
         body = {
             "schema": "bhiksha.cartographer_projection_receipt.v1",
             "status": "failed",
@@ -45,7 +46,16 @@ def main(argv: list[str] | None = None) -> int:
             "trading_date": args.trading_date,
             "apply_requested": args.apply,
             "error": f"{type(exc).__name__}:{exc}",
-            "effects": {"broker": False, "orders": False, "auth": False, "sheet": False, "active_plan": False, "external_send": False},
+            "preimage": exc.preimage if apply_failure else [],
+            "sheet_write_outcome": "unknown" if apply_failure else "none",
+            "effects": {
+                "broker": False,
+                "orders": False,
+                "auth": False,
+                "sheet": apply_failure,
+                "active_plan": False,
+                "external_send": False,
+            },
         }
         receipt = {**body, "receipt_hash": canonical_hash(body)}
         if args.receipt:

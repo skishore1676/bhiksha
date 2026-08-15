@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -18,12 +18,40 @@ MANUAL_ENTRY_HEADERS = [
     "management_policy_spec", "metadata", "execution", "risk",
 ]
 OWNER = "market_cartographer"
+_SHEETS_DATE_EPOCH = date(1899, 12, 30)
 
 
 class TableClient(Protocol):
     def read_headers(self) -> list[str]: ...
     def read_rows(self) -> list[dict[str, Any]]: ...
     def update_exact_rows(self, *, headers: list[str], rows: list[tuple[int, list[Any]]]) -> None: ...
+
+
+class ProjectionApplyError(RuntimeError):
+    """An apply may have changed owned Sheet cells but could not be confirmed."""
+
+    def __init__(self, message: str, *, preimage: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.preimage = preimage
+
+
+def _sheet_equivalent_value(index: int, value: Any) -> Any:
+    """Normalize the date/time coercions produced by USER_ENTERED Sheet writes."""
+
+    if index == 8 and isinstance(value, (int, float)) and not isinstance(value, bool):
+        minutes = round(float(value) * 24 * 60) % (24 * 60)
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    if index == 9 and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (_SHEETS_DATE_EPOCH + timedelta(days=int(value))).isoformat()
+    return value
+
+
+def _sheet_rows_equal(left: Sequence[Any], right: Sequence[Any]) -> bool:
+    return len(left) == len(right) and all(
+        _sheet_equivalent_value(index, left_value)
+        == _sheet_equivalent_value(index, right_value)
+        for index, (left_value, right_value) in enumerate(zip(left, right, strict=True))
+    )
 
 
 def _json(value: Mapping[str, Any]) -> str:
@@ -214,7 +242,7 @@ def project_with_table(
             continue
         current = next(record for record in before if int(record["row_index"]) == index)
         values = [current.get(header, "") for header in headers]
-        if values != row:
+        if not _sheet_rows_equal(values, row):
             updates.append((index, row))
             preimage.append({"row_index": index, "before": values, "id": row_id})
     receipt_body: dict[str, Any] = {
@@ -231,13 +259,20 @@ def project_with_table(
     }
     if not apply:
         return {**receipt_body, "receipt_hash": canonical_hash(receipt_body)}
-    table.update_exact_rows(headers=headers, rows=updates)
-    after = table.read_rows()
-    after_by_id = {str(record.get("id") or ""): record for record in after}
-    for _, expected in updates:
-        actual = after_by_id.get(str(expected[0]))
-        if actual is None or [actual.get(header, "") for header in headers] != expected:
-            raise RuntimeError("Cartographer projection readback mismatch; retain preimage for rollback")
+    try:
+        table.update_exact_rows(headers=headers, rows=updates)
+        after = table.read_rows()
+        after_by_id = {str(record.get("id") or ""): record for record in after}
+        for _, expected in updates:
+            actual = after_by_id.get(str(expected[0]))
+            if actual is None or not _sheet_rows_equal(
+                [actual.get(header, "") for header in headers], expected
+            ):
+                raise RuntimeError("Cartographer projection readback mismatch")
+    except Exception as exc:
+        raise ProjectionApplyError(
+            f"{exc}; retain preimage for rollback", preimage=preimage
+        ) from exc
     postimage = [
         {"row_index": index, "id": str(values[0])}
         for index, values in updates
@@ -260,4 +295,10 @@ def row_to_compiler_payload(row: Sequence[Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["MANUAL_ENTRY_HEADERS", "project_signals", "project_with_table", "row_to_compiler_payload"]
+__all__ = [
+    "MANUAL_ENTRY_HEADERS",
+    "ProjectionApplyError",
+    "project_signals",
+    "project_with_table",
+    "row_to_compiler_payload",
+]

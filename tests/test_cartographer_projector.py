@@ -6,7 +6,13 @@ import pytest
 
 from bhiksha.active_plan.compiler import ActivePlanSheetRow, compile_active_plan_from_rows
 from bhiksha.cartographer_profiles import canonical_hash
-from bhiksha.integrations.cartographer_projector import MANUAL_ENTRY_HEADERS, project_signals, project_with_table, row_to_compiler_payload
+from bhiksha.integrations.cartographer_projector import (
+    MANUAL_ENTRY_HEADERS,
+    ProjectionApplyError,
+    project_signals,
+    project_with_table,
+    row_to_compiler_payload,
+)
 
 
 def _signal() -> dict[str, object]:
@@ -104,6 +110,30 @@ def test_table_projector_validates_headers_dry_runs_and_readbacks() -> None:
     assert applied["receipt_hash"] == canonical_hash({key: value for key, value in applied.items() if key != "receipt_hash"})
 
 
+def test_table_projector_accepts_google_date_and_time_coercion() -> None:
+    class _GoogleCoercingTable(_Table):
+        def update_exact_rows(self, *, headers, rows):
+            coerced = []
+            for row_index, values in rows:
+                values = list(values)
+                values[8] = 0.4409722222222222  # 10:35 ET
+                values[9] = 46251  # 2026-08-17
+                coerced.append((row_index, values))
+            super().update_exact_rows(headers=headers, rows=coerced)
+
+    table = _GoogleCoercingTable(MANUAL_ENTRY_HEADERS, [])
+    applied = project_with_table(
+        table, _batch(), operator_premium_ceiling=400,
+        trading_date="2026-08-17", apply=True,
+    )
+    assert applied["status"] == "applied"
+    retry = project_with_table(
+        table, _batch(), operator_premium_ceiling=400,
+        trading_date="2026-08-17", apply=True,
+    )
+    assert retry["planned_updates"] == 0
+
+
 def test_table_projector_fails_header_duplicate_and_readback_errors() -> None:
     with pytest.raises(ValueError, match="headers"):
         project_with_table(_Table(["id"], []), _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
@@ -115,7 +145,7 @@ def test_table_projector_fails_header_duplicate_and_readback_errors() -> None:
         def update_exact_rows(self, *, headers, rows):
             self.writes.append(rows)
 
-    with pytest.raises(RuntimeError, match="readback mismatch"):
+    with pytest.raises(ProjectionApplyError, match="readback mismatch"):
         project_with_table(
             _ReadbackMismatch(MANUAL_ENTRY_HEADERS, []), _batch(),
             operator_premium_ceiling=400, trading_date="2026-08-17", apply=True,
