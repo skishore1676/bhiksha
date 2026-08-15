@@ -251,10 +251,65 @@ def write_json(value: Mapping[str, Any], path: str | Path) -> Path:
     return destination
 
 
+def build_terminal_fact(
+    *,
+    deployment: Mapping[str, Any],
+    trade_id: str,
+    terminal_reason: str,
+    option_excursion: Mapping[str, Any],
+    underlying_excursion: Mapping[str, Any],
+    gross_pnl_usd: float | None = None,
+    net_pnl_usd: float | None = None,
+) -> dict[str, Any]:
+    """Freeze one local shadow result without inferring missing coverage or economics."""
+
+    source = dict(deployment.get("source") or {})
+    metadata = dict(source.get("metadata") or {})
+    if metadata.get("source_owner") != "market_cartographer":
+        raise ValueError("terminal fact requires a Cartographer-owned deployment")
+    required = ("signal_id", "signal_hash", "cartographer_version", "run_id", "profile_slug", "bundle_hash")
+    missing = [key for key in required if not metadata.get(key)]
+    if missing:
+        raise ValueError(f"terminal fact is missing identity: {', '.join(missing)}")
+    coverage = {
+        "option": str(option_excursion.get("coverage") or "missing"),
+        "underlying": str(underlying_excursion.get("coverage") or "missing"),
+    }
+    decision_ready = all(value == "complete" for value in coverage.values())
+    if not decision_ready:
+        gross_pnl_usd = None
+        net_pnl_usd = None
+    body: dict[str, Any] = {
+        "schema": "bhiksha.cartographer_shadow_terminal_fact.v1",
+        "status": "closed" if decision_ready else "inconclusive",
+        "decision_ready": decision_ready,
+        "identity": {
+            "signal_id": metadata["signal_id"],
+            "signal_hash": metadata["signal_hash"],
+            "cartographer_version": metadata["cartographer_version"],
+            "run_id": metadata["run_id"],
+            "deployment_id": deployment["deployment_id"],
+            "trade_id": trade_id,
+            "profile_slug": metadata["profile_slug"],
+            "bundle_hash": metadata["bundle_hash"],
+        },
+        "terminal_reason": terminal_reason,
+        "option_excursion": dict(option_excursion),
+        "underlying_excursion": dict(underlying_excursion),
+        "coverage": coverage,
+        "gross_pnl_usd": gross_pnl_usd,
+        "net_pnl_usd": net_pnl_usd,
+        "effects": zero_effects(),
+    }
+    body["fact_receipt_id"] = canonical_hash(body)
+    return body
+
+
 __all__ = [
     "FACTS_SCHEMA",
     "OBSERVATION_SCHEMA",
     "build_market_facts_from_mala",
+    "build_terminal_fact",
     "build_observation",
     "canonical_hash",
     "validate_batch",
