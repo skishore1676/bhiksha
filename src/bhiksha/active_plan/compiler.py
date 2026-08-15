@@ -1698,6 +1698,7 @@ def _compile_cartographer_manual_trigger_row(
         "valid_through",
         "profile_slug",
         "bundle_hash",
+        "invalidation_price",
     )
     missing = [key for key in required_text if not str(metadata.get(key) or "").strip()]
     if missing:
@@ -1714,6 +1715,12 @@ def _compile_cartographer_manual_trigger_row(
     bundle = validate_profile_bundle(profile_bundle(str(metadata["profile_slug"])))
     if metadata["bundle_hash"] != bundle["bundle_hash"]:
         raise ValueError("Cartographer profile bundle hash does not match compiler registry")
+    invalidation = _cartographer_number(metadata["invalidation_price"], "invalidation price")
+    trigger = _cartographer_number(row.trigger_price, "trigger price")
+    if row.direction == "long" and invalidation >= trigger:
+        raise ValueError("Cartographer long invalidation must be below trigger")
+    if row.direction == "short" and invalidation <= trigger:
+        raise ValueError("Cartographer short invalidation must be above trigger")
     execution = dict(bundle["execution"])
     requested_execution = dict(row.execution_overrides)
     if requested_execution != execution:
@@ -1769,6 +1776,7 @@ def _compile_cartographer_manual_trigger_row(
         }
     )
     deployment = _compile_manual_trigger_row(effective_row)
+    deployment.strategy.params["cartographer_metadata"] = effective_metadata
     if deployment.execution.dte_min != execution["dte_min"] or deployment.execution.dte_max != execution["dte_max"]:
         raise ValueError("Cartographer compiled DTE values drifted from the profile bundle")
     if deployment.risk.max_trade_premium_usd != effective_premium:

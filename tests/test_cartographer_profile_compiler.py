@@ -38,6 +38,7 @@ def _row() -> ActivePlanSheetRow:
                 "valid_through": "2026-08-17T15:00:00-05:00",
                 "profile_slug": "TREND_CONTINUATION",
                 "bundle_hash": bundle["bundle_hash"],
+                "invalidation_price": 590.0,
             },
         }
     )

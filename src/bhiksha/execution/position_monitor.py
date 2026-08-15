@@ -10,6 +10,7 @@ from bhiksha.app.replay import ReplaySignalEvaluator
 from bhiksha.config.models import DeploymentManifest
 from bhiksha.domain.models import ExitDecision
 from bhiksha.execution.thesis_exit import evaluate_underlying_thesis_exit
+from bhiksha.execution.cartographer_invalidation import evaluate_invalidation
 from bhiksha.state.position_tracker import PositionTracker, TrackedPosition
 
 
@@ -45,6 +46,14 @@ class PositionMonitor:
                 continue
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None:
+                continue
+            chart_decision = evaluate_invalidation(deployment, frame, position)
+            if chart_decision is not None:
+                evaluations.append(
+                    ExitEvaluation(
+                        deployment=deployment, position=position, decision=chart_decision
+                    )
+                )
                 continue
             thesis_decision = evaluate_underlying_thesis_exit(deployment, frame, position)
             if thesis_decision is not None:

@@ -12,6 +12,7 @@ from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import ExitDecision, SignalDecision
 from bhiksha.market_data.session import ET, ensure_utc
 from bhiksha.state.position_tracker import TrackedPosition
+from bhiksha.execution.cartographer_invalidation import entry_guard
 from bhiksha.strategy.base import coerce_time
 
 
@@ -82,6 +83,15 @@ class ManualTriggerStrategy:
         else:
             reasons.append("manual_trigger_waiting")
 
+        chart_block = entry_guard(
+            dict(params.get("cartographer_metadata") or {}),
+            direction=direction_filter,
+            close=close or 0.0,
+            observed_at=latest["timestamp"],
+        )
+        if chart_block is not None:
+            signal = False
+            reasons.append(chart_block)
         return SignalDecision(
             deployment_id=deployment_id,
             symbol=str(latest["symbol"]),
