@@ -14,6 +14,7 @@ from bhiksha.tools.cartographer_evidence_status import (
     build_status,
     read_terminal_facts,
 )
+from bhiksha.tools.launchd_status import _cartographer_installed_pending_first_run
 
 
 def test_composed_status_requires_fresh_producer_and_projection(tmp_path) -> None:
@@ -86,6 +87,20 @@ def test_terminal_fact_reader_is_read_only_and_dedupes_exact_receipts(tmp_path) 
             [("cartographer_terminal_fact", json.dumps(fact))] * 2,
         )
     assert read_terminal_facts(database) == [fact]
+
+
+def test_newly_installed_job_is_quiet_only_before_its_first_run() -> None:
+    semantic = {
+        "status": "blocked",
+        "producer": {"status": "missing"},
+        "projection": {"status": "missing"},
+    }
+    assert _cartographer_installed_pending_first_run(
+        semantic, {"loaded": True, "last_exit_code": "(never exited)"}
+    )
+    assert not _cartographer_installed_pending_first_run(
+        semantic, {"loaded": True, "last_exit_code": 3}
+    )
 
 
 def test_shadow_runner_checks_producer_projects_before_observing() -> None:

@@ -161,11 +161,24 @@ def build_status_snapshot(
             }
         if spec.runner_job == "cartographer-shadow":
             semantic = _cartographer_semantic_status(repo_root)
+            if _cartographer_installed_pending_first_run(
+                semantic, launchd.get(spec.label, {})
+            ):
+                semantic = {
+                    **semantic,
+                    "status": "installed_pending_first_run",
+                    "attention_required": False,
+                }
+                job["declared_enabled"] = True
             job["last"] = {"domain": semantic, "recorded_at": generated_at.isoformat()}
             job["last_run_status"] = str(semantic["status"])
-            job["last_run_at"] = generated_at.isoformat()
-            job["lifecycle"] = "armed" if semantic["status"] in {"healthy", "compile_pending"} else "stuck"
-            job["findings"] = [] if semantic["status"] in {"healthy", "compile_pending"} else ["cartographer_evidence_blocked"]
+            job["last_run_at"] = (
+                None if semantic["status"] == "installed_pending_first_run"
+                else generated_at.isoformat()
+            )
+            quiet = {"healthy", "compile_pending", "installed_pending_first_run"}
+            job["lifecycle"] = "armed" if semantic["status"] in quiet else "stuck"
+            job["findings"] = [] if semantic["status"] in quiet else ["cartographer_evidence_blocked"]
         details = _job_details(last)
         if details:
             job["details"] = details
@@ -200,6 +213,20 @@ def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
         producer_status_path=projection_root / "producer-status.json",
         projection_receipt_path=projection_root / "latest.json",
         active_plan_path=repo_root / "artifacts/playbook/active_plan.json",
+    )
+
+
+def _cartographer_installed_pending_first_run(
+    semantic: dict[str, Any], launchd: dict[str, Any]
+) -> bool:
+    """Keep a newly installed weekend job quiet until its first eligible fire."""
+
+    return bool(
+        semantic.get("status") == "blocked"
+        and (semantic.get("producer") or {}).get("status") == "missing"
+        and (semantic.get("projection") or {}).get("status") == "missing"
+        and launchd.get("loaded") is True
+        and launchd.get("last_exit_code") == "(never exited)"
     )
 
 
