@@ -77,7 +77,7 @@ def test_cartographer_entry_guard_requires_fresh_unexpired_observation(tmp_path)
 def test_chart_invalidation_preempts_other_exit_management(tmp_path) -> None:
     deployment = _compile(tmp_path, _row()).plan.deployments[0]
     frame = pl.DataFrame(
-        {"timestamp": [datetime(2026, 8, 17, 15, 0, tzinfo=UTC)], "close": [590.0]}
+        {"timestamp": [datetime(2026, 8, 17, 15, 0, tzinfo=UTC)], "close": [600.0], "low": [590.0], "high": [601.0]}
     )
     decision = evaluate_invalidation(
         deployment,
@@ -96,7 +96,7 @@ def test_short_high_breach_is_chart_invalidation(tmp_path) -> None:
     row.source_metadata["invalidation_price"] = 610.0
     deployment = _compile(tmp_path, row).plan.deployments[0]
     frame = pl.DataFrame(
-        {"timestamp": [datetime(2026, 8, 17, 15, 0, tzinfo=UTC)], "close": [610.0]}
+        {"timestamp": [datetime(2026, 8, 17, 15, 0, tzinfo=UTC)], "close": [600.0], "low": [599.0], "high": [610.0]}
     )
     assert evaluate_invalidation(
         deployment,

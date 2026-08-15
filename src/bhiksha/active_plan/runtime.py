@@ -1212,11 +1212,31 @@ class BhikshaRuntime:
                 "unit": "ms",
             },
         )
+        # Evaluate thesis exits before queuing any profile management. In
+        # particular, a Cartographer intrabar invalidation must never leave a
+        # competing ``manage`` task ahead of its forced exit in this symbol's
+        # serial dispatcher.
+        exit_evaluations = position_monitor.evaluate_symbol(
+            bar.symbol,
+            frame,
+            deployments_by_id,
+            enriched_frames=enriched_frames,
+            positions=tracker_positions,
+        )
+        exiting_positions = {
+            (evaluation.deployment.deployment_id, evaluation.position.option_symbol)
+            for evaluation in exit_evaluations
+            if evaluation.decision.exit
+            and "chart_invalidation_underlying" in evaluation.decision.reason
+        }
         for position in list(tracker_positions):
             if position.symbol != bar.symbol:
                 continue
             deployment = deployments_by_id.get(position.deployment_id)
             if deployment is None:
+                continue
+            if (deployment.deployment_id, position.option_symbol) in exiting_positions:
+                output(f"{deployment.deployment_id}: manage_skipped_chart_invalidation")
                 continue
             enqueued = execution_dispatcher.submit(
                 bar.symbol,
@@ -1241,13 +1261,6 @@ class BhikshaRuntime:
                 output(f"{deployment.deployment_id}: manage_enqueued option={position.option_symbol}")
 
         exited_deployments: set[str] = set()
-        exit_evaluations = position_monitor.evaluate_symbol(
-            bar.symbol,
-            frame,
-            deployments_by_id,
-            enriched_frames=enriched_frames,
-            positions=tracker_positions,
-        )
         for evaluation in exit_evaluations:
             output(
                 f"{evaluation.deployment.deployment_id}: exit={evaluation.decision.exit} "

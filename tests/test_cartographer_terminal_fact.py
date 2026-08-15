@@ -27,4 +27,5 @@ def test_terminal_fact_preserves_identity_and_coverage_blocker() -> None:
         option_excursion={"coverage": "partial"}, underlying_excursion=complete, gross_pnl_usd=5, net_pnl_usd=4,
     )
     assert incomplete["status"] == "inconclusive"
-    assert incomplete["gross_pnl_usd"] is None
+    assert incomplete["gross_pnl_usd"] == 5
+    assert incomplete["economics"]["excursion_decision_ready"] is False

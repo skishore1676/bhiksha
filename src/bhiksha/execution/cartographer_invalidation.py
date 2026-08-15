@@ -54,11 +54,14 @@ def evaluate_invalidation(
     if metadata is None or frame.is_empty():
         return None
     latest = frame.tail(1).to_dicts()[0]
-    close = float(latest["close"])
+    # A thesis breach is intrabar: use the adverse extreme, not the closing
+    # print that can recover after the stop condition has already happened.
+    low = float(latest["low"])
+    high = float(latest["high"])
     invalidation = float(metadata["invalidation_price"])
     direction = str(deployment.strategy.params["direction"])
-    breached = (direction == "long" and close <= invalidation) or (
-        direction == "short" and close >= invalidation
+    breached = (direction == "long" and low <= invalidation) or (
+        direction == "short" and high >= invalidation
     )
     if not breached:
         return None
@@ -70,7 +73,9 @@ def evaluate_invalidation(
         action="exit",
         reason=["chart_invalidation_underlying"],
         features={
-            "underlying_close": close,
+            "underlying_low": low,
+            "underlying_high": high,
+            "bar_timestamp": latest["timestamp"].isoformat(),
             "invalidation_price": invalidation,
             "profile_slug": metadata["profile_slug"],
             "signal_id": metadata["signal_id"],

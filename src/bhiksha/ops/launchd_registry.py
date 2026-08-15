@@ -82,6 +82,16 @@ def every_10_minutes(start_hour: int, start_minute: int, end_hour: int, end_minu
 
 ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
     LaunchdJobSpec(
+        label="com.bhiksha.cartographer-shadow",
+        runner_job="cartographer-shadow",
+        schedule=weekdays(7, 30),
+        schedule_label="Weekdays 07:30 CT",
+        purpose="Project fresh Cartographer shadow signals before the 08:20 compiler.",
+        skips_non_trading_days=True,
+        risk_class="shadow_projection",
+        install_opt_in_env="BHIKSHA_ENABLE_CARTOGRAPHER_SHADOW",
+    ),
+    LaunchdJobSpec(
         label="com.bhiksha.live-start",
         runner_job="live-start",
         schedule=weekdays(8, 20),

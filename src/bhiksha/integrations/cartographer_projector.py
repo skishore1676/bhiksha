@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from bhiksha.cartographer_profiles import canonical_hash, profile_bundle, validate_profile_bundle
@@ -18,6 +18,12 @@ MANUAL_ENTRY_HEADERS = [
     "management_policy_spec", "metadata", "execution", "risk",
 ]
 OWNER = "market_cartographer"
+
+
+class TableClient(Protocol):
+    def read_headers(self) -> list[str]: ...
+    def read_rows(self) -> list[dict[str, Any]]: ...
+    def update_exact_rows(self, *, headers: list[str], rows: list[tuple[int, list[Any]]]) -> None: ...
 
 
 def _json(value: Mapping[str, Any]) -> str:
@@ -143,6 +149,77 @@ def project_signals(
     return output, {**receipt_body, "receipt_hash": canonical_hash(receipt_body)}
 
 
+def project_with_table(
+    table: TableClient,
+    signal_batch: Mapping[str, Any],
+    *,
+    operator_premium_ceiling: float,
+    trading_date: str,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Plan, optionally apply, and verify an owned A:V projection.
+
+    This is deliberately the only impure seam.  The default is dry-run and an
+    apply is accepted only after an exact header/preimage read and followed by
+    a readback that must reproduce every Cartographer-owned target row.
+    """
+
+    headers = table.read_headers()
+    if headers != MANUAL_ENTRY_HEADERS:
+        raise ValueError("manual_entry headers must exactly match the A:V projection contract")
+    before = table.read_rows()
+    ids: set[str] = set()
+    existing_rows: list[list[Any]] = []
+    indexes: dict[str, int] = {}
+    for record in before:
+        row_id = str(record.get("id") or "")
+        if row_id and row_id in ids:
+            raise ValueError("manual_entry has duplicate IDs; refusing ambiguous projection")
+        if row_id:
+            ids.add(row_id)
+            indexes[row_id] = int(record["row_index"])
+        existing_rows.append([record.get(header, "") for header in headers])
+    projected, pure_receipt = project_signals(
+        existing_rows, signal_batch,
+        operator_premium_ceiling=operator_premium_ceiling, trading_date=trading_date,
+    )
+    updates: list[tuple[int, list[Any]]] = []
+    preimage: list[dict[str, Any]] = []
+    next_index = max((int(record["row_index"]) for record in before), default=1) + 1
+    for row in projected:
+        row_id = str(row[0])
+        index = indexes.get(row_id)
+        if index is None:
+            updates.append((next_index, row))
+            preimage.append({"row_index": next_index, "before": None, "id": row_id})
+            next_index += 1
+            continue
+        current = next(record for record in before if int(record["row_index"]) == index)
+        values = [current.get(header, "") for header in headers]
+        if values != row:
+            updates.append((index, row))
+            preimage.append({"row_index": index, "before": values, "id": row_id})
+    receipt: dict[str, Any] = {
+        **pure_receipt,
+        "status": "applied" if apply else pure_receipt["status"],
+        "apply_requested": apply,
+        "header_contract": "A:V_exact",
+        "planned_updates": len(updates),
+        "preimage": preimage,
+        "effects": {**pure_receipt["effects"], "sheet": apply},
+    }
+    if not apply:
+        return receipt
+    table.update_exact_rows(headers=headers, rows=updates)
+    after = table.read_rows()
+    after_by_id = {str(record.get("id") or ""): record for record in after}
+    for _, expected in updates:
+        actual = after_by_id.get(str(expected[0]))
+        if actual is None or [actual.get(header, "") for header in headers] != expected:
+            raise RuntimeError("Cartographer projection readback mismatch; retain preimage for rollback")
+    return receipt
+
+
 def row_to_compiler_payload(row: Sequence[Any]) -> dict[str, Any]:
     """Map one A:V row to the existing Bhiksha manual-row normalizer shape."""
 
@@ -157,4 +234,4 @@ def row_to_compiler_payload(row: Sequence[Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["MANUAL_ENTRY_HEADERS", "project_signals", "row_to_compiler_payload"]
+__all__ = ["MANUAL_ENTRY_HEADERS", "project_signals", "project_with_table", "row_to_compiler_payload"]

@@ -6,7 +6,7 @@ import pytest
 
 from bhiksha.active_plan.compiler import ActivePlanSheetRow, compile_active_plan_from_rows
 from bhiksha.cartographer_profiles import canonical_hash
-from bhiksha.integrations.cartographer_projector import project_signals, row_to_compiler_payload
+from bhiksha.integrations.cartographer_projector import MANUAL_ENTRY_HEADERS, project_signals, project_with_table, row_to_compiler_payload
 
 
 def _signal() -> dict[str, object]:
@@ -74,3 +74,52 @@ def test_projector_rejects_ownership_collision_and_expired_signal() -> None:
     rows, receipt = project_signals([], _batch(), operator_premium_ceiling=500.0, trading_date="2026-08-18")
     assert rows == []
     assert receipt["actions"] == [{"signal_id": _signal()["signal_id"], "action": "expired"}]
+
+
+class _Table:
+    def __init__(self, headers, rows):
+        self.headers, self.rows = headers, rows
+        self.writes = []
+    def read_headers(self): return self.headers
+    def read_rows(self): return [dict(row) for row in self.rows]
+    def update_exact_rows(self, *, headers, rows):
+        self.writes.append(rows)
+        for index, values in rows:
+            found = next((row for row in self.rows if row["row_index"] == index), None)
+            record = dict(zip(headers, values, strict=True)); record["row_index"] = index
+            if found is None: self.rows.append(record)
+            else: found.update(record)
+
+
+def test_table_projector_validates_headers_dry_runs_and_readbacks() -> None:
+    table = _Table(MANUAL_ENTRY_HEADERS, [])
+    dry = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+    assert dry["planned_updates"] == 1 and table.writes == []
+    applied = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17", apply=True)
+    assert applied["status"] == "applied" and len(table.writes) == 1
+    retry = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17", apply=True)
+    assert retry["planned_updates"] == 0
+
+
+def test_table_projector_fails_header_duplicate_and_readback_errors() -> None:
+    with pytest.raises(ValueError, match="headers"):
+        project_with_table(_Table(["id"], []), _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+    duplicate = _Table(MANUAL_ENTRY_HEADERS, [{"id": "x", "row_index": 2}, {"id": "x", "row_index": 3}])
+    with pytest.raises(ValueError, match="duplicate"):
+        project_with_table(duplicate, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+
+    class _ReadbackMismatch(_Table):
+        def update_exact_rows(self, *, headers, rows):
+            self.writes.append(rows)
+
+    with pytest.raises(RuntimeError, match="readback mismatch"):
+        project_with_table(
+            _ReadbackMismatch(MANUAL_ENTRY_HEADERS, []), _batch(),
+            operator_premium_ceiling=400, trading_date="2026-08-17", apply=True,
+        )
+
+    class _ReadFailure(_Table):
+        def read_headers(self): raise OSError("read unavailable")
+
+    with pytest.raises(OSError, match="read unavailable"):
+        project_with_table(_ReadFailure(MANUAL_ENTRY_HEADERS, []), _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")

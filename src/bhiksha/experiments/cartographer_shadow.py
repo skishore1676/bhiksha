@@ -276,9 +276,6 @@ def build_terminal_fact(
         "underlying": str(underlying_excursion.get("coverage") or "missing"),
     }
     decision_ready = all(value == "complete" for value in coverage.values())
-    if not decision_ready:
-        gross_pnl_usd = None
-        net_pnl_usd = None
     body: dict[str, Any] = {
         "schema": "bhiksha.cartographer_shadow_terminal_fact.v1",
         "status": "closed" if decision_ready else "inconclusive",
@@ -299,6 +296,11 @@ def build_terminal_fact(
         "coverage": coverage,
         "gross_pnl_usd": gross_pnl_usd,
         "net_pnl_usd": net_pnl_usd,
+        "economics": {
+            "gross_pnl_available": gross_pnl_usd is not None,
+            "net_pnl_available": net_pnl_usd is not None,
+            "excursion_decision_ready": decision_ready,
+        },
         "effects": zero_effects(),
     }
     body["fact_receipt_id"] = canonical_hash(body)

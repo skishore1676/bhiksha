@@ -55,6 +55,7 @@ from bhiksha.execution.exit_policy import (
     canonical_policy_hash,
     compose_safety_stack_floor_r,
 )
+from bhiksha.experiments.cartographer_shadow import build_terminal_fact
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.market_data.session import as_et_time
 from bhiksha.persistence.repository import EventRepository, NullEventRepository, NullTradeStateRepository, TradeStateRepository
@@ -3627,7 +3628,11 @@ class ExecutionSupervisor:
                     },
                 )
                 return None
-            if self._profile_exit_is_authoritative(deployment, position):
+            # Cartographer invalidation is a typed thesis kill. It always keeps
+            # native exit authority even when profile management normally owns
+            # the position, so a queued profile route cannot yield it away.
+            chart_invalidation = "chart_invalidation_underlying" in decision.reason
+            if self._profile_exit_is_authoritative(deployment, position) and not chart_invalidation:
                 await self.event_repository.append(
                     "native_exit_yielded_to_profile",
                     {
@@ -3782,6 +3787,9 @@ class ExecutionSupervisor:
             await self._emit_lifecycle_transition(transition, reason="exit_closed")
             if updated_position.source == "shadow":
                 await self._emit_shadow_exit_assumed(deployment, updated_position, fill_details, reason=decision.reason)
+            await self._record_cartographer_terminal_fact(
+                deployment, updated_position, terminal_reason=decision.reason[0] if decision.reason else "exit_closed"
+            )
             plan = ExitPlan(
                 trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
                 deployment_id=deployment.deployment_id,
@@ -3833,6 +3841,28 @@ class ExecutionSupervisor:
             else None,
         )
         return plan
+
+    async def _record_cartographer_terminal_fact(
+        self, deployment: DeploymentManifest, position: TrackedPosition, *, terminal_reason: str
+    ) -> None:
+        """Persist a terminal identity fact at the real close chokepoint.
+
+        Excursion coverage is intentionally ``missing`` until the lifecycle has
+        complete entry-to-exit quote coverage; a closed trade therefore cannot
+        pass the evidence decision gate merely because its economics exist.
+        """
+
+        metadata = deployment.source.metadata
+        if metadata.get("source_owner") != "market_cartographer":
+            return
+        fact = build_terminal_fact(
+            deployment={"deployment_id": deployment.deployment_id, "source": {"metadata": metadata}},
+            trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+            terminal_reason=terminal_reason,
+            option_excursion={"coverage": "missing"},
+            underlying_excursion={"coverage": "missing"},
+        )
+        await self.event_repository.append("cartographer_terminal_fact", fact)
 
     async def _readback_exact_partial_fill(
         self,
@@ -5917,6 +5947,7 @@ class ExecutionSupervisor:
             if self.manual_status_writer is not None
             else None,
         )
+        await self._record_cartographer_terminal_fact(deployment, position, terminal_reason=reason)
         return plan
 
     async def _cancel_exit_order_and_check_fill(
