@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from bhiksha.cartographer_profiles import canonical_hash
 from bhiksha.integrations.cartographer_projector import project_with_table
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 
@@ -31,8 +32,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="perform the otherwise dry-run Sheet update")
     parser.add_argument("--receipt", type=Path)
     args = parser.parse_args(argv)
-    table = GoogleSheetTableClient(args.spreadsheet_id, args.sheet_name, args.credentials)
-    receipt = run_projection(table=table, signal_batch=args.signal_batch, trading_date=args.trading_date, premium_ceiling=args.premium_ceiling, apply=args.apply)
+    batch = json.loads(args.signal_batch.expanduser().read_text(encoding="utf-8"))
+    try:
+        table = GoogleSheetTableClient(args.spreadsheet_id, args.sheet_name, args.credentials)
+        receipt = run_projection(table=table, signal_batch=args.signal_batch, trading_date=args.trading_date, premium_ceiling=args.premium_ceiling, apply=args.apply)
+    except Exception as exc:
+        body = {
+            "schema": "bhiksha.cartographer_projection_receipt.v1",
+            "status": "failed",
+            "producer_run_id": batch.get("run_id") if isinstance(batch, dict) else None,
+            "signal_batch_hash": batch.get("signal_batch_hash") if isinstance(batch, dict) else None,
+            "trading_date": args.trading_date,
+            "apply_requested": args.apply,
+            "error": f"{type(exc).__name__}:{exc}",
+            "effects": {"broker": False, "orders": False, "auth": False, "sheet": False, "active_plan": False, "external_send": False},
+        }
+        receipt = {**body, "receipt_hash": canonical_hash(body)}
+        if args.receipt:
+            args.receipt.parent.mkdir(parents=True, exist_ok=True)
+            args.receipt.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(receipt, sort_keys=True, indent=2))
+        return 2
     if args.receipt:
         args.receipt.parent.mkdir(parents=True, exist_ok=True)
         args.receipt.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8")

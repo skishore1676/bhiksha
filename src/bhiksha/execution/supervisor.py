@@ -6714,6 +6714,9 @@ class ExecutionSupervisor:
                 await self._emit_lifecycle_transition(transition, reason="hard_flat_closed")
                 if position.source == "shadow":
                     await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["hard_flat_time_reached"])
+                await self._record_cartographer_terminal_fact(
+                    deployment, position, terminal_reason="hard_flat_time_reached"
+                )
                 await self._record_manual_status(
                     deployment,
                     stage="hard_flat_closed",
@@ -6912,6 +6915,9 @@ class ExecutionSupervisor:
                 await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_closed")
                 if position.source == "shadow":
                     await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["halt_and_flatten_triggered"])
+                await self._record_cartographer_terminal_fact(
+                    deployment, position, terminal_reason="halt_and_flatten_triggered"
+                )
                 await self._record_manual_status(
                     deployment,
                     stage="halt_and_flatten_closed",

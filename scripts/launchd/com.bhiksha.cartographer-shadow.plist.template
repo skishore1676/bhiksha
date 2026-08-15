@@ -23,6 +23,13 @@
   </array>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CARTOGRAPHER_REPO_ROOT</key><string>__CARTOGRAPHER_ROOT__</string>
+    <key>BHIKSHA_CARTOGRAPHER_SHEET_ID</key><string>__SHEET_ID__</string>
+    <key>BHIKSHA_CARTOGRAPHER_SHEET_CREDENTIALS</key><string>__SHEET_CREDENTIALS__</string>
+    <key>BHIKSHA_CARTOGRAPHER_PREMIUM_CEILING</key><string>__PREMIUM_CEILING__</string>
+  </dict>
   <key>StandardOutPath</key><string>__LOG_ROOT__/cartographer-shadow.stdout.log</string>
   <key>StandardErrorPath</key><string>__LOG_ROOT__/cartographer-shadow.stderr.log</string>
 </dict>

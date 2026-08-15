@@ -54,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
             "schwab-refresh",
             "session-report",
             "weekly-trading-decisions",
+            "cartographer-shadow",
         ],
     )
     parser.add_argument(
@@ -167,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
             return _session_report_job(args)
         if args.job == "weekly-trading-decisions":
             return _weekly_trading_decisions_job(args, repo_root=repo_root)
+        if args.job == "cartographer-shadow":
+            return _cartographer_shadow_job(args, repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
         alert = _send_failure_alert(
             args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc)
@@ -181,6 +184,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     raise ValueError(f"Unsupported job: {args.job}")
+
+
+def _cartographer_shadow_job(args: argparse.Namespace, *, repo_root: Path) -> int:
+    """Run the existing 07:30 owner path; configuration failures stay visible."""
+
+    cartographer_root = os.environ.get("CARTOGRAPHER_REPO_ROOT", "/Users/sunny/Documents/market-cartographer")
+    recommendation_root = os.environ.get("CARTOGRAPHER_ALPHA_OUTPUT_ROOT", f"{cartographer_root}/artifacts/alpha-lab")
+    data_root = os.environ.get("CARTOGRAPHER_MALA_DATA_ROOT", "/Users/sunny/Documents/mala_v2/data")
+    output_root = os.environ.get("BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT", str(repo_root / "artifacts/cartographer-shadow"))
+    completed = subprocess.run(
+        ["/bin/bash", str(repo_root / "scripts/launchd/run_cartographer_shadow.sh"), str(repo_root), recommendation_root, data_root, output_root],
+        text=True, capture_output=True, check=False, env=os.environ.copy(), cwd=repo_root,
+    )
+    payload = {"job": args.job, "status": "ok" if completed.returncode == 0 else "failed", "return_code": completed.returncode, "stdout_tail": _tail(completed.stdout), "stderr_tail": _tail(completed.stderr)}
+    _print_result(payload)
+    return 0 if completed.returncode == 0 else 2
 
 
 def _server_session_job(

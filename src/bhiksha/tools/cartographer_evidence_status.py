@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from bhiksha.cartographer_profiles import canonical_hash
+
 
 def _read(path: Path) -> dict[str, Any] | None:
     try:
@@ -19,14 +21,27 @@ def _read(path: Path) -> dict[str, Any] | None:
 def build_status(*, producer_status_path: Path, projection_receipt_path: Path) -> dict[str, Any]:
     producer = _read(producer_status_path)
     projection = _read(projection_receipt_path)
-    producer_ok = bool(producer and producer.get("lifecycle") == "complete")
-    projection_ok = bool(projection and projection.get("status") == "applied")
+    producer_run_id = ((producer or {}).get("receipt") or {}).get("run_id")
+    projection_hash_ok = bool(
+        projection
+        and projection.get("receipt_hash")
+        == canonical_hash({key: value for key, value in projection.items() if key != "receipt_hash"})
+    )
+    producer_ok = bool(producer and producer.get("lifecycle") == "complete" and producer_run_id)
+    projection_ok = bool(
+        projection and projection.get("status") == "applied" and projection_hash_ok
+        and projection.get("producer_run_id") == producer_run_id
+    )
+    # Between the 07:30 projection and existing 08:20 compiler it is not yet
+    # correct to claim a compiled plan. This is intentionally quiet but typed.
+    status = "compile_pending" if producer_ok and projection_ok else "blocked"
     return {
         "schema": "bhiksha.cartographer_evidence_status.v1",
-        "status": "healthy" if producer_ok and projection_ok else "blocked",
+        "status": status,
+        "attention_required": status == "blocked",
         "producer": producer or {"status": "missing"},
         "projection": projection or {"status": "missing"},
-        "compile": {"status": "owned_by_existing_0820_compiler"},
+        "compile": {"status": status},
         "effects": {"broker": False, "orders": False, "auth": False, "sheet": False, "active_plan": False, "external_send": False},
     }
 

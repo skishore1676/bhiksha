@@ -17,6 +17,7 @@ from typing import Any
 from bhiksha.config.environment import load_dotenv
 from bhiksha.ops.launchd_registry import latest_status_path, registered_launchd_jobs
 from bhiksha.ops.provider_reconciliation_health import inspect_provider_reconciliation
+from bhiksha.tools.cartographer_evidence_status import build_status as cartographer_evidence_status
 
 # External callers (lathi Control Tower) kill this command at 20s
 # (LATHI_BHIKSHA_TIMEOUT_SECONDS). Keep the whole snapshot under that:
@@ -158,6 +159,13 @@ def build_status_snapshot(
                     else None
                 ),
             }
+        if spec.runner_job == "cartographer-shadow":
+            semantic = _cartographer_semantic_status(repo_root)
+            job["last"] = {"domain": semantic, "recorded_at": generated_at.isoformat()}
+            job["last_run_status"] = str(semantic["status"])
+            job["last_run_at"] = generated_at.isoformat()
+            job["lifecycle"] = "armed" if semantic["status"] == "compile_pending" else "stuck"
+            job["findings"] = [] if semantic["status"] == "compile_pending" else ["cartographer_evidence_blocked"]
         details = _job_details(last)
         if details:
             job["details"] = details
@@ -183,6 +191,15 @@ def build_status_snapshot(
         "provider_reconciliation": provider_reconciliation,
         "transport": _transport_rollup(jobs),
     }
+
+
+def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
+    output_root = Path(os.getenv("BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT", repo_root / "artifacts/cartographer-shadow"))
+    projection_root = output_root / "projection"
+    return cartographer_evidence_status(
+        producer_status_path=projection_root / "producer-status.json",
+        projection_receipt_path=projection_root / "latest.json",
+    )
 
 
 def _apply_live_start_recovery(jobs: list[dict[str, Any]], runtime_status: dict[str, Any]) -> None:

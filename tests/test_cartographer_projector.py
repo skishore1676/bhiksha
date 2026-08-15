@@ -99,6 +99,7 @@ def test_table_projector_validates_headers_dry_runs_and_readbacks() -> None:
     assert applied["status"] == "applied" and len(table.writes) == 1
     retry = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17", apply=True)
     assert retry["planned_updates"] == 0
+    assert applied["receipt_hash"] == canonical_hash({key: value for key, value in applied.items() if key != "receipt_hash"})
 
 
 def test_table_projector_fails_header_duplicate_and_readback_errors() -> None:

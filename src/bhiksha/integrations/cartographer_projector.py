@@ -183,6 +183,19 @@ def project_with_table(
         existing_rows, signal_batch,
         operator_premium_ceiling=operator_premium_ceiling, trading_date=trading_date,
     )
+    batch_ids = {str(signal.get("signal_id") or "") for signal in signal_batch.get("signals", [])}
+    expired_rows: list[str] = []
+    for index, row in enumerate(projected[: len(existing_rows)]):
+        owner = _load_json(row[19])
+        if (
+            owner is not None
+            and owner.get("source_owner") == OWNER
+            and str(owner.get("trading_date") or "") < trading_date
+            and str(row[0]) not in batch_ids
+            and row[1] is not False
+        ):
+            row[1] = False
+            expired_rows.append(str(row[0]))
     updates: list[tuple[int, list[Any]]] = []
     preimage: list[dict[str, Any]] = []
     next_index = max((int(record["row_index"]) for record in before), default=1) + 1
@@ -199,17 +212,19 @@ def project_with_table(
         if values != row:
             updates.append((index, row))
             preimage.append({"row_index": index, "before": values, "id": row_id})
-    receipt: dict[str, Any] = {
-        **pure_receipt,
+    receipt_body: dict[str, Any] = {
+        **{key: value for key, value in pure_receipt.items() if key != "receipt_hash"},
         "status": "applied" if apply else pure_receipt["status"],
+        "producer_run_id": signal_batch.get("run_id"),
         "apply_requested": apply,
         "header_contract": "A:V_exact",
         "planned_updates": len(updates),
         "preimage": preimage,
+        "expired_rows": expired_rows,
         "effects": {**pure_receipt["effects"], "sheet": apply},
     }
     if not apply:
-        return receipt
+        return {**receipt_body, "receipt_hash": canonical_hash(receipt_body)}
     table.update_exact_rows(headers=headers, rows=updates)
     after = table.read_rows()
     after_by_id = {str(record.get("id") or ""): record for record in after}
@@ -217,7 +232,12 @@ def project_with_table(
         actual = after_by_id.get(str(expected[0]))
         if actual is None or [actual.get(header, "") for header in headers] != expected:
             raise RuntimeError("Cartographer projection readback mismatch; retain preimage for rollback")
-    return receipt
+    postimage = [
+        {"row_index": index, "id": str(values[0])}
+        for index, values in updates
+    ]
+    receipt_body["postimage"] = postimage
+    return {**receipt_body, "receipt_hash": canonical_hash(receipt_body)}
 
 
 def row_to_compiler_payload(row: Sequence[Any]) -> dict[str, Any]:
