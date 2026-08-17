@@ -4,7 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from bhiksha.active_plan.compiler import ActivePlanSheetRow, compile_active_plan_from_rows
+from bhiksha.active_plan.compiler import (
+    ActivePlanSheetRow,
+    compile_active_plan_from_rows,
+)
 from bhiksha.cartographer_profiles import canonical_hash
 from bhiksha.integrations.cartographer_projector import (
     MANUAL_ENTRY_HEADERS,
@@ -18,7 +21,7 @@ from bhiksha.integrations.cartographer_projector import (
 def _signal() -> dict[str, object]:
     body: dict[str, object] = {
         "schema": "market_cartographer.signal.v1",
-        "cartographer_version": "1.0",
+        "cartographer_version": "1.1",
         "run_id": "run-1",
         "trading_date": "2026-08-17",
         "symbol": "SPY",
@@ -29,7 +32,7 @@ def _signal() -> dict[str, object]:
         "rationale": [{"text": "daily trend=rising", "evidence_refs": ["SPY:daily:trend"]}],
         "authorization_mode": "shadow",
         "management_policy": "TREND_CONTINUATION",
-        "valid_after": "2026-08-17T09:35:00-05:00",
+        "valid_after": "2026-08-17T08:35:00-05:00",
         "valid_through": "2026-08-17T15:00:00-05:00",
         "evidence": {"source_batch_hash": "sha256:batch", "candidate_id": "c1", "candidate_hash": "sha256:c", "evidence_refs": ["SPY:daily:trend"]},
         "effects": {"broker": False, "orders": False, "auth": False, "sheet": False, "active_plan": False, "external_send": False},
@@ -51,6 +54,7 @@ def test_projector_maps_av_and_round_trips_through_compiler(tmp_path: Path) -> N
     rows, receipt = project_signals([], _batch(), operator_premium_ceiling=400.0, trading_date="2026-08-17")
     assert receipt["actions"][0]["action"] == "created"
     assert len(rows[0]) == 22
+    assert rows[0][8] == "09:35"
     row = ActivePlanSheetRow.model_validate(row_to_compiler_payload(rows[0]))
     catalog = tmp_path / "catalog"
     catalog.mkdir()
@@ -66,10 +70,12 @@ def test_projector_retry_preserves_consumed_state_and_writebacks() -> None:
     rows, _ = project_signals([], _batch(), operator_premium_ceiling=500.0, trading_date="2026-08-17")
     rows[0][1] = False
     rows[0][2] = "live"
+    rows[0][8] = "10:30"
     rows[0][12:16] = ["triggered", "at", "note", "trade-1"]
     retried, receipt = project_signals(rows, _batch(), operator_premium_ceiling=500.0, trading_date="2026-08-17")
     assert receipt["actions"][0]["action"] == "preserved"
     assert retried[0][1:3] == [False, "live"]
+    assert retried[0][8] == "09:35"
     assert retried[0][12:16] == ["triggered", "at", "note", "trade-1"]
 
 
@@ -118,7 +124,7 @@ def test_table_projector_accepts_google_date_and_time_coercion() -> None:
                 values = list(values)
                 values[1] = "TRUE"
                 values[6] = "600.0"
-                values[8] = 0.4409722222222222  # 10:35 ET
+                values[8] = 0.3993055555555556  # 09:35 ET
                 values[9] = 46251  # 2026-08-17
                 values[10] = "7"
                 values[16] = "590.0"
