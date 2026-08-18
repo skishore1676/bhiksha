@@ -144,6 +144,26 @@ def test_table_projector_accepts_google_date_and_time_coercion() -> None:
     assert retry["planned_updates"] == 0
 
 
+def test_idempotent_apply_returns_success_without_a_sheet_write() -> None:
+    class _NoOpTrackingTable(_Table):
+        def update_exact_rows(self, *, headers, rows):
+            self.writes.append(rows)
+            super().update_exact_rows(headers=headers, rows=rows)
+
+    rows, _ = project_signals([], _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+    records = [dict(zip(MANUAL_ENTRY_HEADERS, rows[0], strict=True))]
+    records[0]["row_index"] = 3
+    table = _NoOpTrackingTable(MANUAL_ENTRY_HEADERS, records)
+    receipt = project_with_table(
+        table, _batch(), operator_premium_ceiling=400,
+        trading_date="2026-08-17", apply=True,
+    )
+    assert receipt["status"] == "succeeded"
+    assert receipt["planned_updates"] == 0
+    assert receipt["sheet_write_outcome"] == "not_needed"
+    assert table.writes == []
+
+
 def test_table_projector_fails_header_duplicate_and_readback_errors() -> None:
     with pytest.raises(ValueError, match="headers"):
         project_with_table(_Table(["id"], []), _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")

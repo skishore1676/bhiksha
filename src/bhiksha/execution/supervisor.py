@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from loguru import logger
@@ -54,6 +55,14 @@ from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_ex
 from bhiksha.execution.exit_policy import (
     canonical_policy_hash,
     compose_safety_stack_floor_r,
+)
+from bhiksha.experiments.cartographer_attempts import (
+    ATTEMPT_EVENT,
+    OUTCOME_EVENT,
+    attempt_context,
+    attempt_outcome_payload,
+    attempt_start_payload,
+    is_cartographer_deployment,
 )
 from bhiksha.experiments.cartographer_shadow import build_terminal_fact
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
@@ -232,6 +241,7 @@ class ExecutionSupervisor:
         self._frozen_exit_policies: dict[str, TradeExitPolicySnapshot] = {}
         self._profile_exit_degraded_trades: set[str] = set()
         self._profile_exit_recovery_events: set[str] = set()
+        self._manual_status_tasks: set[asyncio.Task] = set()
 
     async def close(self) -> None:
         if self.exit_edge_recorder is not None:
@@ -1667,24 +1677,56 @@ class ExecutionSupervisor:
                 self._canary_rollback_deployments.add(
                     deployment.deployment_id
                 )
-        await self.event_repository.append(
-            "signal_decision",
-            {
-                "deployment_id": decision.deployment_id,
-                "symbol": decision.symbol,
-                "timestamp": decision.timestamp.isoformat(),
-                "signal": decision.signal,
-                "direction": decision.direction.value if decision.direction else None,
-                "reason": decision.reason,
-                "features": decision.features,
-            },
+        attempt = (
+            attempt_context(
+                deployment,
+                deployment_id=decision.deployment_id,
+                timestamp=decision.timestamp,
+                identity=self.deployment_evidence_identity.get(
+                    deployment.deployment_id, {}
+                ),
+            )
+            if decision.signal
+            else None
         )
+        signal_payload = {
+            "deployment_id": decision.deployment_id,
+            "symbol": decision.symbol,
+            "timestamp": decision.timestamp.isoformat(),
+            "signal": decision.signal,
+            "direction": decision.direction.value if decision.direction else None,
+            "reason": decision.reason,
+            "features": decision.features,
+        }
+        if attempt is not None:
+            # This append is deliberately before any Sheet status call.  It is
+            # the durable handoff that makes an interruption recoverable.
+            signal_payload.update({"signal_attempt_id": attempt["signal_attempt_id"]})
+        await self.event_repository.append("signal_decision", signal_payload)
+        if attempt is not None:
+            await self.event_repository.append(
+                ATTEMPT_EVENT,
+                attempt_start_payload(
+                    attempt,
+                    decision_reason=decision.reason,
+                    direction=(
+                        decision.direction.value if decision.direction else None
+                    ),
+                    features=decision.features,
+                ),
+            )
         if not self.can_submit_deployment_entry(deployment):
+            if attempt is not None:
+                await self._record_cartographer_attempt_outcome(
+                    attempt,
+                    outcome="blocked",
+                    reason="deployment_entry_not_submitable",
+                )
             return None
         if decision.signal:
             if _is_self_disarming_manual_deployment(deployment):
                 self._disabled_entry_deployments.add(deployment.deployment_id)
-            await self._record_manual_status(
+            await self._dispatch_manual_status(
                 deployment,
                 stage="signal_triggered",
                 writer_call=self.manual_status_writer.mark_signal_triggered(deployment, decision)
@@ -1704,7 +1746,7 @@ class ExecutionSupervisor:
                         "state": lifecycle.state.value if lifecycle else None,
                     },
                 )
-                await self._record_manual_status(
+                await self._dispatch_manual_status(
                     deployment,
                     stage="entry_blocked",
                     writer_call=self.manual_status_writer.mark_entry_blocked(
@@ -1715,6 +1757,14 @@ class ExecutionSupervisor:
                     if self.manual_status_writer is not None
                     else None,
                 )
+                if attempt is not None:
+                    await self._record_cartographer_attempt_outcome(
+                        attempt,
+                        outcome="blocked",
+                        reason=(
+                            f"lifecycle_blocked:{lifecycle.state.value if lifecycle else 'unknown'}"
+                        ),
+                    )
                 return None
             if decision.signal and decision.direction is not None and live_entry_block_reason and not dry_run and not simulate_only:
                 plan = TradePlan(
@@ -1746,7 +1796,7 @@ class ExecutionSupervisor:
                     and (plan.order_id is not None or plan.dry_run)
                 ):
                     mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")
-                    await self._record_manual_status(
+                    await self._dispatch_manual_status(
                         deployment,
                         stage="entry_planned",
                         writer_call=self.manual_status_writer.mark_entry_planned(
@@ -1759,7 +1809,7 @@ class ExecutionSupervisor:
                     )
                 else:
                     note = ",".join(plan.risk_reasons) or "entry_blocked"
-                    await self._record_manual_status(
+                    await self._dispatch_manual_status(
                         deployment,
                         stage="entry_blocked",
                         writer_call=self.manual_status_writer.mark_entry_blocked(
@@ -1844,6 +1894,11 @@ class ExecutionSupervisor:
                         {
                             "deployment_id": deployment.deployment_id,
                             "symbol": deployment.symbol,
+                            **(
+                                {"signal_attempt_id": attempt["signal_attempt_id"]}
+                                if attempt is not None
+                                else {}
+                            ),
                             "trade_id": plan.trade_id,
                             "option_symbol": plan.option_symbol,
                             "quantity": plan.quantity,
@@ -1879,7 +1934,43 @@ class ExecutionSupervisor:
                         protected=False,
                     )
                     await self._emit_lifecycle_transition(transition, reason="dry_run_entry_open")
-                await self.event_repository.append("trade_plan", asdict(plan))
+                trade_plan_payload = asdict(plan)
+                if attempt is not None:
+                    trade_plan_payload["signal_attempt_id"] = attempt[
+                        "signal_attempt_id"
+                    ]
+                await self.event_repository.append("trade_plan", trade_plan_payload)
+                if attempt is not None:
+                    approved = (
+                        _entry_plan_approved(plan)
+                        and plan.quantity > 0
+                        and bool(plan.option_symbol)
+                        and (plan.order_id is not None or plan.dry_run)
+                    )
+                    await self._record_cartographer_attempt_outcome(
+                        attempt,
+                        outcome="execution" if approved else "blocked",
+                        reason=(
+                            "entry_plan_created"
+                            if approved
+                            else (",".join(plan.risk_reasons) or "entry_blocked")
+                        ),
+                        details={
+                            "trade_id": plan.trade_id,
+                            "mode": (
+                                "live"
+                                if plan.order_id and not plan.dry_run
+                                else ("shadow" if simulate_only else "dry_run")
+                            ),
+                            "approved": approved,
+                        },
+                    )
+            elif attempt is not None:
+                await self._record_cartographer_attempt_outcome(
+                    attempt,
+                    outcome="failure",
+                    reason="planner_returned_no_plan",
+                )
             return plan
 
     def can_submit_deployment_entry(self, deployment: DeploymentManifest) -> bool:
@@ -8009,7 +8100,10 @@ class ExecutionSupervisor:
     ) -> None:
         if writer_call is None:
             return
-        error = await writer_call
+        try:
+            error = await writer_call
+        except Exception as exc:  # pragma: no cover - defensive external seam
+            error = str(exc)
         if error is None:
             return
         await self.event_repository.append(
@@ -8021,6 +8115,90 @@ class ExecutionSupervisor:
                 "error": error,
             },
         )
+
+    async def _dispatch_manual_status(
+        self,
+        deployment: DeploymentManifest,
+        *,
+        stage: str,
+        writer_call,
+    ) -> None:
+        """Schedule Cartographer Sheet status without gating local execution.
+
+        Existing non-Cartographer rows retain their synchronous status behavior.
+        Cartographer's durable attempt event is written before this helper is
+        reached, so an external Sheet failure cannot cancel or delay planning.
+        """
+
+        if writer_call is None:
+            return
+        if not is_cartographer_deployment(deployment):
+            # This path intentionally preserves the established behavior for
+            # the 28-lane fleet and its existing tests.
+            await self._record_manual_status(
+                deployment, stage=stage, writer_call=writer_call
+            )
+            return
+        task = asyncio.create_task(
+            self._record_manual_status(
+                deployment, stage=stage, writer_call=writer_call
+            )
+        )
+        self._manual_status_tasks.add(task)
+        task.add_done_callback(self._forget_manual_status_task)
+
+    def _forget_manual_status_task(self, task: asyncio.Task) -> None:
+        self._manual_status_tasks.discard(task)
+        # _record_manual_status converts writer errors into ledger events.  A
+        # repository failure is still surfaced to the loop rather than hidden.
+        if not task.cancelled():
+            task.exception()
+
+    async def _record_cartographer_attempt_outcome(
+        self,
+        context: Mapping[str, Any],
+        *,
+        outcome: str,
+        reason: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        await self.event_repository.append(
+            OUTCOME_EVENT,
+            attempt_outcome_payload(
+                context,
+                outcome=outcome,
+                reason=reason,
+                details=details,
+            ),
+        )
+
+    async def record_cartographer_attempt_failure(
+        self,
+        deployment: DeploymentManifest,
+        decision: SignalDecision,
+        *,
+        reason: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record an execution-runner failure after an in-process exception."""
+
+        if not decision.signal or not is_cartographer_deployment(deployment):
+            return
+        context = attempt_context(
+            deployment,
+            deployment_id=decision.deployment_id,
+            timestamp=decision.timestamp,
+            identity=self.deployment_evidence_identity.get(
+                deployment.deployment_id, {}
+            ),
+        )
+        if context is not None:
+            await self._record_cartographer_attempt_outcome(
+                context,
+                outcome="failure",
+                reason=reason,
+                details=details,
+            )
 
     async def _upsert_trade_record(self, record: TradeRecord) -> None:
         identity = self.deployment_evidence_identity.get(record.deployment_id)

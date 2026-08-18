@@ -126,6 +126,81 @@ def test_signal_lifecycle_resolves_expired_without_inventing_a_trade(tmp_path) -
     ]
 
 
+def test_triggered_attempt_is_exported_as_infrastructure_censored_with_identity(tmp_path) -> None:
+    database = tmp_path / "bhiksha.db"
+    start = {
+        "signal_attempt_id": "sa-v1-bac",
+        "signal_id": "mc-v1-bac",
+        "deployment_id": "mc-v1-bac",
+        "signal_timestamp": "2026-08-18T13:35:12.102151+00:00",
+        "run_id": "run-1",
+        "cartographer_version": "1.1",
+        "profile_slug": "TREND_CONTINUATION",
+        "reason": ["manual_trigger_met"],
+    }
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, event_type TEXT, payload TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO events(event_type, payload) VALUES (?, ?)",
+            ("cartographer_signal_attempt", json.dumps(start)),
+        )
+    lifecycle = read_signal_lifecycle(database)
+    assert lifecycle == [{
+        "signal_id": "mc-v1-bac",
+        "status": "infrastructure_censored",
+        "signal_attempt_id": "sa-v1-bac",
+        "signal_timestamp": "2026-08-18T13:35:12.102151+00:00",
+        "run_id": "run-1",
+        "cartographer_version": "1.1",
+        "profile_slug": "TREND_CONTINUATION",
+        "trigger_reason": ["manual_trigger_met"],
+        "reason": "triggered_without_terminal_outcome",
+        "attempt_outcome": "infrastructure_censored",
+    }]
+
+
+def test_tuesday_legacy_bac_and_abnb_triggers_are_both_infrastructure_censored(tmp_path) -> None:
+    database = tmp_path / "bhiksha.db"
+    legacy = [
+        {
+            "deployment_id": "mc-v1-4325b7068a8b9e1097007de7",
+            "symbol": "BAC",
+            "signal": True,
+            "timestamp": "2026-08-18T13:35:12.102151+00:00",
+            "reason": ["manual_trigger_met"],
+        },
+        {
+            "deployment_id": "mc-v1-c7c2d95389ddf850708f116f",
+            "symbol": "ABNB",
+            "signal": True,
+            "timestamp": "2026-08-18T13:35:12.102151+00:00",
+            "reason": ["manual_trigger_met"],
+        },
+    ]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, event_type TEXT, payload TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO events(event_type, payload) VALUES (?, ?)",
+            [("signal_decision", json.dumps(item)) for item in legacy],
+        )
+
+    lifecycle = read_signal_lifecycle(database)
+    assert [item["signal_id"] for item in lifecycle] == [
+        "mc-v1-4325b7068a8b9e1097007de7",
+        "mc-v1-c7c2d95389ddf850708f116f",
+    ]
+    assert [item["status"] for item in lifecycle] == [
+        "infrastructure_censored",
+        "infrastructure_censored",
+    ]
+    assert all(item["attempt_outcome"] == "infrastructure_censored" for item in lifecycle)
+    assert all(item["signal_timestamp"] == "2026-08-18T13:35:12.102151+00:00" for item in lifecycle)
+
+
 def test_newly_installed_job_is_quiet_only_before_its_first_run() -> None:
     semantic = {
         "status": "blocked",

@@ -213,6 +213,7 @@ def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
         producer_status_path=projection_root / "producer-status.json",
         projection_receipt_path=projection_root / "latest.json",
         active_plan_path=repo_root / "artifacts/playbook/active_plan.json",
+        events_db_path=repo_root / "bhiksha.db",
     )
 
 

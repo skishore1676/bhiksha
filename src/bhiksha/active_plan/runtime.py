@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from contextlib import closing, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,7 @@ from bhiksha.app.token_daemon import PublicTokenRefreshDaemon, SchwabTokenRefres
 from bhiksha.config.loader import load_bias_config
 from bhiksha.config.models import AppConfig, BiasSelection, DeploymentManifest, ProviderConfig, StrategyCatalogEntry
 from bhiksha.domain.events import BarClosedEvent
+from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import Bar, SignalDecision
 from bhiksha.domain.runtime import ProviderHealth, StartupReport
 from bhiksha.execution.order_manager import OrderManager
@@ -66,6 +68,14 @@ from bhiksha.persistence.sqlite import (
     SQLiteTradeStateRepository,
 )
 from bhiksha.persistence.repository import EvidenceIdentityEventRepository
+from bhiksha.experiments.cartographer_attempts import (
+    OUTCOME_EVENT,
+    RECOVERY_EVENT,
+    attempt_outcome_payload,
+    load_attempt_events,
+    recovery_action,
+    unresolved_attempts,
+)
 from bhiksha.persistence.exit_state import SQLiteExitStateRepository
 from bhiksha.risk.cash_guard import CashGuard, trade_date_et
 from bhiksha.risk.canary_inhibition_store import CanaryInhibitionStore
@@ -103,6 +113,201 @@ async def record_signal_evaluation(event_repository, decision: SignalDecision) -
     """Persist every runtime signal evaluation, including false decisions."""
 
     await event_repository.append("signal_evaluation", _signal_decision_payload(decision))
+
+
+async def reconcile_cartographer_attempts(
+    *,
+    events_db_path: str | Path,
+    event_repository,
+    supervisor: ExecutionSupervisor,
+    deployments_by_id: Mapping[str, DeploymentManifest],
+    trade_state_repository,
+    live: bool,
+    now: datetime,
+    output: callable,
+) -> dict[str, int]:
+    """Resolve interrupted Cartographer shadow attempts once at startup.
+
+    The recovery marker is written before a fresh shadow replay.  If the process
+    dies again, the next startup censors that attempt instead of replaying twice.
+    Stale, non-shadow, or already-entered attempts are censored without creating
+    a simulated fill.  This function never submits a broker order.
+    """
+
+    events = load_attempt_events(events_db_path)
+    pending = unresolved_attempts(events)
+    if not pending:
+        return {"pending": 0, "replayed": 0, "censored": 0, "deferred": 0}
+
+    # A persisted trade plan is stronger evidence than an unresolved startup
+    # marker: the process reached the local planning/entry seam.  Close it from
+    # the plan itself and never call the planner again.  This branch runs before
+    # the recent-trade lookup so an already-persisted plan cannot be censored
+    # merely because the trade-state read is unavailable.
+    remaining: list[dict[str, Any]] = []
+    for attempt in pending:
+        plans = attempt.get("trade_plans") or []
+        if not plans:
+            remaining.append(attempt)
+            continue
+        plan = plans[-1] if isinstance(plans[-1], Mapping) else {}
+        try:
+            quantity = float(plan.get("quantity") or 0)
+        except (TypeError, ValueError):
+            quantity = 0.0
+        option_symbol = str(plan.get("option_symbol") or "")
+        approved = quantity > 0 and bool(option_symbol) and (
+            plan.get("order_id") is not None or bool(plan.get("dry_run"))
+        )
+        await event_repository.append(
+            OUTCOME_EVENT,
+            attempt_outcome_payload(
+                attempt,
+                outcome="execution" if approved else "blocked",
+                reason=("trade_plan_persisted" if approved else "trade_plan_blocked"),
+                details={
+                    "recovery": "persisted_trade_plan",
+                    "trade_id": plan.get("trade_id"),
+                    "approved": approved,
+                },
+            ),
+        )
+    if not remaining:
+        return {"pending": len(pending), "replayed": 0, "censored": 0, "deferred": 0}
+    pending = remaining
+    try:
+        recent_trades = await trade_state_repository.get_recent_trades(limit=500)
+    except Exception as exc:
+        for attempt in pending:
+            await event_repository.append(
+                OUTCOME_EVENT,
+                attempt_outcome_payload(
+                    attempt,
+                    outcome="infrastructure_censored",
+                    reason="existing_entry_state_unavailable",
+                    details={
+                        "recovery": "startup",
+                        "error": f"{type(exc).__name__}:{exc}",
+                    },
+                ),
+            )
+        return {
+            "pending": len(pending),
+            "replayed": 0,
+            "censored": len(pending),
+            "deferred": 0,
+        }
+    existing_deployments = {
+        str(getattr(trade, "deployment_id", "") or "") for trade in recent_trades
+    }
+    counts = {"pending": len(pending), "replayed": 0, "censored": 0, "deferred": 0}
+    for attempt in pending:
+        deployment_id = str(attempt.get("deployment_id") or "")
+        deployment = deployments_by_id.get(deployment_id)
+        if deployment is None:
+            await event_repository.append(
+                OUTCOME_EVENT,
+                attempt_outcome_payload(
+                    attempt,
+                    outcome="infrastructure_censored",
+                    reason="recovery_identity_incomplete",
+                    details={"recovery": "startup"},
+                ),
+            )
+            counts["censored"] += 1
+            continue
+        shadow_only = bool(
+            getattr(getattr(deployment, "execution", None), "shadow_only", False)
+        )
+        action, reason = recovery_action(
+            attempt,
+            now=now,
+            shadow_only=shadow_only,
+            has_existing_entry=deployment_id in existing_deployments,
+        )
+        if action == "defer":
+            counts["deferred"] += 1
+            continue
+        if action == "censor":
+            await event_repository.append(
+                OUTCOME_EVENT,
+                attempt_outcome_payload(
+                    attempt,
+                    outcome="infrastructure_censored",
+                    reason=reason,
+                    details={"recovery": "startup", "live_session": live},
+                ),
+            )
+            counts["censored"] += 1
+            output(
+                "CARTOGRAPHER_ATTEMPT_CENSORED "
+                f"attempt={attempt.get('signal_attempt_id')} reason={reason}"
+            )
+            continue
+        if not attempt.get("direction"):
+            await event_repository.append(
+                OUTCOME_EVENT,
+                attempt_outcome_payload(
+                    attempt,
+                    outcome="infrastructure_censored",
+                    reason="recovery_identity_incomplete",
+                    details={"recovery": "startup"},
+                ),
+            )
+            counts["censored"] += 1
+            continue
+        try:
+            direction = SignalDirection(str(attempt["direction"]))
+            timestamp = datetime.fromisoformat(
+                str(attempt["signal_timestamp"]).replace("Z", "+00:00")
+            )
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+            decision = SignalDecision(
+                deployment_id=deployment_id,
+                symbol=str(attempt.get("symbol") or deployment.symbol),
+                timestamp=timestamp,
+                signal=True,
+                direction=direction,
+                reason=[str(reason) for reason in (attempt.get("reason") or [])],
+                features=dict(attempt.get("features") or {}),
+            )
+            await event_repository.append(
+                RECOVERY_EVENT,
+                {
+                    "signal_attempt_id": attempt["signal_attempt_id"],
+                    "deployment_id": deployment_id,
+                    "signal_id": attempt.get("signal_id"),
+                    "reason": "fresh_shadow_recovery",
+                },
+            )
+            await supervisor.handle_signal(
+                deployment,
+                decision,
+                dry_run=True,
+                simulate_only=True,
+            )
+            counts["replayed"] += 1
+            output(
+                "CARTOGRAPHER_ATTEMPT_REPLAYED "
+                f"attempt={attempt.get('signal_attempt_id')} mode=shadow"
+            )
+        except Exception as exc:
+            await event_repository.append(
+                OUTCOME_EVENT,
+                attempt_outcome_payload(
+                    attempt,
+                    outcome="failure",
+                    reason=f"recovery:{type(exc).__name__}:{exc}",
+                    details={"recovery": "startup"},
+                ),
+            )
+            counts["censored"] += 1
+            output(
+                "CARTOGRAPHER_ATTEMPT_RECOVERY_FAILED "
+                f"attempt={attempt.get('signal_attempt_id')} error={exc}"
+            )
+    return counts
 
 
 def _signal_decision_payload(decision: SignalDecision) -> dict:
@@ -653,6 +858,16 @@ class BhikshaRuntime:
                 output(f"RUNTIME_ISSUE ALL stage=session_manifest_receipt error={exc}")
             output("STARTUP_CONFIG " + json.dumps(startup_snapshot, sort_keys=True))
             await event_repository.append("startup_config", startup_snapshot)
+            await reconcile_cartographer_attempts(
+                events_db_path=self.app_config.sqlite_path,
+                event_repository=event_repository,
+                supervisor=supervisor,
+                deployments_by_id=deployments_by_id,
+                trade_state_repository=trade_state_repository,
+                live=live,
+                now=datetime.now(UTC),
+                output=output,
+            )
             await self._refresh_reconciliation(
                 broker=broker,
                 supervisor=supervisor,
@@ -1971,6 +2186,12 @@ class BhikshaRuntime:
                         f"symbol={deployment.symbol} "
                         f"error={exc}"
                     )
+                await supervisor.record_cartographer_attempt_failure(
+                    deployment,
+                    decision,
+                    reason=f"{type(exc).__name__}:{exc}",
+                    details={"stage": "execution_runner"},
+                )
                 await self._record_live_entry_failure(supervisor, deployment, live=live, output=output)
                 if supervisor.manual_status_writer is not None:
                     error = await supervisor.manual_status_writer.mark_entry_error(
@@ -1990,7 +2211,10 @@ class BhikshaRuntime:
                         )
                 raise
             if plan is None:
-                output(f"ENTRY_BLOCKED deployment={deployment.deployment_id} symbol={deployment.symbol} reason=lifecycle")
+                output(
+                    f"ENTRY_FAILED deployment={deployment.deployment_id} "
+                    f"symbol={deployment.symbol} reason=planner_returned_no_plan"
+                )
                 return
             if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):
                 mode = "live" if plan.order_id and not plan.dry_run else ("shadow" if simulate_only else "dry_run")

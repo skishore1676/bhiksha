@@ -22,3 +22,19 @@ def test_missing_evidence_and_projection_readback_failures_are_attention_items()
     failed = owner_status(_producer("succeeded"), projection={"status": "failed"})
     assert failed["last_run_status"] == "projection_failed"
     assert failed["attention_required"] is True
+
+
+def test_trigger_accounting_remainder_is_projected_as_semantic_attention() -> None:
+    status = owner_status(
+        _producer("succeeded"),
+        projection={"status": "succeeded"},
+        trigger_accounting={
+            "status": "attention",
+            "true_triggers": 2,
+            "accounted": 1,
+            "remainder": 1,
+        },
+    )
+    assert status["lifecycle"] == "blocked"
+    assert status["attention_required"] is True
+    assert status["last"]["trigger_accounting"]["remainder"] == 1

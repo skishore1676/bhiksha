@@ -109,6 +109,28 @@ class SQLiteEventRepository(EventRepository):
 
     def _append_sync(self, event_type: str, payload: dict[str, Any]) -> None:
         with closing(self.backend.connect()) as conn:
+            # Cartographer trigger starts, recovery markers, and terminal
+            # outcomes are idempotency records.  A watchdog or a repeated
+            # strategy callback may present the same attempt again; the
+            # existing append-only ledger is the durable dedupe surface.
+            if event_type in {
+                "cartographer_signal_attempt",
+                "cartographer_signal_attempt_recovery",
+                "cartographer_signal_attempt_outcome",
+            }:
+                attempt_id = str(payload.get("signal_attempt_id") or "")
+                if attempt_id:
+                    existing = conn.execute(
+                        "SELECT payload FROM events WHERE event_type = ?",
+                        (event_type,),
+                    ).fetchall()
+                    for (raw_payload,) in existing:
+                        try:
+                            prior = json.loads(raw_payload)
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if str(prior.get("signal_attempt_id") or "") == attempt_id:
+                            return
             conn.execute(
                 "INSERT INTO events (created_at, event_type, payload) VALUES (?, ?, ?)",
                 (

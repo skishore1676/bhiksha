@@ -39,6 +39,8 @@ class ProjectionApplyError(RuntimeError):
 def _sheet_equivalent_value(index: int, value: Any) -> Any:
     """Normalize the date/time coercions produced by USER_ENTERED Sheet writes."""
 
+    if value is None:
+        return ""
     if index == 1:
         if isinstance(value, str) and value.strip().upper() in {"TRUE", "FALSE"}:
             return value.strip().upper() == "TRUE"
@@ -48,11 +50,40 @@ def _sheet_equivalent_value(index: int, value: Any) -> Any:
             return Decimal(str(value))
         except (InvalidOperation, ValueError):
             return value
-    if index == 8 and isinstance(value, (int, float)) and not isinstance(value, bool):
-        minutes = round(float(value) * 24 * 60) % (24 * 60)
-        return f"{minutes // 60:02d}:{minutes % 60:02d}"
-    if index == 9 and isinstance(value, (int, float)) and not isinstance(value, bool):
-        return (_SHEETS_DATE_EPOCH + timedelta(days=int(value))).isoformat()
+    if index == 8:
+        numeric = value
+        if isinstance(value, str):
+            text = value.strip()
+            if ":" in text:
+                try:
+                    hour, minute = (int(part) for part in text.split(":", 1))
+                    if 0 <= hour < 24 and 0 <= minute < 60:
+                        return f"{hour:02d}:{minute:02d}"
+                except ValueError:
+                    pass
+        if isinstance(numeric, (int, float)) and not isinstance(numeric, bool):
+            minutes = round(float(numeric) * 24 * 60) % (24 * 60)
+            return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    if index == 9:
+        numeric = value
+        if isinstance(numeric, str):
+            text = numeric.strip()
+            try:
+                numeric = float(text)
+            except ValueError:
+                try:
+                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except ValueError:
+                    parsed = None
+                if parsed is not None:
+                    return parsed.date().isoformat()
+                return text
+        if isinstance(numeric, (int, float)) and not isinstance(numeric, bool):
+            return (_SHEETS_DATE_EPOCH + timedelta(days=int(numeric))).isoformat()
+    if index in {18, 19, 20, 21}:
+        loaded = _load_json(value)
+        if loaded is not None:
+            return json.dumps(loaded, sort_keys=True, separators=(",", ":"))
     return value
 
 
@@ -109,6 +140,7 @@ def _projected_row(signal: Mapping[str, Any], *, operator_premium_ceiling: float
         "cartographer_version": signal["cartographer_version"],
         "run_id": signal["run_id"],
         "trading_date": signal["trading_date"],
+        "valid_after": signal["valid_after"],
         "valid_through": signal["valid_through"],
         "profile_slug": signal["management_policy"],
         "bundle_hash": bundle["bundle_hash"],
@@ -257,7 +289,10 @@ def project_with_table(
             preimage.append({"row_index": index, "before": values, "id": row_id})
     receipt_body: dict[str, Any] = {
         **{key: value for key, value in pure_receipt.items() if key != "receipt_hash"},
-        "status": "applied" if apply else pure_receipt["status"],
+        # A no-op apply is a confirmed success, not another ambiguous dry run.
+        "status": "applied" if apply and updates else (
+            "succeeded" if apply else pure_receipt["status"]
+        ),
         "producer_run_id": signal_batch.get("run_id"),
         "trading_date": trading_date,
         "apply_requested": apply,
@@ -265,20 +300,24 @@ def project_with_table(
         "planned_updates": len(updates),
         "preimage": preimage,
         "expired_rows": expired_rows,
-        "effects": {**pure_receipt["effects"], "sheet": apply},
+        "sheet_write_outcome": (
+            "confirmed" if apply and updates else ("not_needed" if apply else "none")
+        ),
+        "effects": {**pure_receipt["effects"], "sheet": bool(apply and updates)},
     }
     if not apply:
         return {**receipt_body, "receipt_hash": canonical_hash(receipt_body)}
     try:
-        table.update_exact_rows(headers=headers, rows=updates)
-        after = table.read_rows()
-        after_by_id = {str(record.get("id") or ""): record for record in after}
-        for _, expected in updates:
-            actual = after_by_id.get(str(expected[0]))
-            if actual is None or not _sheet_rows_equal(
-                [actual.get(header, "") for header in headers], expected
-            ):
-                raise RuntimeError("Cartographer projection readback mismatch")
+        if updates:
+            table.update_exact_rows(headers=headers, rows=updates)
+            after = table.read_rows()
+            after_by_id = {str(record.get("id") or ""): record for record in after}
+            for _, expected in updates:
+                actual = after_by_id.get(str(expected[0]))
+                if actual is None or not _sheet_rows_equal(
+                    [actual.get(header, "") for header in headers], expected
+                ):
+                    raise RuntimeError("Cartographer projection readback mismatch")
     except Exception as exc:
         raise ProjectionApplyError(
             f"{exc}; retain preimage for rollback", preimage=preimage

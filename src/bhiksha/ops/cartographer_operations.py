@@ -11,6 +11,7 @@ def owner_status(
     *,
     projection: Mapping[str, Any] | None = None,
     compile_readback: Mapping[str, Any] | None = None,
+    trigger_accounting: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project owner facts; launchd exit success alone is never healthy evidence."""
 
@@ -18,14 +19,30 @@ def owner_status(
     lifecycle = str(producer.get("lifecycle") or "blocked")
     attention = bool(producer.get("attention_required"))
     reason = str(producer.get("reason") or "owner_status_missing")
+    if trigger_accounting is None:
+        trigger_accounting = producer.get("trigger_accounting")
+    if (
+        isinstance(trigger_accounting, Mapping)
+        and trigger_accounting.get("status") == "attention"
+    ):
+        return _status(
+            "blocked",
+            "trigger_accounting_attention",
+            True,
+            "trigger_accounting_remainder",
+            producer,
+            projection,
+            compile_readback,
+            trigger_accounting,
+        )
     if attention or lifecycle == "blocked":
-        return _status("blocked", producer_status, True, reason, producer, projection, compile_readback)
+        return _status("blocked", producer_status, True, reason, producer, projection, compile_readback, trigger_accounting)
     if lifecycle == "running":
-        return _status("recovering", producer_status, False, reason, producer, projection, compile_readback)
+        return _status("recovering", producer_status, False, reason, producer, projection, compile_readback, trigger_accounting)
     if projection is not None and projection.get("status") not in {"dry_run", "no_signal", "succeeded"}:
-        return _status("blocked", "projection_failed", True, "projection_receipt_failed", producer, projection, compile_readback)
+        return _status("blocked", "projection_failed", True, "projection_receipt_failed", producer, projection, compile_readback, trigger_accounting)
     if compile_readback is not None and compile_readback.get("status") not in {"succeeded", "no_plan"}:
-        return _status("blocked", "compile_or_readback_failed", True, "compile_readback_failed", producer, projection, compile_readback)
+        return _status("blocked", "compile_or_readback_failed", True, "compile_readback_failed", producer, projection, compile_readback, trigger_accounting)
     quiet = producer_status == "no_plan"
     return _status(
         "complete",
@@ -35,6 +52,7 @@ def owner_status(
         producer,
         projection,
         compile_readback,
+        trigger_accounting,
     )
 
 
@@ -46,6 +64,7 @@ def _status(
     producer: Mapping[str, Any],
     projection: Mapping[str, Any] | None,
     compile_readback: Mapping[str, Any] | None,
+    trigger_accounting: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "schema": "bhiksha.cartographer_owner_status.v1",
@@ -65,6 +84,7 @@ def _status(
             "producer": dict(producer),
             "projection": dict(projection or {}),
             "compile_readback": dict(compile_readback or {}),
+            "trigger_accounting": dict(trigger_accounting or {}),
         },
         "available_actions": [],
     }
