@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from pathlib import Path
 import subprocess
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 from bhiksha.ops.alerts import AlertResult
 from bhiksha.ops.daily_report import DailyReportWriteResult
 from bhiksha.tools import launchd_job
+
+
+def test_scheduled_close_report_is_named_as_a_pre_close_snapshot() -> None:
+    observed_at = datetime.fromisoformat("2026-08-17T14:45:00-05:00")
+
+    assert launchd_job._report_label("scheduled", now=observed_at) == "pre-close"
+    assert launchd_job._report_label("close", now=observed_at) == "close"
 
 
 def test_report_warning_without_attention_uses_normal_receipt_level() -> None:

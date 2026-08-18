@@ -12,6 +12,7 @@ from bhiksha.tools import launchd_job
 from bhiksha.tools.cartographer_evidence_status import (
     build_fact_graph,
     build_status,
+    read_signal_lifecycle,
     read_terminal_facts,
 )
 from bhiksha.tools.launchd_status import _cartographer_installed_pending_first_run
@@ -87,6 +88,42 @@ def test_terminal_fact_reader_is_read_only_and_dedupes_exact_receipts(tmp_path) 
             [("cartographer_terminal_fact", json.dumps(fact))] * 2,
         )
     assert read_terminal_facts(database) == [fact]
+
+
+def test_signal_lifecycle_resolves_expired_without_inventing_a_trade(tmp_path) -> None:
+    database = tmp_path / "bhiksha.db"
+    expired = {
+        "deployment_id": "mc-v1-expired",
+        "signal": False,
+        "reason": ["manual_trigger_waiting", "chart_signal_expired"],
+    }
+    triggered = {
+        "deployment_id": "mc-v1-triggered",
+        "signal": True,
+        "reason": ["manual_trigger_met"],
+    }
+    censored_fact = {
+        "status": "inconclusive",
+        "decision_ready": False,
+        "identity": {"signal_id": "mc-v1-triggered"},
+    }
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, event_type TEXT, payload TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO events(event_type, payload) VALUES (?, ?)",
+            [
+                ("signal_evaluation", json.dumps(expired)),
+                ("signal_evaluation", json.dumps(triggered)),
+                ("cartographer_terminal_fact", json.dumps(censored_fact)),
+            ],
+        )
+
+    assert read_signal_lifecycle(database) == [
+        {"signal_id": "mc-v1-expired", "status": "expired"},
+        {"signal_id": "mc-v1-triggered", "status": "censored"},
+    ]
 
 
 def test_newly_installed_job_is_quiet_only_before_its_first_run() -> None:

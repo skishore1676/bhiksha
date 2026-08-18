@@ -4,9 +4,15 @@ from datetime import UTC, datetime, timedelta
 
 import polars as pl
 
-from bhiksha.active_plan.compiler import ActivePlanSheetRow, compile_active_plan_from_rows
+from bhiksha.active_plan.compiler import (
+    ActivePlanSheetRow,
+    compile_active_plan_from_rows,
+)
 from bhiksha.cartographer_profiles import profile_bundle
-from bhiksha.execution.cartographer_invalidation import entry_guard, evaluate_invalidation
+from bhiksha.execution.cartographer_invalidation import (
+    entry_guard,
+    evaluate_invalidation,
+)
 from bhiksha.state.position_tracker import TrackedPosition
 
 
@@ -60,8 +66,17 @@ def _compile(tmp_path, row: ActivePlanSheetRow):
 def test_cartographer_entry_guard_requires_fresh_unexpired_observation(tmp_path) -> None:
     deployment = _compile(tmp_path, _row()).plan.deployments[0]
     metadata = deployment.source.metadata
-    observed_at = datetime.now(UTC)
-    assert entry_guard(metadata, direction="long", close=600.0, observed_at=observed_at) is None
+    observed_at = datetime(2026, 8, 17, 15, 0, tzinfo=UTC)
+    assert (
+        entry_guard(
+            metadata,
+            direction="long",
+            close=600.0,
+            observed_at=observed_at,
+            now=observed_at,
+        )
+        is None
+    )
     assert (
         entry_guard(
             metadata,

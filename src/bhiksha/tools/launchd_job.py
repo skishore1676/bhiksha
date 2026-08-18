@@ -26,7 +26,6 @@ from bhiksha.ops.daily_report import (
     DailyReportWriteResult,
     render_daily_report_ryg_telegram_html,
     render_daily_report_ryg_telegram_text,
-    render_daily_report_telegram_summary,
     write_daily_report,
 )
 from bhiksha.ops.launchd_status_store import write_latest_status
@@ -656,7 +655,6 @@ def _should_watchdog_refresh(*, repo_root: Path, args: argparse.Namespace) -> bo
     # Need a running process to be worth refreshing
     try:
         from bhiksha.tools.server_session import _runtime_status
-        from bhiksha.ops.launchd_registry import latest_status_path
 
         pid_path = Path(args.pid_path) if hasattr(args, "pid_path") else repo_root / "artifacts" / "playbook" / "runtime" / "bhiksha.pid"
         status = _runtime_status(pid_path)
@@ -712,15 +710,15 @@ def _alert_level_for_report(report: dict) -> str:
     return "info"
 
 
-def _report_label(raw: str) -> str:
+def _report_label(raw: str, *, now: datetime | None = None) -> str:
     if raw != "scheduled":
         return raw
-    now = datetime.now(CENTRAL).time()
-    if now.hour < 10:
+    current = (now or datetime.now(CENTRAL)).astimezone(CENTRAL).time()
+    if current.hour < 10:
         return "morning"
-    if now.hour < 14:
+    if current.hour < 14:
         return "midday"
-    return "close"
+    return "pre-close"
 
 
 def _parse_runtime_status(stdout: str) -> dict | None:

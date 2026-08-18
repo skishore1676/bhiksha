@@ -136,6 +136,50 @@ def read_terminal_facts(events_db_path: Path) -> list[dict[str, Any]]:
     return facts
 
 
+def read_signal_lifecycle(events_db_path: Path) -> list[dict[str, str]]:
+    """Collapse Bhiksha-owned Cartographer events to one lifecycle state per signal."""
+
+    path = events_db_path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+        rows = connection.execute(
+            "SELECT event_type, payload FROM events "
+            "WHERE event_type IN (?, ?) ORDER BY id",
+            ("signal_evaluation", "cartographer_terminal_fact"),
+        ).fetchall()
+    lifecycle: dict[str, str] = {}
+    for event_type, payload_text in rows:
+        payload = json.loads(payload_text)
+        if not isinstance(payload, dict):
+            continue
+        if event_type == "cartographer_terminal_fact":
+            signal_id = str((payload.get("identity") or {}).get("signal_id") or "")
+            if not signal_id:
+                continue
+            lifecycle[signal_id] = (
+                "closed"
+                if payload.get("status") == "closed"
+                and payload.get("decision_ready") is True
+                else "censored"
+            )
+            continue
+        signal_id = str(payload.get("deployment_id") or "")
+        if not signal_id.startswith("mc-v1-"):
+            continue
+        reasons = {str(reason) for reason in (payload.get("reason") or [])}
+        if "chart_signal_expired" in reasons:
+            lifecycle[signal_id] = "expired"
+        elif payload.get("signal") is True:
+            lifecycle[signal_id] = "triggered"
+        else:
+            lifecycle.setdefault(signal_id, "eligible")
+    return [
+        {"signal_id": signal_id, "status": lifecycle[signal_id]}
+        for signal_id in sorted(lifecycle)
+    ]
+
+
 def build_fact_graph(*, signal_batch_path: Path, terminal_facts_path: Path) -> dict[str, Any]:
     """Read-only identity graph; absent facts remain absent rather than zero P&L."""
 
@@ -179,7 +223,11 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--events-db and --terminal-facts are mutually exclusive")
         facts = read_terminal_facts(args.events_db)
         if args.signal_batch is None:
-            payload = {"schema": "bhiksha.cartographer_terminal_facts.v1", "facts": facts}
+            payload = {
+                "schema": "bhiksha.cartographer_evidence_export.v1",
+                "facts": facts,
+                "lifecycle": read_signal_lifecycle(args.events_db),
+            }
         else:
             batch = _read(args.signal_batch)
             if batch is None:
