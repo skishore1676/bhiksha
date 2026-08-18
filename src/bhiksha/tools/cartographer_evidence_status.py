@@ -84,15 +84,18 @@ def build_status(
         and projection.get("producer_run_id") == producer_run_id
         and projection.get("signal_batch_hash") == producer_batch_hash
     )
+    trading_date = str((projection or {}).get("trading_date") or "")
     accounting = None
     if events_db_path is not None:
-        accounting = trigger_accounting(load_attempt_events(events_db_path))
+        accounting = trigger_accounting(
+            load_attempt_events(events_db_path),
+            trading_date=trading_date or None,
+        )
     expected_ids = {
         str(action.get("signal_id") or "")
         for action in ((projection or {}).get("actions") or [])
         if isinstance(action, dict) and action.get("action") in {"created", "preserved"}
     }
-    trading_date = str((projection or {}).get("trading_date") or "")
     compiled_ids = (
         _compiled_cartographer_ids(active_plan_path, run_id=str(producer_run_id))
         if active_plan_path is not None and producer_run_id else None

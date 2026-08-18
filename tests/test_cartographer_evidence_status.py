@@ -78,6 +78,53 @@ def test_status_requires_matching_compile_after_deadline(tmp_path) -> None:
     assert mismatched["compile"]["status"] == "mismatch"
 
 
+def test_status_scopes_trigger_attention_to_projection_trading_date(tmp_path) -> None:
+    producer = tmp_path / "producer.json"
+    projection = tmp_path / "projection.json"
+    active_plan = tmp_path / "active_plan.json"
+    database = tmp_path / "bhiksha.db"
+    producer.write_text(json.dumps({
+        "lifecycle": "complete",
+        "receipt": {"run_id": "run-1", "signal_batch_hash": "sha256:batch"},
+    }), encoding="utf-8")
+    body = {
+        "status": "applied",
+        "producer_run_id": "run-1",
+        "signal_batch_hash": "sha256:batch",
+        "trading_date": "2026-08-19",
+        "actions": [],
+    }
+    projection.write_text(
+        json.dumps({**body, "receipt_hash": canonical_hash(body)}), encoding="utf-8"
+    )
+    active_plan.write_text(json.dumps({"deployments": []}), encoding="utf-8")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, created_at TEXT, event_type TEXT, payload TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO events(created_at, event_type, payload) VALUES (?, ?, ?)",
+            (
+                "2026-08-18T13:35:00+00:00",
+                "signal_decision",
+                json.dumps({
+                    "deployment_id": "mc-v1-legacy",
+                    "signal": True,
+                    "timestamp": "2026-08-18T13:35:00+00:00",
+                }),
+            ),
+        )
+    status = build_status(
+        producer_status_path=producer,
+        projection_receipt_path=projection,
+        active_plan_path=active_plan,
+        events_db_path=database,
+        now=datetime.fromisoformat("2026-08-19T08:45:00-05:00"),
+    )
+    assert status["status"] == "healthy"
+    assert status["trigger_accounting"]["true_triggers"] == 0
+
+
 def test_terminal_fact_reader_is_read_only_and_dedupes_exact_receipts(tmp_path) -> None:
     database = tmp_path / "bhiksha.db"
     fact = {"fact_receipt_id": "sha256:one", "identity": {"signal_id": "mc-1"}}

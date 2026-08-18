@@ -216,6 +216,24 @@ def test_frozen_tuesday_cartographer_accounting_is_two_legacy_triggers() -> None
     assert report["status"] == "attention"
 
 
+def test_daily_accounting_does_not_carry_legacy_gap_into_next_session() -> None:
+    events = [
+        {
+            "event_type": "signal_decision",
+            "payload": {
+                "deployment_id": "mc-v1-legacy",
+                "signal": True,
+                "timestamp": "2026-08-18T13:35:12.102151+00:00",
+            },
+        }
+    ]
+    assert trigger_accounting(events, trading_date="2026-08-18")["status"] == "attention"
+    next_session = trigger_accounting(events, trading_date="2026-08-19")
+    assert next_session["true_triggers"] == 0
+    assert next_session["remainder"] == 0
+    assert next_session["status"] == "healthy"
+
+
 def test_unresolved_attempt_reader_excludes_terminal_outcome() -> None:
     timestamp = datetime(2026, 8, 18, 13, 35, tzinfo=UTC)
     context = _context(timestamp=timestamp)

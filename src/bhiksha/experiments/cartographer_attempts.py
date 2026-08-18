@@ -16,6 +16,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 ATTEMPT_EVENT = "cartographer_signal_attempt"
@@ -289,8 +290,16 @@ def unresolved_attempts(events: Sequence[Mapping[str, Any]]) -> list[dict[str, A
     ]
 
 
-def trigger_accounting(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Count true triggers against exactly one terminal outcome each."""
+def trigger_accounting(
+    events: Sequence[Mapping[str, Any]], *, trading_date: str | None = None
+) -> dict[str, Any]:
+    """Count true triggers against exactly one terminal outcome each.
+
+    Operational health is daily.  When ``trading_date`` is supplied, retain
+    historical events in the ledger but exclude starts outside that New York
+    trading date so a prior infrastructure-censored session cannot poison
+    every later day's owner status.
+    """
 
     starts: dict[str, Mapping[str, Any]] = {}
     outcomes: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
@@ -308,6 +317,12 @@ def trigger_accounting(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             if not deployment_id.startswith("mc-v1-"):
                 continue
             timestamp = _parse_timestamp(payload.get("timestamp")) or datetime.fromtimestamp(0, UTC)
+            if (
+                trading_date
+                and timestamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+                != trading_date
+            ):
+                continue
             attempt_id = attempt_id or signal_attempt_id(
                 deployment_id=deployment_id,
                 timestamp=timestamp,
@@ -324,6 +339,16 @@ def trigger_accounting(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 },
             )
         elif event_type == ATTEMPT_EVENT and attempt_id:
+            timestamp = _parse_timestamp(payload.get("signal_timestamp"))
+            if (
+                trading_date
+                and (
+                    timestamp is None
+                    or timestamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+                    != trading_date
+                )
+            ):
+                continue
             existing = starts.get(attempt_id)
             if existing is None:
                 starts[attempt_id] = payload
