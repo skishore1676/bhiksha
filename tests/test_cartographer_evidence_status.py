@@ -267,7 +267,18 @@ def test_shadow_runner_checks_producer_projects_before_observing() -> None:
     assert "market_cartographer.alpha_cli status" in source
     assert "bhiksha.tools.cartographer_projector" in source
     assert "--apply" in source
+    assert "--defaults-sheet-name" in source
+    assert "premium-ceiling" not in source
     assert source.index("bhiksha.tools.cartographer_projector") < source.index("cartographer_shadow observe-root")
+
+
+def test_both_runtime_entry_runners_terminalize_cartographer_exceptions() -> None:
+    for path in ("src/bhiksha/app/runtime.py", "src/bhiksha/active_plan/runtime.py"):
+        source = Path(path).read_text(encoding="utf-8")
+        assert "await supervisor.record_cartographer_attempt_failure(" in source
+        assert source.index(
+            "await supervisor.record_cartographer_attempt_failure("
+        ) < source.index("await self._record_live_entry_failure(")
 
 
 def test_advertised_launchd_job_invokes_real_shadow_runner(tmp_path, monkeypatch) -> None:

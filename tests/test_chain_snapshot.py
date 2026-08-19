@@ -187,7 +187,7 @@ def test_build_chain_snapshot_cross_check_against_real_selector_winner() -> None
     assert real_selection.option_symbol == "SMH260717P00610000"
 
 
-def test_build_chain_snapshot_persists_farther_fallback_winner() -> None:
+def test_build_chain_snapshot_records_only_the_bounded_nearest_fallback() -> None:
     request = _request(
         dte_min=0,
         dte_max=3,
@@ -208,21 +208,19 @@ def test_build_chain_snapshot_persists_farther_fallback_winner() -> None:
         ),
     ]
 
-    selection = SingleLegOptionSelector().select(request, contracts)
+    with pytest.raises(SelectorEmptyError) as excinfo:
+        SingleLegOptionSelector().select(request, contracts)
     attempt = build_chain_snapshot(
         request,
         contracts,
         lane="live",
         snapshot_id="snap-farther-fallback",
-        selection=selection,
+        selector_error=excinfo.value,
     )
 
-    assert selection.option_symbol == "SMH_FARTHER_LIQUID"
     assert attempt.nearest_after_dte == 4
-    assert {row.dte for row in attempt.rows} == {4, 11}
-    selected = [row for row in attempt.rows if row.is_selected]
-    assert len(selected) == 1
-    assert selected[0].option_symbol == selection.option_symbol
+    assert {row.dte for row in attempt.rows} == {4}
+    assert [row for row in attempt.rows if row.is_selected] == []
 
 
 def test_build_chain_snapshot_handles_empty_chain() -> None:

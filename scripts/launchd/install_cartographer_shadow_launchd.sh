@@ -12,7 +12,6 @@ TEMPLATE="$REPO_ROOT/scripts/launchd/com.bhiksha.cartographer-shadow.plist.templ
 DOMAIN="gui/$(id -u)"
 : "${BHIKSHA_CARTOGRAPHER_SHEET_ID:?set the approved target Sheet id before installation}"
 : "${BHIKSHA_CARTOGRAPHER_SHEET_CREDENTIALS:?set the approved credential file path before installation}"
-: "${BHIKSHA_CARTOGRAPHER_PREMIUM_CEILING:?set the approved premium ceiling before installation}"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$OUTPUT_ROOT" "$LOG_ROOT"
 sed \
@@ -24,7 +23,6 @@ sed \
   -e "s#__LOG_ROOT__#$LOG_ROOT#g" \
   -e "s#__SHEET_ID__#$BHIKSHA_CARTOGRAPHER_SHEET_ID#g" \
   -e "s#__SHEET_CREDENTIALS__#$BHIKSHA_CARTOGRAPHER_SHEET_CREDENTIALS#g" \
-  -e "s#__PREMIUM_CEILING__#$BHIKSHA_CARTOGRAPHER_PREMIUM_CEILING#g" \
   "$TEMPLATE" > "$PLIST"
 plutil -lint "$PLIST"
 launchctl bootout "$DOMAIN/com.bhiksha.cartographer-shadow" 2>/dev/null || true

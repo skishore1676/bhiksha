@@ -35,14 +35,13 @@ fi
 
 : "${BHIKSHA_CARTOGRAPHER_SHEET_ID:?Cartographer Sheet id is required}"
 : "${BHIKSHA_CARTOGRAPHER_SHEET_CREDENTIALS:?Cartographer Sheet credentials path is required}"
-: "${BHIKSHA_CARTOGRAPHER_PREMIUM_CEILING:?Cartographer premium ceiling is required}"
 
 cd "$REPO_ROOT"
 "$PYTHON_BIN" -m bhiksha.tools.cartographer_projector \
   --signal-batch "$RECOMMENDATION_ROOT/latest/signals.json" \
   --trading-date "$(date +%F)" \
-  --premium-ceiling "$BHIKSHA_CARTOGRAPHER_PREMIUM_CEILING" \
   --spreadsheet-id "$BHIKSHA_CARTOGRAPHER_SHEET_ID" \
+  --defaults-sheet-name "${OPERATOR_DEFAULTS_SHEET_NAME:-Operator_Defaults_v1}" \
   --credentials "$BHIKSHA_CARTOGRAPHER_SHEET_CREDENTIALS" \
   --apply \
   --receipt "$PROJECTION_RECEIPT"

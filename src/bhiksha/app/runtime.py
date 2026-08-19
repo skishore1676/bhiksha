@@ -1953,6 +1953,12 @@ class BhikshaRuntime:
                         f"symbol={deployment.symbol} "
                         f"error={exc}"
                     )
+                await supervisor.record_cartographer_attempt_failure(
+                    deployment,
+                    decision,
+                    reason=f"{type(exc).__name__}:{exc}",
+                    details={"stage": "execution_runner"},
+                )
                 await self._record_live_entry_failure(supervisor, deployment, live=live, output=output)
                 if supervisor.manual_status_writer is not None:
                     error = await supervisor.manual_status_writer.mark_entry_error(

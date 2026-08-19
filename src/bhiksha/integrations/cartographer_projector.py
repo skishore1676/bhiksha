@@ -123,14 +123,27 @@ def _validate_signal(signal: Mapping[str, Any]) -> dict[str, Any]:
     return dict(signal)
 
 
-def _projected_row(signal: Mapping[str, Any], *, operator_premium_ceiling: float) -> list[Any]:
+def _operator_premium_ceiling(operator_defaults: Mapping[str, Any]) -> float:
+    try:
+        ceiling = float(operator_defaults.get("max_trade_premium_usd"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("operator premium ceiling must be numeric") from exc
+    if ceiling <= 0:
+        raise ValueError("operator premium ceiling must be positive")
+    return ceiling
+
+
+def _projected_row(
+    signal: Mapping[str, Any], *, operator_defaults: Mapping[str, Any]
+) -> list[Any]:
     signal = _validate_signal(signal)
-    bundle = validate_profile_bundle(profile_bundle(str(signal["management_policy"])))
+    bundle = validate_profile_bundle(
+        profile_bundle(str(signal["management_policy"]), operator_defaults)
+    )
     execution = bundle["execution"]
     management = bundle["management"]
     requested = float(bundle["requested_max_trade_premium_usd"])
-    if operator_premium_ceiling <= 0:
-        raise ValueError("operator premium ceiling must be positive")
+    operator_premium_ceiling = _operator_premium_ceiling(operator_defaults)
     effective = min(requested, operator_premium_ceiling)
     evidence = dict(signal["evidence"])
     metadata = {
@@ -168,7 +181,7 @@ def project_signals(
     existing_rows: Sequence[Sequence[Any]],
     signal_batch: Mapping[str, Any],
     *,
-    operator_premium_ceiling: float,
+    operator_defaults: Mapping[str, Any],
     trading_date: str,
 ) -> tuple[list[list[Any]], dict[str, Any]]:
     """Return an idempotent fake-workbook update and a zero-write receipt."""
@@ -183,7 +196,7 @@ def project_signals(
     actions: list[dict[str, Any]] = []
     for signal in signal_batch.get("signals", []):
         normalized = _validate_signal(signal)
-        target = _projected_row(normalized, operator_premium_ceiling=operator_premium_ceiling)
+        target = _projected_row(normalized, operator_defaults=operator_defaults)
         row_id = str(target[0])
         if str(normalized["trading_date"]) != trading_date:
             actions.append({"signal_id": row_id, "action": "expired"})
@@ -223,7 +236,7 @@ def project_with_table(
     table: TableClient,
     signal_batch: Mapping[str, Any],
     *,
-    operator_premium_ceiling: float,
+    operator_defaults: Mapping[str, Any],
     trading_date: str,
     apply: bool = False,
 ) -> dict[str, Any]:
@@ -251,7 +264,7 @@ def project_with_table(
         existing_rows.append([record.get(header, "") for header in headers])
     projected, pure_receipt = project_signals(
         existing_rows, signal_batch,
-        operator_premium_ceiling=operator_premium_ceiling, trading_date=trading_date,
+        operator_defaults=operator_defaults, trading_date=trading_date,
     )
     batch_ids = {str(signal.get("signal_id") or "") for signal in signal_batch.get("signals", [])}
     expired_rows: list[str] = []

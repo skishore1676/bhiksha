@@ -50,8 +50,29 @@ def _batch() -> dict[str, object]:
     return {**body, "signal_batch_hash": canonical_hash(body)}
 
 
+def _operator_defaults(ceiling: float = 500.0) -> dict[str, object]:
+    return {
+        "max_trade_premium_usd": ceiling,
+        "dte_fallback_policy": "allow_nearest_after",
+        "delta_min": 0.15,
+        "delta_max": 0.35,
+        "min_open_interest": 100,
+        "max_bid_ask_spread_pct": 0.20,
+        "max_contracts": 1,
+        "profile__trend_continuation": {
+            "dte_min": 3,
+            "dte_max": 7,
+            "max_trade_premium_usd": 500.0,
+            "max_contracts": 1,
+        },
+    }
+
+
 def test_projector_maps_av_and_round_trips_through_compiler(tmp_path: Path) -> None:
-    rows, receipt = project_signals([], _batch(), operator_premium_ceiling=400.0, trading_date="2026-08-17")
+    defaults = _operator_defaults(400.0)
+    rows, receipt = project_signals(
+        [], _batch(), operator_defaults=defaults, trading_date="2026-08-17"
+    )
     assert receipt["actions"][0]["action"] == "created"
     assert len(rows[0]) == 22
     assert rows[0][8] == "09:35"
@@ -60,19 +81,24 @@ def test_projector_maps_av_and_round_trips_through_compiler(tmp_path: Path) -> N
     catalog.mkdir()
     compiled = compile_active_plan_from_rows(
         rows=[row], strategy_catalog_path=catalog, trading_date="2026-08-17",
-        operator_defaults={"max_trade_premium_usd": 400.0},
+        operator_defaults=defaults,
     )
     assert compiled.plan.suppressed == []
     assert compiled.plan.deployments[0].risk.max_trade_premium_usd == 400.0
 
 
 def test_projector_retry_preserves_consumed_state_and_writebacks() -> None:
-    rows, _ = project_signals([], _batch(), operator_premium_ceiling=500.0, trading_date="2026-08-17")
+    defaults = _operator_defaults()
+    rows, _ = project_signals(
+        [], _batch(), operator_defaults=defaults, trading_date="2026-08-17"
+    )
     rows[0][1] = False
     rows[0][2] = "live"
     rows[0][8] = "10:30"
     rows[0][12:16] = ["triggered", "at", "note", "trade-1"]
-    retried, receipt = project_signals(rows, _batch(), operator_premium_ceiling=500.0, trading_date="2026-08-17")
+    retried, receipt = project_signals(
+        rows, _batch(), operator_defaults=defaults, trading_date="2026-08-17"
+    )
     assert receipt["actions"][0]["action"] == "preserved"
     assert retried[0][1:3] == [False, "live"]
     assert retried[0][8] == "09:35"
@@ -82,8 +108,12 @@ def test_projector_retry_preserves_consumed_state_and_writebacks() -> None:
 def test_projector_rejects_ownership_collision_and_expired_signal() -> None:
     rows = [[_signal()["signal_id"], True, "shadow"]]
     with pytest.raises(ValueError, match="non-Cartographer"):
-        project_signals(rows, _batch(), operator_premium_ceiling=500.0, trading_date="2026-08-17")
-    rows, receipt = project_signals([], _batch(), operator_premium_ceiling=500.0, trading_date="2026-08-18")
+        project_signals(
+            rows, _batch(), operator_defaults=_operator_defaults(), trading_date="2026-08-17"
+        )
+    rows, receipt = project_signals(
+        [], _batch(), operator_defaults=_operator_defaults(), trading_date="2026-08-18"
+    )
     assert rows == []
     assert receipt["actions"] == [{"signal_id": _signal()["signal_id"], "action": "expired"}]
 
@@ -105,13 +135,21 @@ class _Table:
 
 def test_table_projector_validates_headers_dry_runs_and_readbacks() -> None:
     table = _Table(MANUAL_ENTRY_HEADERS, [{"id": "", "row_index": 2}])
-    dry = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+    dry = project_with_table(
+        table, _batch(), operator_defaults=_operator_defaults(400), trading_date="2026-08-17"
+    )
     assert dry["planned_updates"] == 1 and table.writes == []
     assert dry["preimage"] == [{"row_index": 3, "before": None, "id": _signal()["signal_id"]}]
-    applied = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17", apply=True)
+    applied = project_with_table(
+        table, _batch(), operator_defaults=_operator_defaults(400),
+        trading_date="2026-08-17", apply=True,
+    )
     assert applied["status"] == "applied" and len(table.writes) == 1
     assert applied["trading_date"] == "2026-08-17"
-    retry = project_with_table(table, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17", apply=True)
+    retry = project_with_table(
+        table, _batch(), operator_defaults=_operator_defaults(400),
+        trading_date="2026-08-17", apply=True,
+    )
     assert retry["planned_updates"] == 0
     assert applied["receipt_hash"] == canonical_hash({key: value for key, value in applied.items() if key != "receipt_hash"})
 
@@ -133,12 +171,12 @@ def test_table_projector_accepts_google_date_and_time_coercion() -> None:
 
     table = _GoogleCoercingTable(MANUAL_ENTRY_HEADERS, [])
     applied = project_with_table(
-        table, _batch(), operator_premium_ceiling=400,
+        table, _batch(), operator_defaults=_operator_defaults(400),
         trading_date="2026-08-17", apply=True,
     )
     assert applied["status"] == "applied"
     retry = project_with_table(
-        table, _batch(), operator_premium_ceiling=400,
+        table, _batch(), operator_defaults=_operator_defaults(400),
         trading_date="2026-08-17", apply=True,
     )
     assert retry["planned_updates"] == 0
@@ -150,12 +188,14 @@ def test_idempotent_apply_returns_success_without_a_sheet_write() -> None:
             self.writes.append(rows)
             super().update_exact_rows(headers=headers, rows=rows)
 
-    rows, _ = project_signals([], _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+    rows, _ = project_signals(
+        [], _batch(), operator_defaults=_operator_defaults(400), trading_date="2026-08-17"
+    )
     records = [dict(zip(MANUAL_ENTRY_HEADERS, rows[0], strict=True))]
     records[0]["row_index"] = 3
     table = _NoOpTrackingTable(MANUAL_ENTRY_HEADERS, records)
     receipt = project_with_table(
-        table, _batch(), operator_premium_ceiling=400,
+        table, _batch(), operator_defaults=_operator_defaults(400),
         trading_date="2026-08-17", apply=True,
     )
     assert receipt["status"] == "succeeded"
@@ -166,10 +206,16 @@ def test_idempotent_apply_returns_success_without_a_sheet_write() -> None:
 
 def test_table_projector_fails_header_duplicate_and_readback_errors() -> None:
     with pytest.raises(ValueError, match="headers"):
-        project_with_table(_Table(["id"], []), _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+        project_with_table(
+            _Table(["id"], []), _batch(), operator_defaults=_operator_defaults(400),
+            trading_date="2026-08-17",
+        )
     duplicate = _Table(MANUAL_ENTRY_HEADERS, [{"id": "x", "row_index": 2}, {"id": "x", "row_index": 3}])
     with pytest.raises(ValueError, match="duplicate"):
-        project_with_table(duplicate, _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+        project_with_table(
+            duplicate, _batch(), operator_defaults=_operator_defaults(400),
+            trading_date="2026-08-17",
+        )
 
     class _ReadbackMismatch(_Table):
         def update_exact_rows(self, *, headers, rows):
@@ -178,11 +224,14 @@ def test_table_projector_fails_header_duplicate_and_readback_errors() -> None:
     with pytest.raises(ProjectionApplyError, match="readback mismatch"):
         project_with_table(
             _ReadbackMismatch(MANUAL_ENTRY_HEADERS, []), _batch(),
-            operator_premium_ceiling=400, trading_date="2026-08-17", apply=True,
+            operator_defaults=_operator_defaults(400), trading_date="2026-08-17", apply=True,
         )
 
     class _ReadFailure(_Table):
         def read_headers(self): raise OSError("read unavailable")
 
     with pytest.raises(OSError, match="read unavailable"):
-        project_with_table(_ReadFailure(MANUAL_ENTRY_HEADERS, []), _batch(), operator_premium_ceiling=400, trading_date="2026-08-17")
+        project_with_table(
+            _ReadFailure(MANUAL_ENTRY_HEADERS, []), _batch(),
+            operator_defaults=_operator_defaults(400), trading_date="2026-08-17",
+        )

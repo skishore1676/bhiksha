@@ -262,7 +262,53 @@ def test_single_leg_selector_strict_reports_nearest_after_without_selecting_it()
     }
 
 
-def test_single_leg_selector_fallback_does_not_rescue_non_dte_filter_failures() -> None:
+def test_single_leg_selector_fallback_uses_nearest_after_when_primary_has_no_eligible_contract() -> None:
+    selector = SingleLegOptionSelector()
+    request = OptionSelectionRequest(
+        deployment_id="amd_short_lane",
+        symbol="AMD",
+        direction=SignalDirection.SHORT,
+        signal_timestamp=datetime(2026, 6, 17, 14, 30, 0, tzinfo=UTC),
+        execution_profile="single_leg_long_premium_v1",
+        execution_params={
+            "short_signal_contract_type": "PUT",
+            "dte_min": 3,
+            "dte_max": 7,
+            "dte_fallback_policy": "allow_nearest_after",
+            "target_abs_delta_min": 0.15,
+            "target_abs_delta_max": 0.35,
+            "min_open_interest": 100,
+            "max_bid_ask_spread_pct": 0.08,
+        },
+    )
+
+    selected = selector.select(
+        request,
+        [
+            _contract(
+                "AMD260622P00150000",
+                symbol="AMD",
+                dte=5,
+                delta=-0.30,
+                bid=2.00,
+                ask=2.50,
+            ),
+            _contract(
+                "AMD260626P00150000",
+                symbol="AMD",
+                dte=9,
+                delta=-0.30,
+                bid=2.00,
+                ask=2.05,
+            ),
+        ],
+    )
+
+    assert selected.option_symbol == "AMD260626P00150000"
+    assert selected.dte_fallback_policy == "allow_nearest_after"
+
+
+def test_single_leg_selector_fallback_never_skips_the_nearest_later_expiry() -> None:
     selector = SingleLegOptionSelector()
     request = OptionSelectionRequest(
         deployment_id="amd_short_lane",
@@ -287,17 +333,17 @@ def test_single_leg_selector_fallback_does_not_rescue_non_dte_filter_failures() 
             request,
             [
                 _contract(
-                    "AMD260622P00150000",
+                    "AMD260626P00150000",
                     symbol="AMD",
-                    dte=5,
+                    dte=9,
                     delta=-0.30,
                     bid=2.00,
                     ask=2.50,
                 ),
                 _contract(
-                    "AMD260626P00150000",
+                    "AMD260629P00150000",
                     symbol="AMD",
-                    dte=9,
+                    dte=12,
                     delta=-0.30,
                     bid=2.00,
                     ask=2.05,
@@ -305,8 +351,58 @@ def test_single_leg_selector_fallback_does_not_rescue_non_dte_filter_failures() 
             ],
         )
 
-    assert excinfo.value.breakdown["spread_above_max"] == 1
-    assert excinfo.value.diagnostics["dte_window_candidates"] == 1
+    assert excinfo.value.diagnostics["nearest_after_dte"] == 9
+
+
+def test_pdd_regression_selects_eligible_nearest_after_when_primary_window_is_empty_after_filters() -> None:
+    selector = SingleLegOptionSelector()
+    request = OptionSelectionRequest(
+        deployment_id="strategy_triage_market_impulse_pdd_pdd_long_live_row_29",
+        symbol="PDD",
+        direction=SignalDirection.LONG,
+        signal_timestamp=datetime(2026, 8, 19, 14, 1, tzinfo=UTC),
+        execution_profile="single_leg_long_premium_v1",
+        execution_params={
+            "long_signal_contract_type": "CALL",
+            "dte_min": 0,
+            "dte_max": 3,
+            "dte_fallback_policy": "allow_nearest_after",
+            "target_abs_delta_min": 0.15,
+            "target_abs_delta_max": 0.35,
+            "min_open_interest": 50,
+            "max_bid_ask_spread_pct": 0.20,
+        },
+    )
+
+    selected = selector.select(
+        request,
+        [
+            _contract(
+                "PDD260821C00095000",
+                symbol="PDD",
+                dte=2,
+                delta=0.30,
+                bid=1.00,
+                ask=1.40,
+                open_interest=49,
+                contract_type="CALL",
+            ),
+            _contract(
+                "PDD260828C00095000",
+                symbol="PDD",
+                dte=9,
+                delta=0.2666,
+                bid=1.24,
+                ask=1.40,
+                open_interest=906,
+                contract_type="CALL",
+            ),
+        ],
+    )
+
+    assert selected.option_symbol == "PDD260828C00095000"
+    assert selected.dte == 9
+    assert selected.dte_fallback_policy == "allow_nearest_after"
 
 
 def _contract(
@@ -317,16 +413,18 @@ def _contract(
     delta: float,
     bid: float,
     ask: float,
+    open_interest: int = 500,
+    contract_type: str = "PUT",
 ) -> OptionContractSnapshot:
     return OptionContractSnapshot(
         option_symbol=option_symbol,
         underlying_symbol=symbol,
-        contract_type="PUT",
+        contract_type=contract_type,
         expiration_date="2026-06-26",
         dte=dte,
         strike=610.0,
         delta=delta,
         bid=bid,
         ask=ask,
-        open_interest=500,
+        open_interest=open_interest,
     )

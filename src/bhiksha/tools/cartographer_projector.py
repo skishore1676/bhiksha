@@ -6,17 +6,23 @@ import argparse
 import json
 from pathlib import Path
 
+from bhiksha.active_plan.compiler import load_operator_defaults_sheet_rows
 from bhiksha.cartographer_profiles import canonical_hash
-from bhiksha.integrations.cartographer_projector import ProjectionApplyError, project_with_table
+from bhiksha.integrations.cartographer_projector import (
+    ProjectionApplyError,
+    project_with_table,
+)
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 
 
-def run_projection(*, table, signal_batch: Path, trading_date: str, premium_ceiling: float, apply: bool) -> dict:
+def run_projection(
+    *, table, signal_batch: Path, trading_date: str, operator_defaults: dict, apply: bool
+) -> dict:
     payload = json.loads(signal_batch.expanduser().read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("signal batch must be a JSON object")
     return project_with_table(
-        table, payload, operator_premium_ceiling=premium_ceiling,
+        table, payload, operator_defaults=operator_defaults,
         trading_date=trading_date, apply=apply,
     )
 
@@ -25,9 +31,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--signal-batch", type=Path, required=True)
     parser.add_argument("--trading-date", required=True)
-    parser.add_argument("--premium-ceiling", type=float, required=True)
     parser.add_argument("--spreadsheet-id", required=True)
     parser.add_argument("--sheet-name", default="manual_entry")
+    parser.add_argument("--defaults-sheet-name", default="Operator_Defaults_v1")
     parser.add_argument("--credentials", type=Path, required=True)
     parser.add_argument("--apply", action="store_true", help="perform the otherwise dry-run Sheet update")
     parser.add_argument("--receipt", type=Path)
@@ -35,7 +41,19 @@ def main(argv: list[str] | None = None) -> int:
     batch = json.loads(args.signal_batch.expanduser().read_text(encoding="utf-8"))
     try:
         table = GoogleSheetTableClient(args.spreadsheet_id, args.sheet_name, args.credentials)
-        receipt = run_projection(table=table, signal_batch=args.signal_batch, trading_date=args.trading_date, premium_ceiling=args.premium_ceiling, apply=args.apply)
+        defaults_table = GoogleSheetTableClient(
+            args.spreadsheet_id, args.defaults_sheet_name, args.credentials
+        )
+        operator_defaults = load_operator_defaults_sheet_rows(
+            defaults_table.read_rows()
+        )
+        receipt = run_projection(
+            table=table,
+            signal_batch=args.signal_batch,
+            trading_date=args.trading_date,
+            operator_defaults=operator_defaults,
+            apply=args.apply,
+        )
     except Exception as exc:
         apply_failure = isinstance(exc, ProjectionApplyError)
         body = {

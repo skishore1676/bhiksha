@@ -1714,9 +1714,13 @@ def _compile_cartographer_manual_trigger_row(
         raise ValueError("Cartographer valid_through must be timezone-aware ISO-8601") from exc
     if valid_through.tzinfo is None or valid_through.date().isoformat() != effective_trading_date:
         raise ValueError("Cartographer signal validity does not cover this compilation date")
-    bundle = validate_profile_bundle(profile_bundle(str(metadata["profile_slug"])))
+    bundle = validate_profile_bundle(
+        profile_bundle(str(metadata["profile_slug"]), operator_defaults or {})
+    )
     if metadata["bundle_hash"] != bundle["bundle_hash"]:
-        raise ValueError("Cartographer profile bundle hash does not match compiler registry")
+        raise ValueError(
+            "Cartographer profile snapshot hash does not match Operator_Defaults_v1"
+        )
     invalidation = _cartographer_number(metadata["invalidation_price"], "invalidation price")
     trigger = _cartographer_number(row.trigger_price, "trigger price")
     if row.direction == "long" and invalidation >= trigger:
@@ -1726,19 +1730,25 @@ def _compile_cartographer_manual_trigger_row(
     execution = dict(bundle["execution"])
     requested_execution = dict(row.execution_overrides)
     if requested_execution != execution:
-        raise ValueError("Cartographer execution specification does not match compiler registry")
+        raise ValueError(
+            "Cartographer execution specification does not match Operator_Defaults_v1"
+        )
     if row.end_in_days != execution["dte_max"]:
         raise ValueError("Cartographer end_in_days must mirror the profile DTE maximum")
     management = dict(bundle["management"])
     provided_management = dict(row.exit_profile_spec or {})
     if provided_management != management:
-        raise ValueError("Cartographer management specification does not match compiler registry")
+        raise ValueError(
+            "Cartographer management specification does not match its profile snapshot"
+        )
     requested_risk = dict(row.risk_overrides)
     requested_premium = _cartographer_number(
         requested_risk.get("requested_max_trade_premium_usd"), "requested premium ceiling"
     )
     if requested_premium != float(bundle["requested_max_trade_premium_usd"]):
-        raise ValueError("Cartographer requested premium ceiling does not match compiler registry")
+        raise ValueError(
+            "Cartographer requested premium ceiling does not match Operator_Defaults_v1"
+        )
     operator_premium = _cartographer_number(
         (operator_defaults or {}).get("max_trade_premium_usd"), "operator premium ceiling"
     )

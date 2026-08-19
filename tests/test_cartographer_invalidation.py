@@ -16,8 +16,26 @@ from bhiksha.execution.cartographer_invalidation import (
 from bhiksha.state.position_tracker import TrackedPosition
 
 
+def _operator_defaults() -> dict:
+    return {
+        "max_trade_premium_usd": 400.0,
+        "dte_fallback_policy": "allow_nearest_after",
+        "delta_min": 0.15,
+        "delta_max": 0.35,
+        "min_open_interest": 100,
+        "max_bid_ask_spread_pct": 0.20,
+        "max_contracts": 1,
+        "profile__trend_continuation": {
+            "dte_min": 3,
+            "dte_max": 7,
+            "max_trade_premium_usd": 500.0,
+            "max_contracts": 1,
+        },
+    }
+
+
 def _row() -> ActivePlanSheetRow:
-    bundle = profile_bundle("TREND_CONTINUATION")
+    bundle = profile_bundle("TREND_CONTINUATION", _operator_defaults())
     return ActivePlanSheetRow.model_validate(
         {
             "row_id": "mc-v1-example",
@@ -59,7 +77,7 @@ def _compile(tmp_path, row: ActivePlanSheetRow):
         rows=[row],
         strategy_catalog_path=catalog,
         trading_date="2026-08-17",
-        operator_defaults={"max_trade_premium_usd": 400.0},
+        operator_defaults=_operator_defaults(),
     )
 
 
