@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,11 @@ STATUS_COLUMNS = [
 class ManualSheetStatusWriter:
     client: GoogleSheetTableClient
     row_index_by_deployment: dict[str, int]
+    _row_locks: dict[int, asyncio.Lock] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @classmethod
     def from_active_plan(
@@ -45,10 +50,12 @@ class ManualSheetStatusWriter:
             sheet_name=str(manual_sheet_name),
             credentials_path=Path(credentials_path),
         )
-        # Metadata discovery happens during startup and may use the control-
-        # plane retry budget. Intraday status writebacks are best-effort and
-        # must not add exponential-backoff latency around entry/exit handling.
-        client.api_retries = 0
+        # Metadata discovery happens during startup and may use the full
+        # control-plane retry budget. Intraday status writebacks get exactly
+        # one transport retry: enough to recover the transient SSL/5xx class
+        # seen in production without turning Sheet projection into an
+        # unbounded execution-path dependency.
+        client.api_retries = 1
         row_index_by_deployment: dict[str, int] = {}
         for deployment in deployments:
             if not _is_sheet_backed_manual(deployment):
@@ -169,8 +176,17 @@ class ManualSheetStatusWriter:
         }
         if disable_row:
             payload["enabled"] = False
+        # Cartographer status calls are dispatched without blocking execution.
+        # Serialize writes to one physical row so a recovered earlier write
+        # cannot overtake a later terminal/planned status.
+        row_lock = self._row_locks.setdefault(row_index, asyncio.Lock())
         try:
-            await asyncio.to_thread(self.client.update_row_cells, row_index=row_index, values=payload)
+            async with row_lock:
+                await asyncio.to_thread(
+                    self.client.update_row_cells,
+                    row_index=row_index,
+                    values=payload,
+                )
         except Exception as exc:  # pragma: no cover - exercised via runtime fallback
             return str(exc)
         return None

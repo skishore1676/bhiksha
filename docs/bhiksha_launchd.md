@@ -80,8 +80,9 @@ If `live-start` still cannot compile a plan, the runtime remains stopped. The
 next watchdog attempt retries Sheet compilation before starting and never
 silently launches the previous active plan.
 
-Intraday manual-row status writebacks remain best-effort with no retry loop, so
-a Sheet outage cannot add backoff latency around entry or exit processing.
+Intraday manual-row status writebacks remain best-effort with one Google transport
+retry and per-row write ordering. Cartographer dispatch stays off the execution path;
+an exhausted Sheet write is recorded without changing local trade facts.
 
 The session report intentionally uses Lathi Bus's Telegram `status` template.
 Telegram gets a compact operator card: quick read, open positions, watch items,
