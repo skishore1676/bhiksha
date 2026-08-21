@@ -24,8 +24,8 @@ STATUS_COLUMNS = [
 class ManualSheetStatusWriter:
     client: GoogleSheetTableClient
     row_index_by_deployment: dict[str, int]
-    _row_locks: dict[int, asyncio.Lock] = field(
-        default_factory=dict,
+    _client_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
         init=False,
         repr=False,
     )
@@ -95,6 +95,7 @@ class ManualSheetStatusWriter:
             event_at=event_at,
             note=_trim_note(note),
             trade_id=trade_id,
+            disable_row=_is_cartographer_owned(deployment),
         )
 
     async def mark_entry_planned(
@@ -104,6 +105,11 @@ class ManualSheetStatusWriter:
         plan: TradePlan,
         mode: str,
     ) -> str | None:
+        if _is_cartographer_owned(deployment):
+            # Bhiksha's event and trade stores own intraday lifecycle truth.
+            # Cartographer Sheet rows need only the one-shot trigger latch and
+            # a terminal operator-facing status.
+            return None
         status = "entry_submitted" if mode == "live" else "entry_planned"
         note = _trim_note(
             f"{mode} option={plan.option_symbol} qty={plan.quantity} est={round(plan.estimated_entry_price, 2)}"
@@ -128,9 +134,12 @@ class ManualSheetStatusWriter:
             status="entry_error",
             event_at=event_at,
             note=_trim_note(error),
+            disable_row=_is_cartographer_owned(deployment),
         )
 
     async def mark_exit_submitted(self, deployment: DeploymentManifest, *, plan: ExitPlan) -> str | None:
+        if _is_cartographer_owned(deployment):
+            return None
         return await self._write_status(
             deployment,
             status="exit_pending",
@@ -153,6 +162,7 @@ class ManualSheetStatusWriter:
             event_at=event_at or datetime.now(UTC),
             note=_trim_note(note),
             trade_id=trade_id,
+            disable_row=_is_cartographer_owned(deployment),
         )
 
     async def _write_status(
@@ -177,11 +187,12 @@ class ManualSheetStatusWriter:
         if disable_row:
             payload["enabled"] = False
         # Cartographer status calls are dispatched without blocking execution.
-        # Serialize writes to one physical row so a recovered earlier write
-        # cannot overtake a later terminal/planned status.
-        row_lock = self._row_locks.setdefault(row_index, asyncio.Lock())
+        # GoogleSheetTableClient is a shared synchronous client, so protect the
+        # client itself rather than only one physical row. This also preserves
+        # submission order for one row without creating a workbook-wide or
+        # cross-process lock.
         try:
-            async with row_lock:
+            async with self._client_lock:
                 await asyncio.to_thread(
                     self.client.update_row_cells,
                     row_index=row_index,
@@ -199,6 +210,12 @@ def _is_sheet_backed_manual(deployment: DeploymentManifest) -> bool:
         and metadata.get("row_index") is not None
         and metadata.get("sheet_name") is not None
     )
+
+
+def _is_cartographer_owned(deployment: DeploymentManifest) -> bool:
+    source = getattr(deployment, "source", None)
+    metadata = getattr(source, "metadata", None)
+    return isinstance(metadata, dict) and metadata.get("source_owner") == "market_cartographer"
 
 
 def _trim_note(value: str, *, max_length: int = 240) -> str:

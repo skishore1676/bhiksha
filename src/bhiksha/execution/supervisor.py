@@ -28,8 +28,9 @@ from bhiksha.domain.exit_state import (
     TradeExitPolicySnapshot,
 )
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
-from bhiksha.execution.planner import ExecutionPlanner
+from bhiksha.execution.cartographer_excursions import option_mfe_mae, underlying_mfe_mae
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
+from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.quote_lineage import proved_quote_timestamp_lineage
 from bhiksha.execution.brokers.public.order_status import (
     PUBLIC_DEAD_ORDER_STATUSES,
@@ -242,6 +243,9 @@ class ExecutionSupervisor:
         self._profile_exit_degraded_trades: set[str] = set()
         self._profile_exit_recovery_events: set[str] = set()
         self._manual_status_tasks: set[asyncio.Task] = set()
+        self._cartographer_excursion_observations: dict[
+            str, dict[str, list[dict[str, Any]]]
+        ] = {}
 
     async def close(self) -> None:
         if self.exit_edge_recorder is not None:
@@ -2763,6 +2767,7 @@ class ExecutionSupervisor:
         position: TrackedPosition,
         *,
         dry_run: bool,
+        underlying_bar: Mapping[str, Any] | None = None,
     ) -> TrackedPosition | None:
         # A deployment may be demoted to shadow while a broker position from
         # its previously-live lane is still open or being reconciled. The
@@ -2772,7 +2777,12 @@ class ExecutionSupervisor:
         if position.source in NON_LIVE_POSITION_SOURCES:
             dry_run = True
         async with self._symbol_locks[position.symbol]:
-            return await self._manage_open_position_locked(deployment, position, dry_run=dry_run)
+            return await self._manage_open_position_locked(
+                deployment,
+                position,
+                dry_run=dry_run,
+                underlying_bar=underlying_bar,
+            )
 
     @staticmethod
     def _deployment_with_frozen_exit(
@@ -3077,6 +3087,7 @@ class ExecutionSupervisor:
         position: TrackedPosition,
         *,
         dry_run: bool,
+        underlying_bar: Mapping[str, Any] | None = None,
     ) -> TrackedPosition | None:
         if position.option_symbol is None or position.quantity <= 0:
             return None
@@ -3179,6 +3190,14 @@ class ExecutionSupervisor:
         if dry_run and updated.source == "shadow":
             current_quote = await ensure_quote()
             reference_price = current_quote.exit_reference_price
+            observed_at = datetime.now(UTC)
+            self._capture_cartographer_excursion_observation(
+                deployment,
+                updated,
+                observed_at=observed_at,
+                option_price=reference_price,
+                underlying_bar=underlying_bar,
+            )
             await self.event_repository.append(
                 "shadow_mark",
                 {
@@ -3193,6 +3212,8 @@ class ExecutionSupervisor:
                     "ask": current_quote.ask,
                     "last": current_quote.last,
                     "spread_pct": current_quote.spread_pct,
+                    "timestamp": observed_at.isoformat(),
+                    "underlying_bar": self._serialize_excursion_bar(underlying_bar),
                     "unrealized_pnl_usd": _premium_pnl(updated.entry_price, reference_price, updated.quantity),
                     "unrealized_stop_r": _realized_stop_r(
                         updated.entry_price,
@@ -3939,27 +3960,146 @@ class ExecutionSupervisor:
         self, deployment: DeploymentManifest, position: TrackedPosition, *,
         terminal_reason: str, fill_details: dict[str, Any] | None = None,
     ) -> None:
-        """Persist a terminal identity fact at the real close chokepoint.
-
-        Excursion coverage is intentionally ``missing`` until the lifecycle has
-        complete entry-to-exit quote coverage; a closed trade therefore cannot
-        pass the evidence decision gate merely because its economics exist.
-        """
+        """Persist physical close, economics, and honest excursion coverage."""
 
         metadata = deployment.source.metadata
         if metadata.get("source_owner") != "market_cartographer":
             return
+        details = fill_details or {}
+        exit_at = details.get("exit_filled_at") or datetime.now(UTC)
+        if isinstance(exit_at, str):
+            exit_at = datetime.fromisoformat(exit_at.replace("Z", "+00:00"))
+        if exit_at.tzinfo is None:
+            exit_at = exit_at.replace(tzinfo=UTC)
+        trade_id = position.trade_id or position.order_id or "UNKNOWN_TRADE"
+        observation_store = getattr(self, "_cartographer_excursion_observations", {})
+        observations = observation_store.pop(
+            trade_id, {"option_marks": [], "underlying_bars": []}
+        )
+        option_marks = observations["option_marks"]
+        if position.entry_timestamp is not None and position.entry_price is not None:
+            option_marks.insert(
+                0,
+                {
+                    "trade_id": trade_id,
+                    "timestamp": position.entry_timestamp,
+                    "price": position.entry_price,
+                    "coverage": "complete",
+                },
+            )
+        if details.get("exit_price") is not None:
+            option_marks.append(
+                {
+                    "trade_id": trade_id,
+                    "timestamp": exit_at,
+                    "price": details["exit_price"],
+                    "coverage": "complete",
+                }
+            )
+        option_excursion = self._option_excursion_fact(
+            position, trade_id=trade_id, exit_at=exit_at, marks=option_marks
+        )
+        underlying_excursion = self._underlying_excursion_fact(
+            deployment,
+            position,
+            exit_at=exit_at,
+            bars=observations["underlying_bars"],
+        )
         fact = build_terminal_fact(
             deployment={"deployment_id": deployment.deployment_id, "source": {"metadata": metadata}},
-            trade_id=position.trade_id or position.order_id or "UNKNOWN_TRADE",
+            trade_id=trade_id,
             terminal_reason=terminal_reason,
-            option_excursion={"coverage": "missing"},
-            underlying_excursion={"coverage": "missing"},
+            option_excursion=option_excursion,
+            underlying_excursion=underlying_excursion,
             gross_pnl_usd=_premium_pnl(
-                position.entry_price, (fill_details or {}).get("exit_price"), position.quantity
+                position.entry_price, details.get("exit_price"), position.quantity
             ),
         )
         await self.event_repository.append("cartographer_terminal_fact", fact)
+
+    def _capture_cartographer_excursion_observation(
+        self,
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        observed_at: datetime,
+        option_price: float | None,
+        underlying_bar: Mapping[str, Any] | None,
+    ) -> None:
+        if deployment.source.metadata.get("source_owner") != "market_cartographer":
+            return
+        trade_id = position.trade_id or position.order_id
+        if trade_id is None:
+            return
+        observations = self._cartographer_excursion_observations.setdefault(
+            trade_id, {"option_marks": [], "underlying_bars": []}
+        )
+        if option_price is not None:
+            observations["option_marks"].append(
+                {
+                    "trade_id": trade_id,
+                    "timestamp": observed_at,
+                    "price": option_price,
+                    "coverage": "complete",
+                }
+            )
+        if underlying_bar is not None:
+            observations["underlying_bars"].append(dict(underlying_bar))
+
+    @staticmethod
+    def _serialize_excursion_bar(bar: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if bar is None:
+            return None
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in bar.items()
+        }
+
+    @staticmethod
+    def _option_excursion_fact(
+        position: TrackedPosition,
+        *,
+        trade_id: str,
+        exit_at: datetime,
+        marks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if (
+            position.entry_timestamp is None
+            or position.entry_price is None
+            or exit_at < position.entry_timestamp
+        ):
+            return {"coverage": "missing", "coverage_reasons": ["entry_option_fact_missing"]}
+        return option_mfe_mae(
+            trade_id=trade_id,
+            entry_at=position.entry_timestamp,
+            exit_at=exit_at,
+            entry_price=position.entry_price,
+            marks=marks,
+        )
+
+    @staticmethod
+    def _underlying_excursion_fact(
+        deployment: DeploymentManifest,
+        position: TrackedPosition,
+        *,
+        exit_at: datetime,
+        bars: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        direction = str(deployment.strategy.params.get("direction") or "").lower()
+        if (
+            position.entry_timestamp is None
+            or position.underlying_entry_price is None
+            or direction not in {"long", "short"}
+            or exit_at < position.entry_timestamp
+        ):
+            return {"coverage": "missing", "coverage_reasons": ["entry_underlying_fact_missing"]}
+        return underlying_mfe_mae(
+            direction=direction,
+            entry_at=position.entry_timestamp,
+            exit_at=exit_at,
+            entry_price=position.underlying_entry_price,
+            bars=bars,
+        )
 
     async def _readback_exact_partial_fill(
         self,

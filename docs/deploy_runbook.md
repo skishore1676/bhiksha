@@ -36,6 +36,14 @@ For manual rows, Bhiksha now writes back execution status into the same `manual_
   - this makes the row one-shot by default, so yesterday's triggered manual setup does not silently re-arm tomorrow
   - re-enable the row manually if you want to reuse it
 
+Cartographer-owned rows use a narrower operator-facing contract. Bhiksha writes the
+immediate one-shot trigger latch and then the final terminal M:P status; intermediate
+entry-planned and exit-pending states remain in Bhiksha's event/trade stores. Every
+Cartographer terminal write repeats `enabled=FALSE`, so it can repair a failed trigger
+latch. One process-local lock serializes the shared Google client across rows, while
+the existing one bounded transport retry and failure event remain unchanged. Human
+manual rows retain their prior intermediate writebacks.
+
 ## Time Conventions
 
 Enter sheet times in ET.

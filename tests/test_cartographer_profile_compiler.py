@@ -236,4 +236,71 @@ async def test_terminal_owner_fact_keeps_valid_shadow_gross_pnl(tmp_path: Path) 
     event_type, fact = events.rows[0]
     assert event_type == "cartographer_terminal_fact"
     assert fact["gross_pnl_usd"] == 50.0
-    assert fact["decision_ready"] is False
+    assert fact["status"] == "closed"
+    assert "decision_ready" not in fact
+
+
+@pytest.mark.asyncio
+async def test_terminal_owner_fact_emits_four_excursions_when_coverage_is_complete(
+    tmp_path: Path,
+) -> None:
+    deployment = _compile(tmp_path, _row()).plan.deployments[0]
+    events = _Events()
+    supervisor = object.__new__(ExecutionSupervisor)
+    supervisor.event_repository = events
+    entry_at = datetime(2026, 8, 17, 15, tzinfo=UTC)
+    exit_at = entry_at.replace(minute=2)
+    supervisor._cartographer_excursion_observations = {
+        "trade-1": {
+            "option_marks": [
+                {
+                    "trade_id": "trade-1",
+                    "timestamp": entry_at.replace(minute=1),
+                    "price": 1.1,
+                    "coverage": "complete",
+                }
+            ],
+            "underlying_bars": [
+                {
+                    "start": entry_at,
+                    "end": entry_at.replace(minute=1),
+                    "high": 101.0,
+                    "low": 99.0,
+                    "coverage": "complete",
+                },
+                {
+                    "start": entry_at.replace(minute=1),
+                    "end": exit_at,
+                    "high": 102.0,
+                    "low": 98.0,
+                    "coverage": "complete",
+                },
+            ],
+        }
+    }
+    position = TrackedPosition(
+        symbol="SPY",
+        deployment_id=deployment.deployment_id,
+        trade_id="trade-1",
+        option_symbol="SPY_CALL",
+        quantity=1,
+        entry_price=1.0,
+        underlying_entry_price=100.0,
+        entry_timestamp=entry_at,
+        source="shadow",
+    )
+
+    await supervisor._record_cartographer_terminal_fact(
+        deployment,
+        position,
+        terminal_reason="profile_exit",
+        fill_details={"exit_price": 1.25, "exit_filled_at": exit_at},
+    )
+
+    _, fact = events.rows[0]
+    assert fact["option_mfe_pct"] == 0.25
+    assert fact["option_mae_pct"] == 0.0
+    assert fact["underlying_mfe_pct"] == 0.02
+    assert fact["underlying_mae_pct"] == -0.02
+    assert fact["coverage"]["option"]["status"] == "complete"
+    assert fact["coverage"]["underlying"]["status"] == "complete"

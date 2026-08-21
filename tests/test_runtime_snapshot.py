@@ -111,6 +111,56 @@ def test_position_runner_keeps_genuine_paper_positions_simulated() -> None:
         assert supervisor.dry_run_values == [True]
 
 
+def test_position_runner_forwards_the_current_underlying_bar() -> None:
+    runtime = build_runtime()
+    deployment = _runtime_deployment(
+        runtime,
+        symbol="QQQ",
+        fallback_id="market_impulse_qqq_short_v1",
+    )
+    position = TrackedPosition(
+        symbol="QQQ",
+        deployment_id=deployment.deployment_id,
+        trade_id="SHADOW",
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        entry_price=2.1,
+        source="shadow",
+    )
+    underlying_bar = {
+        "start": datetime(2026, 8, 21, 14, 0, tzinfo=UTC),
+        "end": datetime(2026, 8, 21, 14, 1, tzinfo=UTC),
+        "high": 600.0,
+        "low": 598.0,
+        "coverage": "complete",
+    }
+
+    class StubSupervisor:
+        def __init__(self) -> None:
+            self.underlying_bar = None
+
+        async def manage_open_position(
+            self, deployment, position, *, dry_run: bool, underlying_bar=None
+        ):
+            del deployment, position, dry_run
+            self.underlying_bar = underlying_bar
+            return None
+
+    supervisor = StubSupervisor()
+    runner = runtime._make_manage_position_runner(
+        supervisor,
+        deployment,
+        position,
+        live=True,
+        output=lambda _message: None,
+        underlying_bar=underlying_bar,
+    )
+
+    asyncio.run(runner())
+
+    assert supervisor.underlying_bar == underlying_bar
+
+
 def test_exit_runner_keeps_recovered_live_position_real_after_demotion() -> None:
     runtime = build_runtime()
     base = _runtime_deployment(

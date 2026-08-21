@@ -81,8 +81,11 @@ next watchdog attempt retries Sheet compilation before starting and never
 silently launches the previous active plan.
 
 Intraday manual-row status writebacks remain best-effort with one Google transport
-retry and per-row write ordering. Cartographer dispatch stays off the execution path;
-an exhausted Sheet write is recorded without changing local trade facts.
+retry. One process-local lock serializes the shared Google client across rows.
+Cartographer rows write the immediate one-shot trigger latch and a terminal status
+that repeats `enabled=FALSE`; their intermediate lifecycle stays in Bhiksha's durable
+facts. Cartographer dispatch stays off the execution path, and an exhausted Sheet
+write is recorded without changing local trade facts.
 
 The session report intentionally uses Lathi Bus's Telegram `status` template.
 Telegram gets a compact operator card: quick read, open positions, watch items,

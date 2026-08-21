@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 
@@ -13,7 +13,6 @@ def _result(*, coverage: str, reasons: list[str], mfe: float | None, mae: float 
         "coverage_reasons": reasons,
         "mfe_pct": mfe,
         "mae_pct": mae,
-        "decision_ready": coverage == "complete",
     }
 
 
@@ -27,18 +26,27 @@ def option_mfe_mae(
 
     if entry_price <= 0 or exit_at < entry_at:
         raise ValueError("excursion interval and entry price must be valid")
-    selected = [
-        mark
-        for mark in marks
-        if mark.get("trade_id") == trade_id and entry_at <= mark.get("timestamp") <= exit_at
-    ]
+    selected = sorted(
+        [
+            mark
+            for mark in marks
+            if mark.get("trade_id") == trade_id
+            and isinstance(mark.get("timestamp"), datetime)
+            and entry_at <= mark["timestamp"] <= exit_at
+        ],
+        key=lambda mark: mark["timestamp"],
+    )
     if not selected:
         return _result(coverage="missing", reasons=["no_trade_keyed_marks"], mfe=None, mae=None)
     if any(mark.get("coverage") != "complete" for mark in selected):
         return _result(coverage="partial", reasons=["partial_option_mark"], mfe=None, mae=None)
-    times = sorted(mark["timestamp"] for mark in selected)
+    times = [mark["timestamp"] for mark in selected]
+    if times[0] > entry_at:
+        return _result(coverage="partial", reasons=["entry_option_mark_missing"], mfe=None, mae=None)
     if times[-1] < exit_at:
-        return _result(coverage="missing", reasons=["terminal_option_mark_missing"], mfe=None, mae=None)
+        return _result(coverage="partial", reasons=["terminal_option_mark_missing"], mfe=None, mae=None)
+    if any(later - earlier > timedelta(seconds=90) for earlier, later in zip(times, times[1:])):
+        return _result(coverage="partial", reasons=["option_mark_gap"], mfe=None, mae=None)
     returns = [(float(mark["price"]) / entry_price - 1.0) for mark in selected]
     return _result(
         coverage="complete",
@@ -58,13 +66,20 @@ def underlying_mfe_mae(
     source = list(bars)
     if any(bar["start"] < entry_at < bar["end"] for bar in source):
         return _result(coverage="partial", reasons=["entry_bar_inseparable"], mfe=None, mae=None)
-    selected = [bar for bar in source if entry_at <= bar["start"] and bar["end"] <= exit_at]
+    selected = sorted(
+        [bar for bar in source if entry_at <= bar["start"] and bar["end"] <= exit_at],
+        key=lambda bar: bar["start"],
+    )
     if not selected:
         return _result(coverage="missing", reasons=["no_post_entry_underlying_bars"], mfe=None, mae=None)
     if any(bar.get("coverage") != "complete" for bar in selected):
         return _result(coverage="partial", reasons=["partial_underlying_bar"], mfe=None, mae=None)
-    if max(bar["end"] for bar in selected) < exit_at:
-        return _result(coverage="missing", reasons=["terminal_underlying_bar_missing"], mfe=None, mae=None)
+    if selected[0]["start"] > entry_at:
+        return _result(coverage="partial", reasons=["entry_underlying_interval_unobserved"], mfe=None, mae=None)
+    if any(later["start"] > earlier["end"] for earlier, later in zip(selected, selected[1:])):
+        return _result(coverage="partial", reasons=["underlying_bar_gap"], mfe=None, mae=None)
+    if selected[-1]["end"] < exit_at:
+        return _result(coverage="partial", reasons=["terminal_underlying_bar_missing"], mfe=None, mae=None)
     if direction == "long":
         favorable = [(float(bar["high"]) / entry_price - 1.0) for bar in selected]
         adverse = [(float(bar["low"]) / entry_price - 1.0) for bar in selected]

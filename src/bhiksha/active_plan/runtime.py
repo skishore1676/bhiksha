@@ -1467,6 +1467,13 @@ class BhikshaRuntime:
                     supervisor,
                     deployment,
                     position,
+                    underlying_bar={
+                        "start": bar.timestamp,
+                        "end": bar.timestamp + timedelta(minutes=1),
+                        "high": bar.high,
+                        "low": bar.low,
+                        "coverage": "complete",
+                    },
                     live=live,
                     output=output,
                     ),
@@ -2291,14 +2298,20 @@ class BhikshaRuntime:
         *,
         live: bool,
         output: callable,
+        underlying_bar=None,
     ):
         async def runner() -> None:
+            manage_kwargs = {
+                "dry_run": (not live) or position.source in NON_LIVE_POSITION_SOURCES,
+            }
+            if underlying_bar is not None:
+                manage_kwargs["underlying_bar"] = underlying_bar
             managed = await supervisor.manage_open_position(
                 deployment,
                 position,
                 # Existing broker positions remain real execution obligations
                 # even if Rail B has since demoted their deployment's entry lane.
-                dry_run=(not live) or position.source in NON_LIVE_POSITION_SOURCES,
+                **manage_kwargs,
             )
             if managed is not None and managed != position:
                 output(

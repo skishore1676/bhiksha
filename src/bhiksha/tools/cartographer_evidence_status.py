@@ -183,12 +183,10 @@ def read_signal_lifecycle(events_db_path: Path) -> list[dict[str, Any]]:
                 continue
             lifecycle[signal_id] = {
                 "signal_id": signal_id,
-                "status": (
-                    "closed"
-                    if payload.get("status") == "closed"
-                    and payload.get("decision_ready") is True
-                    else "censored"
-                ),
+                # Terminal facts are emitted only from physical close
+                # chokepoints. Excursion coverage is independent lifecycle
+                # evidence and never changes a close into censoring.
+                "status": "closed",
             }
             continue
         signal_id = str(payload.get("signal_id") or payload.get("deployment_id") or "")
@@ -210,11 +208,16 @@ def read_signal_lifecycle(events_db_path: Path) -> list[dict[str, Any]]:
             continue
         if event_type == OUTCOME_EVENT:
             outcome = str(payload.get("outcome") or "")
+            reason = str(payload.get("reason") or "")
             record.update(
                 {
                     "status": {
                         "blocked": "blocked",
-                        "failure": "failed",
+                        "failure": (
+                            "no_contract"
+                            if "SelectorEmptyError" in reason
+                            else "failed"
+                        ),
                         "infrastructure_censored": "infrastructure_censored",
                     }.get(outcome, "triggered"),
                     "signal_attempt_id": payload.get("signal_attempt_id"),

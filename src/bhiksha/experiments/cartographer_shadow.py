@@ -259,9 +259,8 @@ def build_terminal_fact(
     option_excursion: Mapping[str, Any],
     underlying_excursion: Mapping[str, Any],
     gross_pnl_usd: float | None = None,
-    net_pnl_usd: float | None = None,
 ) -> dict[str, Any]:
-    """Freeze one local shadow result without inferring missing coverage or economics."""
+    """Freeze one physical close without inferring missing path evidence."""
 
     source = dict(deployment.get("source") or {})
     metadata = dict(source.get("metadata") or {})
@@ -272,14 +271,18 @@ def build_terminal_fact(
     if missing:
         raise ValueError(f"terminal fact is missing identity: {', '.join(missing)}")
     coverage = {
-        "option": str(option_excursion.get("coverage") or "missing"),
-        "underlying": str(underlying_excursion.get("coverage") or "missing"),
+        "option": {
+            "status": str(option_excursion.get("coverage") or "missing"),
+            "reasons": list(option_excursion.get("coverage_reasons") or []),
+        },
+        "underlying": {
+            "status": str(underlying_excursion.get("coverage") or "missing"),
+            "reasons": list(underlying_excursion.get("coverage_reasons") or []),
+        },
     }
-    decision_ready = all(value == "complete" for value in coverage.values())
     body: dict[str, Any] = {
-        "schema": "bhiksha.cartographer_shadow_terminal_fact.v1",
-        "status": "closed" if decision_ready else "inconclusive",
-        "decision_ready": decision_ready,
+        "schema": "bhiksha.cartographer_shadow_terminal_fact.v2",
+        "status": "closed",
         "identity": {
             "signal_id": metadata["signal_id"],
             "signal_hash": metadata["signal_hash"],
@@ -290,16 +293,15 @@ def build_terminal_fact(
             "profile_slug": metadata["profile_slug"],
             "bundle_hash": metadata["bundle_hash"],
         },
-        "terminal_reason": terminal_reason,
-        "option_excursion": dict(option_excursion),
-        "underlying_excursion": dict(underlying_excursion),
+        "exit_reason": terminal_reason,
         "coverage": coverage,
         "gross_pnl_usd": gross_pnl_usd,
-        "net_pnl_usd": net_pnl_usd,
+        "option_mfe_pct": option_excursion.get("mfe_pct"),
+        "option_mae_pct": option_excursion.get("mae_pct"),
+        "underlying_mfe_pct": underlying_excursion.get("mfe_pct"),
+        "underlying_mae_pct": underlying_excursion.get("mae_pct"),
         "economics": {
             "gross_pnl_available": gross_pnl_usd is not None,
-            "net_pnl_available": net_pnl_usd is not None,
-            "excursion_decision_ready": decision_ready,
         },
         "effects": zero_effects(),
     }

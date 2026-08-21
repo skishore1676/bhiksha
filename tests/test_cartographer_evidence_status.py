@@ -149,9 +149,8 @@ def test_signal_lifecycle_resolves_expired_without_inventing_a_trade(tmp_path) -
         "signal": True,
         "reason": ["manual_trigger_met"],
     }
-    censored_fact = {
-        "status": "inconclusive",
-        "decision_ready": False,
+    closed_fact = {
+        "status": "closed",
         "identity": {"signal_id": "mc-v1-triggered"},
     }
     with sqlite3.connect(database) as connection:
@@ -163,13 +162,13 @@ def test_signal_lifecycle_resolves_expired_without_inventing_a_trade(tmp_path) -
             [
                 ("signal_evaluation", json.dumps(expired)),
                 ("signal_evaluation", json.dumps(triggered)),
-                ("cartographer_terminal_fact", json.dumps(censored_fact)),
+                ("cartographer_terminal_fact", json.dumps(closed_fact)),
             ],
         )
 
     assert read_signal_lifecycle(database) == [
         {"signal_id": "mc-v1-expired", "status": "expired"},
-        {"signal_id": "mc-v1-triggered", "status": "censored"},
+        {"signal_id": "mc-v1-triggered", "status": "closed"},
     ]
 
 
@@ -206,6 +205,31 @@ def test_triggered_attempt_is_exported_as_infrastructure_censored_with_identity(
         "reason": "triggered_without_terminal_outcome",
         "attempt_outcome": "infrastructure_censored",
     }]
+
+
+def test_selector_empty_attempt_is_exported_as_bounded_no_contract(tmp_path) -> None:
+    database = tmp_path / "bhiksha.db"
+    outcome = {
+        "signal_attempt_id": "sa-v1-xle",
+        "signal_id": "mc-v1-xle",
+        "deployment_id": "mc-v1-xle",
+        "outcome": "failure",
+        "reason": "SelectorEmptyError:no option contract matched bounded fallback",
+    }
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, event_type TEXT, payload TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO events(event_type, payload) VALUES (?, ?)",
+            ("cartographer_signal_attempt_outcome", json.dumps(outcome)),
+        )
+
+    lifecycle = read_signal_lifecycle(database)
+    assert lifecycle[0]["signal_id"] == "mc-v1-xle"
+    assert lifecycle[0]["status"] == "no_contract"
+    assert lifecycle[0]["attempt_outcome"] == "failure"
+    assert lifecycle[0]["reason"] == outcome["reason"]
 
 
 def test_tuesday_legacy_bac_and_abnb_triggers_are_both_infrastructure_censored(tmp_path) -> None:
