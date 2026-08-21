@@ -52,6 +52,7 @@ from bhiksha.ops.issues import classify_runtime_issue_category
 from bhiksha.ops.code_version import code_version_snapshot
 from bhiksha.ops.daily_report import write_daily_report
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
+from bhiksha.ops.evidence_identity import effective_exit_policy_identity
 from bhiksha.ops.session_manifest import (
     effective_exit_policy_records,
     write_session_manifest,
@@ -409,6 +410,9 @@ class BhikshaRuntime:
         )
         for deployment in self.deployments:
             metadata = deployment.source.metadata
+            exit_policy_id, exit_policy_sha256 = effective_exit_policy_identity(
+                deployment.exit
+            )
             deployment_evidence_identity[deployment.deployment_id] = {
                 "active_plan_id": active_plan_id,
                 "research_run_id": _optional_identity_text(metadata.get("run_id")),
@@ -441,14 +445,8 @@ class BhikshaRuntime:
                 "authorization_identity_status": _optional_identity_text(
                     metadata.get("authorization_identity_status")
                 ),
-                "exit_policy_id": deployment.exit.profile,
-                "exit_policy_sha256": hashlib.sha256(
-                    json.dumps(
-                        deployment.exit.model_dump(mode="json"),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest(),
+                "exit_policy_id": exit_policy_id,
+                "exit_policy_sha256": exit_policy_sha256,
                 "canary_id": _optional_identity_text(metadata.get("canary_id")),
                 "canary_authorization_sha256": _optional_identity_text(
                     metadata.get("authorization_sha256")
