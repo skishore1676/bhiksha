@@ -867,6 +867,48 @@ def test_rail_b_fires_exactly_at_min_n_with_negative_expectancy(tmp_path) -> Non
     assert demotion_events[0]["payload"]["mean_pnl_usd"] == -100.0
 
 
+def test_rail_b_backfills_past_unpriced_closed_trade_to_build_complete_window(tmp_path) -> None:
+    manager, _ = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0),
+    )
+    _seed_large_budget(manager)
+    for i in range(10):
+        trade = _closed_live_trade(
+            f"PRICED-{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW
+        )
+        asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+        asyncio.run(
+            manager.trade_state_repository.mark_closed(
+                trade.trade_id, exit_price=4.0, exit_filled_quantity=1, exit_filled_at=NOW
+            )
+        )
+
+    # Reproduce a legacy/runtime-corrupt row like the live SMH record: status
+    # says closed, but no durable exit economics exist. It is the most recent
+    # raw row and must not consume one of Rail B's ten evidence slots.
+    unpriced = replace(
+        _closed_live_trade(
+            "UNPRICED", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW
+        ),
+        exit_price=None,
+        exit_filled_quantity=None,
+        exit_filled_at=None,
+    )
+    asyncio.run(manager.trade_state_repository.upsert_trade(unpriced))
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+
+    assert decision.allowed is False
+    assert decision.reason == RAIL_B_DEMOTED_REASON
+    record = manager.demotion_store.load()["dep1"]
+    assert record.window_n == 10
+    assert record.mean_pnl_usd == -100.0
+    assert "UNPRICED" not in record.trade_ids
+    assert set(record.trade_ids) == {f"PRICED-{i}" for i in range(10)}
+
+
 def test_rail_b_does_not_fire_with_positive_expectancy(tmp_path) -> None:
     manager, db_path = _manager(tmp_path, now=NOW, settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0))
     _seed_large_budget(manager)

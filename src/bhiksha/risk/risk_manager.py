@@ -48,8 +48,9 @@ RAIL A (two-tier portfolio daily-drawdown cap, realized-only v1):
 
 RAIL B (per-deployment auto-demote, operator-resettable):
   - over the rolling last N (demote_window, default 10) CLOSED LIVE trades
-    of a deployment, once at least min_n (default 10) trades exist, if mean
-    P&L per trade < demote_threshold_usd (default $0) -> demote: block
+    with complete realized economics for a deployment, once at least min_n
+    (default 10) priced trades exist, if mean P&L per trade <
+    demote_threshold_usd (default $0) -> demote: block
     further live entries for it this session (consult-point decision) AND
     persist a local override (``DemotionStore``) the active-plan compiler
     merges at next compile to force the row to shadow.
@@ -911,23 +912,30 @@ class RiskManager:
                 if trade.exit_filled_at is not None
                 and _as_utc(trade.exit_filled_at) > cutoff
             ]
-        # get_recent_trades is ordered by updated_at DESC; take the most
-        # recent demote_window trades as "the rolling last N".
-        window = deployment_live_closed[: self.settings.demote_window]
-        if len(window) < self.settings.demote_min_n:
-            return RailBStatus(demoted=False, reason="insufficient_trade_count", window_n=len(window))
-
+        # get_recent_trades is ordered by updated_at DESC. Build the rolling
+        # window from the latest trades with complete realized economics,
+        # rather than slicing raw ``status='closed'`` rows first. A legacy or
+        # corrupt closed row with no exit truth must not permanently consume
+        # an evidence slot and prevent Rail B from seeing older priced trades.
+        if len(deployment_live_closed) < self.settings.demote_min_n:
+            return RailBStatus(
+                demoted=False,
+                reason="insufficient_trade_count",
+                window_n=len(deployment_live_closed),
+            )
         partials_by_trade = await self.trade_state_repository.get_partial_fills_for_trades(
-            [trade.trade_id for trade in window]
+            [trade.trade_id for trade in deployment_live_closed]
         )
         pnls = []
         priced_trade_ids = []
-        for trade in window:
+        for trade in deployment_live_closed:
             partials = partials_by_trade.get(trade.trade_id, [])
             pnl = _complete_realized_pnl_usd(trade, partials)
             if pnl is not None:
                 pnls.append(pnl)
                 priced_trade_ids.append(trade.trade_id)
+                if len(pnls) == self.settings.demote_window:
+                    break
         if len(pnls) < self.settings.demote_min_n:
             return RailBStatus(demoted=False, reason="insufficient_priced_trade_count", window_n=len(pnls))
 
