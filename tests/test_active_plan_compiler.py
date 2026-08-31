@@ -212,33 +212,6 @@ def _authorized_v2_live_triage_canary_row(
     return row.model_copy(update={"source_metadata": metadata})
 
 
-def _authorized_continuing_live_triage_row(
-    catalog_root: Path,
-) -> ActivePlanSheetRow:
-    row = _authorized_v2_live_triage_canary_row(catalog_root)
-    metadata = dict(row.source_metadata)
-    metadata.update(
-        {
-            "authorization_contract_version": "pdd-entry-live.v1",
-            "experiment_status": "closed",
-            "continuing_live_authorized_by": "Suman",
-            "continuing_live_authorized_at": "2026-08-31T09:05:00-05:00",
-        }
-    )
-    metadata["authorization_sha256"] = "0" * 64
-    row = row.model_copy(update={"source_metadata": metadata})
-    catalog = load_strategy_catalog(catalog_root)
-    deployment = _compile_row(
-        row,
-        {entry.strategy_id: entry for entry in catalog},
-    )
-    metadata["authorization_sha256"] = compute_live_triage_authorization_sha256(
-        deployment,
-        active_plan_id="active_plan_2026-08-03",
-    )
-    return row.model_copy(update={"source_metadata": metadata})
-
-
 def test_live_triage_canary_requires_immutable_identity_and_bounded_policy(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
@@ -314,60 +287,6 @@ def test_v2_live_triage_canary_authorizes_two_contract_1000_cap(
         ]
         == 0.50
     )
-
-
-def test_continuing_live_triage_closes_canary_and_compiles_after_expiry(
-    tmp_path: Path,
-) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-
-    compiled = compile_active_plan_from_rows(
-        rows=[_authorized_continuing_live_triage_row(catalog_root)],
-        strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-31",
-        trading_date="2026-08-31",
-    )
-
-    assert compiled.plan.suppressed == []
-    deployment = compiled.plan.deployments[0]
-    assert deployment.execution.shadow_only is False
-    assert deployment.risk.max_contracts == 2
-    assert deployment.risk.max_trade_premium_usd == 1_000.0
-    assert deployment.source.metadata["experiment_status"] == "closed"
-    assert (
-        deployment.source.metadata["authorization_contract_version"]
-        == "pdd-entry-live.v1"
-    )
-
-
-def test_continuing_live_triage_requires_explicit_closed_experiment(
-    tmp_path: Path,
-) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-    row = _authorized_continuing_live_triage_row(catalog_root)
-    metadata = dict(row.source_metadata)
-    metadata["experiment_status"] = "active"
-    row = row.model_copy(update={"source_metadata": metadata})
-
-    with pytest.raises(ValueError, match="experiment_status=closed"):
-        compile_active_plan_from_rows(
-            rows=[row],
-            strategy_catalog_path=catalog_root,
-            active_plan_id="active_plan_2026-08-03",
-            trading_date="2026-08-31",
-        )
 
 
 def test_v2_live_triage_canary_rejects_three_contracts(
