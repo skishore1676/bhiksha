@@ -219,10 +219,13 @@ def main() -> None:
             operator_defaults=operator_defaults,
         )
         deployment = next(item for item in compiled.plan.deployments if item.deployment_id == DEPLOYMENT_ID)
-        if deployment.execution.shadow_only:
-            raise RuntimeError("PDD continuing-live preview compiled shadow-only")
         if deployment.risk.max_contracts != 2 or deployment.risk.max_trade_premium_usd != 1_000.0:
             raise RuntimeError("PDD continuing-live size changed unexpectedly")
+        inhibition_warnings = [
+            warning
+            for warning in compiled.plan.summary.get("canary_inhibition_warnings", [])
+            if warning.get("deployment_id") == DEPLOYMENT_ID
+        ]
 
     result = {
         "schema": "bhiksha.pdd_continuing_live_graduation.v1",
@@ -238,7 +241,9 @@ def main() -> None:
         "contract_before": CANARY_CONTRACT,
         "contract_after": CONTINUING_CONTRACT,
         "experiment_status": "closed",
-        "continuing_live": True,
+        "continuing_live_authorized": True,
+        "effective_live": not deployment.execution.shadow_only,
+        "inhibition_warnings": inhibition_warnings,
         "max_contracts": 2,
         "max_trade_premium_usd": 1_000.0,
     }
