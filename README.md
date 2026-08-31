@@ -25,6 +25,8 @@ only in historical release receipts; it has no current compiler, runtime, risk-m
 or evidence-binding authority. Bhiksha's plan sync reads the Sheet, validates coverage,
 and atomically replaces the plan. It does not create Mala packets or advance a binding
 registry as a side effect.
+See [`docs/lessons/expired-experiments-collapse-to-ordinary-sheet-rows.md`](docs/lessons/expired-experiments-collapse-to-ordinary-sheet-rows.md)
+for the migration rule and the evidence that led to it.
 
 ## Exit authority rule (operator rule, 2026-07-02 — not overridable by config)
 
