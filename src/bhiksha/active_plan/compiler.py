@@ -1587,7 +1587,11 @@ def _validate_compiled_live_triage_authority(
             metadata.get("authorization_contract_version")
             or LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V1
         ).strip()
-        if metadata.get("authorized_active_plan_id") != active_plan_id:
+        if (
+            authorization_contract
+            != LIVE_TRIAGE_AUTHORIZATION_CONTRACT_CONTINUING_V1
+            and metadata.get("authorized_active_plan_id") != active_plan_id
+        ):
             # Autonomous fallback: instead of failing the whole plan compilation
             # (which blocks all trading and requires SSH), inhibit the canary
             # to shadow_only and surface via Tower/Lathi Bus for Sheet correction.
@@ -1657,8 +1661,14 @@ def _validate_compiled_live_triage_authority(
                     f"live triage canary {deployment.deployment_id!r} is outside "
                     "its authorization window"
                 )
+        authorization_scope_id = (
+            str(metadata.get("authorized_active_plan_id") or "")
+            if authorization_contract
+            == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_CONTINUING_V1
+            else active_plan_id
+        )
         expected = compute_live_triage_authorization_sha256(
-            deployment, active_plan_id=active_plan_id
+            deployment, active_plan_id=authorization_scope_id
         )
         if str(metadata.get("authorization_sha256") or "").lower() != expected:
             raise ValueError(

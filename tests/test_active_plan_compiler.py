@@ -330,7 +330,7 @@ def test_continuing_live_triage_closes_canary_and_compiles_after_expiry(
     compiled = compile_active_plan_from_rows(
         rows=[_authorized_continuing_live_triage_row(catalog_root)],
         strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
+        active_plan_id="active_plan_2026-08-31",
         trading_date="2026-08-31",
     )
 
