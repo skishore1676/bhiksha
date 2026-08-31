@@ -57,6 +57,7 @@ from bhiksha.time_utils import normalize_time_text, parse_time_text
 LIVE_TRIAGE_PROVIDER_OVERLAP_FLOOR = 0.90
 LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V1 = "pdd-entry-canary.v1"
 LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2 = "pdd-entry-canary.v2"
+LIVE_TRIAGE_AUTHORIZATION_CONTRACT_CONTINUING_V1 = "pdd-entry-live.v1"
 
 
 class PolicyGateSuppression(ValueError):
@@ -1457,7 +1458,10 @@ def _validate_live_triage_canary(deployment: DeploymentManifest, *, strategy_id:
         required_max_contracts = 1
         premium_ceiling = 300.0
         authorized_fraction = 0.20
-    elif authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2:
+    elif authorization_contract in {
+        LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2,
+        LIVE_TRIAGE_AUTHORIZATION_CONTRACT_CONTINUING_V1,
+    }:
         required_max_contracts = 2
         premium_ceiling = 1_000.0
         authorized_fraction = 0.50
@@ -1521,7 +1525,11 @@ def _validate_live_triage_canary(deployment: DeploymentManifest, *, strategy_id:
             "baseline_max_trade_premium_usd"
         )
     if (
-        authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2
+        authorization_contract
+        in {
+            LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2,
+            LIVE_TRIAGE_AUTHORIZATION_CONTRACT_CONTINUING_V1,
+        }
         and abs(float(baseline_cap) - 2_000.0) > 1e-9
     ):
         raise ValueError(
@@ -1530,7 +1538,11 @@ def _validate_live_triage_canary(deployment: DeploymentManifest, *, strategy_id:
             "baseline_max_trade_premium_usd=2000"
         )
     if (
-        authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2
+        authorization_contract
+        in {
+            LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V2,
+            LIVE_TRIAGE_AUTHORIZATION_CONTRACT_CONTINUING_V1,
+        }
         and abs(deployment.risk.max_trade_premium_usd - 1_000.0) > 1e-9
     ):
         raise ValueError(
@@ -1571,6 +1583,10 @@ def _validate_compiled_live_triage_authority(
         )
     for deployment in candidates:
         metadata = deployment.source.metadata
+        authorization_contract = str(
+            metadata.get("authorization_contract_version")
+            or LIVE_TRIAGE_AUTHORIZATION_CONTRACT_V1
+        ).strip()
         if metadata.get("authorized_active_plan_id") != active_plan_id:
             # Autonomous fallback: instead of failing the whole plan compilation
             # (which blocks all trading and requires SSH), inhibit the canary
@@ -1606,20 +1622,41 @@ def _validate_compiled_live_triage_authority(
                 f"live triage canary {deployment.deployment_id!r} requires "
                 "frozen 0-3 DTE with allow_nearest_after"
             )
-        start = _parse_authorization_time(
-            metadata.get("canary_start_at"), "canary_start_at"
-        )
-        expires = _parse_authorization_time(
-            metadata.get("canary_expires_at"), "canary_expires_at"
-        )
-        if expires <= start:
-            raise ValueError("live triage canary expiry must be after start")
         effective_date = datetime.fromisoformat(trading_date).date()
-        if not start.date() <= effective_date <= expires.date():
-            raise ValueError(
-                f"live triage canary {deployment.deployment_id!r} is outside "
-                "its authorization window"
+        if authorization_contract == LIVE_TRIAGE_AUTHORIZATION_CONTRACT_CONTINUING_V1:
+            if metadata.get("experiment_status") != "closed":
+                raise ValueError(
+                    f"continuing live triage {deployment.deployment_id!r} requires "
+                    "experiment_status=closed"
+                )
+            if not str(metadata.get("continuing_live_authorized_by") or "").strip():
+                raise ValueError(
+                    f"continuing live triage {deployment.deployment_id!r} requires "
+                    "continuing_live_authorized_by"
+                )
+            authorized_at = _parse_authorization_time(
+                metadata.get("continuing_live_authorized_at"),
+                "continuing_live_authorized_at",
             )
+            if authorized_at.date() > effective_date:
+                raise ValueError(
+                    f"continuing live triage {deployment.deployment_id!r} was "
+                    "authorized after the plan date"
+                )
+        else:
+            start = _parse_authorization_time(
+                metadata.get("canary_start_at"), "canary_start_at"
+            )
+            expires = _parse_authorization_time(
+                metadata.get("canary_expires_at"), "canary_expires_at"
+            )
+            if expires <= start:
+                raise ValueError("live triage canary expiry must be after start")
+            if not start.date() <= effective_date <= expires.date():
+                raise ValueError(
+                    f"live triage canary {deployment.deployment_id!r} is outside "
+                    "its authorization window"
+                )
         expected = compute_live_triage_authorization_sha256(
             deployment, active_plan_id=active_plan_id
         )
