@@ -725,28 +725,6 @@ class ActivePlan(BaseModel):
                 "active plan may arm at most one risk-envelope canary: "
                 + ", ".join(sorted(armed))
             )
-        live_entry_canaries = [
-            deployment.deployment_id
-            for deployment in self.deployments
-            if deployment.enabled
-            and not deployment.execution.shadow_only
-            and str(
-                deployment.source.metadata.get("strategy_id") or ""
-            ).startswith("triage-")
-            and str(
-                deployment.source.metadata.get("authorization_mode") or ""
-            ).lower()
-            == "live"
-        ]
-        experimental_authorities = sorted(
-            set(armed) | set(live_entry_canaries)
-        )
-        if len(experimental_authorities) > 1:
-            raise ValueError(
-                "active plan may arm at most one experimental live authority "
-                "across entry and exit-envelope canaries: "
-                + ", ".join(experimental_authorities)
-            )
         for deployment in self.deployments:
             if (
                 deployment.enabled

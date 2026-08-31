@@ -25,6 +25,12 @@ what is live for today's session.
 
 Bhiksha allows multiple same-symbol lanes, so `SPY` can have multiple active strategy rows and manual rows at the same time.
 
+All strategy rows share this contract. A row does not gain a new compiler or risk
+subsystem because it began as an experiment: `mode=shadow` observes it without broker
+orders and `mode=live` routes it through the existing live execution and risk rails.
+Historical PDD canary metadata is provenance only. The sync does not write Mala evidence
+packets or a mutable evidence-binding registry.
+
 For manual rows, Bhiksha now writes back execution status into the same `manual_entry` tab.
 
 - new status columns are added automatically when needed:

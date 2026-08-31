@@ -10,7 +10,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import tempfile
 import time
 from typing import Iterator
@@ -24,8 +23,6 @@ from bhiksha.execution.pricing import (
     resolve_entry_reprice_max_chase_pct,
     resolve_initial_spread_fraction,
 )
-from bhiksha.evidence.bindings import DEFAULT_EVIDENCE_BINDINGS_PATH
-from bhiksha.experiments.auto_shadow import resolve_mala_packet_root
 from bhiksha.strategy.capabilities import CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST_PATH
 from bhiksha.tools.generate_runtime_capabilities import generate_runtime_capability_manifest
 
@@ -209,48 +206,6 @@ def _first_not_none(*values: object) -> object | None:
     return next((value for value in values if value is not None), None)
 
 
-def _require_staged_packets_for_plan(
-    plan_payload: dict[str, object], staged_packet_root: Path
-) -> None:
-    referenced: set[str] = set()
-    for deployment in plan_payload.get("deployments") or []:
-        if not isinstance(deployment, dict):
-            continue
-        source = deployment.get("source")
-        metadata = source.get("metadata") if isinstance(source, dict) else None
-        if not isinstance(metadata, dict):
-            continue
-        for key in ("evidence_packet_id", "observation_evidence_packet_id"):
-            value = metadata.get(key)
-            if isinstance(value, str) and value:
-                referenced.add(value)
-    retained: dict[str, int] = {}
-    for manifest_path in staged_packet_root.glob("*/manifest.json"):
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"staged evidence manifest is unreadable: {manifest_path}: {exc}"
-            ) from exc
-        packet_id = manifest.get("evidence_packet_id")
-        if isinstance(packet_id, str):
-            retained[packet_id] = retained.get(packet_id, 0) + 1
-    invalid = sorted(packet_id for packet_id in referenced if retained.get(packet_id) != 1)
-    if invalid:
-        raise ValueError(
-            "active-plan candidate references evidence packets that are not "
-            "retained exactly once in the staged canonical store: "
-            + ", ".join(invalid)
-        )
-
-
-def _restore_optional_bytes(path: Path, prior: bytes | None) -> None:
-    if prior is None:
-        path.unlink(missing_ok=True)
-    else:
-        _write_if_changed(path, prior.decode("utf-8"))
-
-
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     default_google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
@@ -277,11 +232,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strategy-sheet-name", default=default_strategy_sheet_name, help="Worksheet name for active strategies")
     parser.add_argument("--manual-sheet-name", default=default_manual_sheet_name, help="Worksheet name for manual entries")
     parser.add_argument("--strategy-catalog", default=default_strategy_catalog_path, help="Local Bhiksha strategy catalog path")
-    parser.add_argument(
-        "--evidence-bindings",
-        default=os.getenv("BHIKSHA_EVIDENCE_BINDINGS_PATH", str(DEFAULT_EVIDENCE_BINDINGS_PATH)),
-        help="Immutable experiment-to-deployment binding registry",
-    )
     parser.add_argument("--out", default=default_output_path, help="Where to write the active plan JSON")
     parser.add_argument("--log-dir", default=default_log_dir, help="Directory for dated active-plan sync logs")
     parser.add_argument(
@@ -339,7 +289,6 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=output_path,
                 log_dir=log_dir,
                 runtime_capabilities_path=None if args.skip_runtime_capability_refresh else args.runtime_capabilities,
-                evidence_bindings_path=args.evidence_bindings,
                 active_plan_id=args.active_plan_id,
                 trading_date=args.trading_date,
                 source_name=args.source_name,
@@ -414,7 +363,6 @@ def sync_active_plan_once(
     output_path: str | Path,
     log_dir: str | Path,
     runtime_capabilities_path: str | Path | None = None,
-    evidence_bindings_path: str | Path | None = DEFAULT_EVIDENCE_BINDINGS_PATH,
     active_plan_id: str | None = None,
     trading_date: str | None = None,
     source_name: str = "google_sheet_integration",
@@ -433,99 +381,26 @@ def sync_active_plan_once(
         )
     else:
         capability_path = None
-    runtime_bindings_path = resolved_output.with_name("evidence_bindings_v1.json")
-    seed_bindings_path = (
-        runtime_bindings_path
-        if runtime_bindings_path.exists()
-        else (
-            Path(evidence_bindings_path)
-            if evidence_bindings_path is not None
-            and Path(evidence_bindings_path).exists()
-            else None
+    with _capability_manifest_override(capability_path):
+        compiled = compile_active_plan_from_google_sheets(
+            spreadsheet_id=spreadsheet_id,
+            credentials_path=credentials_path,
+            catalog_sheet_name=catalog_sheet_name,
+            defaults_sheet_name=defaults_sheet_name,
+            strategy_sheet_name=strategy_sheet_name,
+            manual_sheet_name=manual_sheet_name,
+            strategy_catalog_path=strategy_catalog_path,
+            active_plan_id=active_plan_id,
+            trading_date=trading_date,
+            source_name=source_name,
         )
-    )
-    canonical_packet_root = resolve_mala_packet_root()
-    if canonical_packet_root is None or not canonical_packet_root.is_dir():
-        raise ValueError(
-            "canonical Mala evidence packet root is missing or unreadable; "
-            "previous active plan and runtime registry preserved"
-        )
-    with tempfile.TemporaryDirectory(prefix="bhiksha-active-plan-stage-") as stage:
-        stage_root = Path(stage)
-        staged_bindings_path = stage_root / "evidence_bindings_v1.json"
-        if seed_bindings_path is not None:
-            shutil.copy2(seed_bindings_path, staged_bindings_path)
-        staged_packet_root = stage_root / "evidence_packets"
-        if canonical_packet_root is not None and canonical_packet_root.exists():
-            shutil.copytree(canonical_packet_root, staged_packet_root)
-        else:
-            staged_packet_root.mkdir(parents=True)
-        with _capability_manifest_override(capability_path):
-            compiled = compile_active_plan_from_google_sheets(
-                spreadsheet_id=spreadsheet_id,
-                credentials_path=credentials_path,
-                catalog_sheet_name=catalog_sheet_name,
-                defaults_sheet_name=defaults_sheet_name,
-                strategy_sheet_name=strategy_sheet_name,
-                manual_sheet_name=manual_sheet_name,
-                strategy_catalog_path=strategy_catalog_path,
-                active_plan_id=active_plan_id,
-                trading_date=trading_date,
-                source_name=source_name,
-                evidence_bindings_path=seed_bindings_path,
-                auto_experiment_packet_root=staged_packet_root,
-                auto_experiment_bindings_path=staged_bindings_path,
-            )
-        require_release_safe_coverage(compiled.plan.summary)
-        plan_payload = compiled.plan.model_dump(mode="json")
-        _require_staged_packets_for_plan(plan_payload, staged_packet_root)
-        previous_lane_config = _read_previous_lane_config(resolved_output)
-        lane_config = lane_config_snapshot(plan_payload)
-        lane_config_changes = diff_lane_configs(previous_lane_config, lane_config)
-        payload = json.dumps(plan_payload, indent=2, sort_keys=True) + "\n"
-
-        # Only an accepted candidate may publish immutable packets or advance
-        # the mutable runtime binding registry.  The tracked config remains an
-        # immutable seed/fallback and is never rewritten by sync.
-        prior_runtime_bindings = (
-            runtime_bindings_path.read_bytes()
-            if runtime_bindings_path.exists()
-            else None
-        )
-        canonical_packet_registry = canonical_packet_root / "registry.json"
-        prior_packet_registry = (
-            canonical_packet_registry.read_bytes()
-            if canonical_packet_registry.exists()
-            else None
-        )
-        created_packet_dirs: list[Path] = []
-        try:
-            for staged_dir in sorted(staged_packet_root.iterdir()):
-                if not staged_dir.is_dir():
-                    continue
-                destination = canonical_packet_root / staged_dir.name
-                if not destination.exists():
-                    created_packet_dirs.append(destination)
-                    shutil.copytree(staged_dir, destination)
-            staged_packet_registry = staged_packet_root / "registry.json"
-            if staged_packet_registry.exists():
-                _write_if_changed(
-                    canonical_packet_registry,
-                    staged_packet_registry.read_text(encoding="utf-8"),
-                )
-            if staged_bindings_path.exists():
-                _write_if_changed(
-                    runtime_bindings_path,
-                    staged_bindings_path.read_text(encoding="utf-8"),
-                )
-            changed = _write_if_changed(resolved_output, payload)
-        except Exception:
-            _restore_optional_bytes(runtime_bindings_path, prior_runtime_bindings)
-            _restore_optional_bytes(canonical_packet_registry, prior_packet_registry)
-            for created_dir in reversed(created_packet_dirs):
-                if created_dir.exists():
-                    shutil.rmtree(created_dir)
-            raise
+    require_release_safe_coverage(compiled.plan.summary)
+    plan_payload = compiled.plan.model_dump(mode="json")
+    previous_lane_config = _read_previous_lane_config(resolved_output)
+    lane_config = lane_config_snapshot(plan_payload)
+    lane_config_changes = diff_lane_configs(previous_lane_config, lane_config)
+    payload = json.dumps(plan_payload, indent=2, sort_keys=True) + "\n"
+    changed = _write_if_changed(resolved_output, payload)
     log_path = _append_sync_log(
         log_dir=resolved_log_dir,
         started_at=started_at,

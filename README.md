@@ -11,6 +11,21 @@ exits, protection, reconciliation, and risk rails against real (or paper/shadow)
   caps. Gate-affecting cells are honored and audit-surfaced, never silently stripped
   (`docs/lessons/sheet-is-the-operator-control-surface.md`).
 
+## Stable operating model
+
+```text
+Google Sheet row -> compiled active plan -> ordinary live/shadow execution
+                 -> Bhiksha facts/status -> read-only TradeLab analysis
+```
+
+Strategy experiments do not require a second mutable registry or a custom runtime
+subsystem. `authorization_mode` controls live versus shadow through the same compiler
+and risk rails for every strategy row. PDD's expired entry-canary machinery is retained
+only in historical release receipts; it has no current compiler, runtime, risk-manager,
+or evidence-binding authority. Bhiksha's plan sync reads the Sheet, validates coverage,
+and atomically replaces the plan. It does not create Mala packets or advance a binding
+registry as a side effect.
+
 ## Exit authority rule (operator rule, 2026-07-02 — not overridable by config)
 
 **When the profile-exit route is armed for a deployment (live, `profile_exit_drives_live` +

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import base64
 import csv
-import gzip
-import hashlib
 import json
 from pathlib import Path
 
@@ -13,17 +10,13 @@ import yaml
 from bhiksha.active_plan.compiler import (
     ActivePlanSheetRow,
     StrategyCatalogSheetRow,
-    _compile_row,
     compile_active_plan_from_google_sheets,
     compile_active_plan_from_rows,
     compile_active_plan_from_sheet,
-    compute_live_triage_authorization_sha256,
     sync_google_strategy_catalog,
 )
-from bhiksha.config.loader import load_active_plan, load_strategy_catalog
-from bhiksha.config.models import ActivePlan, DeploymentManifest
+from bhiksha.config.loader import load_active_plan
 from bhiksha.execution.exit_policy import canonical_policy_hash
-from bhiksha.evidence.bindings import build_registry_payload, canonical_sha256
 from bhiksha.tools.compile_active_plan import main as compile_active_plan_main
 
 
@@ -117,504 +110,47 @@ def test_compile_active_plan_from_csv_supports_strategy_and_manual_same_symbol(t
     assert manual.source.metadata["manual_setup_type"] == "manual_trigger"
 
 
-def _live_triage_canary_row(*, metadata: dict | None = None) -> ActivePlanSheetRow:
-    packet_id = "a" * 64
-    default_metadata = {
-        "run_id": "triage-w1w2-20260710-pdd-long",
-        "evidence_packet_id": packet_id,
-        "artifact_sha256": "b" * 64,
-        "artifact_uri": f"mala-evidence://sha256/{packet_id}/pdd_research_evidence.json",
-        "canary_id": "pdd-live-canary-v1",
-        "canary_start_at": "2026-08-03T00:00:00-05:00",
-        "canary_expires_at": "2026-08-28T15:15:00-05:00",
-        "authorized_active_plan_id": "active_plan_2026-08-03",
-        "authorized_deployment_id": "pdd_live_canary",
-        "baseline_max_trade_premium_usd": 2000.0,
-        "provider_signal_overlap": 0.96,
-        "canary_policy": {
-            "max_cumulative_loss_r": -2.0,
-            "provider_overlap_floor": 0.90,
-            "stop_on_unprotected_position": True,
-            "stop_on_missing_attribution": True,
-            "stop_on_failed_exit_receipt": True,
-            "scale_min_clean_closes": 10,
-            "r_definition": "sum_after_cost_trade_pnl_over_frozen_entry_stop_risk",
-            "scale_fraction_of_baseline": 0.20,
-            "round_trip_cost_per_contract_usd": 2.0,
-        },
-    }
-    default_metadata["authorization_sha256"] = "0" * 64
-    return ActivePlanSheetRow.model_validate(
-        {
-            "row_id": "pdd_live_canary",
-            "row_type": "strategy",
-            "strategy_id": "triage-market_impulse-PDD__pdd_long",
-            "authorization_mode": "live",
-            "max_trade_premium_usd": 300,
-            "max_contracts": 1,
-            "execution": {
-                "runtime_mode": "live_approval_gated",
-                "shadow_only": False,
-                "dte_min": 0,
-                "dte_max": 3,
-                "dte_fallback_policy": "allow_nearest_after",
-            },
-            "exit": {"profile_exit_drives_live": True, "profile_exit_shadow_only": False},
-            "metadata": default_metadata if metadata is None else metadata,
-        }
-    )
-
-
-def _authorized_live_triage_canary_row(
-    catalog_root: Path,
-) -> ActivePlanSheetRow:
-    row = _live_triage_canary_row()
-    catalog = load_strategy_catalog(catalog_root)
-    deployment = _compile_row(
-        row,
-        {entry.strategy_id: entry for entry in catalog},
-    )
-    metadata = dict(row.source_metadata)
-    metadata["authorization_sha256"] = compute_live_triage_authorization_sha256(
-        deployment,
-        active_plan_id="active_plan_2026-08-03",
-    )
-    return row.model_copy(update={"source_metadata": metadata})
-
-
-def _authorized_v2_live_triage_canary_row(
-    catalog_root: Path,
-) -> ActivePlanSheetRow:
-    row = _live_triage_canary_row()
-    metadata = dict(row.source_metadata)
-    metadata["authorization_contract_version"] = "pdd-entry-canary.v2"
-    metadata["canary_id"] = "pdd-live-canary-v2"
-    policy = dict(metadata["canary_policy"])
-    policy["scale_fraction_of_baseline"] = 0.50
-    metadata["canary_policy"] = policy
-    row = row.model_copy(
-        update={
-            "max_trade_premium_usd": 1_000.0,
-            "max_contracts": 2,
-            "source_metadata": metadata,
-        }
-    )
-    catalog = load_strategy_catalog(catalog_root)
-    deployment = _compile_row(
-        row,
-        {entry.strategy_id: entry for entry in catalog},
-    )
-    metadata = dict(row.source_metadata)
-    metadata["authorization_sha256"] = compute_live_triage_authorization_sha256(
-        deployment,
-        active_plan_id="active_plan_2026-08-03",
-    )
-    return row.model_copy(update={"source_metadata": metadata})
-
-
-def test_live_triage_canary_requires_immutable_identity_and_bounded_policy(tmp_path: Path) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-
-    compiled = compile_active_plan_from_rows(
-        rows=[_live_triage_canary_row(metadata={})],
-        strategy_catalog_path=catalog_root,
-        trading_date="2026-08-03",
-    )
-
-    assert compiled.plan.deployments == []
-    assert "missing identity metadata" in compiled.plan.suppressed[0]["reason"]
-
-
-def test_live_triage_canary_carries_packet_and_stop_gates_into_plan(tmp_path: Path) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-
-    compiled = compile_active_plan_from_rows(
-        rows=[_authorized_live_triage_canary_row(catalog_root)],
-        strategy_catalog_path=catalog_root,
-        trading_date="2026-08-03",
-    )
-
-    assert compiled.plan.suppressed == []
-    deployment = compiled.plan.deployments[0]
-    assert deployment.execution.shadow_only is False
-    assert deployment.risk.max_contracts == 1
-    assert deployment.risk.max_trade_premium_usd == 300
-    assert deployment.source.metadata["evidence_packet_id"] == "a" * 64
-    assert deployment.source.metadata["canary_policy"]["scale_min_clean_closes"] == 10
-
-
-def test_v2_live_triage_canary_authorizes_two_contract_1000_cap(
+def test_strategy_authorization_mode_alone_controls_shadow_or_live(
     tmp_path: Path,
 ) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
+    strategy_id = "triage-market_impulse-PDD__pdd_long"
     _write_catalog_entry(
         catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
+        strategy_id=strategy_id,
         symbol="PDD",
     )
-
-    compiled = compile_active_plan_from_rows(
-        rows=[_authorized_v2_live_triage_canary_row(catalog_root)],
-        strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
-        trading_date="2026-08-03",
-    )
-
-    assert compiled.plan.suppressed == []
-    deployment = compiled.plan.deployments[0]
-    assert deployment.risk.max_contracts == 2
-    assert deployment.risk.max_trade_premium_usd == 1_000.0
-    assert (
-        deployment.source.metadata["authorization_contract_version"]
-        == "pdd-entry-canary.v2"
-    )
-    assert (
-        deployment.source.metadata["canary_policy"][
-            "scale_fraction_of_baseline"
-        ]
-        == 0.50
-    )
-
-
-def test_v2_live_triage_canary_rejects_three_contracts(
-    tmp_path: Path,
-) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-    row = _authorized_v2_live_triage_canary_row(catalog_root)
-    row = row.model_copy(update={"max_contracts": 3})
-
-    compiled = compile_active_plan_from_rows(
-        rows=[row],
-        strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
-        trading_date="2026-08-03",
-    )
-
-    assert compiled.plan.deployments == []
-    assert "requires max_contracts=2" in compiled.plan.suppressed[0]["reason"]
-
-
-@pytest.mark.parametrize(
-    ("baseline_cap", "canary_cap", "expected_reason"),
-    [
-        (4_000.0, 1_000.0, "baseline_max_trade_premium_usd=2000"),
-        (1_000.0, 500.0, "baseline_max_trade_premium_usd=2000"),
-        (2_000.0, 999.0, "max_trade_premium_usd=1000"),
-    ],
-)
-def test_v2_live_triage_canary_requires_exact_operator_authorized_size(
-    tmp_path: Path,
-    baseline_cap: float,
-    canary_cap: float,
-    expected_reason: str,
-) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-    row = _authorized_v2_live_triage_canary_row(catalog_root)
-    metadata = dict(row.source_metadata)
-    metadata["baseline_max_trade_premium_usd"] = baseline_cap
-    row = row.model_copy(
-        update={
-            "max_trade_premium_usd": canary_cap,
-            "source_metadata": metadata,
-        }
-    )
-    compiled = compile_active_plan_from_rows(
-        rows=[row],
-        strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
-        trading_date="2026-08-03",
-    )
-
-    assert compiled.plan.deployments == []
-    assert expected_reason in compiled.plan.suppressed[0]["reason"]
-
-
-@pytest.mark.parametrize(
-    ("authorization_contract_version", "expected_reason"),
-    [
-        ("pdd-entry-canary.v3", "unsupported authorization_contract_version"),
-        (None, "requires max_contracts=1"),
-    ],
-)
-def test_v2_live_triage_canary_rejects_unknown_or_downgraded_contract(
-    tmp_path: Path,
-    authorization_contract_version: str | None,
-    expected_reason: str,
-) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-    row = _authorized_v2_live_triage_canary_row(catalog_root)
-    metadata = dict(row.source_metadata)
-    if authorization_contract_version is None:
-        metadata.pop("authorization_contract_version", None)
-    else:
-        metadata["authorization_contract_version"] = (
-            authorization_contract_version
-        )
-    row = row.model_copy(update={"source_metadata": metadata})
-    compiled = compile_active_plan_from_rows(
-        rows=[row],
-        strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
-        trading_date="2026-08-03",
-    )
-
-    assert compiled.plan.deployments == []
-    assert expected_reason in compiled.plan.suppressed[0]["reason"]
-
-
-def test_v2_live_triage_authorization_hash_binds_size_fields(
-    tmp_path: Path,
-) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-    row = _authorized_v2_live_triage_canary_row(catalog_root)
-    catalog = load_strategy_catalog(catalog_root)
-    deployment = _compile_row(
-        row,
-        {entry.strategy_id: entry for entry in catalog},
-    )
-    tampered = deployment.model_copy(
-        update={
-            "risk": deployment.risk.model_copy(
-                update={"max_trade_premium_usd": 999.0}
-            )
-        }
-    )
-
-    assert compute_live_triage_authorization_sha256(
-        deployment,
-        active_plan_id="active_plan_2026-08-03",
-    ) != compute_live_triage_authorization_sha256(
-        tampered,
-        active_plan_id="active_plan_2026-08-03",
-    )
-
-
-def test_retained_pdd_release_candidate_recomputes_exact_authorization() -> None:
-    receipt_path = (
-        Path(__file__).resolve().parents[1]
-        / "docs"
-        / "release_candidates"
-        / "mala_research_release_20260802"
-        / "pdd_canary_candidate.json"
-    )
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    deployment = DeploymentManifest.model_validate(
-        receipt["authorization_payload"]["deployment"]
-    )
-
-    assert compute_live_triage_authorization_sha256(
-        deployment,
-        active_plan_id=receipt["authorization_payload"]["active_plan_id"],
-    ) == receipt["authorization_sha256"]
-    assert receipt["authorization_sha256"] == (
-        "7500d4f18bd7f0dde4697d4a77efcb90f881365f51fd898b33823a4f644efa01"
-    )
-    assert receipt["plan_revision_id"] == (
-        "sha256:608a2641d7b70d8c038ca3c866c6bb153b5d274518c75c99e1241f7272530e56"
-    )
-    active_plan_bytes = gzip.decompress(
-        base64.b64decode(receipt["active_plan_gzip_base64"])
-    )
-    assert hashlib.sha256(active_plan_bytes).hexdigest() == receipt["active_plan_sha256"]
-    plan_payload = json.loads(active_plan_bytes)
-    claimed_revision = plan_payload.pop("plan_revision_id")
-    assert ActivePlan.model_validate(plan_payload).plan_revision_id == claimed_revision
-    assert claimed_revision == receipt["plan_revision_id"]
-    assert receipt["projection_assertions"]["qqq_triage_present"] is False
-    assert receipt["projection_assertions"]["iwm_risk_envelope_mode"] == "off"
-
-
-def test_retained_pdd_v2_release_candidate_recomputes_exact_authorization() -> None:
-    receipt_path = (
-        Path(__file__).resolve().parents[1]
-        / "docs"
-        / "release_candidates"
-        / "pdd_resize_20260802"
-        / "pdd_canary_candidate_v2.json"
-    )
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    deployment = DeploymentManifest.model_validate(
-        receipt["authorization_payload"]["deployment"]
-    )
-
-    assert compute_live_triage_authorization_sha256(
-        deployment,
-        active_plan_id=receipt["authorization_payload"]["active_plan_id"],
-    ) == receipt["authorization_sha256"]
-    assert receipt["authorization_sha256"] == (
-        "4d8bb1d188190ee5d0e2c066fc960f99daa79b01a34dcefa9ff11cd4b9663539"
-    )
-    assert receipt["plan_revision_id"] == (
-        "sha256:fb7fa031bbc27b532ee99e6aa04470c540995c91483bac40958826a53cfab510"
-    )
-    active_plan_bytes = gzip.decompress(
-        base64.b64decode(receipt["active_plan_gzip_base64"])
-    )
-    assert hashlib.sha256(active_plan_bytes).hexdigest() == (
-        "30c498b6ad3c6b9ce97a131edb8e540f66071008910c402168e99679d65f871d"
-    )
-    plan_payload = json.loads(active_plan_bytes)
-    claimed_revision = plan_payload.pop("plan_revision_id")
-    assert ActivePlan.model_validate(plan_payload).plan_revision_id == claimed_revision
-    assertions = receipt["projection_assertions"]
-    assert assertions["pdd_max_trade_premium_usd"] == 1_000.0
-    assert assertions["pdd_max_contracts"] == 2
-    assert assertions["pdd_profile_exit_id"] == "profile__trend_continuation"
-    assert assertions["pdd_target_1_quantity"] == 0.60
-    assert assertions["pdd_target_1_contracts"] == 1
-    assert assertions["pdd_runner_contracts"] == 1
-    assert assertions["pdd_risk_envelope_live_mode"] == "off"
-
-
-def test_pdd_v2_authorization_validates_before_observation_binding(tmp_path: Path) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-    row = _authorized_v2_live_triage_canary_row(catalog_root)
-    baseline = compile_active_plan_from_rows(
-        rows=[row],
-        strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
-        trading_date="2026-08-03",
-    ).plan.deployments[0]
-    option = {
-        "schema_version": "mala.option_selection_contract.v1",
-        "contract_id": "pdd-observation-v2",
-        "selector_family": "single_leg_long_premium",
-        "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
-        "selector_version": "1",
-        "parameters": {
-            "dte_min": baseline.execution.dte_min,
-            "dte_max": baseline.execution.dte_max,
-            "dte_fallback_policy": baseline.execution.dte_fallback_policy,
-            "target_abs_delta_min": baseline.execution.target_abs_delta_min,
-            "target_abs_delta_max": baseline.execution.target_abs_delta_max,
-            "min_open_interest": baseline.execution.min_open_interest,
-            "max_bid_ask_spread_pct": baseline.execution.max_bid_ask_spread_pct,
-            "long_signal_contract_type": baseline.execution.option_mapping["long_signal"],
-            "short_signal_contract_type": baseline.execution.option_mapping["short_signal"],
-        },
-    }
-    option["contract_sha256"] = canonical_sha256(option)
-    registry = build_registry_payload(
-        [
+    rows = [
+        ActivePlanSheetRow.model_validate(
             {
-                "strategy_id": "triage-market_impulse-PDD__pdd_long",
-                "symbol": "PDD",
-                "direction": baseline.strategy.params["direction"],
-                "allowed_authorization_modes": ["live"],
-                "run_id": "triage-w1w2-20260710-pdd-long",
-                "evidence_packet_id": "9" * 64,
-                "artifact_sha256": "8" * 64,
-                "artifact_uri": "mala-evidence://sha256/" + "9" * 64 + "/observation.json",
-                "experiment_id": "pdd-prospective-v2",
-                "cohort_id": "pdd-next20-v2",
-                "cohort_contract_sha256": "7" * 64,
-                "declared_option_selection_contract": option,
+                "row_id": "pdd_shadow",
+                "row_type": "strategy",
+                "strategy_id": strategy_id,
+                "authorization_mode": "shadow",
             }
-        ]
-    )
+        ),
+        ActivePlanSheetRow.model_validate(
+            {
+                "row_id": "pdd_live",
+                "row_type": "strategy",
+                "strategy_id": strategy_id,
+                "authorization_mode": "live",
+            }
+        ),
+    ]
 
     compiled = compile_active_plan_from_rows(
-        rows=[row],
+        rows=rows,
         strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
-        trading_date="2026-08-03",
-        evidence_bindings={
-            "triage-market_impulse-PDD__pdd_long": registry["bindings"][0]
-        },
+        trading_date="2026-08-31",
     )
 
-    assert len(compiled.plan.deployments) == 1
-    deployment = compiled.plan.deployments[0]
-    assert deployment.risk.max_trade_premium_usd == 1_000.0
-    assert deployment.risk.max_contracts == 2
-    assert deployment.source.metadata["evidence_packet_id"] == "a" * 64
-    assert deployment.source.metadata["observation_evidence_packet_id"] == "9" * 64
-    assert deployment.source.metadata["authorization_identity_status"] == "compiled_observation_only"
-
-
-@pytest.mark.parametrize(
-    ("baseline_cap", "canary_cap", "expected_reason"),
-    [
-        (2_000.0, 299.0, "premium cap must equal min(300, 20%"),
-        (2_000.0, 301.0, "requires max_trade_premium_usd<=300"),
-        (1_000.0, 300.0, "premium cap must equal min(300, 20%"),
-    ],
-)
-def test_live_triage_canary_requires_exact_lower_of_300_and_20_percent_baseline(
-    tmp_path: Path,
-    baseline_cap: float,
-    canary_cap: float,
-    expected_reason: str,
-) -> None:
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "pdd.yaml",
-        strategy_id="triage-market_impulse-PDD__pdd_long",
-        symbol="PDD",
-    )
-    row = _live_triage_canary_row()
-    metadata = dict(row.source_metadata)
-    metadata["baseline_max_trade_premium_usd"] = baseline_cap
-    row = row.model_copy(
-        update={
-            "max_trade_premium_usd": canary_cap,
-            "source_metadata": metadata,
-        }
-    )
-
-    compiled = compile_active_plan_from_rows(
-        rows=[row],
-        strategy_catalog_path=catalog_root,
-        active_plan_id="active_plan_2026-08-03",
-        trading_date="2026-08-03",
-    )
-
-    assert compiled.plan.deployments == []
-    assert expected_reason in compiled.plan.suppressed[0]["reason"]
+    assert compiled.plan.suppressed == []
+    assert [
+        deployment.execution.shadow_only
+        for deployment in compiled.plan.deployments
+    ] == [True, False]
 
 
 def test_compile_active_plan_suppresses_unknown_strategy_id(tmp_path: Path) -> None:
@@ -2793,64 +2329,3 @@ def test_enabled_google_strategy_row_missing_strategy_id_is_unsafe_coverage_loss
     assert coverage["expected_enabled_row_count"] == 1
     assert coverage["unexpected_coverage_loss_count"] == 1
     assert coverage["release_safe"] is False
-
-
-def test_auto_reconcile_uses_exact_row_ids_not_suffix_matches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from bhiksha.evidence.bindings import build_registry_payload
-    import bhiksha.active_plan.compiler as compiler_module
-
-    catalog_root = tmp_path / "strategy_catalog"
-    catalog_root.mkdir()
-    _write_catalog_entry(
-        catalog_root / "short.yaml", strategy_id="strategy-short", symbol="SPY"
-    )
-    _write_catalog_entry(
-        catalog_root / "long.yaml", strategy_id="strategy-long", symbol="QQQ"
-    )
-    rows = [
-        ActivePlanSheetRow.model_validate(
-            {
-                "row_id": "row",
-                "row_type": "strategy",
-                "strategy_id": "strategy-short",
-                "symbol": "SPY",
-            }
-        ),
-        ActivePlanSheetRow.model_validate(
-            {
-                "row_id": "prefix-row",
-                "row_type": "strategy",
-                "strategy_id": "strategy-long",
-                "symbol": "QQQ",
-            }
-        ),
-    ]
-    bindings_path = tmp_path / "bindings.json"
-    bindings_path.write_text(json.dumps(build_registry_payload([])))
-    packet_root = tmp_path / "packets"
-    packet_root.mkdir()
-
-    def fake_reconcile(**kwargs):
-        mapped = kwargs["rows_by_id"]
-        assert mapped["row"].strategy_id == "strategy-short"
-        assert mapped["prefix-row"].strategy_id == "strategy-long"
-        return {"created": [], "reused": [], "blocked": [], "bindings": {}}
-
-    monkeypatch.setattr(compiler_module, "reconcile_shadow_experiments", fake_reconcile)
-
-    compiled = compile_active_plan_from_rows(
-        rows=rows,
-        strategy_catalog_path=catalog_root,
-        evidence_bindings={},
-        auto_reconcile_shadow_experiments=True,
-        auto_experiment_packet_root=packet_root,
-        auto_experiment_bindings_path=bindings_path,
-    )
-
-    assert {item.deployment_id for item in compiled.plan.deployments} == {
-        "row",
-        "prefix-row",
-    }
-    assert compiled.plan.summary["coverage"]["release_safe"] is True
