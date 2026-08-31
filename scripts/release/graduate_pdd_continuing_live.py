@@ -7,6 +7,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,7 @@ from bhiksha.active_plan.compiler import (
     sync_google_strategy_catalog,
 )
 from bhiksha.config.loader import load_strategy_catalog
+from bhiksha.config.environment import load_dotenv
 
 
 DEPLOYMENT_ID = "strategy_triage_market_impulse_pdd_pdd_long_live_row_29"
@@ -92,10 +94,19 @@ def _assert_preimage(row: dict) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
+    load_dotenv()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--spreadsheet-id", required=True)
-    parser.add_argument("--credentials", type=Path, required=True)
-    parser.add_argument("--active-plan", type=Path, required=True)
+    parser.add_argument("--spreadsheet-id", default=os.getenv("GOOGLE_SHEET_ID"))
+    parser.add_argument(
+        "--credentials",
+        type=Path,
+        default=os.getenv("GOOGLE_API_CREDENTIALS_PATH"),
+    )
+    parser.add_argument(
+        "--active-plan",
+        type=Path,
+        default=Path("artifacts/playbook/active_plan.json"),
+    )
     parser.add_argument("--approved-by", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
@@ -103,7 +114,12 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("artifacts/playbook/releases/pdd_live_graduation_20260831.json"),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.spreadsheet_id:
+        parser.error("--spreadsheet-id or GOOGLE_SHEET_ID is required")
+    if not args.credentials:
+        parser.error("--credentials or GOOGLE_API_CREDENTIALS_PATH is required")
+    return args
 
 
 def main() -> None:
