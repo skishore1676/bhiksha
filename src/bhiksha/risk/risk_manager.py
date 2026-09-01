@@ -46,16 +46,16 @@ RAIL A (two-tier portfolio daily-drawdown cap, realized-only v1):
     (``bhiksha.app.runtime.prefetch_cash_budget_day``), which upserts the
     row before the bar loop starts specifically to keep this window short.
 
-RAIL B (per-deployment auto-demote, operator-resettable):
+RAIL B (per-deployment session entry veto):
   - over the rolling last N (demote_window, default 10) CLOSED LIVE trades
     with complete realized economics for a deployment, once at least min_n
     (default 10) priced trades exist, if mean P&L per trade <
-    demote_threshold_usd (default $0) -> demote: block
-    further live entries for it this session (consult-point decision) AND
-    persist a local override (``DemotionStore``) the active-plan compiler
-    merges at next compile to force the row to shadow.
-  - never auto-re-promotes. A protected operator re-promotion records a cutoff
-    and Rail B requires a fresh post-cutoff window before it can demote again.
+    demote_threshold_usd (default $0) -> block further live entries for that
+    deployment for the rest of this session.
+  - The Google Sheet remains the sole persistent LIVE/SHADOW authority. Rail B
+    records and alerts on its refusal, but it never rewrites the next compiled
+    plan. A new session recompiles the Sheet faithfully and re-evaluates the
+    same evidence if another live signal reaches the consult point.
 """
 
 from __future__ import annotations
@@ -69,7 +69,6 @@ from bhiksha.domain.models import EntryRiskReservation, PartialFillRecord, Trade
 from bhiksha.ops.alerts import AlertMode, send_lathi_alert
 from bhiksha.persistence.repository import CashBudgetRepository, EventRepository, TradeStateRepository
 from bhiksha.risk.clusters import correlation_cluster
-from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.risk.planned_loss import planned_stop_loss_usd
 from bhiksha.risk.risk_settings import RiskSettings
 
@@ -77,7 +76,7 @@ SHADOW_ENTRY_ORDER_ID = "SHADOW_ENTRY"
 
 TIER1_HALT_REASON = "risk_rail_a_tier1_halt"
 TIER2_FLATTEN_REASON = "risk_rail_a_tier2_flatten"
-RAIL_B_DEMOTED_REASON = "risk_rail_b_demoted"
+RAIL_B_SESSION_BLOCK_REASON = "risk_rail_b_session_block"
 BUDGET_UNAVAILABLE_REASON = "risk_rail_a_budget_unavailable"
 OPEN_DRAWDOWN_WARNING_REASON = "risk_open_drawdown_warning"
 PROSPECTIVE_LOSS_HEADROOM_REASON = "risk_prospective_loss_headroom_exceeded"
@@ -279,12 +278,12 @@ class OpenDrawdownStatus:
 
 @dataclass(slots=True, frozen=True)
 class RailBStatus:
-    demoted: bool
+    blocked: bool
     reason: str | None
     window_n: int = 0
     mean_pnl_usd: float | None = None
     threshold_usd: float | None = None
-    newly_demoted: bool = False
+    newly_blocked: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -304,7 +303,7 @@ class BookActionsResult:
 
 
 class RiskManager:
-    """Pure-ish decision core for Rail A (drawdown halt/flatten) and Rail B (auto-demote).
+    """Pure-ish decision core for Rail A and Rail B's session entry veto.
 
     Constructor mirrors ``CashGuard``: repositories in, no order-placement
     capability. The caller (``BhikshaRuntime`` / ``ExecutionSupervisor``)
@@ -319,7 +318,6 @@ class RiskManager:
         cash_budget_repository: CashBudgetRepository,
         trade_state_repository: TradeStateRepository,
         event_repository: EventRepository,
-        demotion_store: DemotionStore | None = None,
         alert_mode: AlertMode = "live",
         alert_profile: str | None = None,
         now_fn=None,
@@ -329,7 +327,6 @@ class RiskManager:
         self.cash_budget_repository = cash_budget_repository
         self.trade_state_repository = trade_state_repository
         self.event_repository = event_repository
-        self.demotion_store = demotion_store or DemotionStore()
         self.alert_mode = alert_mode
         self.alert_profile = alert_profile
         self._now_fn = now_fn or (lambda: datetime.now(UTC))
@@ -349,10 +346,9 @@ class RiskManager:
         # similarly session-latched to avoid repeated flatten submissions.
         self._session_halted = False
         self._session_flattened = False
-        # Newly-demoted-this-session ids, so allow_entry can block them
-        # immediately (consult-point decision) even before the compiler
-        # reruns on the override file at next compile.
-        self._session_demoted_ids: set[str] = set()
+        # Session-latched ids, so a repeated signal cannot flap back to live
+        # after Rail B has refused the first entry consult.
+        self._session_blocked_ids: set[str] = set()
         self._notified_tier1 = False
         self._notified_tier2 = False
         # Operator audit P4: same "once per session" latch as tier1/tier2 --
@@ -761,16 +757,15 @@ class RiskManager:
         )
 
     # ------------------------------------------------------------------ #
-    # Rail B: per-deployment auto-demote
+    # Rail B: per-deployment session entry veto
     # ------------------------------------------------------------------ #
 
     async def _evaluate_rail_b(self, deployment_id: str) -> RailBStatus:
         if not self.settings.rail_b_enabled:
-            return RailBStatus(demoted=False, reason="rail_b_disabled")
+            return RailBStatus(blocked=False, reason="rail_b_disabled")
 
-        if deployment_id in self._session_demoted_ids or self.demotion_store.is_demoted(deployment_id):
-            self._session_demoted_ids.add(deployment_id)
-            return RailBStatus(demoted=True, reason=RAIL_B_DEMOTED_REASON)
+        if deployment_id in self._session_blocked_ids:
+            return RailBStatus(blocked=True, reason=RAIL_B_SESSION_BLOCK_REASON)
 
         trades = await self.trade_state_repository.get_recent_trades(limit=1000)
         deployment_live_closed = [
@@ -778,14 +773,6 @@ class RiskManager:
             for trade in trades
             if trade.deployment_id == deployment_id and _is_live_trade(trade) and _is_closed_trade(trade)
         ]
-        cutoff = self.demotion_store.repromotion_cutoff(deployment_id)
-        if cutoff is not None:
-            deployment_live_closed = [
-                trade
-                for trade in deployment_live_closed
-                if trade.exit_filled_at is not None
-                and _as_utc(trade.exit_filled_at) > cutoff
-            ]
         # get_recent_trades is ordered by updated_at DESC. Build the rolling
         # window from the latest trades with complete realized economics,
         # rather than slicing raw ``status='closed'`` rows first. A legacy or
@@ -793,7 +780,7 @@ class RiskManager:
         # an evidence slot and prevent Rail B from seeing older priced trades.
         if len(deployment_live_closed) < self.settings.demote_min_n:
             return RailBStatus(
-                demoted=False,
+                blocked=False,
                 reason="insufficient_trade_count",
                 window_n=len(deployment_live_closed),
             )
@@ -811,53 +798,47 @@ class RiskManager:
                 if len(pnls) == self.settings.demote_window:
                     break
         if len(pnls) < self.settings.demote_min_n:
-            return RailBStatus(demoted=False, reason="insufficient_priced_trade_count", window_n=len(pnls))
+            return RailBStatus(blocked=False, reason="insufficient_priced_trade_count", window_n=len(pnls))
 
         mean_pnl = round(sum(pnls) / len(pnls), 2)
         if mean_pnl >= self.settings.demote_threshold_usd:
-            return RailBStatus(demoted=False, reason=None, window_n=len(pnls), mean_pnl_usd=mean_pnl, threshold_usd=self.settings.demote_threshold_usd)
+            return RailBStatus(blocked=False, reason=None, window_n=len(pnls), mean_pnl_usd=mean_pnl, threshold_usd=self.settings.demote_threshold_usd)
 
-        record = self.demotion_store.record_demotion(
-            deployment_id=deployment_id,
-            reason="rolling_window_negative_expectancy",
-            window_n=len(pnls),
-            mean_pnl_usd=mean_pnl,
-            threshold_usd=self.settings.demote_threshold_usd,
-            trade_ids=priced_trade_ids,
-            now=self._now_fn(),
-        )
-        self._session_demoted_ids.add(deployment_id)
+        blocked_at = self._now_fn().isoformat()
+        self._session_blocked_ids.add(deployment_id)
 
         await self.event_repository.append(
-            "risk_manager_demotion",
+            "risk_manager_session_block",
             {
                 "deployment_id": deployment_id,
-                "window_n": record.window_n,
-                "mean_pnl_usd": record.mean_pnl_usd,
-                "threshold_usd": record.threshold_usd,
-                "demoted_at": record.demoted_at,
+                "window_n": len(pnls),
+                "mean_pnl_usd": mean_pnl,
+                "threshold_usd": self.settings.demote_threshold_usd,
+                "trade_ids": priced_trade_ids,
+                "blocked_at": blocked_at,
+                "scope": "current_session",
+                "sheet_authorization_changed": False,
             },
         )
         await self._notify(
-            title=f"Rail B auto-demote: {deployment_id}",
+            title=f"Rail B session block: {deployment_id}",
             body=(
-                f"Deployment {deployment_id} demoted live->shadow. "
-                f"Last {record.window_n} closed live trades averaged "
-                f"${record.mean_pnl_usd:.2f}/trade (threshold ${record.threshold_usd:.2f}). "
-                "Live entries for this deployment are blocked for the rest of this session "
-                "and it will compile shadow-only starting next active-plan compile. "
-                "There is no automatic re-promotion. A protected operator reset "
-                "is required and starts a fresh Rail B evidence window."
+                f"Deployment {deployment_id} is blocked from live entry for the rest "
+                f"of this session. Its last {len(pnls)} priced closed live trades "
+                f"averaged ${mean_pnl:.2f}/trade (threshold "
+                f"${self.settings.demote_threshold_usd:.2f}). The Google Sheet "
+                "authorization was not changed. If this lane should remain shadow in "
+                "the next session, change its authorization_mode in the Sheet."
             ),
             level="warning",
         )
         return RailBStatus(
-            demoted=True,
-            reason=RAIL_B_DEMOTED_REASON,
-            window_n=record.window_n,
-            mean_pnl_usd=record.mean_pnl_usd,
-            threshold_usd=record.threshold_usd,
-            newly_demoted=True,
+            blocked=True,
+            reason=RAIL_B_SESSION_BLOCK_REASON,
+            window_n=len(pnls),
+            mean_pnl_usd=mean_pnl,
+            threshold_usd=self.settings.demote_threshold_usd,
+            newly_blocked=True,
         )
 
     # ------------------------------------------------------------------ #
@@ -934,10 +915,10 @@ class RiskManager:
             return decision
 
         rail_b = await self._evaluate_rail_b(deployment_id)
-        if rail_b.demoted:
+        if rail_b.blocked:
             decision = EntryDecision(
                 allowed=False,
-                reason=RAIL_B_DEMOTED_REASON,
+                reason=RAIL_B_SESSION_BLOCK_REASON,
                 rail="B",
                 details={
                     "window_n": rail_b.window_n,

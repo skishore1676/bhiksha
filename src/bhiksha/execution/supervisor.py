@@ -3891,19 +3891,29 @@ class ExecutionSupervisor:
                 option_symbol=updated_position.option_symbol,
             )
             self.clear_profile_exit_state(updated_position)
-            if updated_position.trade_id is not None:
-                await self.trade_state_repository.mark_closed(
-                    updated_position.trade_id, exit_rule=exit_rule, **fill_details
-                )
-            transition = self.lifecycle_store.mark_closed(updated_position.symbol, updated_position.deployment_id)
-            await self._emit_lifecycle_transition(transition, reason="exit_closed")
-            if updated_position.source == "shadow":
-                await self._emit_shadow_exit_assumed(deployment, updated_position, fill_details, reason=decision.reason)
-            await self._record_cartographer_terminal_fact(
-                deployment, updated_position,
-                terminal_reason=decision.reason[0] if decision.reason else "exit_closed",
-                fill_details=fill_details,
+            closed_now = await self._mark_dry_run_closed_once(
+                updated_position, exit_rule=exit_rule, fill_details=fill_details
             )
+            if closed_now:
+                transition = self.lifecycle_store.mark_closed(
+                    updated_position.symbol, updated_position.deployment_id
+                )
+                await self._emit_lifecycle_transition(transition, reason="exit_closed")
+                if updated_position.source == "shadow":
+                    await self._emit_shadow_exit_assumed(
+                        deployment,
+                        updated_position,
+                        fill_details,
+                        reason=decision.reason,
+                    )
+                await self._record_cartographer_terminal_fact(
+                    deployment,
+                    updated_position,
+                    terminal_reason=decision.reason[0]
+                    if decision.reason
+                    else "exit_closed",
+                    fill_details=fill_details,
+                )
             plan = ExitPlan(
                 trade_id=updated_position.trade_id or updated_position.order_id or "UNKNOWN_TRADE",
                 deployment_id=deployment.deployment_id,
@@ -3919,17 +3929,18 @@ class ExecutionSupervisor:
                 error=cancel_error,
             )
             await self.event_repository.append("exit_plan", asdict(plan))
-            await self._record_manual_status(
-                deployment,
-                stage="exit_closed",
-                writer_call=self.manual_status_writer.mark_closed(
+            if closed_now:
+                await self._record_manual_status(
                     deployment,
-                    trade_id=plan.trade_id,
-                    note="dry_run_exit_closed",
+                    stage="exit_closed",
+                    writer_call=self.manual_status_writer.mark_closed(
+                        deployment,
+                        trade_id=plan.trade_id,
+                        note="dry_run_exit_closed",
+                    )
+                    if self.manual_status_writer is not None
+                    else None,
                 )
-                if self.manual_status_writer is not None
-                else None,
-            )
             return plan
 
         updated_position, plan = await self._submit_exit_request(
@@ -6948,28 +6959,41 @@ class ExecutionSupervisor:
                     option_symbol=position.option_symbol,
                 )
                 self.clear_profile_exit_state(position)  # NEW-4: EOD sweep is terminal
-                if position.trade_id is not None:
-                    await self.trade_state_repository.mark_closed(position.trade_id, **fill_details)
-                transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
-                await self._emit_lifecycle_transition(transition, reason="hard_flat_closed")
-                if position.source == "shadow":
-                    await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["hard_flat_time_reached"])
-                await self._record_cartographer_terminal_fact(
-                    deployment, position, terminal_reason="hard_flat_time_reached",
-                    fill_details=fill_details,
+                closed_now = await self._mark_dry_run_closed_once(
+                    position, fill_details=fill_details
                 )
-                await self._record_manual_status(
-                    deployment,
-                    stage="hard_flat_closed",
-                    writer_call=self.manual_status_writer.mark_closed(
-                        deployment,
-                        trade_id=position.trade_id,
-                        note="hard_flat_closed",
-                        event_at=now,
+                if closed_now:
+                    transition = self.lifecycle_store.mark_closed(
+                        position.symbol, position.deployment_id
                     )
-                    if self.manual_status_writer is not None
-                    else None,
-                )
+                    await self._emit_lifecycle_transition(
+                        transition, reason="hard_flat_closed"
+                    )
+                    if position.source == "shadow":
+                        await self._emit_shadow_exit_assumed(
+                            deployment,
+                            position,
+                            fill_details,
+                            reason=["hard_flat_time_reached"],
+                        )
+                    await self._record_cartographer_terminal_fact(
+                        deployment,
+                        position,
+                        terminal_reason="hard_flat_time_reached",
+                        fill_details=fill_details,
+                    )
+                    await self._record_manual_status(
+                        deployment,
+                        stage="hard_flat_closed",
+                        writer_call=self.manual_status_writer.mark_closed(
+                            deployment,
+                            trade_id=position.trade_id,
+                            note="hard_flat_closed",
+                            event_at=now,
+                        )
+                        if self.manual_status_writer is not None
+                        else None,
+                    )
             else:
                 updated_position, canceled_stop_order_id, canceled_target_order_id, cancel_error = await self._cancel_exit_protection(
                     deployment,
@@ -7150,27 +7174,40 @@ class ExecutionSupervisor:
                     option_symbol=position.option_symbol,
                 )
                 self.clear_profile_exit_state(position)  # NEW-4: halt-and-flatten is terminal
-                if position.trade_id is not None:
-                    await self.trade_state_repository.mark_closed(position.trade_id, **fill_details)
-                transition = self.lifecycle_store.mark_closed(position.symbol, position.deployment_id)
-                await self._emit_lifecycle_transition(transition, reason="halt_and_flatten_closed")
-                if position.source == "shadow":
-                    await self._emit_shadow_exit_assumed(deployment, position, fill_details, reason=["halt_and_flatten_triggered"])
-                await self._record_cartographer_terminal_fact(
-                    deployment, position, terminal_reason="halt_and_flatten_triggered",
-                    fill_details=fill_details,
+                closed_now = await self._mark_dry_run_closed_once(
+                    position, fill_details=fill_details
                 )
-                await self._record_manual_status(
-                    deployment,
-                    stage="halt_and_flatten_closed",
-                    writer_call=self.manual_status_writer.mark_closed(
-                        deployment,
-                        trade_id=position.trade_id,
-                        note="halt_and_flatten_closed",
+                if closed_now:
+                    transition = self.lifecycle_store.mark_closed(
+                        position.symbol, position.deployment_id
                     )
-                    if self.manual_status_writer is not None
-                    else None,
-                )
+                    await self._emit_lifecycle_transition(
+                        transition, reason="halt_and_flatten_closed"
+                    )
+                    if position.source == "shadow":
+                        await self._emit_shadow_exit_assumed(
+                            deployment,
+                            position,
+                            fill_details,
+                            reason=["halt_and_flatten_triggered"],
+                        )
+                    await self._record_cartographer_terminal_fact(
+                        deployment,
+                        position,
+                        terminal_reason="halt_and_flatten_triggered",
+                        fill_details=fill_details,
+                    )
+                    await self._record_manual_status(
+                        deployment,
+                        stage="halt_and_flatten_closed",
+                        writer_call=self.manual_status_writer.mark_closed(
+                            deployment,
+                            trade_id=position.trade_id,
+                            note="halt_and_flatten_closed",
+                        )
+                        if self.manual_status_writer is not None
+                        else None,
+                    )
             else:
                 updated_position, canceled_stop_order_id, canceled_target_order_id, cancel_error = await self._cancel_exit_protection(
                     deployment,
@@ -8508,6 +8545,30 @@ class ExecutionSupervisor:
             "exit_order_type": "PAPER" if exit_price is not None else None,
             "exit_broker_payload": payload,
         }
+
+    async def _mark_dry_run_closed_once(
+        self,
+        position: TrackedPosition,
+        *,
+        fill_details: dict[str, Any],
+        exit_rule: str | None = None,
+    ) -> bool:
+        """Claim one terminal close before emitting shadow economic facts.
+
+        Live dry-runs retain the established enrichment-friendly close path.
+        Shadow trades use a conditional SQLite transition so two concurrent
+        exit evaluations cannot publish two terminal P&L events for one trade.
+        """
+        if position.trade_id is None:
+            return True
+        if position.source == "shadow":
+            return await self.trade_state_repository.mark_closed_if_open(
+                position.trade_id, exit_rule=exit_rule, **fill_details
+            )
+        await self.trade_state_repository.mark_closed(
+            position.trade_id, exit_rule=exit_rule, **fill_details
+        )
+        return True
 
     async def _emit_shadow_exit_assumed(
         self,

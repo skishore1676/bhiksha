@@ -21,7 +21,6 @@ from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalo
 from bhiksha.cartographer_profiles import profile_bundle, validate_profile_bundle
 from bhiksha.execution.pricing import resolve_entry_reprice_max_chase_pct
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
-from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.strategy.capabilities import (
     NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS,
     derive_strategy_variant,
@@ -372,7 +371,6 @@ def compile_active_plan_from_rows(
     google_strategy_catalog: list[StrategyCatalogSheetRow] | None = None,
     operator_defaults: dict[str, Any] | None = None,
     suppressed: list[dict[str, Any]] | None = None,
-    risk_demotion_store: DemotionStore | None = None,
     expected_enabled_row_ids_override: list[str] | None = None,
 ) -> CompiledActivePlan:
     suppressed_rows = list(suppressed or [])
@@ -448,7 +446,6 @@ def compile_active_plan_from_rows(
 
     effective_active_plan_id = active_plan_id or f"active_plan_{effective_trading_date}"
 
-    deployments, demotion_warnings = apply_risk_demotion_overrides(deployments, demotion_store=risk_demotion_store)
     pre_observation_deployment_ids = {
         deployment.deployment_id for deployment in deployments if deployment.enabled
     }
@@ -524,7 +521,6 @@ def compile_active_plan_from_rows(
             "suppressed_count": len(suppressed_rows),
             "symbols": sorted({deployment.symbol for deployment in deployments}),
             "gate_override_key_warnings": gate_override_warnings,
-            "risk_demotion_warnings": demotion_warnings,
             "coverage": coverage_summary,
         },
         suppressed=suppressed_rows,
@@ -846,69 +842,6 @@ def _load_json_rows_with_report(path: Path) -> RowValidationResult:
         except (ValidationError, ValueError) as exc:
             suppressed.append(_suppressed_row(reason=str(exc), payload=prepared, raw=item))
     return RowValidationResult(rows=validated_rows, suppressed=suppressed)
-
-
-def apply_risk_demotion_overrides(
-    deployments: list[DeploymentManifest],
-    *,
-    demotion_store: DemotionStore | None = None,
-) -> tuple[list[DeploymentManifest], list[dict[str, Any]]]:
-    """Rail B compiler hook: force demoted deployments to compile shadow-only.
-
-    Additive and safe by construction:
-      - Only ever flips ``execution.shadow_only`` to ``True`` for a
-        deployment id present in the local ``DemotionStore`` (see
-        ``bhiksha.risk.demotion_store``); every other deployment and every
-        other field is passed through completely unchanged.
-      - A demotion entry for a deployment id that is not present in this
-        compiled plan (an unknown/stale id -- e.g. a retired deployment, or
-        an id typo) is ignored, with a warning entry returned for the
-        caller's summary. It is never an error: a demotion override must
-        never be able to break a compile.
-      - One-way: this function only reads the store; only
-        ``RiskManager._evaluate_rail_b`` (in ``bhiksha.risk.risk_manager``)
-        ever writes to it. Protected re-promotion removes the active override
-        before compile and leaves a separate evidence-reset audit record.
-    """
-    store = demotion_store or DemotionStore()
-    demotions = store.load()
-    if not demotions:
-        return deployments, []
-
-    known_ids = {deployment.deployment_id for deployment in deployments}
-    warnings: list[dict[str, Any]] = []
-    updated: list[DeploymentManifest] = []
-    for deployment in deployments:
-        record = demotions.get(deployment.deployment_id)
-        if record is None:
-            updated.append(deployment)
-            continue
-        if deployment.execution.shadow_only:
-            updated.append(deployment)
-            continue
-        forced_execution = deployment.execution.model_copy(update={"shadow_only": True})
-        updated.append(deployment.model_copy(update={"execution": forced_execution}))
-        warnings.append(
-            {
-                "deployment_id": deployment.deployment_id,
-                "reason": record.reason,
-                "demoted_at": record.demoted_at,
-                "mean_pnl_usd": record.mean_pnl_usd,
-                "window_n": record.window_n,
-                "message": "Rail B demotion override forced this deployment to shadow_only at compile.",
-            }
-        )
-
-    for deployment_id in sorted(set(demotions) - known_ids):
-        warnings.append(
-            {
-                "deployment_id": deployment_id,
-                "reason": "unknown_deployment_id",
-                "message": "Demotion override references a deployment id not present in this compiled plan; ignored.",
-            }
-        )
-
-    return updated, warnings
 
 
 def _compile_row(

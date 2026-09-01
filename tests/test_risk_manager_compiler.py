@@ -6,12 +6,9 @@ from pathlib import Path
 
 from bhiksha.active_plan.compiler import (
     ActivePlanSheetRow,
-    apply_risk_demotion_overrides,
     compile_active_plan_from_rows,
     compile_active_plan_from_sheet,
 )
-from bhiksha.config.models import DeploymentManifest
-from bhiksha.risk.demotion_store import DemotionStore
 
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
@@ -159,117 +156,14 @@ def test_legitimate_override_keys_pass_through_untouched() -> None:
 
 
 # --------------------------------------------------------------------------
-# Rail B compiler hook: demotion override merge
+# Sheet authorization authority
 # --------------------------------------------------------------------------
 
 
-def _live_deployment(deployment_id: str) -> DeploymentManifest:
-    return DeploymentManifest.model_validate(
-        {
-            "deployment_id": deployment_id,
-            "enabled": True,
-            "symbol": "SPY",
-            "strategy": {"key": "market_impulse", "version": 1, "params": {"direction": "short"}},
-            "execution": {
-                "profile": "single_leg_long_premium_v1",
-                "shadow_only": False,
-                "dte_min": 0,
-                "dte_max": 7,
-            },
-            "risk": {"profile": "conservative_day1", "stop_loss_pct": 0.45},
-        }
-    )
-
-
-def test_compiler_merges_demotion_override_forcing_row_shadow(tmp_path: Path) -> None:
-    store = DemotionStore(tmp_path / "demoted_deployments.json")
-    store.record_demotion(
-        deployment_id="dep_live_1",
-        reason="rolling_window_negative_expectancy",
-        window_n=10,
-        mean_pnl_usd=-42.0,
-        threshold_usd=0.0,
-        trade_ids=[f"T{i}" for i in range(10)],
-    )
-
-    deployments = [_live_deployment("dep_live_1"), _live_deployment("dep_live_2")]
-    updated, warnings = apply_risk_demotion_overrides(deployments, demotion_store=store)
-
-    by_id = {deployment.deployment_id: deployment for deployment in updated}
-    assert by_id["dep_live_1"].execution.shadow_only is True
-    assert by_id["dep_live_2"].execution.shadow_only is False  # untouched
-    assert len(warnings) == 1
-    assert warnings[0]["deployment_id"] == "dep_live_1"
-
-
-def test_compiler_ignores_unknown_demoted_deployment_id_with_warning(tmp_path: Path) -> None:
-    store = DemotionStore(tmp_path / "demoted_deployments.json")
-    store.record_demotion(
-        deployment_id="dep_does_not_exist",
-        reason="rolling_window_negative_expectancy",
-        window_n=10,
-        mean_pnl_usd=-10.0,
-        threshold_usd=0.0,
-        trade_ids=[],
-    )
-
-    deployments = [_live_deployment("dep_live_1")]
-    updated, warnings = apply_risk_demotion_overrides(deployments, demotion_store=store)
-
-    # The compile must not break, and the known deployment is untouched.
-    assert len(updated) == 1
-    assert updated[0].execution.shadow_only is False
-    assert len(warnings) == 1
-    assert warnings[0]["deployment_id"] == "dep_does_not_exist"
-    assert warnings[0]["reason"] == "unknown_deployment_id"
-
-
-def test_compiler_demotion_override_is_noop_when_no_demotions(tmp_path: Path) -> None:
-    store = DemotionStore(tmp_path / "demoted_deployments.json")
-    deployments = [_live_deployment("dep_live_1")]
-
-    updated, warnings = apply_risk_demotion_overrides(deployments, demotion_store=store)
-
-    assert updated == deployments
-    assert warnings == []
-
-
-def test_compiler_restores_live_row_after_operator_repromotion(tmp_path: Path) -> None:
-    store = DemotionStore(tmp_path / "demoted_deployments.json")
-    store.record_demotion(
-        deployment_id="dep_live_1",
-        reason="rolling_window_negative_expectancy",
-        window_n=10,
-        mean_pnl_usd=-42.0,
-        threshold_usd=0.0,
-        trade_ids=[f"T{i}" for i in range(10)],
-    )
-    store.repromote_many(
-        ["dep_live_1"], reason="operator fresh trial", approved_by="suman"
-    )
-
-    updated, warnings = apply_risk_demotion_overrides(
-        [_live_deployment("dep_live_1")], demotion_store=store
-    )
-
-    assert updated[0].execution.shadow_only is False
-    assert warnings == []
-
-
-def test_compile_active_plan_from_rows_applies_demotion_override_end_to_end(tmp_path: Path) -> None:
+def test_compile_active_plan_from_rows_preserves_sheet_live_authorization(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()
     _write_catalog_entry(catalog_root / "spy.yaml", strategy_id="spy_strategy_v1", symbol="SPY")
-
-    store = DemotionStore(tmp_path / "demoted_deployments.json")
-    store.record_demotion(
-        deployment_id="live_row",
-        reason="rolling_window_negative_expectancy",
-        window_n=10,
-        mean_pnl_usd=-15.0,
-        threshold_usd=0.0,
-        trade_ids=[],
-    )
 
     row = ActivePlanSheetRow.model_validate(
         {
@@ -285,8 +179,7 @@ def test_compile_active_plan_from_rows_applies_demotion_override_end_to_end(tmp_
         strategy_catalog_path=catalog_root,
         active_plan_id="ap_test",
         trading_date="2026-04-20",
-        risk_demotion_store=store,
     )
 
-    assert compiled.plan.deployments[0].execution.shadow_only is True
-    assert compiled.plan.summary["risk_demotion_warnings"][0]["deployment_id"] == "live_row"
+    assert compiled.plan.deployments[0].execution.shadow_only is False
+    assert "risk_demotion_warnings" not in compiled.plan.summary

@@ -3,11 +3,9 @@ title: Risk rails must use complete trade economics
 type: bug
 area: live risk and promotion governance
 date: 2026-07-16
-tags: [risk, partial-fill, pnl, demotion, repromotion]
+tags: [risk, partial-fill, pnl, session-veto]
 refs:
   - src/bhiksha/risk/risk_manager.py
-  - src/bhiksha/risk/demotion_store.py
-  - src/bhiksha/tools/risk_demotion_admin.py
 ---
 
 # Risk Rails Must Use Complete Trade Economics
@@ -24,19 +22,20 @@ confirmed, non-abandoned partial leg. A daily book decision must instead
 attribute each leg to its own fill date: banked partials when they fill and the
 residual when it closes.
 
-Re-promotion also needs an evidence boundary. Removing a demotion without a
-persisted cutoff lets the same old losing window immediately demote the row
-again, so it does not create a real second chance.
+Rail B is deliberately a session-scoped entry veto. It may refuse a live entry
+when the complete-economics window is negative, but it may not persist a mode
+override or change the next plan. The Sheet remains the sole LIVE/SHADOW
+authority; a new session evaluates the same evidence again if the Sheet still
+authorizes the lane as live.
 
 ## Specifics
 - Rail B mirrors the weekly scorecard's complete realized P&L semantics.
 - Rail A books confirmed partials on `filled_at` and the final leg on
   `exit_filled_at`; unconfirmed or abandoned legs are never estimated.
-- Operator re-promotion preserves the prior demotion and records
-  `repromoted_at`; only trades closed after that timestamp count toward the new
-  Rail B window.
-- The protected command refuses to run while Bhiksha is active, requires an
-  exact confirmation, and changes a batch atomically.
+- A Rail B refusal is latched only for the running session and emitted as a
+  `risk_manager_session_block` event with the priced trade ids and explicit
+  `sheet_authorization_changed=false` evidence.
+- Persistent mode changes happen only when the operator changes the Sheet.
 
 ## Apply It Next Time
 Any metric, gate, report, or optimizer that reads realized trade economics must

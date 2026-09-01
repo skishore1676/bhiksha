@@ -2022,15 +2022,22 @@ def test_execution_supervisor_records_shadow_exit_pnl(tmp_path) -> None:
     supervisor._profile_exit_degraded_trades.add("SHADOW1")
 
     plan = asyncio.run(supervisor.handle_exit(deployment, tracked_position, decision, dry_run=True))
+    supervisor.planner.order_manager.quote_bid = 2.5
+    duplicate_plan = asyncio.run(
+        supervisor.handle_exit(
+            deployment, tracked_position, decision, dry_run=True
+        )
+    )
 
     assert plan is not None
+    assert duplicate_plan is not None
     recent = asyncio.run(trade_repo.get_recent_trades(limit=5))
     assert recent[0].status == "closed"
     assert recent[0].exit_price == 3.0
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
     event_types = [row[0] for row in rows]
-    assert "shadow_exit_assumed" in event_types
+    assert event_types.count("shadow_exit_assumed") == 1
     assert "native_exit_blocked_state_degraded" not in event_types
     shadow_exit_payload = next(json.loads(row[1]) for row in rows if row[0] == "shadow_exit_assumed")
     assert shadow_exit_payload["realized_pnl_usd"] == 100.0

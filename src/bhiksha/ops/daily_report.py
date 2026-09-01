@@ -167,7 +167,9 @@ def build_daily_report(
             if trade.get("trade_id")
         },
     )
-    entry_selector_empty_by_deployment = _entry_selector_empty_by_deployment(events, deployments)
+    entry_selector_empty_by_deployment = _entry_selector_empty_by_deployment(
+        events, deployments, trades
+    )
     entry_profile_comparison = _entry_profile_comparison_summary(events)
 
     return {
@@ -436,7 +438,20 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Entry Selector Empty (per lane)"])
         for lane in selector_empty_lanes:
             marker = "LIVE" if lane.get("live") else "shadow"
-            lines.append(f"- `{lane.get('deployment_id')}` [{marker}]: `{lane.get('count')}`")
+            diagnostics = lane.get("latest_diagnostics") or {}
+            requested = (
+                f"{diagnostics.get('requested_dte_min')}-{diagnostics.get('requested_dte_max')}"
+                if diagnostics.get("requested_dte_min") is not None
+                else "unknown"
+            )
+            nearest = diagnostics.get("nearest_after_dte")
+            fallback = diagnostics.get("dte_fallback_policy") or "strict"
+            lines.append(
+                f"- `{lane.get('deployment_id')}` [{marker}]: `{lane.get('count')}`; "
+                f"outcome `{lane.get('outcome')}`; requested DTE `{requested}`; "
+                f"fallback `{fallback}`; nearest-after `{nearest}`; "
+                f"rejections `{lane.get('latest_rejections') or {}}`"
+            )
 
     # --- Risk rails section (operator-audit P3) ---------------------------
     risk_rails = report.get("risk_rails")
@@ -445,7 +460,7 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         lines.append(
             "- rails: "
             f"`rail-A(halt) {'on' if risk_rails.get('rail_a_enabled') else 'off'}, "
-            f"rail-B(demote) {'on' if risk_rails.get('rail_b_enabled') else 'off'}`"
+            f"rail-B(session veto) {'on' if risk_rails.get('rail_b_enabled') else 'off'}`"
         )
         usable_budget = risk_rails.get("usable_budget_usd")
         budget_text = f"${usable_budget:,.2f}" if usable_budget is not None else "unknown"
@@ -461,7 +476,7 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
             f"({_fmt_money_or_na(risk_rails.get('flatten_daily_drawdown_usd'))})`"
         )
         lines.append(
-            "- auto-demote: "
+            "- session entry veto: "
             f"`window {risk_rails.get('demote_window')}, "
             f"min_n {risk_rails.get('demote_min_n')}, "
             f"threshold {_fmt_money_or_na(risk_rails.get('demote_threshold_usd'))}`"
@@ -617,7 +632,11 @@ def render_daily_report_telegram_summary(
             issue_text = f"{issue_text}, +{more} more"
         watch_items.append(f"Runtime issue: {issue_text}")
     selector_empty_lanes = ((report.get("provider_health") or {}).get("entry_selector_empty_by_deployment") or [])
-    live_selector_empty_lanes = [lane for lane in selector_empty_lanes if lane.get("live")]
+    live_selector_empty_lanes = [
+        lane
+        for lane in selector_empty_lanes
+        if lane.get("live") and lane.get("outcome") != "selected_later"
+    ]
     if live_selector_empty_lanes:
         # Item C: surface LIVE lanes distinctly so a filtered-out live signal
         # (2026-07-07 SMH) is never buried behind shadow-lane noise.
@@ -1257,6 +1276,7 @@ def _relaxed_evidence_lanes(
 def _entry_selector_empty_by_deployment(
     events: list[dict[str, Any]],
     deployments: list["DeploymentManifest"] | None,
+    trades: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Per-deployment ``entry_selector_empty`` count, flagging LIVE lanes
     distinctly (2026-07-08 hygiene batch, item C).
@@ -1272,6 +1292,7 @@ def _entry_selector_empty_by_deployment(
     so a live lane's count is never buried among shadow-lane noise.
     """
     counts: Counter[str] = Counter()
+    latest_payloads: dict[str, dict[str, Any]] = {}
     for event in events:
         if event["event_type"] != "runtime_issue":
             continue
@@ -1279,7 +1300,9 @@ def _entry_selector_empty_by_deployment(
         if payload.get("category") != "entry_selector_empty":
             continue
         deployment_id = payload.get("deployment_id") or payload.get("symbol") or "UNKNOWN"
-        counts[str(deployment_id)] += 1
+        deployment_id = str(deployment_id)
+        counts[deployment_id] += 1
+        latest_payloads[deployment_id] = payload
     if not counts:
         return []
     live_deployment_ids = {
@@ -1287,10 +1310,33 @@ def _entry_selector_empty_by_deployment(
         for deployment in (deployments or [])
         if not getattr(getattr(deployment, "execution", None), "shadow_only", False)
     }
-    rows = [
-        {"deployment_id": deployment_id, "count": count, "live": deployment_id in live_deployment_ids}
-        for deployment_id, count in counts.items()
-    ]
+    selected_deployment_ids = {
+        str(trade.get("deployment_id"))
+        for trade in (trades or [])
+        if trade.get("deployment_id") and trade.get("option_symbol")
+    }
+    rows = []
+    for deployment_id, count in counts.items():
+        latest = latest_payloads[deployment_id]
+        breakdown = latest.get("selector_breakdown") or {}
+        rows.append(
+            {
+                "deployment_id": deployment_id,
+                "count": count,
+                "live": deployment_id in live_deployment_ids,
+                "outcome": (
+                    "selected_later"
+                    if deployment_id in selected_deployment_ids
+                    else "no_contract_selected"
+                ),
+                "latest_diagnostics": latest.get("selector_diagnostics") or {},
+                "latest_rejections": {
+                    key: value
+                    for key, value in breakdown.items()
+                    if key != "total_candidates" and value
+                },
+            }
+        )
     return sorted(rows, key=lambda row: (not row["live"], -row["count"], row["deployment_id"]))
 
 

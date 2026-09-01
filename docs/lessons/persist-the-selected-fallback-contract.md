@@ -22,6 +22,12 @@ The attempt receipt and chain snapshot must say whether the primary window or
 the nearest-later fallback supplied the selected contract. A genuine no-match
 must still produce a terminal attempt receipt.
 
+Daily reporting should not turn an early selector miss into a false terminal
+failure. It reports the requested DTE range, the nearest-after expiry, and the
+nonzero rejection counts from the existing receipt, then labels the lane
+`selected_later` when a trade for that deployment was subsequently opened in
+the same session. No new selector policy or evidence store is needed.
+
 ## Context and Evidence
 
 On 2026-08-03 the older selector could inspect a nearer illiquid expiry and

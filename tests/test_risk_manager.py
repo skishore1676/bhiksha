@@ -8,12 +8,11 @@ import sqlite3
 
 from bhiksha.domain.models import CashBudgetDay, PartialFillRecord, TradeRecord
 from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteEventRepository, SQLiteTradeStateRepository
-from bhiksha.risk.demotion_store import DemotionStore
 from bhiksha.risk.risk_manager import (
     RiskManager,
     TIER1_HALT_REASON,
     TIER2_FLATTEN_REASON,
-    RAIL_B_DEMOTED_REASON,
+    RAIL_B_SESSION_BLOCK_REASON,
     BUDGET_UNAVAILABLE_REASON,
     OPEN_DRAWDOWN_WARNING_REASON,
     CORRELATION_CLUSTER_CAP_REASON,
@@ -60,7 +59,6 @@ def _manager(tmp_path, *, settings=None, now=None, alert_mode="off", mark_price_
         cash_budget_repository=SQLiteCashBudgetRepository(db_path, backend=backend),
         trade_state_repository=SQLiteTradeStateRepository(db_path, backend=backend),
         event_repository=SQLiteEventRepository(db_path, backend=backend),
-        demotion_store=DemotionStore(tmp_path / "demoted_deployments.json"),
         alert_mode=alert_mode,
         now_fn=(lambda: now) if now is not None else None,
         mark_price_provider=mark_price_provider,
@@ -844,27 +842,27 @@ def test_rail_b_fires_exactly_at_min_n_with_negative_expectancy(tmp_path) -> Non
         asyncio.run(manager.trade_state_repository.upsert_trade(trade))
         asyncio.run(manager.trade_state_repository.mark_closed(f"T{i}", exit_price=4.0, exit_filled_quantity=1, exit_filled_at=NOW))
 
-    # 9 losing trades: not demoted yet (below min_n)
+    # 9 losing trades: no session block yet (below min_n)
     decision = asyncio.run(manager.allow_entry("dep1"))
     assert decision.allowed is True
-    assert manager.demotion_store.is_demoted("dep1") is False
 
-    # 10th losing trade crosses min_n with negative mean -> demoted
+    # 10th losing trade crosses min_n with negative mean -> session-blocked
     trade10 = _closed_live_trade("T9", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW)
     asyncio.run(manager.trade_state_repository.upsert_trade(trade10))
     asyncio.run(manager.trade_state_repository.mark_closed("T9", exit_price=4.0, exit_filled_quantity=1, exit_filled_at=NOW))
 
     decision = asyncio.run(manager.allow_entry("dep1"))
     assert decision.allowed is False
-    assert decision.reason == RAIL_B_DEMOTED_REASON
+    assert decision.reason == RAIL_B_SESSION_BLOCK_REASON
     assert decision.rail == "B"
-    assert manager.demotion_store.is_demoted("dep1") is True
 
-    demotion_events = _events(db_path, "risk_manager_demotion")
-    assert len(demotion_events) == 1
-    assert demotion_events[0]["payload"]["deployment_id"] == "dep1"
-    assert demotion_events[0]["payload"]["window_n"] == 10
-    assert demotion_events[0]["payload"]["mean_pnl_usd"] == -100.0
+    block_events = _events(db_path, "risk_manager_session_block")
+    assert len(block_events) == 1
+    assert block_events[0]["payload"]["deployment_id"] == "dep1"
+    assert block_events[0]["payload"]["window_n"] == 10
+    assert block_events[0]["payload"]["mean_pnl_usd"] == -100.0
+    assert block_events[0]["payload"]["scope"] == "current_session"
+    assert block_events[0]["payload"]["sheet_authorization_changed"] is False
 
 
 def test_rail_b_backfills_past_unpriced_closed_trade_to_build_complete_window(tmp_path) -> None:
@@ -901,12 +899,12 @@ def test_rail_b_backfills_past_unpriced_closed_trade_to_build_complete_window(tm
     decision = asyncio.run(manager.allow_entry("dep1"))
 
     assert decision.allowed is False
-    assert decision.reason == RAIL_B_DEMOTED_REASON
-    record = manager.demotion_store.load()["dep1"]
-    assert record.window_n == 10
-    assert record.mean_pnl_usd == -100.0
-    assert "UNPRICED" not in record.trade_ids
-    assert set(record.trade_ids) == {f"PRICED-{i}" for i in range(10)}
+    assert decision.reason == RAIL_B_SESSION_BLOCK_REASON
+    block = _events(str(tmp_path / "bhiksha.db"), "risk_manager_session_block")[0]["payload"]
+    assert block["window_n"] == 10
+    assert block["mean_pnl_usd"] == -100.0
+    assert "UNPRICED" not in block["trade_ids"]
+    assert set(block["trade_ids"]) == {f"PRICED-{i}" for i in range(10)}
 
 
 def test_rail_b_does_not_fire_with_positive_expectancy(tmp_path) -> None:
@@ -920,7 +918,6 @@ def test_rail_b_does_not_fire_with_positive_expectancy(tmp_path) -> None:
 
     decision = asyncio.run(manager.allow_entry("dep1"))
     assert decision.allowed is True
-    assert manager.demotion_store.is_demoted("dep1") is False
 
 
 def test_rail_b_counts_confirmed_banked_partial_pnl(tmp_path) -> None:
@@ -941,7 +938,7 @@ def test_rail_b_counts_confirmed_banked_partial_pnl(tmp_path) -> None:
             )
         )
     # Nine -$100 trades plus T9's -$100 residual and +$1,100 banked leg
-    # produce a +$10 mean. The old residual-only calculation falsely demoted.
+    # produce a +$10 mean. Residual-only calculation would falsely block it.
     asyncio.run(
         manager.trade_state_repository.record_partial_fill(
             _confirmed_partial(
@@ -953,7 +950,6 @@ def test_rail_b_counts_confirmed_banked_partial_pnl(tmp_path) -> None:
     decision = asyncio.run(manager.allow_entry("dep1"))
 
     assert decision.allowed is True
-    assert manager.demotion_store.is_demoted("dep1") is False
 
 
 def test_complete_pnl_counts_duplicate_partial_order_once() -> None:
@@ -1060,51 +1056,34 @@ def test_rail_a_books_partial_on_fill_day_not_runner_close_day(tmp_path) -> None
     assert status.realized_live_pnl_usd == 200.0
 
 
-def test_rail_b_repromotion_requires_fresh_post_cutoff_window(tmp_path) -> None:
+def test_rail_b_re_evaluates_the_same_window_in_a_new_session(tmp_path) -> None:
     manager, _ = _manager(
         tmp_path,
         now=NOW,
         settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0),
     )
     _seed_large_budget(manager)
-    store = manager.demotion_store
-    store.record_demotion(
-        deployment_id="dep1",
-        reason="rolling_window_negative_expectancy",
-        window_n=10,
-        mean_pnl_usd=-100.0,
-        threshold_usd=0.0,
-        trade_ids=[f"OLD{i}" for i in range(10)],
-        now=NOW,
-    )
     for i in range(10):
         trade = _closed_live_trade(
             f"OLD{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=NOW
         )
         asyncio.run(manager.trade_state_repository.upsert_trade(trade))
-    store.repromote_many(
-        ["dep1"], reason="operator fresh trial", approved_by="suman", now=NOW
-    )
 
-    # A new process has no session demotion latch. The old ten trades are
-    # before the persisted cutoff and therefore cannot immediately re-demote.
-    fresh_manager, _ = _manager(
+    first = asyncio.run(manager.allow_entry("dep1"))
+    assert first.allowed is False
+
+    # A fresh runtime has no hidden persistent mode override. If the Sheet
+    # still compiles the lane live, Rail B evaluates the evidence again and
+    # may refuse that new session's entry again.
+    fresh_manager, fresh_db_path = _manager(
         tmp_path,
         now=NOW + timedelta(minutes=1),
         settings=_settings(demote_window=10, demote_min_n=10, demote_threshold_usd=0.0),
     )
-    first = asyncio.run(fresh_manager.allow_entry("dep1"))
-    assert first.allowed is True
-
-    after_cutoff = NOW + timedelta(seconds=1)
-    for i in range(10):
-        trade = _closed_live_trade(
-            f"NEW{i}", deployment_id="dep1", entry=5.0, exit_=4.0, exit_at=after_cutoff
-        )
-        asyncio.run(fresh_manager.trade_state_repository.upsert_trade(trade))
     second = asyncio.run(fresh_manager.allow_entry("dep1"))
     assert second.allowed is False
-    assert second.reason == RAIL_B_DEMOTED_REASON
+    assert second.reason == RAIL_B_SESSION_BLOCK_REASON
+    assert len(_events(fresh_db_path, "risk_manager_session_block")) == 2
 
 
 def test_rail_b_is_one_way_no_flap(tmp_path) -> None:
@@ -1119,7 +1098,7 @@ def test_rail_b_is_one_way_no_flap(tmp_path) -> None:
     assert first.allowed is False
 
     # Even if subsequent (hypothetical) trades would look better, add 10 winners
-    # and confirm the deployment STAYS demoted (no re-promote from data).
+    # and confirm the deployment stays blocked for this session.
     for i in range(10, 20):
         trade = _closed_live_trade(f"T{i}", deployment_id="dep1", entry=4.0, exit_=6.0, exit_at=NOW)
         asyncio.run(manager.trade_state_repository.upsert_trade(trade))
@@ -1127,10 +1106,10 @@ def test_rail_b_is_one_way_no_flap(tmp_path) -> None:
 
     second = asyncio.run(manager.allow_entry("dep1"))
     assert second.allowed is False
-    assert second.reason == RAIL_B_DEMOTED_REASON
+    assert second.reason == RAIL_B_SESSION_BLOCK_REASON
 
-    demotion_events = _events(db_path, "risk_manager_demotion")
-    assert len(demotion_events) == 1  # only demoted once, never re-fires
+    block_events = _events(db_path, "risk_manager_session_block")
+    assert len(block_events) == 1  # session latch suppresses repeat alerts
 
 
 def test_rail_b_only_counts_live_closed_trades_for_this_deployment(tmp_path) -> None:
@@ -1173,7 +1152,6 @@ def test_rail_b_disabled_via_settings_never_demotes(tmp_path) -> None:
 
     decision = asyncio.run(manager.allow_entry("dep1"))
     assert decision.allowed is True
-    assert manager.demotion_store.is_demoted("dep1") is False
 
 
 # --------------------------------------------------------------------------
@@ -1347,20 +1325,6 @@ def test_startup_log_carries_validation_warnings(tmp_path, monkeypatch) -> None:
     assert startup and startup[-1]["payload"]["validation_warnings"]
 
 
-def test_demotion_store_default_path_is_absolute(monkeypatch) -> None:
-    """Audit finding #4: the default store path must not depend on cwd."""
-    monkeypatch.delenv("BHIKSHA_RISK_DEMOTION_STORE_PATH", raising=False)
-    store = DemotionStore()
-    assert store.path.is_absolute()
-    assert store.path.name == "demoted_deployments.json"
-
-
-def test_demotion_store_env_path_override(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BHIKSHA_RISK_DEMOTION_STORE_PATH", str(tmp_path / "alt.json"))
-    store = DemotionStore()
-    assert store.path == tmp_path / "alt.json"
-
-
 def test_trade_sessions_updated_at_index_created(tmp_path) -> None:
     """Audit perf finding: get_recent_trades must not full-table-scan."""
     db_path = str(tmp_path / "bhiksha.db")
@@ -1395,7 +1359,6 @@ def _manager_with_clock(tmp_path, clock: _ManualClock, *, settings=None, alert_m
         cash_budget_repository=SQLiteCashBudgetRepository(db_path, backend=backend),
         trade_state_repository=SQLiteTradeStateRepository(db_path, backend=backend),
         event_repository=SQLiteEventRepository(db_path, backend=backend),
-        demotion_store=DemotionStore(tmp_path / "demoted_deployments.json"),
         alert_mode=alert_mode,
         now_fn=clock,
         mark_price_provider=mark_price_provider,

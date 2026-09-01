@@ -121,6 +121,22 @@ class TradeStateRepository(ABC):
         """Mark a trade session as closed."""
 
     @abstractmethod
+    async def mark_closed_if_open(
+        self,
+        trade_id: str,
+        *,
+        exit_order_id: str | None = None,
+        exit_price: float | None = None,
+        exit_filled_quantity: int | None = None,
+        exit_filled_at: datetime | None = None,
+        exit_order_status: str | None = None,
+        exit_order_type: str | None = None,
+        exit_broker_payload: dict[str, Any] | None = None,
+        exit_rule: str | None = None,
+    ) -> bool:
+        """Atomically close an open trade; return whether this caller won."""
+
+    @abstractmethod
     async def get_open_trades(self) -> list[TradeRecord]:
         """Return open or pending trade sessions."""
 
@@ -208,6 +224,32 @@ class NullTradeStateRepository(TradeStateRepository):
             exit_rule,
         )
         return None
+
+    async def mark_closed_if_open(
+        self,
+        trade_id: str,
+        *,
+        exit_order_id: str | None = None,
+        exit_price: float | None = None,
+        exit_filled_quantity: int | None = None,
+        exit_filled_at: datetime | None = None,
+        exit_order_status: str | None = None,
+        exit_order_type: str | None = None,
+        exit_broker_payload: dict[str, Any] | None = None,
+        exit_rule: str | None = None,
+    ) -> bool:
+        del (
+            trade_id,
+            exit_order_id,
+            exit_price,
+            exit_filled_quantity,
+            exit_filled_at,
+            exit_order_status,
+            exit_order_type,
+            exit_broker_payload,
+            exit_rule,
+        )
+        return True
 
     async def get_open_trades(self) -> list[TradeRecord]:
         return []

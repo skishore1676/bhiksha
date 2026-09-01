@@ -13,6 +13,7 @@ from bhiksha.config.models import (
 from bhiksha.domain.enums import ExitMode
 from bhiksha.domain.models import CashBudgetDay, PartialFillRecord, TradeRecord
 from bhiksha.ops.daily_report import (
+    _entry_selector_empty_by_deployment,
     build_daily_report,
     render_daily_report_markdown,
     render_daily_report_telegram_summary,
@@ -36,6 +37,41 @@ def _minimal_deployment(deployment_id: str, symbol: str, *, metadata: dict | Non
         risk=RiskSpec(profile="default"),
         source=SourceSpec(metadata=metadata or {}),
     )
+
+
+def test_selector_empty_reporting_distinguishes_later_selection() -> None:
+    deployment = _minimal_deployment("wfc_shadow", "WFC")
+    events = [
+        {
+            "event_type": "runtime_issue",
+            "payload": {
+                "category": "entry_selector_empty",
+                "deployment_id": "wfc_shadow",
+                "selector_breakdown": {
+                    "total_candidates": 144,
+                    "open_interest_below_min": 72,
+                },
+                "selector_diagnostics": {
+                    "requested_dte_min": 0,
+                    "requested_dte_max": 3,
+                    "dte_fallback_policy": "allow_nearest_after",
+                    "nearest_after_dte": 10,
+                },
+            },
+        }
+    ]
+    trades = [
+        {
+            "deployment_id": "wfc_shadow",
+            "option_symbol": "WFC260911C00089000",
+        }
+    ]
+
+    rows = _entry_selector_empty_by_deployment(events, [deployment], trades)
+
+    assert rows[0]["outcome"] == "selected_later"
+    assert rows[0]["latest_diagnostics"]["nearest_after_dte"] == 10
+    assert rows[0]["latest_rejections"] == {"open_interest_below_min": 72}
 
 
 def test_write_daily_report_persists_runtime_probe_in_canonical_json(tmp_path) -> None:
@@ -1133,9 +1169,13 @@ def test_daily_report_entry_selector_empty_by_deployment_flags_live_lanes(tmp_pa
 
     report = build_daily_report(db_path, trading_date="2026-07-07", deployments=deployments)
 
-    assert report["provider_health"]["entry_selector_empty_by_deployment"] == [
-        {"deployment_id": "smh_live", "count": 2, "live": True},
-        {"deployment_id": "acme_shadow", "count": 1, "live": False},
+    selector_rows = report["provider_health"]["entry_selector_empty_by_deployment"]
+    assert [
+        (row["deployment_id"], row["count"], row["live"], row["outcome"])
+        for row in selector_rows
+    ] == [
+        ("smh_live", 2, True, "no_contract_selected"),
+        ("acme_shadow", 1, False, "no_contract_selected"),
     ]
     # dead_lane must still be counted separately in the existing summary, and
     # entry_selector_empty must not double up with it.
@@ -1145,8 +1185,8 @@ def test_daily_report_entry_selector_empty_by_deployment_flags_live_lanes(tmp_pa
         db_path, output_dir=tmp_path / "reports", trading_date="2026-07-07", deployments=deployments
     ).markdown_path.read_text(encoding="utf-8")
     assert "## Entry Selector Empty (per lane)" in markdown
-    assert "`smh_live` [LIVE]: `2`" in markdown
-    assert "`acme_shadow` [shadow]: `1`" in markdown
+    assert "`smh_live` [LIVE]: `2`; outcome `no_contract_selected`" in markdown
+    assert "`acme_shadow` [shadow]: `1`; outcome `no_contract_selected`" in markdown
 
     telegram = render_daily_report_telegram_summary(report)
     assert "LIVE entry_selector_empty: smh_live x2" in telegram
@@ -1219,11 +1259,11 @@ def test_daily_report_renders_risk_rails_section_from_startup_event_and_budget(t
     markdown = render_daily_report_markdown(report)
     assert "## Risk Rails" in markdown
     assert "prospective loss on, cluster cap 1" in markdown
-    assert "rail-A(halt) on, rail-B(demote) on" in markdown
+    assert "rail-A(halt) on, rail-B(session veto) on" in markdown
     assert "usable budget: `$8,000.00`" in markdown
     assert "tier-1 halt (new entries): `2.00% ($160.00)`" in markdown
     assert "tier-2 flatten (book): `3.00% ($240.00)`" in markdown
-    assert "auto-demote: `window 10, min_n 10, threshold $0.00`" in markdown
+    assert "session entry veto: `window 10, min_n 10, threshold $0.00`" in markdown
 
 
 def test_daily_report_risk_rails_section_surfaces_validation_warnings(tmp_path) -> None:

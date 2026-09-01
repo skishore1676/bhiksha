@@ -167,6 +167,36 @@ def test_trade_state_mark_closed_persists_exit_fill_truth(tmp_path) -> None:
     assert "averagePrice" in row[7]
 
 
+def test_trade_state_mark_closed_if_open_has_one_terminal_winner(tmp_path) -> None:
+    db_path = tmp_path / "runtime.db"
+    repo = SQLiteTradeStateRepository(str(db_path))
+
+    async def run() -> tuple[bool, bool]:
+        await repo.upsert_trade(
+            TradeRecord(
+                trade_id="SHADOW123",
+                deployment_id="market_impulse_qqq_short_v1",
+                symbol="QQQ",
+                option_symbol="QQQ260401P00556000",
+                quantity=1,
+                entry_price=2.5,
+                entry_timestamp=datetime(2026, 4, 30, 14, 30, tzinfo=UTC),
+                status="open_protected",
+                entry_order_id="SHADOW_ENTRY",
+            )
+        )
+        first = await repo.mark_closed_if_open("SHADOW123", exit_price=3.0)
+        second = await repo.mark_closed_if_open("SHADOW123", exit_price=2.0)
+        return first, second
+
+    first, second = asyncio.run(run())
+    recent = asyncio.run(repo.get_recent_trades(limit=1))
+
+    assert first is True
+    assert second is False
+    assert recent[0].exit_price == 3.0
+
+
 def test_trade_upsert_does_not_regress_pending_exit_to_stale_open_snapshot(tmp_path) -> None:
     db_path = tmp_path / "runtime.db"
     repo = SQLiteTradeStateRepository(str(db_path))

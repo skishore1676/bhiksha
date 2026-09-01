@@ -38,6 +38,15 @@ shadow on missing activation evidence is circular. Partition:
   a verdict, not missing evidence — paper-trading an untradeable option teaches
   nothing.
 
+**3. Runtime safety may refuse an entry, but may not rewrite tomorrow's
+authorization.** Rail B can block a deployment for the remainder of the
+current session when its rolling complete-economics window is negative. That
+is a trade veto, not a mode change. The compiler must continue to translate the
+Sheet's `authorization_mode` faithfully on the next session. Bhiksha records
+the refusal and tells the operator which Sheet row to change if a persistent
+LIVE-to-SHADOW change is desired; it does not maintain a second demotion file
+or re-promotion command.
+
 ## Why / when it applies
 Whenever adding a "hardening" that filters operator-writable config: ask what
 the SAME surface can already do. If it can already do worse, filtering is not a

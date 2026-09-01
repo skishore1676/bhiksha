@@ -182,6 +182,33 @@ class SQLiteTradeStateRepository(TradeStateRepository):
             exit_rule,
         )
 
+    async def mark_closed_if_open(
+        self,
+        trade_id: str,
+        *,
+        exit_order_id: str | None = None,
+        exit_price: float | None = None,
+        exit_filled_quantity: int | None = None,
+        exit_filled_at: datetime | None = None,
+        exit_order_status: str | None = None,
+        exit_order_type: str | None = None,
+        exit_broker_payload: dict[str, Any] | None = None,
+        exit_rule: str | None = None,
+    ) -> bool:
+        await self._ensure_initialized()
+        return await self.backend.run_write(
+            self._mark_closed_if_open_sync,
+            trade_id,
+            exit_order_id,
+            exit_price,
+            exit_filled_quantity,
+            exit_filled_at,
+            exit_order_status,
+            exit_order_type,
+            exit_broker_payload,
+            exit_rule,
+        )
+
     async def get_open_trades(self) -> list[TradeRecord]:
         await self._ensure_initialized()
         return await self.backend.run_read(self._get_open_trades_sync)
@@ -770,6 +797,53 @@ class SQLiteTradeStateRepository(TradeStateRepository):
                 ),
             )
             conn.commit()
+
+    def _mark_closed_if_open_sync(
+        self,
+        trade_id: str,
+        exit_order_id: str | None,
+        exit_price: float | None,
+        exit_filled_quantity: int | None,
+        exit_filled_at: datetime | None,
+        exit_order_status: str | None,
+        exit_order_type: str | None,
+        exit_broker_payload: dict[str, Any] | None,
+        exit_rule: str | None = None,
+    ) -> bool:
+        with closing(self.backend.connect()) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE trade_sessions
+                SET status = ?,
+                    exit_order_id = COALESCE(?, exit_order_id),
+                    exit_price = COALESCE(?, exit_price),
+                    exit_filled_quantity = COALESCE(?, exit_filled_quantity),
+                    exit_filled_at = COALESCE(?, exit_filled_at),
+                    exit_order_status = COALESCE(?, exit_order_status),
+                    exit_order_type = COALESCE(?, exit_order_type),
+                    exit_broker_payload = COALESCE(?, exit_broker_payload),
+                    exit_rule = COALESCE(?, exit_rule),
+                    updated_at = ?
+                WHERE trade_id = ? AND lower(status) != 'closed'
+                """,
+                (
+                    "closed",
+                    exit_order_id,
+                    exit_price,
+                    exit_filled_quantity,
+                    exit_filled_at.isoformat() if exit_filled_at is not None else None,
+                    exit_order_status,
+                    exit_order_type,
+                    json.dumps(exit_broker_payload, default=str)
+                    if exit_broker_payload is not None
+                    else None,
+                    exit_rule,
+                    datetime.now(UTC).isoformat(),
+                    trade_id,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
 
     def _get_open_trades_sync(self) -> list[TradeRecord]:
         with closing(self.backend.connect()) as conn:

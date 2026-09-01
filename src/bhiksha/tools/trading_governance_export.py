@@ -20,7 +20,6 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path("artifacts/playbook/active_plan.json"),
     )
-    parser.add_argument("--demotion-store", type=Path)
     parser.add_argument("--through", default=date.today().isoformat())
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -34,8 +33,6 @@ def main(argv: list[str] | None = None) -> int:
     evidence = build_trading_governance_evidence(
         scorecard,
         through=args.through,
-        deployments=plan.deployments,
-        demotion_store_path=args.demotion_store,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")

@@ -113,7 +113,6 @@ def write_weekly_trading_decisions(
     governance = build_trading_governance_evidence(
         scorecard,
         through=end,
-        deployments=deployments,
     )
     authorized_canaries = [
         {

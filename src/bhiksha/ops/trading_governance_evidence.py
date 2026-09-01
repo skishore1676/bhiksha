@@ -1,8 +1,8 @@
-"""Deterministic promotion and demotion evidence for TradeLab review.
+"""Deterministic promotion evidence and risk-authority facts for review.
 
-Bhiksha owns these facts because it owns both the trade ledger and Rail B's
-persisted demotion state.  The packet is read-only and carries no mechanism to
-promote, re-promote, pause, compile, or submit an order.
+The Google Sheet is the sole persistent LIVE/SHADOW authority. Rail B may veto
+an entry for the current session and records that in Bhiksha events; this
+packet has no competing mode override and carries no action surface.
 """
 
 from __future__ import annotations
@@ -10,13 +10,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 import hashlib
 import json
-from pathlib import Path
-from typing import Any, TYPE_CHECKING
-
-from bhiksha.risk.demotion_store import DemotionStore
-
-if TYPE_CHECKING:
-    from bhiksha.config.models import DeploymentManifest
+from typing import Any
 
 
 SCHEMA = "bhiksha.trading_governance_evidence.v1"
@@ -26,49 +20,9 @@ def build_trading_governance_evidence(
     scorecard: dict[str, Any],
     *,
     through: date | str,
-    deployments: list["DeploymentManifest"] | None = None,
-    demotion_store_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Join persisted enforcement facts with scorecard review facts."""
+    """Build advisory promotion evidence without a persistent mode override."""
     through_text = through.isoformat() if isinstance(through, date) else str(through)
-    deployment_meta = _deployment_metadata(deployments)
-    store = DemotionStore(demotion_store_path)
-    records = store.load()
-    active_demotions = []
-    for deployment_id, record in sorted(records.items()):
-        metadata = deployment_meta.get(deployment_id, {})
-        active_demotions.append(
-            {
-                **record.to_dict(),
-                "symbol": metadata.get("symbol"),
-                "strategy_key": metadata.get("strategy_key"),
-                "mode": "live",
-                "enforcement_status": "demoted_to_shadow",
-                "matching_shadow_deployments": _matching_shadow_deployments(
-                    metadata, deployment_meta, exclude_deployment_id=deployment_id
-                ),
-            }
-        )
-
-    repromotion_resets = []
-    for deployment_id, history in sorted(store.load_repromotion_history().items()):
-        metadata = deployment_meta.get(deployment_id, {})
-        for index, record in enumerate(history):
-            is_current_cutoff = deployment_id not in records and index == len(history) - 1
-            repromotion_resets.append(
-                {
-                    **record.to_dict(),
-                    "symbol": metadata.get("symbol"),
-                    "strategy_key": metadata.get("strategy_key"),
-                    "is_current_cutoff": is_current_cutoff,
-                    "enforcement_status": (
-                        "live_fresh_evidence_window"
-                        if is_current_cutoff
-                        else "historical_repromotion_reset"
-                    ),
-                }
-            )
-
     promotion = scorecard.get("promotion_candidates") or {}
     named_promotion_lanes = {
         str(item.get("deployment_id") or "")
@@ -98,11 +52,9 @@ def build_trading_governance_evidence(
         "through": through_text,
         "generated_at": datetime.now(UTC).isoformat(),
         "sources": {
-            "demotions": "bhiksha.risk.DemotionStore",
+            "session_blocks": "bhiksha.events:risk_manager_session_block",
             "promotions": "bhiksha.ops.weekly_scorecard",
         },
-        "active_demotions": active_demotions,
-        "repromotion_resets": repromotion_resets,
         "promotion_review": {
             "criteria": promotion.get("criteria") or {},
             "candidates": promotion.get("candidates") or [],
@@ -113,7 +65,9 @@ def build_trading_governance_evidence(
         "guardrails": {
             "advisory_only": True,
             "automatic_promotion": False,
-            "automatic_repromotion": False,
+            "persistent_mode_overrides": False,
+            "rail_b_scope": "current_session_entry_veto",
+            "sheet_is_mode_authority": True,
             "operator_decision_required": True,
         },
     }
@@ -135,8 +89,6 @@ def evidence_receipt(payload: dict[str, Any]) -> dict[str, Any]:
         "status": "ok",
         "sha256": digest,
         "through": str(payload.get("through") or ""),
-        "active_demotion_count": len(payload.get("active_demotions") or []),
-        "repromotion_reset_count": len(payload.get("repromotion_resets") or []),
         "promotion_candidate_count": len(
             ((payload.get("promotion_review") or {}).get("candidates") or [])
         ),
@@ -144,39 +96,3 @@ def evidence_receipt(payload: dict[str, Any]) -> dict[str, Any]:
             ((payload.get("promotion_review") or {}).get("observing") or [])
         ),
     }
-
-
-def _deployment_metadata(
-    deployments: list["DeploymentManifest"] | None,
-) -> dict[str, dict[str, Any]]:
-    metadata: dict[str, dict[str, Any]] = {}
-    for deployment in deployments or []:
-        execution = getattr(deployment, "execution", None)
-        strategy = getattr(deployment, "strategy", None)
-        deployment_id = str(getattr(deployment, "deployment_id", ""))
-        if not deployment_id:
-            continue
-        metadata[deployment_id] = {
-            "symbol": getattr(deployment, "symbol", None),
-            "strategy_key": getattr(strategy, "key", None),
-            "shadow_only": bool(getattr(execution, "shadow_only", False)),
-        }
-    return metadata
-
-
-def _matching_shadow_deployments(
-    live: dict[str, Any],
-    deployments: dict[str, dict[str, Any]],
-    *,
-    exclude_deployment_id: str,
-) -> list[str]:
-    if not live:
-        return []
-    return sorted(
-        deployment_id
-        for deployment_id, candidate in deployments.items()
-        if deployment_id != exclude_deployment_id
-        and candidate.get("shadow_only")
-        and candidate.get("symbol") == live.get("symbol")
-        and candidate.get("strategy_key") == live.get("strategy_key")
-    )
