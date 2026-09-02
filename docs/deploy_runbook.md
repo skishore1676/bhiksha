@@ -31,6 +31,11 @@ orders and `mode=live` routes it through the existing live execution and risk ra
 Historical PDD canary metadata is provenance only. The sync does not write Mala evidence
 packets or a mutable evidence-binding registry.
 
+Runtime safety rails may refuse an individual live entry. They do not persistently change
+the row's mode or override a future compile: the next plan again follows the Sheet. Rail B
+records a session-scoped refusal and tells the operator to change the Sheet when a lane
+should remain shadow across sessions.
+
 For manual rows, Bhiksha now writes back execution status into the same `manual_entry` tab.
 
 - new status columns are added automatically when needed:

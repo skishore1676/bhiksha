@@ -51,24 +51,18 @@ override.
 
 Two-tier daily drawdown on realized live P&L vs usable budget — tier-1 halts new entries, tier-2
 flattens the book — plus a final sized-entry headroom check, a correlation-cluster position cap,
-and per-deployment auto-demote (rolling-10 negative expectancy -> forced shadow via a local
-`DemotionStore`; re-promotion is a protected operator action that starts a fresh evidence
-window). The runtime must be stopped and the command requires an explicit gate:
-
-```bash
-python -m bhiksha.tools.risk_demotion_admin repromote \
-  --deployment-id DEPLOYMENT_ID \
-  --reason "operator-approved fresh trial" \
-  --approved-by OPERATOR \
-  --confirm-live-state-change REPROMOTE
-```
+and a per-deployment Rail B session veto. When the rolling priced-trade window falls below its
+threshold, Rail B blocks that lane's live entries for the remainder of the running session and
+emits the evidence window. It does not rewrite the next active plan. The Google Sheet remains
+the sole persistent LIVE/SHADOW authority; change the row's authorization mode there when a
+lane should remain shadow in a later session.
 
 Knobs resolve
 `env > Operator_Defaults_v1 sheet > default` (see `bhiksha.risk.risk_settings.resolve_risk_settings`),
 validated at startup with warnings surfaced in the `risk_manager_startup` event. Every consult
 emits a `risk_manager_decision` event (throttled to state-changes + heartbeat so the stream stays
 readable). The daily session report's **Risk Rails** section renders the resolved thresholds
-(pct and $, the $ figure computed against that day's usable budget), the demote window/min_n/
+(pct and $, the $ figure computed against that day's usable budget), the Rail B window/min_n/
 threshold, rail enabled flags, and any validation warnings.
 
 ### Operator-editable risk knobs (`Operator_Defaults_v1` sheet)
