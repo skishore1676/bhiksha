@@ -1,4 +1,4 @@
-"""Resolve Bhiksha risk-manager thresholds: env > operator-sheet > default.
+"""Resolve Bhiksha risk-manager thresholds: operator-sheet > env > default.
 
 Mirrors the resolution style already used for cash-guard knobs
 (``bhiksha.risk.cash_guard.cash_guard_mode`` /
@@ -21,15 +21,15 @@ for the exact sheet key names the operator adds as rows.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Protocol
 
 
 class SettingsSource(Protocol):
-    """Operator-sheet settings layer consulted between env and default.
+    """Operator-sheet settings layer consulted before env and default.
 
-    Precedence is env > operator-sheet > default. The concrete
+    Precedence is operator-sheet > env > default. The concrete
     implementation, ``PlanOperatorDefaultsSource`` (see
     ``bhiksha.risk.plan_operator_defaults_source``), wraps the
     ``operator_defaults`` dict already carried on the compiled active plan --
@@ -106,7 +106,7 @@ _DEFAULT_OPEN_DRAWDOWN_WARN_PCT = None
 
 
 def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> RiskSettings:
-    """Resolve every risk-manager knob once: env > operator-sheet > default.
+    """Resolve every risk-manager knob once: operator-sheet > env > default.
 
     ``settings_source`` is the ``SettingsSource`` hook described above. The
     live runtime passes a ``PlanOperatorDefaultsSource`` built from the
@@ -215,14 +215,14 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
 
 
 def _raw_value(key: str, settings_source: SettingsSource | None) -> str | None:
-    env_value = os.getenv(key)
-    if env_value is not None and env_value.strip() != "":
-        return env_value
     if settings_source is not None:
         sheet_key = key.removeprefix("BHIKSHA_RISK_").lower()
         sheet_value = settings_source.get(sheet_key)
         if sheet_value is not None and str(sheet_value).strip() != "":
             return str(sheet_value)
+    env_value = os.getenv(key)
+    if env_value is not None and env_value.strip() != "":
+        return env_value
     return None
 
 

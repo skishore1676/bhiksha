@@ -9,8 +9,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-from bhiksha.cartographer_profiles import canonical_hash, profile_bundle, validate_profile_bundle
-
+from bhiksha.cartographer_profiles import (
+    canonical_hash,
+    profile_bundle,
+    validate_profile_bundle,
+)
 
 MANUAL_ENTRY_HEADERS = [
     "id", "enabled", "mode", "strategy", "symbol", "direction", "trigger", "trigger_when",
@@ -72,7 +75,7 @@ def _sheet_equivalent_value(index: int, value: Any) -> Any:
                 numeric = float(text)
             except ValueError:
                 try:
-                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    parsed = datetime.fromisoformat(text)
                 except ValueError:
                     parsed = None
                 if parsed is not None:
@@ -166,7 +169,7 @@ def _projected_row(
         "effective_max_trade_premium_usd": effective,
     }
     rationale = "; ".join(str(item["text"]) for item in signal["rationale"])
-    valid_after_et = datetime.fromisoformat(str(signal["valid_after"]).replace("Z", "+00:00")).astimezone(
+    valid_after_et = datetime.fromisoformat(str(signal["valid_after"])).astimezone(
         ZoneInfo("America/New_York")
     ).strftime("%H:%M")
     return [
@@ -267,22 +270,18 @@ def project_with_table(
         operator_defaults=operator_defaults, trading_date=trading_date,
     )
     batch_ids = {str(signal.get("signal_id") or "") for signal in signal_batch.get("signals", [])}
-    expired_rows: list[str] = []
-    for index, row in enumerate(projected[: len(existing_rows)]):
-        owner = _load_json(row[19])
-        if (
-            owner is not None
-            and owner.get("source_owner") == OWNER
-            and str(owner.get("trading_date") or "") < trading_date
-            and str(row[0]) not in batch_ids
-            and row[1] is not False
-        ):
-            row[1] = False
-            expired_rows.append(str(row[0]))
+    stale_records: list[dict[str, Any]] = []
+    for record in before:
+        owner = _load_json(record.get("metadata"))
+        row_id = str(record.get("id") or "")
+        if owner is not None and owner.get("source_owner") == OWNER and row_id not in batch_ids:
+            stale_records.append(record)
+    stale_indexes = [int(record["row_index"]) for record in stale_records]
+    expired_rows = [str(record.get("id") or "") for record in stale_records]
     updates: list[tuple[int, list[Any]]] = []
     preimage: list[dict[str, Any]] = []
     next_index = max((int(record["row_index"]) for record in before), default=1) + 1
-    for row in projected:
+    for row in projected[: len(existing_rows)]:
         row_id = str(row[0])
         # Formatted legacy Sheet rows can be returned as empty records. They are
         # neither owned inputs nor append targets; only a non-empty signal ID
@@ -290,18 +289,35 @@ def project_with_table(
         if not row_id:
             continue
         index = indexes.get(row_id)
-        if index is None:
-            updates.append((next_index, row))
-            preimage.append({"row_index": next_index, "before": None, "id": row_id})
-            next_index += 1
+        if index is None or index in stale_indexes:
             continue
         current = next(record for record in before if int(record["row_index"]) == index)
         values = [current.get(header, "") for header in headers]
         if not _sheet_rows_equal(values, row):
             updates.append((index, row))
             preimage.append({"row_index": index, "before": values, "id": row_id})
+    reusable_indexes = list(stale_indexes)
+    for row in projected[len(existing_rows) :]:
+        row_id = str(row[0])
+        if reusable_indexes:
+            index = reusable_indexes.pop(0)
+            current = next(record for record in before if int(record["row_index"]) == index)
+            values = [current.get(header, "") for header in headers]
+            updates.append((index, row))
+            preimage.append({"row_index": index, "before": values, "id": row_id})
+        else:
+            updates.append((next_index, row))
+            preimage.append({"row_index": next_index, "before": None, "id": row_id})
+            next_index += 1
+    cleared_indexes = reusable_indexes
+    for index in cleared_indexes:
+        current = next(record for record in before if int(record["row_index"]) == index)
+        values = [current.get(header, "") for header in headers]
+        updates.append((index, [""] * len(headers)))
+        preimage.append({"row_index": index, "before": values, "id": ""})
     receipt_body: dict[str, Any] = {
         **{key: value for key, value in pure_receipt.items() if key != "receipt_hash"},
+        "row_count": len(before) - len(stale_records) + len(projected) - len(existing_rows),
         # A no-op apply is a confirmed success, not another ambiguous dry run.
         "status": "applied" if apply and updates else (
             "succeeded" if apply else pure_receipt["status"]
@@ -313,6 +329,7 @@ def project_with_table(
         "planned_updates": len(updates),
         "preimage": preimage,
         "expired_rows": expired_rows,
+        "cleared_row_indexes": cleared_indexes,
         "sheet_write_outcome": (
             "confirmed" if apply and updates else ("not_needed" if apply else "none")
         ),
@@ -325,12 +342,17 @@ def project_with_table(
             table.update_exact_rows(headers=headers, rows=updates)
             after = table.read_rows()
             after_by_id = {str(record.get("id") or ""): record for record in after}
+            after_indexes = {int(record["row_index"]) for record in after}
             for _, expected in updates:
+                if not str(expected[0]):
+                    continue
                 actual = after_by_id.get(str(expected[0]))
                 if actual is None or not _sheet_rows_equal(
                     [actual.get(header, "") for header in headers], expected
                 ):
                     raise RuntimeError("Cartographer projection readback mismatch")
+            if any(index in after_indexes for index in cleared_indexes):
+                raise RuntimeError("Cartographer projection stale-row clear mismatch")
     except Exception as exc:
         raise ProjectionApplyError(
             f"{exc}; retain preimage for rollback", preimage=preimage

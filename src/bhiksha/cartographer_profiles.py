@@ -12,9 +12,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping
 from typing import Any
-
 
 PROFILE_SECTION_PREFIX = "profile__"
 
@@ -30,7 +30,7 @@ def _profile_section(slug: str) -> str:
 
 def _number(value: Any, *, field: str, minimum: float = 0.0) -> float:
     if isinstance(value, bool):
-        raise ValueError(f"operator profile {field} must be numeric")
+        raise TypeError(f"operator profile {field} must be numeric")
     try:
         result = float(value)
     except (TypeError, ValueError) as exc:
@@ -47,6 +47,24 @@ def _integer(value: Any, *, field: str, minimum: int = 0) -> int:
     return int(number)
 
 
+def _boolean(value: Any, *, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"operator profile {field} must be boolean")
+
+
+def _text(value: Any, *, field: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError(f"operator profile {field} is required")
+    return normalized
+
+
 def _resolved_operator_profile(
     slug: str, operator_defaults: Mapping[str, Any]
 ) -> tuple[str, dict[str, Any]]:
@@ -58,38 +76,77 @@ def _resolved_operator_profile(
     }
     section = operator_defaults.get(section_name)
     if not isinstance(section, Mapping):
-        raise ValueError(
+        raise TypeError(
             f"Operator_Defaults_v1 is missing required section {section_name!r}"
         )
     return section_name, {**global_defaults, **dict(section)}
 
 
-def _management_policy(slug: str) -> dict[str, Any]:
+def _management_policy(slug: str, values: Mapping[str, Any]) -> dict[str, Any]:
     if slug != "TREND_CONTINUATION":
         raise ValueError(f"unknown Cartographer profile slug: {slug!r}")
+    initial_stop_pct = _number(
+        values.get("initial_stop_pct"), field="initial_stop_pct", minimum=0.01
+    )
+    disaster_stop_pct = _number(
+        values.get("premium_disaster_stop_pct"),
+        field="premium_disaster_stop_pct",
+        minimum=0.01,
+    )
+    target_1_r = _number(values.get("target_1_r"), field="target_1_r", minimum=0.01)
+    target_2_r = _number(values.get("target_2_r"), field="target_2_r", minimum=0.01)
+    target_1_quantity = _number(
+        values.get("target_1_quantity_pct"),
+        field="target_1_quantity_pct",
+        minimum=0.01,
+    )
+    if initial_stop_pct > 1 or disaster_stop_pct > 1 or target_1_quantity > 1:
+        raise ValueError("operator profile percentages must be decimals between 0 and 1")
+    if target_2_r < target_1_r:
+        raise ValueError("operator profile target_2_r cannot be below target_1_r")
+    hard_flat_time_et = _text(values.get("hard_flat_time_et"), field="hard_flat_time_et")
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", hard_flat_time_et) is None:
+        raise ValueError("operator profile hard_flat_time_et must use HH:MM")
+    giveback_policy = _text(
+        values.get("high_water_giveback_policy"),
+        field="high_water_giveback_policy",
+    ).upper()
+    if giveback_policy not in {"TIGHT", "MODERATE", "WIDE"}:
+        raise ValueError(
+            "operator profile high_water_giveback_policy must be TIGHT, MODERATE, or WIDE"
+        )
     management = {
         "policy_id": "profile__trend_continuation",
         "stop_family": "entry_bar_failure",
         "stop_anchor": "underlying_entry_bar_failure",
         "exit_family": "profile_staged_r",
         "target_model": "profile_staged_r",
-        "target_r": 2.0,
-        "hard_flat_time_et": "15:55",
-        "option_stop_fallback_pct": 0.35,
+        "target_r": target_2_r,
+        "hard_flat_time_et": hard_flat_time_et,
+        "option_stop_fallback_pct": disaster_stop_pct,
         "target_order_mode": "virtual_or_broker",
-        "target_1_r": 1.0,
-        "target_2_r": 2.0,
-        "target_1_quantity": 0.6,
-        "initial_stop_pct": 0.35,
-        "premium_disaster_stop_pct": 0.35,
-        "no_progress_seconds": 2700,
-        "max_hold_seconds": 10800,
-        "high_water_giveback_policy": "MODERATE",
-        "breakeven_after_t1": True,
-        "eod_flat": True,
+        "target_1_r": target_1_r,
+        "target_2_r": target_2_r,
+        "target_1_quantity": target_1_quantity,
+        "initial_stop_pct": initial_stop_pct,
+        "premium_disaster_stop_pct": disaster_stop_pct,
+        "no_progress_seconds": _integer(
+            values.get("no_progress_minutes"), field="no_progress_minutes", minimum=1
+        ) * 60,
+        "max_hold_seconds": _integer(
+            values.get("max_hold_minutes"), field="max_hold_minutes", minimum=1
+        ) * 60,
+        "high_water_giveback_policy": giveback_policy,
+        "breakeven_after_t1": _boolean(
+            values.get("breakeven_after_t1"), field="breakeven_after_t1"
+        ),
+        "eod_flat": _boolean(values.get("eod_flat"), field="eod_flat"),
         "parameters": {
             "profile_owner": "market_cartographer",
-            "no_progress_favorable_floor_r": 0.25,
+            "no_progress_favorable_floor_r": _number(
+                values.get("no_progress_favorable_floor_r"),
+                field="no_progress_favorable_floor_r",
+            ),
         },
     }
     management["management_hash"] = canonical_hash(management)
@@ -151,7 +208,7 @@ def profile_bundle(
         "profile_slug": normalized_slug,
         "operator_section": section_name,
         "execution": execution,
-        "management": _management_policy(normalized_slug),
+        "management": _management_policy(normalized_slug, values),
         "requested_max_trade_premium_usd": _number(
             values.get("max_trade_premium_usd"),
             field="max_trade_premium_usd",
@@ -171,7 +228,7 @@ def validate_profile_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     execution = bundle.get("execution")
     management = bundle.get("management")
     if not isinstance(execution, Mapping) or not isinstance(management, Mapping):
-        raise ValueError("Cartographer profile snapshot sections are required")
+        raise TypeError("Cartographer profile snapshot sections are required")
     if execution.get("selection_hash") != canonical_hash(
         {key: value for key, value in execution.items() if key != "selection_hash"}
     ):

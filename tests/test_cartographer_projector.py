@@ -64,6 +64,18 @@ def _operator_defaults(ceiling: float = 500.0) -> dict[str, object]:
             "dte_max": 7,
             "max_trade_premium_usd": 500.0,
             "max_contracts": 1,
+            "initial_stop_pct": 0.35,
+            "premium_disaster_stop_pct": 0.35,
+            "target_1_r": 1.0,
+            "target_2_r": 2.0,
+            "target_1_quantity_pct": 0.60,
+            "no_progress_minutes": 45,
+            "max_hold_minutes": 180,
+            "high_water_giveback_policy": "MODERATE",
+            "breakeven_after_t1": True,
+            "eod_flat": True,
+            "hard_flat_time_et": "15:55",
+            "no_progress_favorable_floor_r": 0.25,
         },
     }
 
@@ -130,7 +142,39 @@ class _Table:
             found = next((row for row in self.rows if row["row_index"] == index), None)
             record = dict(zip(headers, values, strict=True)); record["row_index"] = index
             if found is None: self.rows.append(record)
-            else: found.update(record)
+            elif any(str(value).strip() for value in values): found.update(record)
+            else: self.rows.remove(found)
+
+
+def test_table_projector_reuses_and_clears_stale_cartographer_rows() -> None:
+    defaults = _operator_defaults()
+    current_rows, _ = project_signals(
+        [], _batch(), operator_defaults=defaults, trading_date="2026-08-17"
+    )
+    stale_one = list(current_rows[0])
+    stale_one[0] = "mc-v1-stale-one"
+    stale_one[19] = '{"source_owner":"market_cartographer","trading_date":"2026-08-16"}'
+    stale_two = list(stale_one)
+    stale_two[0] = "mc-v1-stale-two"
+    records = []
+    for row_index, values in ((2, stale_one), (3, stale_two)):
+        record = dict(zip(MANUAL_ENTRY_HEADERS, values, strict=True))
+        record["row_index"] = row_index
+        records.append(record)
+    table = _Table(MANUAL_ENTRY_HEADERS, records)
+
+    receipt = project_with_table(
+        table,
+        _batch(),
+        operator_defaults=defaults,
+        trading_date="2026-08-17",
+        apply=True,
+    )
+
+    assert receipt["expired_rows"] == ["mc-v1-stale-one", "mc-v1-stale-two"]
+    assert receipt["cleared_row_indexes"] == [3]
+    assert [row["row_index"] for row in table.rows] == [2]
+    assert table.rows[0]["id"] == _signal()["signal_id"]
 
 
 def test_table_projector_validates_headers_dry_runs_and_readbacks() -> None:

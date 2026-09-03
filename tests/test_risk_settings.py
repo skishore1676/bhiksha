@@ -14,13 +14,13 @@ def test_resolve_risk_settings_uses_sheet_value_when_env_absent(monkeypatch) -> 
     assert settings.validation_warnings == ()
 
 
-def test_resolve_risk_settings_env_wins_over_sheet(monkeypatch) -> None:
+def test_resolve_risk_settings_sheet_wins_over_env(monkeypatch) -> None:
     monkeypatch.setenv("BHIKSHA_RISK_MAX_DAILY_DRAWDOWN_PCT", "4.0")
     source = PlanOperatorDefaultsSource({"max_daily_drawdown_pct": "1.5"})
 
     settings = resolve_risk_settings(settings_source=source)
 
-    assert settings.max_daily_drawdown_pct == 4.0
+    assert settings.max_daily_drawdown_pct == 1.5
 
 
 def test_resolve_risk_settings_falls_back_to_default_when_sheet_and_env_absent(monkeypatch) -> None:
@@ -108,7 +108,7 @@ def test_plan_operator_defaults_source_from_active_plan_handles_none_and_missing
 
 # --------------------------------------------------------------------------
 # Operator audit P4 (2026-07-06): open_drawdown_warn_pct sheet/env/default
-# precedence, following the exact same env > sheet > default pattern as
+# precedence, following the exact same sheet > env > default pattern as
 # max_daily_drawdown_pct above -- the only difference is the "default" is
 # None (unset), not a hardcoded number; RiskManager.effective_open_drawdown_
 # warn_pct applies the "unset -> max_daily_drawdown_pct" fallback at the
@@ -126,13 +126,13 @@ def test_resolve_open_drawdown_warn_pct_uses_sheet_value_when_env_absent(monkeyp
     assert settings.validation_warnings == ()
 
 
-def test_resolve_open_drawdown_warn_pct_env_wins_over_sheet(monkeypatch) -> None:
+def test_resolve_open_drawdown_warn_pct_sheet_wins_over_env(monkeypatch) -> None:
     monkeypatch.setenv("BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", "1.1")
     source = PlanOperatorDefaultsSource({"open_drawdown_warn_pct": "0.9"})
 
     settings = resolve_risk_settings(settings_source=source)
 
-    assert settings.open_drawdown_warn_pct == 1.1
+    assert settings.open_drawdown_warn_pct == 0.9
 
 
 def test_resolve_open_drawdown_warn_pct_falls_back_to_none_when_sheet_and_env_absent(monkeypatch) -> None:

@@ -37,6 +37,18 @@ def _operator_defaults(ceiling: float | str = 400.0) -> dict:
             "dte_max": 7,
             "max_trade_premium_usd": 500.0,
             "max_contracts": 1,
+            "initial_stop_pct": 0.35,
+            "premium_disaster_stop_pct": 0.35,
+            "target_1_r": 1.0,
+            "target_2_r": 2.0,
+            "target_1_quantity_pct": 0.60,
+            "no_progress_minutes": 45,
+            "max_hold_minutes": 180,
+            "high_water_giveback_policy": "MODERATE",
+            "breakeven_after_t1": True,
+            "eod_flat": True,
+            "hard_flat_time_et": "15:55",
+            "no_progress_favorable_floor_r": 0.25,
         },
     }
 
@@ -110,6 +122,10 @@ def test_cartographer_compiles_only_the_sheet_profile_snapshot(tmp_path: Path) -
     assert metadata["requested_max_trade_premium_usd"] == 500.0
     assert metadata["operator_max_trade_premium_usd"] == 400.0
     assert metadata["effective_max_trade_premium_usd"] == 400.0
+    assert (
+        metadata["profile_bundle"]["management"]["management_hash"]
+        == "sha256:a4aeaf1f70e244c9646cbf23888b67a46895eb70ea7046be2a74ad944bfc0534"
+    )
 
 
 def test_operator_sheet_rows_resolve_global_and_profile_values() -> None:
@@ -165,12 +181,47 @@ def test_operator_sheet_rows_resolve_global_and_profile_values() -> None:
                 "key": "max_contracts",
                 "value": 1,
             },
+            *[
+                {
+                    "section": "profile__trend_continuation",
+                    "key": key,
+                    "value": value,
+                }
+                for key, value in {
+                    "initial_stop_pct": 0.35,
+                    "premium_disaster_stop_pct": 0.35,
+                    "target_1_r": 1.0,
+                    "target_2_r": 2.0,
+                    "target_1_quantity_pct": 0.60,
+                    "no_progress_minutes": 45,
+                    "max_hold_minutes": 180,
+                    "high_water_giveback_policy": "MODERATE",
+                    "breakeven_after_t1": True,
+                    "eod_flat": True,
+                    "hard_flat_time_et": "15:55",
+                    "no_progress_favorable_floor_r": 0.25,
+                }.items()
+            ],
         ]
     )
     bundle = profile_bundle("TREND_CONTINUATION", defaults)
     assert bundle["execution"]["dte_fallback_policy"] == "allow_nearest_after"
     assert bundle["execution"]["dte_min"] == 3
     assert bundle["execution"]["dte_max"] == 7
+    assert bundle["management"]["initial_stop_pct"] == 0.35
+    assert bundle["management"]["no_progress_seconds"] == 2700
+
+
+def test_cartographer_management_change_is_sheet_owned() -> None:
+    defaults = _operator_defaults()
+    defaults["profile__trend_continuation"]["no_progress_minutes"] = 30
+    defaults["profile__trend_continuation"]["target_2_r"] = 1.75
+
+    bundle = profile_bundle("TREND_CONTINUATION", defaults)
+
+    assert bundle["management"]["no_progress_seconds"] == 1800
+    assert bundle["management"]["target_2_r"] == 1.75
+    assert bundle["management"]["target_r"] == 1.75
 
 
 def test_cartographer_accepts_authoritative_google_formatted_ceiling(tmp_path: Path) -> None:

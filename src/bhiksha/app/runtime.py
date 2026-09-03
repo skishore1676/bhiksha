@@ -277,7 +277,7 @@ class BhikshaRuntime:
         cash_budget_repository = SQLiteCashBudgetRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         chain_snapshot_repository = SQLiteChainSnapshotRepository(self.app_config.sqlite_path, backend=sqlite_backend)
         await _sweep_chain_snapshot_retention_best_effort(chain_snapshot_repository, output=output)
-        # Operator-sheet risk knobs: env > Operator_Defaults_v1 (via the
+        # Operator-sheet risk knobs: Operator_Defaults_v1 > env fallback (via the
         # already-compiled active plan) > hardcoded default. See
         # bhiksha.risk.plan_operator_defaults_source for the sheet key
         # convention; resolve_risk_settings applies the same validation to

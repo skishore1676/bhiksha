@@ -6,9 +6,9 @@ The live authority is the compiled active plan at [active_plan.json](/Users/suma
 
 ## Control Plane
 
-Use these 3 sheet tabs:
+Use these five workbook tabs:
 
-- `Strategy_Catalog`
+- `Mala_Evidence_v1` (generated, read-only)
   - maintained by Mala or by occasional manual promotion work
   - rows are importable when `bhiksha_ready=true` and `lifecycle_status` is `active` or `candidate`
   - `candidate` rows can still run if you explicitly enable them in `active_strategy`
@@ -18,8 +18,17 @@ Use these 3 sheet tabs:
   - `mode` controls execution authorization: `live` submits real orders, `shadow` does not
 - `manual_entry`
   - defines operator-authored manual setups like breakout triggers
+- `Operator_Defaults_v1`
+  - owns adjustable execution, risk, and Cartographer profile-management knobs
+- `Chart_Scenarios_v2` (generated, read-only)
+  - explains the current Cartographer batch; it is not an execution staging tab
 
-`operator_status_override` in `Strategy_Catalog` is retained as review metadata.
+Only `active_strategy`, `manual_entry`, and `Operator_Defaults_v1` are operator-editable.
+The workbook is a cockpit, not a historical store. The Cartographer projector keeps a
+bounded current slice in `manual_entry`; Bhiksha receipts/database and TradeLab retain
+durable lifecycle history.
+
+`operator_status_override` in `Mala_Evidence_v1` is retained as review metadata.
 It does not override `active_strategy.mode`; use the active sheet when deciding
 what is live for today's session.
 

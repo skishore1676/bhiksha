@@ -34,9 +34,10 @@ to each env var name -- the same derivation
 ``SettingsSource``. Do not rename these keys without updating that mapping;
 ``resolve_risk_settings`` and this module must agree on the exact string.
 
-Precedence (unchanged, enforced by ``resolve_risk_settings``): env var wins
-if set and non-blank; otherwise this sheet-backed source is consulted;
-otherwise the hardcoded default. Values from either layer still flow through
+Precedence (enforced by ``resolve_risk_settings``): the Sheet-backed source
+wins when it contains a non-blank value; environment variables are retained
+only as a compatibility fallback when the compiled plan has no value;
+otherwise the hardcoded default applies. Values from either layer still flow through
 the same validation/clamping in ``resolve_risk_settings`` -- an invalid sheet
 value degrades to the default plus a ``validation_warnings`` entry, exactly
 like an invalid env var.
@@ -70,7 +71,7 @@ class PlanOperatorDefaultsSource:
         return str(value)
 
     @classmethod
-    def from_active_plan(cls, active_plan: dict[str, Any] | None) -> "PlanOperatorDefaultsSource":
+    def from_active_plan(cls, active_plan: dict[str, Any] | None) -> PlanOperatorDefaultsSource:
         """Build directly from ``BhikshaRuntime.active_plan`` (a raw dict, or
         ``None`` when the runtime was built without a compiled plan path)."""
         if not active_plan:

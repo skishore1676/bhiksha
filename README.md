@@ -2,7 +2,7 @@
 
 Bhiksha executes options strategies live on the Public.com API. It consumes validated strategy
 evidence from the Mala research engine via the `Mala_Evidence_v1` Google Sheet, compiles the
-operator's `active_strategies` rows into per-lane deployments each session, and runs entries,
+operator's `active_strategy` rows into per-lane deployments each session, and runs entries,
 exits, protection, reconciliation, and risk rails against real (or paper/shadow) fills.
 
 - Production runs on oldmac (`~/Documents/bhiksha`) via launchd (see `docs/bhiksha_launchd.md`);
@@ -58,7 +58,7 @@ the sole persistent LIVE/SHADOW authority; change the row's authorization mode t
 lane should remain shadow in a later session.
 
 Knobs resolve
-`env > Operator_Defaults_v1 sheet > default` (see `bhiksha.risk.risk_settings.resolve_risk_settings`),
+`Operator_Defaults_v1 sheet > env fallback > default` (see `bhiksha.risk.risk_settings.resolve_risk_settings`),
 validated at startup with warnings surfaced in the `risk_manager_startup` event. Every consult
 emits a `risk_manager_decision` event (throttled to state-changes + heartbeat so the stream stays
 readable). The daily session report's **Risk Rails** section renders the resolved thresholds
@@ -67,8 +67,9 @@ threshold, rail enabled flags, and any validation warnings.
 
 ### Operator-editable risk knobs (`Operator_Defaults_v1` sheet)
 
-Env vars always win. To make a knob operator-editable without a deploy, add a row to the
-`Operator_Defaults_v1` Google Sheet tab with `section=default` and one of these `key` values
+The Sheet wins when a populated row exists; environment variables are compatibility
+fallbacks for plans that predate the row. Add a row to the `Operator_Defaults_v1`
+Google Sheet tab with `section=default` and one of these `key` values
 (`value` is the raw knob value, same format as the env var):
 
 | Sheet `key`                    | Env var                                     | Default |
@@ -82,6 +83,7 @@ Env vars always win. To make a knob operator-editable without a deploy, add a ro
 | `rail_b_enabled`                | `BHIKSHA_RISK_RAIL_B_ENABLED`                 | `true`  |
 | `prospective_loss_enabled`      | `BHIKSHA_RISK_PROSPECTIVE_LOSS_ENABLED`       | `true`  |
 | `max_open_positions_per_cluster` | `BHIKSHA_RISK_MAX_OPEN_POSITIONS_PER_CLUSTER` | `1`     |
+| `open_drawdown_warn_pct`         | `BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT`          | tier-1 pct |
 
 These keys are exactly the env var name with the `BHIKSHA_RISK_` prefix stripped and
 lowercased — see `bhiksha.risk.plan_operator_defaults_source` for the concrete `SettingsSource`
@@ -92,6 +94,15 @@ edit takes effect on the next plan sync/session start — same cadence as any ot
 an invalid value falls back to the default and is reported in `validation_warnings`.
 Set `max_open_positions_per_cluster=0` to disable only the cluster cap. See
 `docs/prospective_entry_risk.md` for the loss formula, confirmed cluster map, and event evidence.
+
+## Google Sheet cockpit
+
+The operational workbook intentionally exposes five tabs: operator-editable
+`active_strategy`, `manual_entry`, and `Operator_Defaults_v1`; generated read-only
+`Mala_Evidence_v1` and `Chart_Scenarios_v2`. `manual_entry` is a bounded current queue,
+not execution history. Cartographer-owned stale rows are recycled or cleared; durable
+events, trades, receipts, and TradeLab retain the history. Machine transport columns
+may be hidden in the Sheet but remain part of the compiler contract.
 
 ## Where to look
 

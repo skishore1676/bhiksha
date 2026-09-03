@@ -30,6 +30,18 @@ def _operator_defaults() -> dict:
             "dte_max": 7,
             "max_trade_premium_usd": 500.0,
             "max_contracts": 1,
+            "initial_stop_pct": 0.35,
+            "premium_disaster_stop_pct": 0.35,
+            "target_1_r": 1.0,
+            "target_2_r": 2.0,
+            "target_1_quantity_pct": 0.60,
+            "no_progress_minutes": 45,
+            "max_hold_minutes": 180,
+            "high_water_giveback_policy": "MODERATE",
+            "breakeven_after_t1": True,
+            "eod_flat": True,
+            "hard_flat_time_et": "15:55",
+            "no_progress_favorable_floor_r": 0.25,
         },
     }
 
