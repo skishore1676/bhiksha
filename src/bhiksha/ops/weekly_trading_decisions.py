@@ -1062,7 +1062,16 @@ def weekly_stable_digest(report: dict[str, Any]) -> str:
 
 def _weekly_receipt(report: dict[str, Any]) -> dict[str, Any]:
     workbook_status = (report.get("workbook_update") or {}).get("status", "pending")
-    status = "ok" if workbook_status == "ok" else workbook_status
+    workbook = report.get("workbook_update") or {}
+    retired = (
+        workbook_status == "retired"
+        and workbook.get("reason") == "tradelab_workbook_writer_retired"
+        and workbook.get("source_receipt") == report.get("facts_export_receipt")
+        and (report.get("facts_export_receipt") or {}).get("status") == "ok"
+    )
+    status = "ok" if workbook_status == "ok" or retired else workbook_status
+    if workbook_status == "retired" and not retired:
+        status = "failed"
     return {
         "status": status,
         "sha256": weekly_stable_digest(report),

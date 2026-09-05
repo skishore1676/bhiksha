@@ -410,6 +410,7 @@ def _launchd_state(*, deadline: _Deadline | None = None) -> dict[str, dict[str, 
             "return_code": completed.returncode,
             "state": _parse_launchctl_field(completed.stdout, "state"),
             "last_exit_code": _parse_launchctl_field(completed.stdout, "last exit code"),
+            "runs": _parse_launchctl_field(completed.stdout, "runs"),
             "stderr_tail": _tail(completed.stderr),
         }
     return result
@@ -479,6 +480,7 @@ def _last_job_view(latest_record: Any, latest_payload: dict[str, Any] | None) ->
         "alert": _alert_summary(alert),
         "action_id": latest_payload.get("action_id"),
         "payload": latest_payload,
+        "recovered_launchd_failure": latest_record.get("recovered_launchd_failure") if isinstance(latest_record, dict) else None,
     }
 
 
@@ -608,6 +610,12 @@ def _launchd_exit_findings(
     """
     code = str(launchd.get("last_exit_code") or "").strip()
     if code in ("", "0", "-", "(never exited)"):
+        return []
+    recovery = (last or {}).get("recovered_launchd_failure") or {}
+    if (last and last.get("status") == "ok" and recovery
+            and launchd.get("state") == "not running"
+            and recovery.get("runs") == launchd.get("runs")
+            and recovery.get("last_exit_code") == code):
         return []
     # launchd loaded but last exit non-zero and we have no fresh last_run_at
     # beyond the failure window — report it.

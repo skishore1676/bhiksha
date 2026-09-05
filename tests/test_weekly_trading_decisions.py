@@ -488,3 +488,27 @@ def test_weekly_job_defaults_to_evidence_only() -> None:
     source = Path("src/bhiksha/tools/launchd_job.py").read_text(encoding="utf-8")
 
     assert 'os.getenv("BHIKSHA_WEEKLY_REVIEW_MODE", "off")' in source
+
+
+def test_retired_workbook_readiness_requires_bound_app_facts():
+    from bhiksha.ops.weekly_trading_decisions import _weekly_receipt
+    facts = {"status": "ok", "sha256": "abc", "through": "2026-09-04"}
+    report = {"week_end": "2026-09-04", "facts_export_receipt": facts,
+              "workbook_update": {"status": "retired", "reason": "tradelab_workbook_writer_retired",
+                                  "source_receipt": dict(facts)}}
+    assert _weekly_receipt(report)["status"] == "ok"
+    report["workbook_update"]["source_receipt"]["sha256"] = "wrong"
+    assert _weekly_receipt(report)["status"] == "failed"
+
+
+def test_retired_workbook_default_never_calls_external_writer(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from bhiksha.tools import launchd_job
+    monkeypatch.delenv("BHIKSHA_WORKBOOK_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(launchd_job.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("writer invoked")))
+    path = tmp_path / "facts.json"
+    path.write_text(json.dumps({"receipt": {"status": "ok", "sha256": "abc"}}))
+    result = launchd_job._update_trading_decision_ledger(SimpleNamespace(workbook_update_mode="on"), path, repo_root=tmp_path)
+    assert result["status"] == "retired"
+    path.write_text(json.dumps({"receipt": {"status": "failed"}}))
+    assert launchd_job._update_trading_decision_ledger(SimpleNamespace(workbook_update_mode="on"), path, repo_root=tmp_path)["status"] == "failed"

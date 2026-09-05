@@ -1224,3 +1224,14 @@ def test_status_snapshot_deadline_exhaustion_short_circuits_to_not_checked(
         assert job["launchd"]["loaded"] is None
     assert round_tripped["runtime"]["ok"] is False
     assert round_tripped["runtime"]["stderr_tail"].startswith("not_checked:")
+
+
+def test_manual_recovery_watermark_does_not_hide_new_scheduler_failure():
+    from datetime import datetime, UTC
+    from bhiksha.tools.launchd_status import _launchd_exit_findings
+    launchd = {"last_exit_code": "2", "runs": "5", "state": "not running"}
+    last = {"status": "ok", "recovered_launchd_failure": {"last_exit_code": "2", "runs": "5"}}
+    assert _launchd_exit_findings("weekly", launchd, last, now=datetime.now(UTC)) == []
+    launchd["runs"] = "6"
+    assert _launchd_exit_findings("weekly", launchd, last, now=datetime.now(UTC))
+    assert _launchd_exit_findings("weekly", launchd, {"status": "ok"}, now=datetime.now(UTC))

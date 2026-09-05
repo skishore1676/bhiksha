@@ -388,7 +388,7 @@ def _reconciliation_supervisor_job(args: argparse.Namespace, *, repo_root: Path)
 
 
 def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) -> int:
-    """Refresh the ledger, then publish exactly one Obsidian decision packet."""
+    """Finalize app-owned evidence, then optionally publish its decision packet."""
     runtime = build_runtime(active_plan_path=args.active_plan)
     output_dir = _weekly_report_output_dir(
         runtime.app_config.playbook_artifacts_dir,
@@ -426,7 +426,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             }
         )
         return 0
-    if workbook.get("status") != "ok":
+    if workbook.get("status") not in {"ok", "retired"}:
         _print_result(
             {
                 "job": args.job,
@@ -491,10 +491,16 @@ def _update_trading_decision_ledger(
 ) -> dict[str, Any]:
     if args.workbook_update_mode == "off":
         return {"status": "skipped", "reason": "workbook update intentionally disabled"}
-    command_text = os.getenv(
-        "BHIKSHA_WORKBOOK_UPDATE_COMMAND",
-        "/Users/sunny/code/tradelab/scripts/review/update_trading_decision_ledger.sh",
-    )
+    command_text = os.getenv("BHIKSHA_WORKBOOK_UPDATE_COMMAND")
+    if not command_text:
+        # TradeLab retired the duplicate workbook writer. Readiness belongs to
+        # the app-owned facts; retain the field for historical packet readers.
+        facts = json.loads(facts_path.read_text(encoding="utf-8"))
+        receipt = facts.get("receipt") or {}
+        if receipt.get("status") != "ok" or not receipt.get("sha256"):
+            return {"status": "failed", "error": "app-owned fact export is not passing"}
+        return {"status": "retired", "reason": "tradelab_workbook_writer_retired",
+                "source_receipt": receipt}
     command = [command_text, str(facts_path)]
     completed = subprocess.run(
         command,
