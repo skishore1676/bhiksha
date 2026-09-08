@@ -971,6 +971,87 @@ def test_launchd_status_treats_non_trading_day_schwab_skip_as_healthy(
     assert guard["findings"] == []
 
 
+@pytest.mark.parametrize(
+    "runner", ["live-start", "live-watchdog", "session-report"]
+)
+def test_launchd_status_treats_non_trading_day_job_skip_as_healthy(
+    monkeypatch, tmp_path, runner
+) -> None:
+    write_latest_status(
+        tmp_path,
+        {"job": runner, "status": "skipped", "reason": "non_trading_day"},
+    )
+    spec = job_by_runner(runner)
+    assert spec is not None
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state",
+        lambda **kwargs: {
+            spec.label: {
+                "available": True,
+                "loaded": True,
+                "state": "not running",
+                "last_exit_code": "0",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 9, 7, 14, 0, tzinfo=UTC),
+    )
+    job = next(item for item in snapshot["jobs"] if item["runner_job"] == runner)
+
+    assert job["last"]["domain"] == {
+        "ok": True,
+        "status": "skipped",
+        "reason": "non_trading_day",
+    }
+    assert job["lifecycle"] == "armed"
+    assert job["findings"] == []
+
+
+def test_non_trading_day_job_skip_does_not_erase_unresolved_failure(
+    monkeypatch, tmp_path
+) -> None:
+    write_latest_status(
+        tmp_path,
+        {"job": "live-start", "status": "failed", "error": "startup failed"},
+    )
+    write_latest_status(
+        tmp_path,
+        {"job": "live-start", "status": "skipped", "reason": "non_trading_day"},
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state", lambda **kwargs: {}
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": False}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 9, 7, 14, 0, tzinfo=UTC),
+    )
+    job = next(
+        item for item in snapshot["jobs"] if item["runner_job"] == "live-start"
+    )
+    stored = json.loads(latest_status_path(tmp_path).read_text(encoding="utf-8"))[
+        "jobs"
+    ]["live-start"]
+
+    assert stored["payload"]["status"] == "failed"
+    assert stored["last_skip_payload"]["status"] == "skipped"
+    assert job["last"]["domain"]["ok"] is False
+    assert job["findings"] == ["Domain health failed: failed"]
+
+
 def test_non_trading_day_skip_does_not_erase_unresolved_schwab_failure(
     monkeypatch, tmp_path
 ) -> None:

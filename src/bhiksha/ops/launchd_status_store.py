@@ -42,13 +42,13 @@ def write_latest_status(repo_root: Path, payload: dict[str, Any]) -> None:
             recorded["recovered_launchd_failure"] = recovered
     previous = jobs.get(job_name) if isinstance(jobs.get(job_name), dict) else None
     previous_payload = previous.get("payload") if isinstance(previous, dict) else None
-    preserve_auth_failure = (
-        job_name == "schwab-refresh"
-        and payload.get("status") == "skipped"
+    preserve_unresolved_failure = (
+        payload.get("status") == "skipped"
+        and payload.get("reason") == "non_trading_day"
         and isinstance(previous_payload, dict)
         and previous_payload.get("status") == "failed"
     )
-    if preserve_auth_failure:
+    if preserve_unresolved_failure:
         jobs[job_name] = {
             **previous,
             "last_skip_at": recorded["recorded_at"],

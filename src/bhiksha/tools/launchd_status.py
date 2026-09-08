@@ -814,6 +814,11 @@ def _next_fire(schedule: tuple[dict[str, int], ...], *, now: datetime) -> str | 
 
 
 def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
+    if (
+        payload.get("status") == "skipped"
+        and payload.get("reason") == "non_trading_day"
+    ):
+        return {"ok": True, "status": "skipped", "reason": "non_trading_day"}
     if payload.get("job") == "session-report":
         report_status = payload.get("report_status")
         if isinstance(report_status, dict):
@@ -833,8 +838,6 @@ def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
             "attention_required": attention_required,
         }
     if payload.get("job") == "schwab-refresh":
-        if payload.get("status") == "skipped":
-            return {"ok": True, "status": "skipped", "reason": payload.get("reason") or "non_trading_day"}
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         final = result.get("final") if isinstance(result.get("final"), dict) else {}
         return {
