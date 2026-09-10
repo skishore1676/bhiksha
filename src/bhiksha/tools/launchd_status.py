@@ -139,24 +139,11 @@ def build_status_snapshot(
                 "last_run_at": last.get("recorded_at") if isinstance(last, dict) else None,
                 "transport_status": _last_transport_status(last),
                 "findings": findings,
-                "lifecycle": (
-                    "armed"
-                    if not findings
-                    else "waiting_you"
-                    if findings and spec.runner_job in {"schwab-refresh", "reconciliation-supervisor"}
-                    else "armed"
-                    if not spec.install_enabled() or not bool(launchd.get(spec.label, {}).get("loaded"))
-                    else "stuck"
-                    if findings
-                    and any(
-                        "launchd job failed" in f
-                        or "stale_last_run" in f
-                        or "alert transport" in f.lower()
-                        for f in findings
-                    )
-                    else "waiting_you"
-                    if findings
-                    else None
+                "lifecycle": _job_lifecycle(
+                    spec=spec,
+                    last=last,
+                    findings=findings,
+                    launchd_state=launchd.get(spec.label, {}),
                 ),
             }
         if spec.runner_job == "cartographer-shadow":
@@ -325,6 +312,39 @@ def _job_domain(job: dict[str, Any]) -> dict[str, Any]:
     last = job.get("last") if isinstance(job.get("last"), dict) else {}
     domain = last.get("domain") if isinstance(last.get("domain"), dict) else {}
     return domain
+
+
+def _job_lifecycle(
+    *,
+    spec: Any,
+    last: dict[str, Any] | None,
+    findings: list[str],
+    launchd_state: dict[str, Any],
+) -> str:
+    """Route evidence failures separately from owner-declared human gates."""
+
+    if not findings:
+        return "armed"
+    if spec.runner_job == "schwab-refresh":
+        return "waiting_you"
+    if spec.runner_job == "reconciliation-supervisor":
+        domain = last.get("domain") if isinstance(last, dict) else None
+        attention_required = (
+            domain.get("attention_required") is True
+            if isinstance(domain, dict)
+            else False
+        )
+        return "waiting_you" if attention_required else "stuck"
+    if not spec.install_enabled() or not bool(launchd_state.get("loaded")):
+        return "armed"
+    if any(
+        "launchd job failed" in finding
+        or "stale_last_run" in finding
+        or "alert transport" in finding.lower()
+        for finding in findings
+    ):
+        return "stuck"
+    return "waiting_you"
 
 
 def _watchdog_runtime_status(job: dict[str, Any]) -> dict[str, Any]:

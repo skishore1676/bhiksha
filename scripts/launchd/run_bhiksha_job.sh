@@ -32,7 +32,10 @@ if [ $rc -ne 0 ]; then
   job_name="${1:-unknown}"
   "$python_bin" - "$REPO_ROOT" "$job_name" "$rc" <<'PY' 2>/dev/null || true
 import json
+import fcntl
+import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -41,41 +44,58 @@ job = sys.argv[2]
 rc = sys.argv[3]
 path = repo_root / "artifacts" / "playbook" / "launchd" / "latest_status.json"
 path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-except Exception:
-    data = {}
-if not isinstance(data.get("jobs"), dict):
-    data["jobs"] = {}
-existing = data["jobs"].get(job) if isinstance(data["jobs"].get(job), dict) else None
-existing_at = existing.get("recorded_at") if isinstance(existing, dict) else None
-should_write = True
-if existing_at:
+lock_path = path.with_suffix(path.suffix + ".lock")
+deadline = time.monotonic() + 2.0
+with lock_path.open("a+", encoding="utf-8") as lock_file:
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out acquiring launchd status lock: {lock_path}")
+            time.sleep(0.01)
     try:
-        from datetime import datetime as _dt
-        prev = _dt.fromisoformat(str(existing_at).replace("Z", "+00:00"))
-        now = datetime.now(UTC)
-        if (now - prev).total_seconds() < 5:
-            should_write = False
-    except Exception:
-        pass
-if should_write:
-    data["jobs"][job] = {
-        "recorded_at": datetime.now(UTC).isoformat(),
-        "label": f"com.bhiksha.{job}",
-        "payload": {
-            "job": job,
-            "status": "failed",
-            "return_code": int(rc),
-            "reason": "runner_crash_before_status_write",
-            "stderr_tail": f"run_bhiksha_job.sh captured non-zero exit {rc} without a payload — likely import-time failure",
-        },
-    }
-    data["generated_at"] = data["jobs"][job]["recorded_at"]
-    data["schema"] = "bhiksha.launchd.latest_status.v1"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except Exception:
+            data = {}
+        if not isinstance(data.get("jobs"), dict):
+            data["jobs"] = {}
+        existing = data["jobs"].get(job) if isinstance(data["jobs"].get(job), dict) else None
+        existing_at = existing.get("recorded_at") if isinstance(existing, dict) else None
+        should_write = True
+        if existing_at:
+            try:
+                from datetime import datetime as _dt
+                prev = _dt.fromisoformat(str(existing_at).replace("Z", "+00:00"))
+                now = datetime.now(UTC)
+                if (now - prev).total_seconds() < 5:
+                    should_write = False
+            except Exception:
+                pass
+        if should_write:
+            data["jobs"][job] = {
+                "recorded_at": datetime.now(UTC).isoformat(),
+                "label": f"com.bhiksha.{job}",
+                "payload": {
+                    "job": job,
+                    "status": "failed",
+                    "return_code": int(rc),
+                    "reason": "runner_crash_before_status_write",
+                    "stderr_tail": f"run_bhiksha_job.sh captured non-zero exit {rc} without a payload — likely import-time failure",
+                },
+            }
+            data["generated_at"] = data["jobs"][job]["recorded_at"]
+            data["schema"] = "bhiksha.launchd.latest_status.v1"
+            tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+            try:
+                tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                tmp.replace(path)
+            finally:
+                tmp.unlink(missing_ok=True)
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 PY
 fi
 exit $rc
