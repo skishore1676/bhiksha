@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
+import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -11,7 +15,7 @@ from bhiksha.ops.launchd_registry import (
     job_by_runner,
     latest_status_path,
 )
-from bhiksha.ops.launchd_status_store import write_latest_status
+from bhiksha.ops.launchd_status_store import _exclusive_status_lock, write_latest_status
 from bhiksha.tools import launchd_control, launchd_job, launchd_status
 
 
@@ -91,6 +95,152 @@ def test_stale_status_detects_missed_repeating_fire_and_clears_after_receipt() -
         {"recorded_at": "2026-08-10T13:30:00+00:00"},
         now=missed,
     ) == []
+
+
+def test_latest_status_rereads_after_cross_process_lock(tmp_path: Path) -> None:
+    path = latest_status_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    ready_path = tmp_path / "child-ready"
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    child_code = """
+import sys
+from pathlib import Path
+from bhiksha.ops.launchd_status_store import write_latest_status
+
+repo_root = Path(sys.argv[1])
+Path(sys.argv[2]).write_text("ready", encoding="utf-8")
+write_latest_status(repo_root, {"job": "live-watchdog", "status": "failed"})
+"""
+
+    with _exclusive_status_lock(path):
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(tmp_path), str(ready_path)],
+            env=env,
+        )
+        deadline = time.monotonic() + 1.0
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready_path.exists()
+        time.sleep(0.05)
+        assert child.poll() is None
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "bhiksha.launchd.latest_status.v1",
+                    "jobs": {
+                        "reconciliation-supervisor": {
+                            "recorded_at": "2026-09-10T20:00:00+00:00",
+                            "payload": {
+                                "job": "reconciliation-supervisor",
+                                "status": "ok",
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert child.wait(timeout=3) == 0
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert set(written["jobs"]) == {
+        "live-watchdog",
+        "reconciliation-supervisor",
+    }
+
+
+def test_status_lock_timeout_cannot_fail_the_domain_job(monkeypatch) -> None:
+    monkeypatch.setattr(
+        launchd_job,
+        "write_latest_status",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("busy")),
+    )
+
+    launchd_job._write_latest_status({"job": "live-watchdog", "status": "ok"})
+
+
+def test_runner_import_failure_fallback_uses_shared_status_lock(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.update(
+        {
+            "BHIKSHA_PYTHON": sys.executable,
+            "BHIKSHA_REPO_ROOT": str(tmp_path),
+        }
+    )
+
+    completed = subprocess.run(
+        [str(repo_root / "scripts" / "launchd" / "run_bhiksha_job.sh"), "not-a-job"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert completed.returncode == 2
+    path = latest_status_path(tmp_path)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["jobs"]["not-a-job"]["payload"]["reason"] == (
+        "runner_crash_before_status_write"
+    )
+    assert path.with_suffix(path.suffix + ".lock").is_file()
+
+
+def test_stale_reconciliation_evidence_is_system_attention_without_owner_gate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    write_latest_status(
+        tmp_path,
+        {
+            "job": "reconciliation-supervisor",
+            "status": "ok",
+            "reconciliation_supervision": {
+                "state": "healthy",
+                "attention_required": False,
+            },
+        },
+    )
+    stored = json.loads(latest_status_path(tmp_path).read_text(encoding="utf-8"))
+    stored["jobs"]["reconciliation-supervisor"]["recorded_at"] = (
+        "2026-09-10T19:50:00+00:00"
+    )
+    latest_status_path(tmp_path).write_text(json.dumps(stored), encoding="utf-8")
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._launchd_state",
+        lambda **kwargs: {
+            "com.bhiksha.reconciliation-supervisor": {
+                "available": True,
+                "loaded": True,
+                "state": "not running",
+                "last_exit_code": "0",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "bhiksha.tools.launchd_status._runtime_status",
+        lambda *, repo_root, **kwargs: {"ok": True, "status": {"running": True}},
+    )
+
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path,
+        active_plan_path=tmp_path / "active_plan.json",
+        now=datetime(2026, 9, 10, 20, 6, tzinfo=UTC),
+    )
+    job = next(
+        item
+        for item in snapshot["jobs"]
+        if item["runner_job"] == "reconciliation-supervisor"
+    )
+
+    assert job["last"]["domain"]["attention_required"] is False
+    assert job["lifecycle"] == "stuck"
+    assert job["findings"][0].startswith("stale_last_run")
 
 
 def test_launchd_status_distinguishes_domain_and_transport(
@@ -1308,7 +1458,8 @@ def test_status_snapshot_deadline_exhaustion_short_circuits_to_not_checked(
 
 
 def test_manual_recovery_watermark_does_not_hide_new_scheduler_failure():
-    from datetime import datetime, UTC
+    from datetime import UTC, datetime
+
     from bhiksha.tools.launchd_status import _launchd_exit_findings
     launchd = {"last_exit_code": "2", "runs": "5", "state": "not running"}
     last = {"status": "ok", "recovered_launchd_failure": {"last_exit_code": "2", "runs": "5"}}
