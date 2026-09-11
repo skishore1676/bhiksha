@@ -1,11 +1,16 @@
 import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from bhiksha.ops.launchd_registry import active_launchd_jobs
+from bhiksha.ops.launchd_registry import (
+    active_launchd_jobs,
+    job_by_runner,
+    standard_launchd_jobs,
+)
 
 
 def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
@@ -154,16 +159,85 @@ def test_cartographer_projector_has_one_bounded_retry_before_compile(
     assert times == {(7, 30), (7, 40)}
     assert "07:30 and 07:40" in projector.schedule_label
 
-    payload = plistlib.loads(
-        Path(
-            "scripts/launchd/com.bhiksha.cartographer-shadow.plist.template"
-        ).read_bytes()
-    )
+    payload = projector.plist_payload(repo_root=Path.cwd())
     schedule = payload["StartCalendarInterval"]
     assert {entry["Weekday"] for entry in schedule} == {1, 2, 3, 4, 5}
     assert {(entry["Hour"], entry["Minute"]) for entry in schedule} == {
         (7, 30),
         (7, 40),
+    }
+    assert payload["ProgramArguments"] == [
+        "/bin/bash",
+        str(Path.cwd() / "scripts/launchd/run_bhiksha_job.sh"),
+        "cartographer-shadow",
+    ]
+    assert payload["ProcessType"] == "Background"
+    assert payload["LowPriorityIO"] is True
+
+
+def test_standard_installer_and_cartographer_opt_in_have_disjoint_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BHIKSHA_ENABLE_CARTOGRAPHER_SHADOW", "true")
+
+    assert "cartographer-shadow" in {job.runner_job for job in active_launchd_jobs()}
+    assert "cartographer-shadow" not in {
+        job.runner_job for job in standard_launchd_jobs()
+    }
+
+
+def test_cartographer_installer_renders_registry_command_and_schedule(
+    tmp_path: Path,
+) -> None:
+    repo = Path.cwd().resolve()
+    launchd_dir = tmp_path / "LaunchAgents"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ("launchctl", "plutil"):
+        executable = fake_bin / name
+        executable.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BHIKSHA_REPO_ROOT": str(repo),
+        "BHIKSHA_LAUNCHD_DIR": str(launchd_dir),
+        "BHIKSHA_PYTHON": sys.executable,
+        "CARTOGRAPHER_REPO_ROOT": "/runtime/market-cartographer",
+        "CARTOGRAPHER_ALPHA_OUTPUT_ROOT": "/runtime/market-cartographer/alpha",
+        "CARTOGRAPHER_MALA_DATA_ROOT": "/runtime/mala/frozen",
+        "BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT": str(tmp_path / "output"),
+        "BHIKSHA_CARTOGRAPHER_SHEET_ID": "sheet-for-test",
+        "BHIKSHA_CARTOGRAPHER_SHEET_CREDENTIALS": "/runtime/config/credentials.json",
+    }
+
+    subprocess.run(
+        ["bash", "scripts/launchd/install_cartographer_shadow_launchd.sh"],
+        cwd=repo,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    projector = job_by_runner("cartographer-shadow")
+    assert projector is not None
+    payload = plistlib.loads(
+        (launchd_dir / "com.bhiksha.cartographer-shadow.plist").read_bytes()
+    )
+    assert payload["ProgramArguments"] == projector.program_arguments(repo)
+    assert payload["StartCalendarInterval"] == [
+        dict(item) for item in projector.schedule
+    ]
+    assert payload["StandardOutPath"] == str(projector.stdout_log(repo))
+    assert payload["StandardErrorPath"] == str(projector.stderr_log(repo))
+    assert payload["EnvironmentVariables"] == {
+        "BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT": str(tmp_path / "output"),
+        "BHIKSHA_CARTOGRAPHER_SHEET_CREDENTIALS": "/runtime/config/credentials.json",
+        "BHIKSHA_CARTOGRAPHER_SHEET_ID": "sheet-for-test",
+        "CARTOGRAPHER_ALPHA_OUTPUT_ROOT": "/runtime/market-cartographer/alpha",
+        "CARTOGRAPHER_MALA_DATA_ROOT": "/runtime/mala/frozen",
+        "CARTOGRAPHER_REPO_ROOT": "/runtime/market-cartographer",
     }
 
 

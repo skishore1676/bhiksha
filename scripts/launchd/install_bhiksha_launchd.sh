@@ -46,10 +46,9 @@ from pathlib import Path
 repo = Path(sys.argv[1])
 launchd_dir = Path(sys.argv[2])
 log_dir = Path(sys.argv[3])
-runner = repo / "scripts" / "launchd" / "run_bhiksha_job.sh"
 sys.path.insert(0, str(repo / "src"))
 
-from bhiksha.ops.launchd_registry import active_launchd_jobs
+from bhiksha.ops.launchd_registry import standard_launchd_jobs
 
 exit_edge_enabled = str(
     os.environ.get("BHIKSHA_INSTALL_EXIT_EDGE_LIVE_SHADOW_ENABLED", "")
@@ -68,24 +67,19 @@ if "BHIKSHA_ACTIVE_PLAN_ID" in os.environ:
             "letters, digits, '.', '_', ':', or '-'"
         )
 
-for job in active_launchd_jobs():
+for job in standard_launchd_jobs():
     label = job.label
-    plist = {
-        "Label": label,
-        "ProgramArguments": ["/bin/bash", str(runner), *job.runner_args()],
-        "StartCalendarInterval": [dict(item) for item in job.schedule],
-        "WorkingDirectory": str(repo),
-        "StandardOutPath": str(log_dir / f"{label}.out.log"),
-        "StandardErrorPath": str(log_dir / f"{label}.err.log"),
-    }
     environment = {}
     if label in {"com.bhiksha.live-start", "com.bhiksha.live-watchdog"}:
         if exit_edge_enabled:
             environment["BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED"] = "true"
         if active_plan_id is not None:
             environment["BHIKSHA_ACTIVE_PLAN_ID"] = active_plan_id
-    if environment:
-        plist["EnvironmentVariables"] = environment
+    plist = job.plist_payload(
+        repo_root=repo,
+        log_dir=log_dir,
+        environment=environment,
+    )
     path = launchd_dir / f"{label}.plist"
     if path.is_symlink():
         raise SystemExit(f"launchd plist cannot be a symlink: {path}")

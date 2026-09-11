@@ -127,7 +127,7 @@ def build_status_snapshot(
                 "available_actions": list(spec.allowed_manual_actions),
                 "requires_confirmation_actions": list(spec.requires_confirmation_actions),
                 "action_requirements": _action_requirements(spec.requires_confirmation_actions),
-                "command": ["scripts/launchd/run_bhiksha_job.sh", *spec.runner_args()],
+                "command": spec.status_command(),
                 "logs": {
                     "stdout": str(spec.stdout_log(repo_root)),
                     "stderr": str(spec.stderr_log(repo_root)),

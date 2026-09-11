@@ -27,6 +27,8 @@ class LaunchdJobSpec:
     allowed_manual_actions: tuple[str, ...] = ()
     requires_confirmation_actions: tuple[str, ...] = ()
     install_opt_in_env: str | None = None
+    process_type: str | None = None
+    low_priority_io: bool = False
 
     def install_enabled(self) -> bool:
         if self.install_opt_in_env is None:
@@ -40,6 +42,55 @@ class LaunchdJobSpec:
 
     def runner_args(self) -> list[str]:
         return [self.runner_job]
+
+    def status_command(self) -> list[str]:
+        """Return the owner-advertised command from the same scheduler contract."""
+
+        return ["scripts/launchd/run_bhiksha_job.sh", *self.runner_args()]
+
+    def program_arguments(self, repo_root: Path) -> list[str]:
+        """Return the exact launchd arguments for this owner-managed job."""
+
+        return [
+            "/bin/bash",
+            str(repo_root / self.status_command()[0]),
+            *self.status_command()[1:],
+        ]
+
+    def plist_payload(
+        self,
+        *,
+        repo_root: Path,
+        log_dir: Path | None = None,
+        environment: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Render the shared launchd fields without duplicating schedule or command."""
+
+        stdout_log = (
+            log_dir / f"{self.label}.out.log"
+            if log_dir is not None
+            else self.stdout_log(repo_root)
+        )
+        stderr_log = (
+            log_dir / f"{self.label}.err.log"
+            if log_dir is not None
+            else self.stderr_log(repo_root)
+        )
+        payload: dict[str, Any] = {
+            "Label": self.label,
+            "ProgramArguments": self.program_arguments(repo_root),
+            "StartCalendarInterval": [dict(item) for item in self.schedule],
+            "WorkingDirectory": str(repo_root),
+            "StandardOutPath": str(stdout_log),
+            "StandardErrorPath": str(stderr_log),
+        }
+        if self.process_type is not None:
+            payload["ProcessType"] = self.process_type
+        if self.low_priority_io:
+            payload["LowPriorityIO"] = True
+        if environment:
+            payload["EnvironmentVariables"] = dict(environment)
+        return payload
 
     def stdout_log(self, repo_root: Path) -> Path:
         return self.log_dir(repo_root) / f"{self.label}.out.log"
@@ -93,6 +144,8 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
         skips_non_trading_days=True,
         risk_class="shadow_projection",
         install_opt_in_env="BHIKSHA_ENABLE_CARTOGRAPHER_SHADOW",
+        process_type="Background",
+        low_priority_io=True,
     ),
     LaunchdJobSpec(
         label="com.bhiksha.live-start",
@@ -170,6 +223,12 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
 
 def active_launchd_jobs() -> tuple[LaunchdJobSpec, ...]:
     return tuple(job for job in ACTIVE_LAUNCHD_JOBS if job.install_enabled())
+
+
+def standard_launchd_jobs() -> tuple[LaunchdJobSpec, ...]:
+    """Jobs owned by the standard installer, excluding explicit opt-in lanes."""
+
+    return tuple(job for job in ACTIVE_LAUNCHD_JOBS if job.install_opt_in_env is None)
 
 
 def registered_launchd_jobs() -> tuple[LaunchdJobSpec, ...]:

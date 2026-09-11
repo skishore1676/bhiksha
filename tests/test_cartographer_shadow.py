@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import copy
 import inspect
-import plistlib
-from pathlib import Path
 
 import pytest
 
 from bhiksha.experiments import cartographer_shadow as subject
+from bhiksha.ops.launchd_registry import job_by_runner
 
 
 def _batch() -> dict[str, object]:
@@ -92,12 +91,11 @@ def test_observer_module_has_no_money_path_imports() -> None:
 
 
 def test_observer_runs_after_cartographer_retry_window() -> None:
-    payload = plistlib.loads(
-        Path("scripts/launchd/com.bhiksha.cartographer-shadow.plist.template").read_bytes()
-    )
+    job = job_by_runner("cartographer-shadow")
+    assert job is not None
     times = {
-        (item["Hour"], item["Minute"]) for item in payload["StartCalendarInterval"]
+        (item["Hour"], item["Minute"]) for item in job.schedule
     }
 
     assert times == {(7, 30), (7, 40)}
-    assert len(payload["StartCalendarInterval"]) == 10
+    assert len(job.schedule) == 10
