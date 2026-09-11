@@ -23,3 +23,5 @@ Hard rules for this repo:
   first on PYTHONPATH plus the kernel's `src`; verify `bhiksha.__file__` resolves into
   the worktree.
 - Engineering lessons: `docs/lessons/` (read before touching the areas they cover).
+- Before changing launchd installers, schedules, commands, or status projection,
+  read `docs/lessons/launchd-installers-must-render-one-owner-registry.md`.
