@@ -223,7 +223,11 @@ class StrategySpec(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+from bhiksha.risk.rail_b_recovery import RailBRecoveryPolicy
+
+
 class ExecutionSpec(BaseModel):
+    rail_b_recovery: RailBRecoveryPolicy | None = None
     profile: str
     option_mapping: dict[str, str] = Field(default_factory=dict)
     dte_min: int = 0

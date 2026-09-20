@@ -39,7 +39,7 @@ adverse — so unlike the underlying policy there is no separate short branch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time as dt_time, timezone
 from enum import Enum
 from typing import Any
@@ -82,6 +82,7 @@ class ProfileLadderRule(str, Enum):
     TARGET_1_PARTIAL = "target_1_partial"
     TARGET_2_RUNNER = "target_2_runner"
     HIGH_WATER_GIVEBACK = "high_water_giveback"
+    POLICY_FLOOR = "policy_floor"
     NO_PROGRESS = "no_progress"
     MAX_HOLD = "max_hold"
     EOD_FLAT = "eod_flat"
@@ -143,6 +144,7 @@ class ProfileExitFields:
     policy_schema_version: str | None = None
     policy_id: str | None = None
     policy_hash: str | None = None
+    policy_floor: dict[str, Any] = field(default_factory=dict)
     explicit_giveback_arm_r: float | None = None
     explicit_giveback_retrace_fraction: float | None = None
 
@@ -253,11 +255,14 @@ class ProfileExitFields:
                     "no_progress_favorable_floor_r",
                     get("no_progress_favorable_floor_r", 0.25),
                 )
-                or 0.25
             ),
             policy_schema_version=get("policy_schema_version"),
             policy_id=get("policy_id"),
             policy_hash=policy_hash,
+            policy_floor={**parameters, **{
+                key: get(key) for key in ("risk_envelope_enabled", "risk_envelope_activation_r",
+                    "risk_envelope_initial_floor_r", "risk_envelope_floor_at_t1_r",
+                    "risk_envelope_curvature", "risk_envelope_ratchet_step_r")}},
             explicit_giveback_arm_r=get("giveback_arm_r"),
             explicit_giveback_retrace_fraction=get("giveback_retrace_fraction"),
         )
@@ -271,6 +276,10 @@ class ProfileExitFields:
         and the evaluator reads them straight off the spec. Accessed via getattr
         so the evaluator keeps no hard import of the config layer.
         """
+        # Named exits consume the same frozen canonical definition as replay.
+        if getattr(exit_spec, "management_exit", None) and getattr(exit_spec, "exit_policy_snapshot", None):
+            fields = cls.from_management_spec(exit_spec.exit_policy_snapshot)
+            return replace(fields, policy_hash=getattr(exit_spec, "exit_policy_hash", None))
         get = lambda k, d=None: getattr(exit_spec, k, d)  # noqa: E731
         return cls(
             profile_id=str(get("profile_exit_id") or get("profile") or "unknown_profile"),
@@ -582,6 +591,29 @@ def evaluate_profile_exit(
             quantity=remaining_qty,
             features=_diag(entry_premium, current, risk, state, elapsed_seconds),
         )
+
+    # Named family floors use the prior observed peak, so the current quote
+    # cannot both arm a floor and retrospectively fill an exit at that floor.
+    floor = None
+    if fields.policy_floor.get("exit_family") == "profit_preservation_ratchet":
+        if peak_r >= fields.policy_floor["profit_lock_arm_r"]:
+            floor = fields.policy_floor["profit_lock_floor_r"]
+    if fields.policy_floor.get("exit_family") == "dynamic_envelope" and fields.policy_floor.get("risk_envelope_enabled"):
+        import math
+        from bhiksha.execution.exit_policy import evaluate_risk_envelope
+        p = fields.policy_floor
+        raw = evaluate_risk_envelope(peak_r=peak_r,
+            activation_r=p["risk_envelope_activation_r"], target_1_r=fields.effective_target_1_r,
+            initial_floor_r=p["risk_envelope_initial_floor_r"],
+            floor_at_t1_r=p["risk_envelope_floor_at_t1_r"], curvature=p["risk_envelope_curvature"])
+        initial = p["risk_envelope_initial_floor_r"]
+        step = p["risk_envelope_ratchet_step_r"]
+        floor = initial + math.floor((raw - initial) / step + 1e-10) * step
+    if floor is not None and current_r <= floor:
+        return _full_exit(profile_id, rule=ProfileLadderRule.POLICY_FLOOR,
+            fsm_action=ProfileFsmAction.SQUARE_OFF, reason="profile_policy_floor",
+            quantity=remaining_qty, features={**_diag(entry_premium, current, risk, state, elapsed_seconds),
+                                             "floor_r": floor})
 
     # 2. Target 1 — bank the partial and arm the breakeven ratchet.
     t1_r = fields.effective_target_1_r

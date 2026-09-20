@@ -780,7 +780,7 @@ class RiskManager:
         if deployment_id in self._session_blocked_ids:
             return self._session_blocked_status.get(deployment_id, RailBStatus(blocked=True, reason=RAIL_B_SESSION_BLOCK_REASON))
 
-        trades = await self.trade_state_repository.get_recent_trades(limit=1000)
+        trades = await self.trade_state_repository.get_closed_trades_for_deployment(deployment_id)
         deployment_eligible_closed = [
             trade
             for trade in trades

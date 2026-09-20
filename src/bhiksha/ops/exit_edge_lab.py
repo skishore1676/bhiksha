@@ -1225,19 +1225,16 @@ def _analyze_named_case(case: ExitEdgeCase) -> dict[str, Any]:
         return {**base, "status": "insufficient_data", "insufficient_reason": problem}
     outcomes = {}
     for policy in case.experiment["named_profiles"]:
+        parameters = policy.get("parameters") or {}
+        if (parameters.get("exit_family") in {"profit_preservation_ratchet", "dynamic_envelope"}
+            and parameters.get("named_exit_evaluator_version") != "named-exits.v2"):
+            return {**base, "status": "insufficient_data",
+                    "insufficient_reason": "unsupported_historical_named_exit_mechanics"}
         fields = ProfileExitFields.from_management_spec(policy)
         arm_case = replace(case, profile=fields, profile_config=policy)
-        if policy.get("risk_envelope_enabled"):
-            arm = {"candidate_id": policy["policy_id"], "candidate_policy_id": policy["policy_id"],
-                   "candidate_policy_hash": canonical_policy_hash(policy), "canonical_policy": policy}
-            # Reuse the already-tested envelope replay with this arm's own risk and state.
-            arm_case = replace(arm_case, experiment={**case.experiment, "risk_envelope": {"experiment_id": "named_profiles"}})
-            observations = _control_observations(arm_case, arm)
-            outcome, _, _ = _replay_envelope_candidate(
-                arm_case, arm, control_observations=observations,
-                latency_ms=int(case.experiment["fill_latency_ms"]), max_freshness_ms=int(case.experiment["max_freshness_ms"]))
-        else:
-            outcome = _replay(arm_case, "profile", int(case.experiment["fill_latency_ms"]), int(case.experiment["max_freshness_ms"]))
+        # Same pure manager for every named arm; legacy canary experiments keep
+        # their separate historical replay below.
+        outcome = _replay(arm_case, "profile", int(case.experiment["fill_latency_ms"]), int(case.experiment["max_freshness_ms"]))
         outcomes[policy["policy_id"]] = asdict(outcome) if outcome else None
     missing = [name for name, outcome in outcomes.items() if outcome is None]
     baseline = case.experiment["named_profiles"][0]["policy_id"]

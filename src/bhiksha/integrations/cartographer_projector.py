@@ -21,6 +21,7 @@ MANUAL_ENTRY_HEADERS = [
     "bhiksha_last_note", "bhiksha_last_trade_id", "idea_invalidation", "management_policy",
     "management_policy_spec", "metadata", "execution", "risk",
 ]
+NAMED_EXIT_HEADERS = [*MANUAL_ENTRY_HEADERS, "management_exit", "compare_exits"]
 OWNER = "market_cartographer"
 _SHEETS_DATE_EPOCH = date(1899, 12, 30)
 
@@ -186,6 +187,7 @@ def project_signals(
     *,
     operator_defaults: Mapping[str, Any],
     trading_date: str,
+    named_exits: bool = False,
 ) -> tuple[list[list[Any]], dict[str, Any]]:
     """Return an idempotent fake-workbook update and a zero-write receipt."""
 
@@ -194,12 +196,24 @@ def project_signals(
     body = {key: value for key, value in signal_batch.items() if key != "signal_batch_hash"}
     if signal_batch.get("signal_batch_hash") != canonical_hash(body):
         raise ValueError("Cartographer signal batch hash mismatch")
-    output = [list(row) + [""] * max(0, 22 - len(row)) for row in existing_rows]
+    width = 24 if named_exits else 22
+    output = [list(row) + [""] * max(0, width - len(row)) for row in existing_rows]
     by_id = {str(row[0]): index for index, row in enumerate(output) if row and row[0]}
     actions: list[dict[str, Any]] = []
     for signal in signal_batch.get("signals", []):
         normalized = _validate_signal(signal)
         target = _projected_row(normalized, operator_defaults=operator_defaults)
+        defaults = operator_defaults.get("profile__" + str(normalized["management_policy"]).lower(), {})
+        management_exit = str(defaults.get("management_exit") or "").strip()
+        compare_exits = defaults.get("compare_exits") or ""
+        if compare_exits and not management_exit:
+            raise ValueError("Cartographer compare_exits requires management_exit in Operator_Defaults_v1")
+        if management_exit and not named_exits:
+            raise ValueError("Cartographer named exits require manual_entry management_exit and compare_exits columns")
+        if named_exits:
+            if management_exit:
+                target[18] = ""  # One exit authority; legacy entry bundle stays intact.
+            target.extend([management_exit, compare_exits])
         row_id = str(target[0])
         if str(normalized["trading_date"]) != trading_date:
             actions.append({"signal_id": row_id, "action": "expired"})
@@ -222,6 +236,11 @@ def project_signals(
         preserved[1] = existing[1]
         preserved[2] = existing[2]
         preserved[12:16] = existing[12:16]
+        if named_exits:
+            # A retry cannot overwrite a human's exit selection (including an
+            # intentionally blank comparison list).
+            preserved[22:24] = existing[22:24]
+            preserved[18] = "" if existing[22] else existing[18]
         output[index] = preserved
         actions.append({"signal_id": row_id, "action": "preserved"})
     receipt_body = {
@@ -250,9 +269,11 @@ def project_with_table(
     a readback that must reproduce every Cartographer-owned target row.
     """
 
-    headers = table.read_headers()
-    if headers != MANUAL_ENTRY_HEADERS:
-        raise ValueError("manual_entry headers must exactly match the A:V projection contract")
+    sheet_headers = table.read_headers()
+    headers = next((candidate for candidate in (MANUAL_ENTRY_HEADERS, NAMED_EXIT_HEADERS)
+                    if len(sheet_headers) == len(candidate) and set(sheet_headers) == set(candidate)), None)
+    if headers is None:
+        raise ValueError("manual_entry headers must exactly match A:V or A:X named exit contract")
     before = table.read_rows()
     ids: set[str] = set()
     existing_rows: list[list[Any]] = []
@@ -268,6 +289,7 @@ def project_with_table(
     projected, pure_receipt = project_signals(
         existing_rows, signal_batch,
         operator_defaults=operator_defaults, trading_date=trading_date,
+        named_exits=headers == NAMED_EXIT_HEADERS,
     )
     batch_ids = {str(signal.get("signal_id") or "") for signal in signal_batch.get("signals", [])}
     stale_records: list[dict[str, Any]] = []
@@ -325,9 +347,10 @@ def project_with_table(
         "producer_run_id": signal_batch.get("run_id"),
         "trading_date": trading_date,
         "apply_requested": apply,
-        "header_contract": "A:V_exact",
+        "header_contract": "A:X_named_exits" if headers == NAMED_EXIT_HEADERS else "A:V_exact",
         "planned_updates": len(updates),
         "preimage": preimage,
+        "preimage_headers": headers,
         "expired_rows": expired_rows,
         "cleared_row_indexes": cleared_indexes,
         "sheet_write_outcome": (
@@ -339,7 +362,9 @@ def project_with_table(
         return {**receipt_body, "receipt_hash": canonical_hash(receipt_body)}
     try:
         if updates:
-            table.update_exact_rows(headers=headers, rows=updates)
+            table.update_exact_rows(headers=sheet_headers, rows=[
+                (index, [dict(zip(headers, row, strict=True))[key] for key in sheet_headers])
+                for index, row in updates])
             after = table.read_rows()
             after_by_id = {str(record.get("id") or ""): record for record in after}
             after_indexes = {int(record["row_index"]) for record in after}
@@ -376,6 +401,7 @@ def row_to_compiler_payload(row: Sequence[Any]) -> dict[str, Any]:
         "after": row[8], "start": row[9], "end_in_days": row[10], "notes": row[11],
         "idea_invalidation": row[16], "management_policy": row[17], "management_policy_spec": row[18],
         "metadata": row[19], "execution": row[20], "risk": row[21],
+        **({"management_exit": row[22], "compare_exits": row[23]} if len(row) >= 24 else {}),
     }
 
 

@@ -1809,6 +1809,7 @@ class BhikshaRuntime:
         output: callable,
     ):
         async def runner() -> None:
+            entry_deployment = deployment
             simulate_only = deployment.execution.shadow_only
             # RISK MANAGER consult point (Rail A halt / Rail B demote). Evaluated
             # lazily here -- once per actual entry attempt, not per bar -- so it
@@ -1838,9 +1839,17 @@ class BhikshaRuntime:
                         )
                     else:
                         entry_block_reason = risk_decision.reason
+            if simulate_only and not deployment.execution.shadow_only and entry_block_reason is None:
+                from bhiksha.risk.rail_b_recovery import recovery_candidate
+                recovered = await recovery_candidate(deployment=deployment, risk_manager=self.risk_manager,
+                    db_path=self.app_config.exit_edge_live_shadow_db_path,
+                    event_repository=supervisor.event_repository)
+                if recovered is not None:
+                    entry_deployment = recovered
+                    simulate_only = False
             try:
                 plan = await supervisor.handle_signal(
-                    deployment,
+                    entry_deployment,
                     decision,
                     dry_run=(not live) or simulate_only,
                     simulate_only=simulate_only,

@@ -17,12 +17,14 @@ class ExitProfileConfig(BaseModel):
     target_1_quantity: float = Field(gt=0, le=1)
     initial_stop_pct: float = Field(gt=0, lt=1)
     disaster_stop_pct: float = Field(gt=0, lt=1)
-    stop_anchor: str = "option_premium"
+    stop_anchor: Literal["option_premium"] = "option_premium"
     structural_buffer: float | None = None
     structural_buffer_unit: str | None = None
     reference_timeframe: str | None = None
     no_progress_seconds: int = Field(gt=0)
-    no_progress_min_r: float | None = None
+    no_progress_min_r: float | None = Field(default=None, ge=0)
+    profit_lock_arm_r: float | None = Field(default=None, gt=0)
+    profit_lock_floor_r: float | None = Field(default=None, ge=0)
     max_hold_seconds: int | None = Field(default=None, gt=0)
     giveback_policy: Literal["OFF", "STRICT", "MODERATE", "LOOSE"]
     giveback_arm_r: float | None = Field(default=None, gt=0)
@@ -62,6 +64,19 @@ class ExitProfileConfig(BaseModel):
             raise ValueError("dynamic envelope requires every envelope field")
         if not self.risk_envelope_enabled and any(v is not None for v in envelope_values):
             raise ValueError("inactive envelope cannot carry envelope fields")
+        if any(v is not None for v in (self.structural_buffer, self.structural_buffer_unit, self.reference_timeframe)):
+            raise ValueError("structural stops require underlying-bar execution support")
+        lock = (self.profit_lock_arm_r, self.profit_lock_floor_r)
+        if self.exit_family == "profit_preservation_ratchet":
+            if any(v is None for v in lock) or lock[1] >= lock[0]:
+                raise ValueError("profit preservation requires explicit floor < arm")
+        elif any(v is not None for v in lock):
+            raise ValueError("profit lock fields require profit_preservation_ratchet")
+        if self.risk_envelope_enabled:
+            from bhiksha.execution.exit_policy import evaluate_risk_envelope
+            evaluate_risk_envelope(peak_r=0, activation_r=self.risk_envelope_activation_r,
+                target_1_r=self.target_1_r, initial_floor_r=self.risk_envelope_initial_floor_r,
+                floor_at_t1_r=self.risk_envelope_floor_at_t1_r, curvature=self.risk_envelope_curvature)
         return self
 
     def to_management_policy_spec_dict(self) -> dict[str, Any]:
@@ -97,11 +112,15 @@ class ExitProfileConfig(BaseModel):
             "hard_flat_time_et": str(self.hard_flat_time_et) if self.hard_flat_time_et else None,
             "option_stop_fallback_pct": float(self.disaster_stop_pct),
             "parameters": {
+                "named_exit_evaluator_version": "named-exits.v2",
                 "trade_archetype": self.trade_archetype,
                 "exit_family": self.exit_family,
                 "description": self.description,
             },
         }
+        if self.profit_lock_arm_r is not None:
+            payload["parameters"].update(profit_lock_arm_r=self.profit_lock_arm_r,
+                                         profit_lock_floor_r=self.profit_lock_floor_r)
         if self.no_progress_min_r is not None:
             payload["parameters"]["no_progress_favorable_floor_r"] = float(self.no_progress_min_r)
         if self.structural_buffer is not None:
@@ -144,22 +163,12 @@ def load_exit_profiles_sheet_rows(rows: list[dict[str, Any]]) -> dict[str, ExitP
             if raw_mhm is not None and str(raw_mhm).strip():
                 values["max_hold_seconds"] = int(float(raw_mhm) * 60)
 
-        # Standard envelope parameter defaults when curvature is specified in Sheet
-        if values.get("risk_envelope_enabled") in {True, "TRUE", "true"} or values.get("exit_family") == "dynamic_envelope":
-            if values.get("risk_envelope_curvature"):
-                values.setdefault("risk_envelope_activation_r", 0.5)
-                values.setdefault("risk_envelope_initial_floor_r", -1.0)
-                values.setdefault("risk_envelope_floor_at_t1_r", 0.0)
-                values.setdefault("risk_envelope_ratchet_step_r", 0.1)
-
-        if "eod_flat" in values and isinstance(values["eod_flat"], str):
-            if values["eod_flat"].strip().lower() not in {"true", "false"}:
-                raise ValueError(f"Exit_Profiles_v1 row {index}: eod_flat must be true or false")
-            values["eod_flat"] = values["eod_flat"].strip().lower() == "true"
-        if "risk_envelope_enabled" in values and isinstance(values["risk_envelope_enabled"], str):
-            values["risk_envelope_enabled"] = values["risk_envelope_enabled"].strip().lower() == "true"
-        if "breakeven_after_t1" in values and isinstance(values["breakeven_after_t1"], str):
-            values["breakeven_after_t1"] = values["breakeven_after_t1"].strip().lower() == "true"
+        for key in ("eod_flat", "risk_envelope_enabled", "breakeven_after_t1"):
+            if key in values and isinstance(values[key], str):
+                value = values[key].strip().lower()
+                if value not in {"true", "false"}:
+                    raise ValueError(f"Exit_Profiles_v1 row {index}: {key} must be true or false")
+                values[key] = value == "true"
 
         try:
             profile = ExitProfileConfig.model_validate(values)

@@ -217,6 +217,19 @@ class SQLiteTradeStateRepository(TradeStateRepository):
         await self._ensure_initialized()
         return await self.backend.run_read(self._get_recent_trades_sync, limit)
 
+    async def get_closed_trades_for_deployment(self, deployment_id: str) -> list[TradeRecord]:
+        await self._ensure_initialized()
+        return await self.backend.run_read(self._get_closed_deployment_trades_sync, deployment_id)
+
+    def _get_closed_deployment_trades_sync(self, deployment_id: str) -> list[TradeRecord]:
+        with closing(self.backend.connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM trade_sessions WHERE deployment_id = ? AND status = 'closed' "
+                "ORDER BY COALESCE(exit_filled_at, updated_at) DESC, trade_id DESC",
+                (deployment_id,),
+            ).fetchall()
+        return [_trade_record_from_row(row) for row in rows]
+
     async def record_partial_fill(self, record: PartialFillRecord) -> int:
         await self._ensure_initialized()
         return await self.backend.run_write(self._record_partial_fill_sync, record)

@@ -1745,8 +1745,6 @@ def _apply_exit_overrides(
         }
         if any(value is not None and value != {} for value in conflicts.values()):
             raise ValueError("Conflicting dual exit authority: management_exit cannot be combined with legacy exit overrides")
-        if active_catalog[row.management_exit].risk_envelope_enabled:
-            raise ValueError("dynamic envelope is comparison-only here; existing canary authority remains separate")
         resolved = [_exit_spec_fields_from_management_policy_spec(
             active_catalog[name].to_management_policy_spec_dict()) for name in names]
         updated = dict(section)

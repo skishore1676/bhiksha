@@ -144,6 +144,11 @@ class TradeStateRepository(ABC):
     async def get_recent_trades(self, *, limit: int = 100) -> list[TradeRecord]:
         """Return recent trade sessions, including recently closed rows."""
 
+    async def get_closed_trades_for_deployment(self, deployment_id: str) -> list[TradeRecord]:
+        """Compatibility for repositories without a dedicated history query."""
+        return [t for t in await self.get_recent_trades(limit=1000)
+                if t.deployment_id == deployment_id and t.status == "closed"]
+
     @abstractmethod
     async def record_partial_fill(self, record: PartialFillRecord) -> int:
         """Persist a banked partial leg at submission time (ITEM B). Returns the row id."""
