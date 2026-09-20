@@ -29,8 +29,39 @@ Automatic recovery remains unconfigured/off. Native flags remain off.
 
 ## Cutover evidence
 
-Pending final oldmac test, atomic Sheet migration, plan publication, and readback.
-This section is replaced with the completed receipt after those actions.
+Completed at 2026-09-20 12:49 UTC (07:49 CT):
+
+- Source release `339d792968ba0138619bbfba999730455cf85cc5`, branch
+  `codex/entry-exit-takeover`; 18 deployed file fingerprints verified.
+- Local **1,279 passed**; oldmac **1,279 passed** using temporary test tools,
+  without changing the production virtual environment.
+- Atomic Sheet migration applied and read back: six explicit profile parameters,
+  named management/comparison columns for all four still-disabled manual rows,
+  and named defaults for future Cartographer hypotheses. Existing strategy
+  primary selections were retained. Added controls were visually checked.
+- Published `active_plan_2026-09-20` through the normal atomic sync. All 28
+  deployments (5 LIVE, 23 SHADOW) carry **six** comparison policies, a matching
+  frozen primary, and the corrected mechanics version. Coverage is release-safe:
+  35 enabled rows = 28 deployments + 7 existing research KILL suppressions.
+- Effective Rail B: enabled, window **20**, minimum **10**, cutoff
+  `2026-09-19T00:00:00Z`; **0** qualifying closed live trades for each live lane.
+  The existing **571-trade** ledger was not reset or rewritten.
+- Automatic recovery opted-in lanes: **0**. Native order enabled lanes: **0**.
+- The installed `com.bhiksha.live-start` points to the correct runner. Its
+  `artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled` marker exists
+  and resolves the scheduled recorder flag to **true**. The plain app.yaml
+  default is false; launcher context is required for a truthful readback.
+- Experiment store: **43 historical cohorts; 0 corrected-mechanics cohorts**.
+  Natural collection begins with qualifying future fills; no exit winner is
+  established by this cutover. No live/test order or new session was started.
+
+[Local production readback](../artifacts/audits/2026-09-20-entry-exit-takeover/production-readback.json).
+Oldmac rollback and migration receipts:
+`/Users/sunny/Documents/bhiksha/artifacts/releases/entry-exit-339d792/`.
+This contains the source manifest, `preimage.tar.gz`, Sheet preimages/exact
+requests, and `readback.json`. The underlying Git HEAD remains `a327e220` with
+pre-existing working-tree changes preserved; the release manifest, not HEAD
+alone, identifies the installed source.
 
 ## Limits
 
