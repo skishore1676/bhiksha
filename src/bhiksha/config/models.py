@@ -229,12 +229,18 @@ class ExecutionSpec(BaseModel):
     dte_min: int = 0
     dte_max: int = 7
     dte_fallback_policy: Literal["strict", "allow_nearest_after"] = "strict"
+    dte_fallback_max: int | None = None
     target_abs_delta_min: float | None = None
     target_abs_delta_max: float | None = None
     min_open_interest: int = 0
+    preferred_min_open_interest: int | None = Field(default=None, ge=0)
     max_bid_ask_spread_pct: float | None = None
+    preferred_max_bid_ask_spread_pct: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     entry_execution_profile: Literal["patient", "balanced", "urgent"] | None = None
-    entry_pricing_mode: Literal["passive", "balanced", "urgent", "cross"] = "urgent"
+    entry_pricing_mode: Literal["passive", "balanced", "urgent", "cross", "price_seeking"] = "urgent"
+    price_improvement_discount_pct: float = Field(default=0.10, ge=0, le=0.5, allow_inf_nan=False)
+    price_improvement_max_pct: float = Field(default=0.35, ge=0, le=0.5, allow_inf_nan=False)
+    price_improvement_curve: float = Field(default=0.85, gt=0, allow_inf_nan=False)
     entry_pricing_urgent_spread_pct: float = 0.25
     entry_pricing_passive_spread_pct: float = 0.25
     entry_pricing_cross_tight_spread_pct: float = 0.03
@@ -260,6 +266,8 @@ class ExecutionSpec(BaseModel):
     # keeps the gate shut. A deployment actually running ``live_automated`` therefore
     # can NEVER dispatch a profile exit, which matches every other Bhiksha gate.
     runtime_mode: str | None = None
+    enable_native_bracket_route: bool = False
+    enable_native_oto_route: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -293,6 +301,16 @@ class ExecutionSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_patient_entry_policy(self) -> "ExecutionSpec":
+        if self.enable_native_bracket_route or self.enable_native_oto_route:
+            raise ValueError("native order groups are unavailable until child reconciliation and recovery are implemented")
+        if self.dte_fallback_max is not None and self.dte_fallback_max <= self.dte_max:
+            raise ValueError("dte_fallback_max must be greater than dte_max")
+        if self.price_improvement_max_pct < self.price_improvement_discount_pct:
+            raise ValueError("price improvement maximum must be >= base discount")
+        if self.preferred_min_open_interest is not None and self.preferred_min_open_interest < self.min_open_interest:
+            raise ValueError("preferred OI must be >= hard minimum OI")
+        if self.preferred_max_bid_ask_spread_pct is not None and self.max_bid_ask_spread_pct is not None and self.preferred_max_bid_ask_spread_pct > self.max_bid_ask_spread_pct:
+            raise ValueError("preferred spread must be <= hard maximum spread")
         checkpoints = self.entry_reprice_checkpoints_seconds
         fractions = self.entry_reprice_spread_fractions
         profile_cancel_after: int | None = None
@@ -401,6 +419,9 @@ class ExitSpec(BaseModel):
     exit_policy_hash: str | None = None
     exit_policy_snapshot: dict[str, Any] = Field(default_factory=dict)
     exit_policy_provenance: dict[str, Any] = Field(default_factory=dict)
+    management_exit: str | None = None
+    compare_exits: list[str] = Field(default_factory=list)
+    compare_exit_policies: list[dict[str, Any]] = Field(default_factory=list)
     giveback_arm_r: float | None = None
     giveback_retrace_fraction: float | None = None
     risk_envelope_enabled: bool = False

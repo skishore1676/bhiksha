@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 """Tests for runtime entry output formatting helpers."""
 
 from types import SimpleNamespace
@@ -227,3 +228,65 @@ def test_dead_lane_alert_skips_shadow_and_successful_lanes():
     asyncio.run(run_failures())
 
     assert repository.events == []
+
+
+def test_make_entry_runner_diverts_rail_b_block_to_shadow():
+    import asyncio
+    from unittest.mock import AsyncMock
+    from bhiksha.risk.risk_manager import RAIL_B_SESSION_BLOCK_REASON, EntryDecision
+
+    runtime = _failure_runtime()
+    runtime.risk_manager = SimpleNamespace(
+        allow_entry=AsyncMock(
+            return_value=EntryDecision(
+                allowed=False,
+                reason=RAIL_B_SESSION_BLOCK_REASON,
+                rail="B",
+                details={"window_n": 20, "mean_pnl_usd": -12.5},
+            )
+        )
+    )
+
+    supervisor = SimpleNamespace(
+        event_repository=SimpleNamespace(append=AsyncMock()),
+        handle_signal=AsyncMock(
+            return_value=SimpleNamespace(
+                quantity=1,
+                option_symbol="QQQ260101C00500000",
+                order_id=None,
+                dry_run=True,
+                estimated_entry_price=4.5,
+                risk_reasons=[],
+                risk_details={},
+            )
+        )
+    )
+
+    deployment = SimpleNamespace(
+        deployment_id="qqq_lane",
+        symbol="QQQ",
+        execution=SimpleNamespace(shadow_only=False),
+    )
+    decision = SimpleNamespace(signal=True, direction="BUY_CALL", timestamp=datetime.now(UTC))
+
+    lines = []
+    runner = runtime._make_entry_runner(
+        supervisor,
+        deployment,
+        decision,
+        live_entry_block_reason=None,
+        live=True,
+        output=lines.append,
+    )
+    asyncio.run(runner())
+
+    supervisor.handle_signal.assert_awaited_once_with(
+        deployment,
+        decision,
+        dry_run=True,
+        simulate_only=True,
+        live_entry_block_reason=None,
+    )
+
+    assert any("ENTRY_RAIL_B_DIVERTED_TO_SHADOW deployment=qqq_lane" in line for line in lines)
+    assert any("mode=shadow" in line for line in lines)

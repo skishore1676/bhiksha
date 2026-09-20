@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from bhiksha.risk.plan_operator_defaults_source import PlanOperatorDefaultsSource
 from bhiksha.risk.risk_settings import resolve_risk_settings
 
@@ -142,3 +144,41 @@ def test_resolve_open_drawdown_warn_pct_falls_back_to_none_when_sheet_and_env_ab
     settings = resolve_risk_settings(settings_source=source)
 
     assert settings.open_drawdown_warn_pct is None  # "unset" -- not a numeric default
+
+
+def test_resolve_demote_reset_at_uses_rail_b_reset_at_sheet_key(monkeypatch) -> None:
+    monkeypatch.delenv("BHIKSHA_RISK_DEMOTE_RESET_AT", raising=False)
+    monkeypatch.delenv("BHIKSHA_RISK_RAIL_B_RESET_AT", raising=False)
+    source = PlanOperatorDefaultsSource({"rail_b_reset_at": "2026-09-19T00:00:00Z"})
+
+    settings = resolve_risk_settings(settings_source=source)
+
+    assert settings.demote_reset_at == datetime(2026, 9, 19, 0, 0, 0, tzinfo=UTC)
+    assert settings.validation_warnings == ()
+    assert settings.to_dict()["demote_reset_at"] == "2026-09-19T00:00:00+00:00"
+
+
+def test_resolve_demote_reset_at_uses_demote_reset_at_sheet_key(monkeypatch) -> None:
+    monkeypatch.delenv("BHIKSHA_RISK_DEMOTE_RESET_AT", raising=False)
+    source = PlanOperatorDefaultsSource({"demote_reset_at": "2026-09-19T14:30:00Z"})
+
+    settings = resolve_risk_settings(settings_source=source)
+
+    assert settings.demote_reset_at == datetime(2026, 9, 19, 14, 30, 0, tzinfo=UTC)
+
+
+def test_resolve_demote_reset_at_uses_env_when_sheet_absent(monkeypatch) -> None:
+    monkeypatch.setenv("BHIKSHA_RISK_DEMOTE_RESET_AT", "2026-09-19T00:00:00Z")
+    source = PlanOperatorDefaultsSource({})
+
+    settings = resolve_risk_settings(settings_source=source)
+
+    assert settings.demote_reset_at == datetime(2026, 9, 19, 0, 0, 0, tzinfo=UTC)
+
+
+def test_resolve_demote_reset_at_invalid_string_fails_closed(monkeypatch) -> None:
+    import pytest
+    monkeypatch.delenv("BHIKSHA_RISK_DEMOTE_RESET_AT", raising=False)
+    for value in ("not-a-datetime", "2026-09-19T00:00:00"):
+        with pytest.raises(ValueError, match="timezone"):
+            resolve_risk_settings(settings_source=PlanOperatorDefaultsSource({"rail_b_reset_at": value}))

@@ -321,6 +321,11 @@ def build_exit_edge_weekly_evidence(
             "rollback_latch": rollback_latch,
         },
         "collection": collection,
+        "named_comparisons": {
+            "weekly": weekly_summary.get("named_comparisons", []),
+            "cumulative": cumulative_summary.get("named_comparisons", []),
+            "decision": "descriptive_only_no_automatic_promotion",
+        },
         "weekly": weekly_v2,
         "cumulative": cumulative_v2,
         "maturity_windows": maturity,
@@ -397,6 +402,7 @@ def _read_health(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 def _report_summary(report: dict[str, Any]) -> dict[str, Any]:
     summary = report.get("summary") or {}
     return {
+        "named_comparisons": list(summary.get("named_comparisons") or []),
         "registration_denominator": dict(
             summary.get("registration_denominator") or _empty_denominator()
         ),
@@ -485,6 +491,8 @@ def _v2_summary(
     summary: dict[str, Any],
     cases: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    cases = [case for case in cases if "named_profiles" not in (case.get("experiment_spec") or {})]
+    summary = {**summary, "paired_count": sum(case.get("status") == "paired" for case in cases)}
     candidates = {
         "control": {
             "paired_count": int(summary.get("paired_count") or 0),

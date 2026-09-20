@@ -10,7 +10,7 @@ Nothing here imports a broker/order manager or mutates runtime/profile state.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
@@ -37,6 +37,7 @@ from bhiksha.shared_kernel import ensure_kernel_on_path
 ensure_kernel_on_path()
 from mala_bhiksha_kernel import (  # noqa: E402
     ExitShadowExperimentSpec,
+    ManagementPolicySpec,
     advance_locked_floor,
     compose_protective_floor,
     evaluate_giveback_floor,
@@ -915,7 +916,14 @@ def analyze_cases(cases: list[ExitEdgeCase]) -> dict[str, Any]:
     ]
     paired = [row for row in rows if row["status"] == "paired"]
     specs = sorted({row["experiment_spec_hash"] for row in rows})
-    summary = _summary(paired, len(rows), heterogeneous_specs=len(specs) > 1)
+    legacy_rows = [row for row in rows if "named_profiles" not in row["experiment_spec"]]
+    summary = _summary([row for row in legacy_rows if row["status"] == "paired"], len(legacy_rows),
+                       heterogeneous_specs=len({row["experiment_spec_hash"] for row in legacy_rows}) > 1)
+    summary["legacy_case_count"] = len(legacy_rows)
+    summary["case_count"] = len(rows)
+    summary["paired_count"] = len(paired)
+    summary["insufficient_count"] = len(rows) - len(paired)
+    summary["named_comparisons"] = _named_comparison_summary(rows)
     summary["risk_envelope_missingness"] = {
         "candidate_observation_rows": sum(
             int(row.get("missingness", {}).get("candidate_observation_rows", 0))
@@ -987,6 +995,8 @@ def analyze_prospective_repository(
     summary["rejected_quote_count"] = sum(rejection_reasons.values())
     summary["rejected_quote_reasons"] = dict(sorted(rejection_reasons.items()))
     blockers: list[str] = []
+    if summary.get("named_comparisons"):
+        blockers.append("named_comparisons_require_separate_cost_and_uncertainty_review")
     if denominator["eligible_attempts"] != denominator["registered_cohorts"]:
         blockers.append("eligible_registration_denominator_incomplete")
     if summary["paired_count"] != denominator["registered_cohorts"]:
@@ -1194,10 +1204,84 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- Inference blockers: {', '.join(s['inference_blockers']) or 'none'}",
             "",
         ])
+    for group in s.get("named_comparisons", []):
+        lines.extend(["", f"### {group['strategy_class']} / {group['deployment_id']} / {group['entry_fill_kind']}",
+                      f"Paired {group['paired']}/{group['registered']}; independent clusters {group['independent_clusters']}; unfinished/censored {group['unfinished_or_censored']}.",
+                      "Descriptive results only; no automatic promotion."])
+        for name, metrics in group["candidate_vs_management"].items():
+            lines.append(f"- {name}: mean delta ${metrics['mean_delta_pnl_usd']}; common R {metrics['mean_delta_common_r']}")
     return "\n".join(lines)
 
 
+def _analyze_named_case(case: ExitEdgeCase) -> dict[str, Any]:
+    base = {"cohort_id": case.cohort_id, "trade_id": case.trade_id,
+            "cluster_id": case.cluster_id, "deployment_id": case.deployment_id,
+            "symbol": case.symbol, "cohort_dimensions": dict(case.cohort_dimensions),
+            "experiment_spec": case.experiment, "experiment_spec_hash": case.experiment_spec_hash,
+            "quote_count": len(case.quotes)}
+    problem = (f"persisted_censor:{case.persisted_censor_reason}" if case.persisted_censor_reason else
+               _tape_problem(case, int(case.experiment["max_freshness_ms"]), int(case.experiment["max_sequence_gap"])))
+    if problem:
+        return {**base, "status": "insufficient_data", "insufficient_reason": problem}
+    outcomes = {}
+    for policy in case.experiment["named_profiles"]:
+        fields = ProfileExitFields.from_management_spec(policy)
+        arm_case = replace(case, profile=fields, profile_config=policy)
+        if policy.get("risk_envelope_enabled"):
+            arm = {"candidate_id": policy["policy_id"], "candidate_policy_id": policy["policy_id"],
+                   "candidate_policy_hash": canonical_policy_hash(policy), "canonical_policy": policy}
+            # Reuse the already-tested envelope replay with this arm's own risk and state.
+            arm_case = replace(arm_case, experiment={**case.experiment, "risk_envelope": {"experiment_id": "named_profiles"}})
+            observations = _control_observations(arm_case, arm)
+            outcome, _, _ = _replay_envelope_candidate(
+                arm_case, arm, control_observations=observations,
+                latency_ms=int(case.experiment["fill_latency_ms"]), max_freshness_ms=int(case.experiment["max_freshness_ms"]))
+        else:
+            outcome = _replay(arm_case, "profile", int(case.experiment["fill_latency_ms"]), int(case.experiment["max_freshness_ms"]))
+        outcomes[policy["policy_id"]] = asdict(outcome) if outcome else None
+    missing = [name for name, outcome in outcomes.items() if outcome is None]
+    baseline = case.experiment["named_profiles"][0]["policy_id"]
+    common_risk = case.entry_premium * case.quantity * 100 * case.profile.stop_pct
+    return {**base, "status": "insufficient_data" if missing else "paired",
+            "insufficient_reason": "right_censored:" + ",".join(missing) if missing else None,
+            "management_exit": baseline, "named_exit_outcomes": outcomes,
+            "common_entry_risk_usd": common_risk,
+            "candidate_delta_pnl_usd": {} if missing else {
+                name: round(outcome["realized_pnl_usd"] - outcomes[baseline]["realized_pnl_usd"], 2)
+                for name, outcome in outcomes.items() if name != baseline}}
+
+
+def _named_comparison_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        if "named_profiles" not in row["experiment_spec"]:
+            continue
+        dims = row["cohort_dimensions"]
+        # Configuration changes, strategies and modeled/broker fills never silently pool.
+        key = (str(dims.get("strategy_class", "unclassified")), str(dims.get("entry_fill_kind", "unknown")),
+               row["deployment_id"], row["experiment_spec_hash"])
+        groups.setdefault(key, []).append(row)
+    result = []
+    for (strategy_class, fill_kind, deployment_id, config_hash), members in sorted(groups.items()):
+        paired = [row for row in members if row["status"] == "paired"]
+        clusters = {row["cluster_id"] for row in paired if row["cluster_id"]}
+        candidates = [p["policy_id"] for p in members[0]["experiment_spec"]["named_profiles"]][1:]
+        result.append({"strategy_class": strategy_class, "entry_fill_kind": fill_kind,
+                       "deployment_id": deployment_id, "config_hash": config_hash,
+                       "registered": len(members), "paired": len(paired), "unfinished_or_censored": len(members)-len(paired),
+                       "independent_clusters": len(clusters),
+                       "decision": "descriptive_only_no_automatic_promotion",
+                       "pnl_basis": "gross_modeled_premium_pnl_before_fees_and_extra_slippage",
+                       "candidate_vs_management": {name: {
+                           "mean_delta_pnl_usd": fmean(row["candidate_delta_pnl_usd"][name] for row in paired) if paired else None,
+                           "mean_delta_common_r": fmean(row["candidate_delta_pnl_usd"][name]/row["common_entry_risk_usd"] for row in paired) if paired else None,
+                       } for name in candidates}})
+    return result
+
+
 def _analyze_case(case: ExitEdgeCase) -> dict[str, Any]:
+    if "named_profiles" in case.experiment:
+        return _analyze_named_case(case)
     max_freshness_ms = int(case.experiment["max_freshness_ms"])
     max_sequence_gap = int(case.experiment["max_sequence_gap"])
     fill_latency_ms = int(case.experiment["fill_latency_ms"])
@@ -1741,7 +1825,7 @@ def _tape_problem(case: ExitEdgeCase, max_freshness_ms: int, max_sequence_gap: i
     if case.entry_premium <= 0 or case.quantity <= 0: return "invalid_entry"
     if not case.trade_id or not case.deployment_id:
         return "missing_trade_or_deployment_identity"
-    if "risk_envelope" not in case.experiment:
+    if "risk_envelope" not in case.experiment and "named_profiles" not in case.experiment:
         return "missing_risk_envelope_experiment_identity"
     if experiment_spec_hash(case.profile_config, case.legacy_config, case.experiment) != case.experiment_spec_hash:
         return "experiment_spec_hash_mismatch"
@@ -1916,6 +2000,16 @@ def _normalized_experiment(value: dict[str, Any]) -> dict[str, Any]:
         "quote_source": str(value["quote_source"]),
         "quote_feed": str(value["quote_feed"]),
     }
+    if "named_profiles" in value:
+        policies = value["named_profiles"]
+        if not isinstance(policies, list) or not policies:
+            raise ValueError("named_profiles must contain a management baseline")
+        normalized["named_profiles"] = [ManagementPolicySpec.model_validate(p).model_dump(mode="json") for p in policies]
+        ids = [p["policy_id"] for p in normalized["named_profiles"]]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate named comparison profile")
+        if "risk_envelope" in value:
+            raise ValueError("named comparisons cannot also carry legacy experiment arms")
     risk_envelope = value.get("risk_envelope")
     if risk_envelope is not None:
         normalized["risk_envelope"] = _normalized_risk_envelope_experiment(

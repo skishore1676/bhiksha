@@ -66,7 +66,7 @@ from bhiksha.persistence.repository import EvidenceIdentityEventRepository
 from bhiksha.persistence.exit_state import SQLiteExitStateRepository
 from bhiksha.risk.cash_guard import CashGuard, trade_date_et
 from bhiksha.risk.plan_operator_defaults_source import PlanOperatorDefaultsSource
-from bhiksha.risk.risk_manager import RiskManager
+from bhiksha.risk.risk_manager import RAIL_B_SESSION_BLOCK_REASON, RiskManager
 from bhiksha.risk.risk_settings import resolve_risk_settings
 from bhiksha.state.position_tracker import NON_LIVE_POSITION_SOURCES, TrackedPosition
 from bhiksha.state.reconciliation import reconcile_public_positions
@@ -416,6 +416,7 @@ class BhikshaRuntime:
             active_plan_id=active_plan_id,
             startup_config_id=startup_config_id,
             deployment_evidence_identity=deployment_evidence_identity,
+            record_signal_outcomes=True,
         )
         position_monitor = PositionMonitor(evaluator, supervisor.planner.position_tracker)
         broker = supervisor.planner.order_manager.broker
@@ -1819,7 +1820,24 @@ class BhikshaRuntime:
             if entry_block_reason is None and self.risk_manager is not None and live and not simulate_only:
                 risk_decision = await self.risk_manager.allow_entry(deployment.deployment_id)
                 if not risk_decision.allowed:
-                    entry_block_reason = risk_decision.reason
+                    if risk_decision.reason == RAIL_B_SESSION_BLOCK_REASON:
+                        # Rail B vetoes live entry; retain a separate paper observation
+                        # (quarantine lane) instead of dropping the trade.
+                        # Observations and ExitEdgeLab exits continue stacking.
+                        await supervisor.event_repository.append("signal_outcome", {
+                            "deployment_id": deployment.deployment_id, "symbol": deployment.symbol,
+                            "timestamp": decision.timestamp.isoformat(), "mode": "live",
+                            "outcome": "risk_block", "rejection_reasons": [risk_decision.reason],
+                            "shadow_observation_requested": True,
+                        })
+                        simulate_only = True
+                        entry_block_reason = None
+                        output(
+                            f"ENTRY_RAIL_B_DIVERTED_TO_SHADOW deployment={deployment.deployment_id} "
+                            f"symbol={deployment.symbol} details={risk_decision.details}"
+                        )
+                    else:
+                        entry_block_reason = risk_decision.reason
             try:
                 plan = await supervisor.handle_signal(
                     deployment,

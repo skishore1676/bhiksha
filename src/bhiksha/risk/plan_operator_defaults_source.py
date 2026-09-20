@@ -27,6 +27,8 @@ knob's raw value, same format as the equivalent env var):
     BHIKSHA_RISK_PROSPECTIVE_LOSS_ENABLED    -> prospective_loss_enabled
     BHIKSHA_RISK_MAX_OPEN_POSITIONS_PER_CLUSTER
                                                 -> max_open_positions_per_cluster
+    BHIKSHA_RISK_DEMOTE_RESET_AT              -> demote_reset_at (or rail_b_reset_at)
+
 
 These keys are exactly ``key.removeprefix("BHIKSHA_RISK_").lower()`` applied
 to each env var name -- the same derivation

@@ -16,6 +16,7 @@ from loguru import logger
 
 from bhiksha.app.bootstrap import build_runtime
 from bhiksha.config.environment import load_dotenv
+from bhiksha.config.loader import load_app_config
 from bhiksha.market_data.trading_calendar import is_trading_day
 from bhiksha.ops.alerts import (
     ReviewPublishResult,
@@ -28,6 +29,7 @@ from bhiksha.ops.daily_report import (
     render_daily_report_ryg_telegram_text,
     write_daily_report,
 )
+from bhiksha.ops.chart_evidence_export import export_chart_evidence
 from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.ops.reconciliation_supervision import run_reconciliation_supervisor
 from bhiksha.ops.schwab_token_guard import run_schwab_token_guard_sync
@@ -246,9 +248,55 @@ def _stop_job(args: argparse.Namespace, *, repo_root: Path) -> int:
     if status.returncode == 0:
         runtime_status = _parse_runtime_status(status.stdout)
         if runtime_status is not None and not runtime_status.get("running"):
-            _print_result({"job": args.job, "status": "ok", "detail": "not_running"})
-            return 0
-    return _server_session_job(args, ["stop"], repo_root=repo_root)
+            return _export_chart_evidence_after_stop(args, repo_root=repo_root, stop_detail="not_running")
+    stopped = _server_session_job(args, ["stop"], repo_root=repo_root)
+    if stopped != 0:
+        return stopped
+    return _export_chart_evidence_after_stop(args, repo_root=repo_root, stop_detail="stopped")
+
+
+def _export_chart_evidence_after_stop(
+    args: argparse.Namespace, *, repo_root: Path, stop_detail: str
+) -> int:
+    """Run only after the existing close-stage succeeds; export is read-only."""
+
+    try:
+        app_config = load_app_config(repo_root / "config" / "app.yaml")
+        db_path = Path(app_config.sqlite_path)
+        if not db_path.is_absolute():
+            db_path = repo_root / db_path
+        result = export_chart_evidence(
+            db_path,
+            output_dir=repo_root / "artifacts" / "chart-workbench" / "publications",
+        )
+    except Exception as exc:  # noqa: BLE001 - close completed; export failure is observational.
+        _print_result(
+            {
+                "job": args.job,
+                "status": "failed",
+                "detail": f"{stop_detail}; chart evidence export failed",
+                "runtime_stop_status": "ok",
+                "chart_evidence": {
+                    "status": "failed",
+                    "reason": f"chart_evidence_export_failed:{type(exc).__name__}",
+                },
+            }
+        )
+        return 2
+    _print_result(
+        {
+            "job": args.job,
+            "status": "ok",
+            "detail": stop_detail,
+            "chart_evidence": {
+                "packet_id": result.packet["id"],
+                "path": str(result.path),
+                "reused": result.reused,
+                "publication": result.packet["publication"],
+            },
+        }
+    )
+    return 0
 
 
 def _schwab_refresh_job(args: argparse.Namespace) -> int:

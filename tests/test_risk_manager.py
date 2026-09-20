@@ -1244,6 +1244,7 @@ def test_resolve_risk_settings_defaults_when_no_env(monkeypatch) -> None:
     assert settings.demote_window == 10
     assert settings.demote_min_n == 10
     assert settings.demote_threshold_usd == 0.0
+    assert settings.demote_reset_at is None
     assert settings.rail_a_enabled is True
     assert settings.rail_b_enabled is True
     assert settings.prospective_loss_enabled is True
@@ -1930,3 +1931,141 @@ def test_startup_log_carries_open_drawdown_warn_pct(tmp_path) -> None:
     asyncio.run(manager.startup_log())
     startup = _events(db_path, "risk_manager_startup")
     assert startup[-1]["payload"]["open_drawdown_warn_pct"] == 0.8
+
+
+def test_rail_b_demote_reset_at_ignores_older_trades(tmp_path) -> None:
+    reset_at = NOW
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(demote_window=20, demote_min_n=20, demote_reset_at=reset_at),
+    )
+    _seed_large_budget(manager)
+    # Seed 25 losing trades that occurred BEFORE reset_at
+    for i in range(25):
+        trade = _closed_live_trade(
+            f"OLD_{i}",
+            deployment_id="dep1",
+            entry=5.0,
+            exit_=1.0,
+            exit_at=reset_at - timedelta(hours=1, minutes=i),
+        )
+        asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+        asyncio.run(
+            manager.trade_state_repository.mark_closed(
+                f"OLD_{i}",
+                exit_price=1.0,
+                exit_filled_quantity=1,
+                exit_filled_at=reset_at - timedelta(hours=1, minutes=i),
+            )
+        )
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+    assert decision.allowed is True
+    status = asyncio.run(manager._evaluate_rail_b("dep1"))
+    assert status.blocked is False
+    assert status.reason == "insufficient_trade_count"
+    assert status.window_n == 0
+
+
+def test_rail_b_demote_reset_at_counts_subsequent_trades(tmp_path) -> None:
+    reset_at = NOW - timedelta(hours=2)
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(demote_window=20, demote_min_n=20, demote_reset_at=reset_at),
+    )
+    _seed_large_budget(manager)
+    # Seed 20 losing trades AFTER reset_at
+    for i in range(20):
+        trade = _closed_live_trade(
+            f"NEW_{i}",
+            deployment_id="dep1",
+            entry=5.0,
+            exit_=1.0,
+            exit_at=reset_at + timedelta(minutes=i + 1),
+        )
+        asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+        asyncio.run(
+            manager.trade_state_repository.mark_closed(
+                f"NEW_{i}",
+                exit_price=1.0,
+                exit_filled_quantity=1,
+                exit_filled_at=reset_at + timedelta(minutes=i + 1),
+            )
+        )
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+    assert decision.allowed is False
+    assert decision.reason == RAIL_B_SESSION_BLOCK_REASON
+
+
+def test_rail_b_paper_winners_cannot_reopen_live_trading(tmp_path) -> None:
+    reset_at = NOW - timedelta(days=1)
+    manager, db_path = _manager(
+        tmp_path,
+        now=NOW,
+        settings=_settings(demote_window=20, demote_min_n=20, demote_threshold_usd=0.0, demote_reset_at=reset_at),
+    )
+    _seed_large_budget(manager)
+    # Day 1: 20 losing live trades -> blocked by Rail B
+    for i in range(20):
+        trade = _closed_live_trade(
+            f"LIVE_{i}",
+            deployment_id="dep1",
+            entry=5.0,
+            exit_=3.0,
+            exit_at=reset_at + timedelta(minutes=i + 1),
+        )
+        asyncio.run(manager.trade_state_repository.upsert_trade(trade))
+        asyncio.run(
+            manager.trade_state_repository.mark_closed(
+                f"LIVE_{i}",
+                exit_price=3.0,
+                exit_filled_quantity=1,
+                exit_filled_at=reset_at + timedelta(minutes=i + 1),
+            )
+        )
+
+    decision = asyncio.run(manager.allow_entry("dep1"))
+    assert decision.allowed is False
+    assert decision.reason == RAIL_B_SESSION_BLOCK_REASON
+
+    # Under Rail B demotion, entries divert to shadow quarantine and stack 20 winning shadow trades
+    shadow_time = NOW + timedelta(hours=1)
+    for i in range(20):
+        shadow_trade = TradeRecord(
+            trade_id=f"SHADOW_{i}",
+            deployment_id="dep1",
+            symbol="QQQ",
+            option_symbol="QQQ260101C00500000",
+            quantity=1,
+            entry_price=4.0,
+            entry_timestamp=shadow_time + timedelta(minutes=i),
+            status="closed",
+            entry_order_id="SHADOW_ENTRY",
+            exit_price=7.0,
+            exit_filled_quantity=1,
+            exit_filled_at=shadow_time + timedelta(minutes=i, seconds=30),
+        )
+        asyncio.run(manager.trade_state_repository.upsert_trade(shadow_trade))
+        asyncio.run(
+            manager.trade_state_repository.mark_closed(
+                f"SHADOW_{i}",
+                exit_price=7.0,
+                exit_filled_quantity=1,
+                exit_filled_at=shadow_time + timedelta(minutes=i, seconds=30),
+            )
+        )
+
+    # Next session starts (new manager instance) -> Rail B evaluates rolling 20 trades
+    # (which are now the 20 winning shadow trades). Mean P&L is +$300/trade.
+    next_session_manager, _ = _manager(
+        tmp_path,
+        now=shadow_time + timedelta(hours=2),
+        settings=_settings(demote_window=20, demote_min_n=20, demote_threshold_usd=0.0, demote_reset_at=reset_at),
+    )
+    next_decision = asyncio.run(next_session_manager.allow_entry("dep1"))
+    # Self-healing: deployment is unblocked and allowed for live trading again!
+    assert next_decision.allowed is False
+    assert next_decision.reason == RAIL_B_SESSION_BLOCK_REASON

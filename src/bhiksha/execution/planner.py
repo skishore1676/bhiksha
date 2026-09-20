@@ -7,6 +7,9 @@ import uuid
 
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
+from bhiksha.execution.native_orders import (
+    decide_execution_route,
+)
 from bhiksha.execution.order_manager import OrderManager, OrderResult
 from bhiksha.execution.pricing import (
     build_entry_profile_comparison,
@@ -104,11 +107,14 @@ class ExecutionPlanner:
         if dte_fallback_policy == "allow_nearest_after":
             dte_lookup_padding_days += DTE_FALLBACK_LOOKAHEAD_DAYS
 
+        lookup_dte_max = deployment.execution.dte_max + dte_lookup_padding_days
+        if dte_fallback_policy == "allow_nearest_after" and deployment.execution.dte_fallback_max is not None:
+            lookup_dte_max = deployment.execution.dte_fallback_max + 1
         contracts = await self.chain_service.get_chain(
             deployment.symbol,
             contract_type="ALL",
             from_date=decision.timestamp.date(),
-            to_date=(decision.timestamp + timedelta(days=deployment.execution.dte_max + dte_lookup_padding_days)).date(),
+            to_date=(decision.timestamp + timedelta(days=lookup_dte_max)).date(),
         )
         lane = "shadow" if simulate_only else ("dry_run" if dry_run else "live")
         snapshot_id = str(uuid.uuid4())
@@ -132,6 +138,7 @@ class ExecutionPlanner:
             selection=selection,
             selector_error=None,
         )
+        route = decide_execution_route(deployment)
         selection_details = {
             **_selection_details(selection),
             **_selection_snapshot_details(snapshot_attempt, persisted=snapshot_persisted),
@@ -366,6 +373,7 @@ class ExecutionPlanner:
                         **premium_cap_receipt,
                         **selection_details,
                     },
+                    execution_route=route,
                 )
             self.position_tracker.open_position(
                 deployment.symbol,
@@ -396,6 +404,7 @@ class ExecutionPlanner:
                     **premium_cap_receipt,
                     **selection_details,
                 },
+                execution_route=route,
             )
 
         try:
@@ -422,6 +431,13 @@ class ExecutionPlanner:
             )
 
         final_limit_price = float(preflight.payload["limitPrice"])
+        if pricing_evidence.get("price_improvement_applied") and final_limit_price > entry_price + 1e-9:
+            return TradePlan(
+                trade_id=trade_id, deployment_id=deployment.deployment_id, symbol=deployment.symbol,
+                direction=decision.direction, option_symbol=selection.option_symbol, quantity=quantity,
+                estimated_entry_price=entry_price, risk_reasons=["price_seeking_tick_exceeds_limit"], dry_run=False,
+                entry_timestamp=decision.timestamp, risk_details={"entry_pricing": pricing_evidence, **selection_details},
+            )
         pricing_evidence = {
             **pricing_evidence,
             "preflight_limit_price": final_limit_price,
@@ -549,10 +565,7 @@ class ExecutionPlanner:
                 )
         try:
             result: OrderResult = await self.order_manager.place_entry_order(
-                selection.option_symbol,
-                final_limit_price,
-                quantity,
-                order_id=trade_id,
+                selection.option_symbol, final_limit_price, quantity, order_id=trade_id,
             )
         except Exception:
             if self.cash_guard is not None:
@@ -599,6 +612,7 @@ class ExecutionPlanner:
                 **sized_risk_details,
                 **cash_guard_details,
             },
+            execution_route=route,
         )
 
     async def _capture_chain_snapshot(
@@ -646,9 +660,13 @@ class ExecutionPlanner:
 def _entry_window_allows(deployment: DeploymentManifest, timestamp) -> bool:
     start = _parse_optional_et_time(deployment.execution.entry_window_start_et)
     end = _parse_optional_et_time(deployment.execution.entry_window_end_et)
+    current = as_et_time(timestamp)
+    if deployment.exit.management_exit and deployment.exit.eod_flat:
+        flat = _parse_optional_et_time(deployment.exit.hard_flat_time_et)
+        if flat is not None and current >= flat:
+            return False
     if start is None and end is None:
         return True
-    current = as_et_time(timestamp)
     if start is not None and current < start:
         return False
     if end is not None and current > end:
@@ -698,6 +716,7 @@ def _selection_details(selection) -> dict:
                 "dte_fallback_policy": selection.dte_fallback_policy,
                 "requested_dte_min": selection.requested_dte_min,
                 "requested_dte_max": selection.requested_dte_max,
+                "attempted_fallback_dtes_count": selection.attempted_fallback_dtes_count,
             }
         )
     return details

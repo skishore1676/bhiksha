@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 import pytest
 
 from bhiksha.execution.order_manager import PublicQuote
@@ -113,3 +114,46 @@ def test_explicit_reprice_chase_cap_overrides_named_profile_default() -> None:
     ) == 0.05
     assert resolve_entry_reprice_max_chase_pct({"entry_execution_profile": "balanced"}) == 0.15
     assert resolve_entry_reprice_max_chase_pct({}) is None
+
+
+def test_price_seeking_mode_prices_below_midpoint() -> None:
+    # bid=2.00, ask=2.50, mid=2.25, spread=0.50
+    # price-seeking discount should be below mid (2.25), but >= bid (2.00)
+    result = select_entry_limit(
+        PublicQuote(quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp", symbol="TEST260619C00100000", bid=2.00, ask=2.50, last=2.25, open_interest=500),
+        policy=EntryPricingPolicy(mode="price_seeking", price_improvement_discount_pct=0.10),
+    )
+    assert result.approved is True
+    assert result.price_improvement_applied is True
+    assert result.limit_price < 2.25
+    assert result.limit_price >= 2.00
+
+
+def test_price_seeking_triggers_when_spread_above_preferred_threshold() -> None:
+    # Hard max is 0.25 (allowed), but preferred max is 0.10.
+    # spread_pct = 0.50 / 2.25 = 0.222 > preferred_max (0.10)
+    result = select_entry_limit(
+        PublicQuote(quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp", symbol="TEST260619C00100000", bid=2.00, ask=2.50, last=2.25, open_interest=500),
+        {
+            "max_bid_ask_spread_pct": 0.30,
+            "entry_pricing_preferred_max_bid_ask_spread_pct": 0.10,
+        },
+    )
+    assert result.approved is True
+    assert result.price_improvement_applied is True
+    assert result.limit_price < 2.25
+
+
+def test_price_seeking_triggers_when_oi_below_preferred_threshold() -> None:
+    # Hard min is 50 (allowed), but preferred min is 500.
+    # open_interest = 100 < 500
+    result = select_entry_limit(
+        PublicQuote(quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp", symbol="TEST260619C00100000", bid=2.00, ask=2.50, last=2.25, open_interest=100),
+        {
+            "min_open_interest": 50,
+            "entry_pricing_preferred_min_open_interest": 500,
+        },
+    )
+    assert result.approved is True
+    assert result.price_improvement_applied is True
+    assert result.limit_price < 2.25

@@ -101,13 +101,15 @@ class SingleLegOptionSelector:
             filtered.append(contract)
 
         fallback_policy_applied: str | None = None
+        attempted_fallback_dtes_count: int = 0
         if (
             not filtered
             and dte_fallback_policy == "allow_nearest_after"
         ):
-            filtered = self._nearest_after_candidates(
+            filtered, attempted_fallback_dtes_count = self._nearest_after_candidates(
                 desired_contracts,
                 dte_max=dte_max,
+                fallback_dte_max=request.execution_params.get("dte_fallback_max"),
                 delta_min=delta_min,
                 delta_max=delta_max,
                 min_open_interest=min_open_interest,
@@ -170,6 +172,7 @@ class SingleLegOptionSelector:
             dte_fallback_policy=fallback_policy_applied,
             requested_dte_min=dte_min if fallback_policy_applied else None,
             requested_dte_max=dte_max if fallback_policy_applied else None,
+            attempted_fallback_dtes_count=attempted_fallback_dtes_count,
         )
 
     def _required_contract_type(self, request: OptionSelectionRequest) -> str:
@@ -196,26 +199,32 @@ class SingleLegOptionSelector:
         contracts: list[OptionContractSnapshot],
         *,
         dte_max: int,
+        fallback_dte_max: int | None = None,
         delta_min: float | None,
         delta_max: float | None,
         min_open_interest: int,
         max_spread_pct: float | None,
-    ) -> list[OptionContractSnapshot]:
-        nearest_dte = self._nearest_after_dte(contracts, dte_max=dte_max)
-        if nearest_dte is None:
-            return []
-        return [
-            contract
-            for contract in contracts
-            if contract.dte == nearest_dte
-            and self._passes_non_dte_filters(
-                contract,
-                delta_min=delta_min,
-                delta_max=delta_max,
-                min_open_interest=min_open_interest,
-                max_spread_pct=max_spread_pct,
-            )
-        ]
+    ) -> tuple[list[OptionContractSnapshot], int]:
+        later_dtes = sorted(
+            {
+                contract.dte
+                for contract in contracts
+                if contract.dte > dte_max
+                and (fallback_dte_max is None or contract.dte <= fallback_dte_max)
+            }
+        )
+        if not later_dtes:
+            return [], 0
+        # Preserve unmigrated nearest-only behavior; explicit bound opts into a walk.
+        attempts = later_dtes if fallback_dte_max is not None else later_dtes[:1]
+        for count, dte in enumerate(attempts, start=1):
+            candidates = [contract for contract in contracts
+                          if contract.dte == dte and self._passes_non_dte_filters(
+                              contract, delta_min=delta_min, delta_max=delta_max,
+                              min_open_interest=min_open_interest, max_spread_pct=max_spread_pct)]
+            if candidates:
+                return candidates, count
+        return [], len(attempts)
 
     @staticmethod
     def _passes_non_dte_filters(
@@ -246,10 +255,18 @@ class SingleLegOptionSelector:
 
     @staticmethod
     def _nearest_after_dte(
-        contracts: list[OptionContractSnapshot], *, dte_max: int
+        contracts: list[OptionContractSnapshot],
+        *,
+        dte_max: int,
+        fallback_dte_max: int | None = None,
     ) -> int | None:
         later_dtes = sorted(
-            {contract.dte for contract in contracts if contract.dte > dte_max}
+            {
+                contract.dte
+                for contract in contracts
+                if contract.dte > dte_max
+                and (fallback_dte_max is None or contract.dte <= fallback_dte_max)
+            }
         )
         return later_dtes[0] if later_dtes else None
 

@@ -26,3 +26,5 @@ config/strategy_catalog/google_promoted/
 artifacts/
 config/risk/demoted_deployments.json
 uv.lock
+.playwright-mcp/
+*.png

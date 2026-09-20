@@ -44,6 +44,7 @@ from bhiksha.execution.pricing import (
     scale_spread_fraction,
     select_entry_limit,
 )
+from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.risk.planned_loss import resolve_planned_stop_loss_pct
 from bhiksha.execution.profile_exit import (
     ProfileExitFields,
@@ -191,6 +192,45 @@ class _ExitCancelRaceOutcome:
     cancel_error: str | None = None
 
 
+def _signal_outcome_payload(
+    deployment: DeploymentManifest,
+    decision: SignalDecision,
+    *,
+    outcome: str,
+    rejection_reasons: list[str] | None = None,
+    plan: TradePlan | None = None,
+    mode: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "signal_id": f"{deployment.deployment_id}:{decision.timestamp.isoformat()}:{decision.direction.value if decision.direction else 'none'}",
+        "deployment_id": deployment.deployment_id,
+        "symbol": deployment.symbol,
+        "timestamp": decision.timestamp.isoformat(),
+        "direction": decision.direction.value if decision.direction else None,
+        "outcome": outcome,
+        "rejection_reasons": list(rejection_reasons or []),
+        "attempted_contract": plan.option_symbol if plan and plan.option_symbol else None,
+        "attempted_quantity": plan.quantity if plan else 0,
+        "attempted_price": plan.estimated_entry_price if plan and plan.estimated_entry_price > 0 else None,
+        "trade_id": plan.trade_id if plan else None,
+        "mode": mode or ("shadow" if deployment.execution.shadow_only else "live"),
+    }
+
+
+def _classify_plan_block(plan: TradePlan) -> tuple[str, list[str]]:
+    reasons = list(plan.risk_reasons) or ["unapproved_plan"]
+    reasons_str = " ".join(reasons).lower()
+    if "budget" in reasons_str or "insufficient" in reasons_str:
+        return "budget_block", reasons
+    if any(k in reasons_str for k in ("owned", "position_limit", "max_open", "already")):
+        return "existing_position_block", reasons
+    if any(k in reasons_str for k in ("window", "time", "expired", "after")):
+        return "expired_invalidated", reasons
+    if any(k in reasons_str for k in ("quote", "spread", "open_interest", "contract", "missing_price")):
+        return "selection_failure", reasons
+    return "risk_block", reasons
+
+
 class ExecutionSupervisor:
     """Coordinates planning and event logging for a signal."""
 
@@ -209,6 +249,7 @@ class ExecutionSupervisor:
         active_plan_id: str | None = None,
         startup_config_id: str | None = None,
         deployment_evidence_identity: dict[str, dict[str, object]] | None = None,
+        record_signal_outcomes: bool = False,
     ) -> None:
         self.planner = planner or ExecutionPlanner()
         self.event_repository = event_repository or NullEventRepository()
@@ -228,6 +269,9 @@ class ExecutionSupervisor:
             str(deployment_id): dict(identity)
             for deployment_id, identity in (deployment_evidence_identity or {}).items()
         }
+        self.record_signal_outcomes = bool(record_signal_outcomes)
+        self._paper_exit_deployments: dict[str, DeploymentManifest] = {}
+        self._paper_entries: dict[str, tuple[DeploymentManifest, SignalDecision, TradePlan, datetime, datetime]] = {}
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._disabled_entry_deployments: set[str] = set()
@@ -248,6 +292,8 @@ class ExecutionSupervisor:
         ] = {}
 
     async def close(self) -> None:
+        for trade_id in list(self._paper_entries):
+            await self._finish_paper_no_fill(trade_id, "shutdown_before_fill")
         if self.exit_edge_recorder is not None:
             self.exit_edge_recorder.close()
         await self.planner.close()
@@ -1363,6 +1409,8 @@ class ExecutionSupervisor:
             and position.trade_id in self._profile_exit_degraded_trades
         ):
             return False
+        if deployment.exit.management_exit and position.source == "shadow":
+            return True
         drives_live = self._profile_exit_drives_live(deployment)
         return profile_exit_dispatch_allowed(
             live=drives_live,
@@ -1726,6 +1774,17 @@ class ExecutionSupervisor:
                     outcome="blocked",
                     reason="deployment_entry_not_submitable",
                 )
+            if decision.signal and self.record_signal_outcomes:
+                await self.event_repository.append(
+                    "signal_outcome",
+                    _signal_outcome_payload(
+                        deployment,
+                        decision,
+                        outcome="risk_block",
+                        rejection_reasons=["deployment_entry_not_submitable"],
+                        mode="shadow" if simulate_only else ("dry_run" if dry_run else "live"),
+                    ),
+                )
             return None
         if decision.signal:
             if _is_self_disarming_manual_deployment(deployment):
@@ -1769,6 +1828,19 @@ class ExecutionSupervisor:
                             f"lifecycle_blocked:{lifecycle.state.value if lifecycle else 'unknown'}"
                         ),
                     )
+                if decision.signal and self.record_signal_outcomes:
+                    await self.event_repository.append(
+                        "signal_outcome",
+                        _signal_outcome_payload(
+                            deployment,
+                            decision,
+                            outcome="existing_position_block",
+                            rejection_reasons=[
+                                f"lifecycle_blocked:{lifecycle.state.value if lifecycle else 'unknown'}"
+                            ],
+                            mode="shadow" if simulate_only else ("dry_run" if dry_run else "live"),
+                        ),
+                    )
                 return None
             if decision.signal and decision.direction is not None and live_entry_block_reason and not dry_run and not simulate_only:
                 plan = TradePlan(
@@ -1786,12 +1858,33 @@ class ExecutionSupervisor:
                     entry_timestamp=decision.timestamp,
                 )
             else:
-                plan = await self.planner.plan_entry(
-                    deployment,
-                    decision,
-                    dry_run=dry_run,
-                    simulate_only=simulate_only,
-                )
+                try:
+                    plan = await self.planner.plan_entry(
+                        deployment,
+                        decision,
+                        dry_run=dry_run,
+                        simulate_only=simulate_only,
+                    )
+                except SelectorEmptyError as exc:
+                    if decision.signal and self.record_signal_outcomes:
+                        await self.event_repository.append(
+                            "signal_outcome",
+                            _signal_outcome_payload(
+                                deployment,
+                                decision,
+                                outcome="selection_failure",
+                                rejection_reasons=[str(exc)],
+                                mode="shadow" if simulate_only else ("dry_run" if dry_run else "live"),
+                            ),
+                        )
+                    raise
+                except Exception as exc:
+                    if decision.signal and self.record_signal_outcomes:
+                        await self.event_repository.append("signal_outcome", _signal_outcome_payload(
+                            deployment, decision, outcome="selection_failure",
+                            rejection_reasons=[f"entry_planning_error:{type(exc).__name__}"],
+                            mode="shadow" if simulate_only else ("dry_run" if dry_run else "live")))
+                    raise
             if plan is not None:
                 if (
                     _entry_plan_approved(plan)
@@ -1850,6 +1943,17 @@ class ExecutionSupervisor:
                         order_id=plan.order_id,
                     )
                     await self._emit_lifecycle_transition(transition, reason="entry_submitted")
+                    if decision.signal and self.record_signal_outcomes and not dry_run and not simulate_only:
+                        await self.event_repository.append(
+                            "signal_outcome",
+                            _signal_outcome_payload(
+                                deployment,
+                                decision,
+                                outcome="pending_execution",
+                                plan=plan,
+                                mode="live",
+                            ),
+                        )
                 if (
                     simulate_only
                     and _entry_plan_approved(plan)
@@ -1857,61 +1961,26 @@ class ExecutionSupervisor:
                     and plan.option_symbol
                     and plan.order_id is None
                 ):
-                    self.planner.position_tracker.open_position(
-                        deployment.symbol,
-                        deployment.deployment_id,
-                        trade_id=plan.trade_id,
-                        option_symbol=plan.option_symbol,
-                        quantity=plan.quantity,
-                        entry_price=plan.estimated_entry_price,
-                        underlying_entry_price=plan.underlying_entry_price,
-                        entry_timestamp=plan.entry_timestamp,
-                        source="shadow",
-                        order_id="SHADOW_ENTRY",
-                    )
-                    await self._upsert_trade_record(
-                        TradeRecord(
-                            trade_id=plan.trade_id,
-                            deployment_id=deployment.deployment_id,
-                            symbol=deployment.symbol,
-                            option_symbol=plan.option_symbol,
-                            quantity=plan.quantity,
-                            entry_price=plan.estimated_entry_price,
-                            underlying_entry_price=plan.underlying_entry_price,
-                            entry_timestamp=plan.entry_timestamp,
-                            status="open_unprotected",
-                            entry_order_id="SHADOW_ENTRY",
-                            can_ladder=plan.quantity >= 2,
-                            **_selection_trade_record_kwargs(plan),
+                    if deployment.exit.management_exit or (deployment.execution.entry_pricing_mode == "price_seeking" or deployment.execution.preferred_min_open_interest is not None or deployment.execution.preferred_max_bid_ask_spread_pct is not None):
+                        from datetime import timedelta
+                        started = datetime.now(UTC)
+                        lifetime = _entry_reprice_cancel_after_seconds(self.app_config, deployment)
+                        self._paper_entries[plan.trade_id] = (
+                            deployment.model_copy(deep=True), decision, plan, started,
+                            started + timedelta(seconds=max(1, lifetime)),
                         )
-                    )
-                    transition = self.lifecycle_store.mark_open(
-                        deployment.symbol,
-                        deployment.deployment_id,
-                        option_symbol=plan.option_symbol,
-                        order_id="SHADOW_ENTRY",
-                        protected=False,
-                    )
-                    await self._emit_lifecycle_transition(transition, reason="shadow_entry_open")
-                    await self.event_repository.append(
-                        "shadow_entry_assumed",
-                        {
-                            "deployment_id": deployment.deployment_id,
-                            "symbol": deployment.symbol,
-                            **(
-                                {"signal_attempt_id": attempt["signal_attempt_id"]}
-                                if attempt is not None
-                                else {}
-                            ),
-                            "trade_id": plan.trade_id,
-                            "option_symbol": plan.option_symbol,
-                            "quantity": plan.quantity,
-                            "entry_price": plan.estimated_entry_price,
-                            "underlying_entry_price": plan.underlying_entry_price,
-                            "entry_timestamp": plan.entry_timestamp.isoformat() if plan.entry_timestamp else None,
-                            "risk_reasons": list(plan.risk_reasons),
-                        },
-                    )
+                        transition = self.lifecycle_store.begin_entry(
+                            deployment.symbol, deployment.deployment_id,
+                            option_symbol=plan.option_symbol, order_id="PAPER_PENDING",
+                        )
+                        await self._emit_lifecycle_transition(transition, reason="paper_limit_pending")
+                        plan.risk_details["paper_entry_status"] = "pending"
+                        await self.event_repository.append("paper_entry_pending", {
+                            **asdict(plan), "started_at": started.isoformat(),
+                            "expires_at": self._paper_entries[plan.trade_id][4].isoformat(),
+                        })
+                    else:
+                        await self._open_shadow_entry(deployment, plan)
                 elif not dry_run and plan.order_id:
                     plan = await self._protect_live_entry(plan, deployment)
                 elif dry_run and plan.order_id:
@@ -1944,6 +2013,49 @@ class ExecutionSupervisor:
                         "signal_attempt_id"
                     ]
                 await self.event_repository.append("trade_plan", trade_plan_payload)
+                if decision.signal and self.record_signal_outcomes:
+                    signal_mode = (
+                        "live"
+                        if not dry_run and not simulate_only
+                        else ("shadow" if simulate_only else "dry_run")
+                    )
+                    if not _entry_plan_approved(plan) or plan.quantity <= 0:
+                        outcome, reasons = _classify_plan_block(plan)
+                        await self.event_repository.append(
+                            "signal_outcome",
+                            _signal_outcome_payload(
+                                deployment,
+                                decision,
+                                outcome=outcome,
+                                rejection_reasons=reasons,
+                                plan=plan,
+                                mode=signal_mode,
+                            ),
+                        )
+                    elif deployment.execution.shadow_only or simulate_only or dry_run:
+                        await self.event_repository.append(
+                            "signal_outcome",
+                            _signal_outcome_payload(
+                                deployment,
+                                decision,
+                                outcome="pending_execution" if plan.risk_details.get("paper_entry_status") == "pending" else "filled",
+                                plan=plan,
+                                mode=signal_mode,
+                            ),
+                        )
+                    elif not plan.order_id:
+                        outcome, reasons = _classify_plan_block(plan)
+                        await self.event_repository.append(
+                            "signal_outcome",
+                            _signal_outcome_payload(
+                                deployment,
+                                decision,
+                                outcome=outcome,
+                                rejection_reasons=reasons,
+                                plan=plan,
+                                mode=signal_mode,
+                            ),
+                        )
                 if attempt is not None:
                     approved = (
                         _entry_plan_approved(plan)
@@ -1969,13 +2081,151 @@ class ExecutionSupervisor:
                             "approved": approved,
                         },
                     )
-            elif attempt is not None:
-                await self._record_cartographer_attempt_outcome(
-                    attempt,
-                    outcome="failure",
-                    reason="planner_returned_no_plan",
+            elif decision.signal:
+                await self.event_repository.append(
+                    "signal_outcome",
+                    _signal_outcome_payload(
+                        deployment,
+                        decision,
+                        outcome="selection_failure",
+                        rejection_reasons=["planner_returned_no_plan"],
+                        mode="shadow" if simulate_only else ("dry_run" if dry_run else "live"),
+                    ),
                 )
+                if attempt is not None:
+                    await self._record_cartographer_attempt_outcome(
+                        attempt,
+                        outcome="failure",
+                        reason="planner_returned_no_plan",
+                    )
             return plan
+
+    async def _open_shadow_entry(self, deployment: DeploymentManifest, plan: TradePlan) -> None:
+        if deployment.exit.management_exit:
+            self._paper_exit_deployments[plan.trade_id] = deployment.model_copy(deep=True)
+        self.planner.position_tracker.open_position(
+            deployment.symbol,
+            deployment.deployment_id,
+            trade_id=plan.trade_id,
+            option_symbol=plan.option_symbol,
+            quantity=plan.quantity,
+            entry_price=plan.estimated_entry_price,
+            underlying_entry_price=plan.underlying_entry_price,
+            entry_timestamp=plan.entry_timestamp,
+            source="shadow",
+            order_id="SHADOW_ENTRY",
+        )
+        await self._upsert_trade_record(
+            TradeRecord(
+                trade_id=plan.trade_id,
+                deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol,
+                option_symbol=plan.option_symbol,
+                quantity=plan.quantity,
+                entry_price=plan.estimated_entry_price,
+                underlying_entry_price=plan.underlying_entry_price,
+                entry_timestamp=plan.entry_timestamp,
+                status="open_unprotected",
+                entry_order_id="SHADOW_ENTRY",
+                can_ladder=plan.quantity >= 2,
+                **_selection_trade_record_kwargs(plan),
+            )
+        )
+        transition = self.lifecycle_store.mark_open(
+            deployment.symbol,
+            deployment.deployment_id,
+            option_symbol=plan.option_symbol,
+            order_id="SHADOW_ENTRY",
+            protected=False,
+        )
+        await self._emit_lifecycle_transition(transition, reason="shadow_entry_open")
+        await self.event_repository.append(
+            "shadow_entry_modeled" if plan.risk_details.get("entry_fill_kind") == "modeled_ask_touch" else "shadow_entry_assumed",
+            {
+                "deployment_id": deployment.deployment_id,
+                "symbol": deployment.symbol,
+                "trade_id": plan.trade_id,
+                "option_symbol": plan.option_symbol,
+                "quantity": plan.quantity,
+                "entry_price": plan.estimated_entry_price,
+                "underlying_entry_price": plan.underlying_entry_price,
+                "entry_timestamp": plan.entry_timestamp.isoformat() if plan.entry_timestamp else None,
+                "risk_reasons": list(plan.risk_reasons),
+            },
+        )
+        if self.exit_edge_recorder is not None and plan.risk_details.get("entry_fill_kind") == "modeled_ask_touch":
+            self.exit_edge_recorder.try_register_entry(
+                deployment=deployment,
+                trade_id=plan.trade_id,
+                option_symbol=plan.option_symbol,
+                entry_timestamp=plan.entry_timestamp,
+                entry_premium=plan.estimated_entry_price,
+                quantity=plan.quantity,
+                entry_context=dict(plan.risk_details),
+            )
+
+    async def _finish_paper_no_fill(self, trade_id: str, reason: str) -> None:
+        item = self._paper_entries.pop(trade_id, None)
+        if item is None:
+            return
+        deployment, decision, plan, _, _ = item
+        transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
+        await self._emit_lifecycle_transition(transition, reason=reason)
+        await self.event_repository.append("signal_outcome", _signal_outcome_payload(
+            deployment, decision, outcome="no_fill", rejection_reasons=[reason], plan=plan, mode="shadow"))
+
+    async def poll_paper_entries(self, *, now: datetime | None = None) -> None:
+        """One bounded read per pending entry, on the existing monitor loop.
+
+        No global entry lock is held over quote IO. A pending lifecycle reserves the
+        deployment slot. The original limit stays fixed: crossing a later ask is
+        required, and no liquidity/size/price assumptions are improved retroactively.
+        """
+        from math import isfinite
+        from bhiksha.execution.quote_lineage import PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
+        from bhiksha.execution.planner import _entry_window_allows
+        for trade_id, item in list(self._paper_entries.items()):
+            deployment, decision, plan, started, expires = item
+            observed = now or datetime.now(UTC)
+            async with self._symbol_locks[deployment.symbol]:
+                if trade_id not in self._paper_entries:
+                    continue
+                if observed >= expires or not _entry_window_allows(deployment, observed):
+                    await self._finish_paper_no_fill(trade_id, "paper_limit_expired")
+                    continue
+                try:
+                    quote = await self.planner.order_manager.get_option_quote(plan.option_symbol)
+                    received = now or datetime.now(UTC)
+                    if received >= expires:
+                        await self._finish_paper_no_fill(trade_id, "paper_limit_expired")
+                        continue
+                    quote_at = datetime.fromisoformat(str(quote.quote_timestamp).replace("Z", "+00:00"))
+                    if quote_at.tzinfo is None or quote.quote_timestamp_field not in PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS:
+                        continue
+                    if not (started < quote_at <= received) or (received - quote_at).total_seconds() > 5:
+                        continue
+                    if quote.bid is None or quote.ask is None or not all(isfinite(v) for v in (quote.bid, quote.ask)):
+                        continue
+                    if not (0 < quote.bid <= quote.ask <= plan.estimated_entry_price):
+                        continue
+                    # Check hard quote gates again at fill; preferred liquidity is not a veto.
+                    from bhiksha.execution.pricing import select_entry_limit
+                    if not select_entry_limit(quote, deployment.execution.model_dump()).approved:
+                        continue
+                except Exception as exc:
+                    await self.event_repository.append("paper_entry_quote_unavailable", {
+                        "trade_id": trade_id, "deployment_id": deployment.deployment_id,
+                        "reason": type(exc).__name__,
+                    })
+                    continue
+                plan = replace(plan, entry_timestamp=received)
+                # Conservative fill at submitted limit, even when the later ask is better.
+                plan.risk_details.update(entry_fill_kind="modeled_ask_touch", paper_entry_status="filled",
+                                         fill_quote_at=quote_at.isoformat(), fill_quote_bid=quote.bid, fill_quote_ask=quote.ask)
+                await self._open_shadow_entry(deployment, plan)
+                self._paper_entries.pop(trade_id, None)
+                await self.event_repository.append("signal_outcome", _signal_outcome_payload(
+                    deployment, decision, outcome="filled", plan=plan, mode="shadow"))
 
     def can_submit_deployment_entry(self, deployment: DeploymentManifest) -> bool:
         if not deployment.enabled:
@@ -2014,6 +2264,22 @@ class ExecutionSupervisor:
                 await self.trade_state_repository.mark_closed(plan.trade_id)
                 transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
                 await self._emit_lifecycle_transition(transition, reason="entry_reprice_no_fill_cancelled")
+                if self.record_signal_outcomes:
+                    await self.event_repository.append(
+                        "signal_outcome",
+                        {
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": deployment.symbol,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "outcome": "no_fill",
+                            "rejection_reasons": ["entry_reprice_no_fill_cancelled"],
+                            "attempted_contract": plan.option_symbol,
+                            "attempted_quantity": plan.quantity,
+                            "attempted_price": plan.estimated_entry_price,
+                            "trade_id": plan.trade_id,
+                            "mode": "live",
+                        },
+                    )
                 return plan
             normalized_error = (error or "").upper()
             if normalized_error in _ENTRY_ORDER_DEAD_STATUSES:
@@ -2034,6 +2300,22 @@ class ExecutionSupervisor:
                 await self.trade_state_repository.mark_closed(plan.trade_id)
                 transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
                 await self._emit_lifecycle_transition(transition, reason="entry_unfilled_closed")
+                if self.record_signal_outcomes:
+                    await self.event_repository.append(
+                        "signal_outcome",
+                        {
+                            "deployment_id": deployment.deployment_id,
+                            "symbol": deployment.symbol,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "outcome": "no_fill",
+                            "rejection_reasons": ["entry_unfilled_closed", normalized_error],
+                            "attempted_contract": plan.option_symbol,
+                            "attempted_quantity": plan.quantity,
+                            "attempted_price": plan.estimated_entry_price,
+                            "trade_id": plan.trade_id,
+                            "mode": "live",
+                        },
+                    )
                 await self.event_repository.append(
                     "entry_reconcile_released",
                     {
@@ -2089,12 +2371,28 @@ class ExecutionSupervisor:
             "broker_average_fill_price": filled_entry_price,
         }
         plan = replace(plan, estimated_entry_price=filled_entry_price, risk_details=risk_details)
+        confirmed_price, confirmed_quantity, confirmed_at = _confirmed_entry_fill_facts(payload)
+        if self.record_signal_outcomes:
+            await self.event_repository.append(
+                "signal_outcome",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "symbol": deployment.symbol,
+                    "timestamp": confirmed_at.isoformat() if confirmed_at else datetime.now(UTC).isoformat(),
+                    "outcome": "filled",
+                    "rejection_reasons": [],
+                    "attempted_contract": plan.option_symbol,
+                    "attempted_quantity": confirmed_quantity or plan.quantity,
+                    "attempted_price": confirmed_price or plan.estimated_entry_price,
+                    "trade_id": plan.trade_id,
+                    "mode": "live",
+                },
+            )
         # Freeze the observational cohort only from CONFIRMED broker fill
         # truth. This is a bounded queue write: no SQLite, await, replay, or
         # broker call occurs on the entry/money path. Failure only affects the
         # experiment's health/censor state.
         if self.exit_edge_recorder is not None:
-            confirmed_price, confirmed_quantity, confirmed_at = _confirmed_entry_fill_facts(payload)
             self.exit_edge_recorder.try_register_entry(
                 deployment=deployment,
                 trade_id=plan.trade_id,
@@ -3096,6 +3394,8 @@ class ExecutionSupervisor:
         if position.exit_mode is not None or position.exit_order_id is not None:
             return position
 
+        if position.source == "shadow" and position.trade_id in self._paper_exit_deployments:
+            deployment = self._paper_exit_deployments[position.trade_id]
         updated = position
         quote = None
 
@@ -3187,6 +3487,8 @@ class ExecutionSupervisor:
             if quote is None:
                 quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
             return quote
+        if dry_run and updated.source == "shadow" and deployment.exit.management_exit:
+            return await self._record_profile_exit_shadow(deployment, updated, await ensure_quote(), dry_run=True)
         if dry_run and updated.source == "shadow":
             current_quote = await ensure_quote()
             reference_price = current_quote.exit_reference_price
@@ -3699,6 +4001,8 @@ class ExecutionSupervisor:
         *,
         dry_run: bool,
     ) -> ExitPlan | None:
+        if position.source == "shadow" and position.trade_id in self._paper_exit_deployments:
+            deployment = self._paper_exit_deployments[position.trade_id]
         async with self._symbol_locks[position.symbol]:
             # DOUBLE-EXIT / AUTHORITY INVARIANT (the #1 risk). ``handle_exit`` is the
             # NATIVE exit entry (the runtime ``exit`` task / position-monitor
@@ -6548,6 +6852,7 @@ class ExecutionSupervisor:
     ) -> list[ExitPlan]:
         plans: list[ExitPlan] = []
         current_now = now or datetime.now(UTC)
+        await self.poll_paper_entries(now=current_now)
         for position in list(self.planner.position_tracker.active_positions()):
             if position.exit_mode is None and position.exit_order_id is None and position.exit_submitted_at is None:
                 continue
@@ -8710,6 +9015,10 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
 
 
 def _entry_reprice_enabled(app_config: AppConfig, deployment: DeploymentManifest) -> bool:
+    if (deployment.execution.entry_pricing_mode == "price_seeking"
+            or deployment.execution.preferred_min_open_interest is not None
+            or deployment.execution.preferred_max_bid_ask_spread_pct is not None):
+        return False  # Fixed concession limit; never chase away the liquidity discount.
     lane_value = deployment.execution.entry_reprice_enabled
     if lane_value is not None:
         return lane_value

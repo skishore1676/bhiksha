@@ -114,6 +114,7 @@ class OptionSelection:
     dte_fallback_policy: str | None = None
     requested_dte_min: int | None = None
     requested_dte_max: int | None = None
+    attempted_fallback_dtes_count: int = 0
 
     @property
     def estimated_entry_price(self) -> float | None:
@@ -139,6 +140,7 @@ class TradePlan:
     underlying_entry_price: float | None = None
     entry_timestamp: datetime | None = None
     risk_details: dict[str, Any] = field(default_factory=dict)
+    execution_route: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

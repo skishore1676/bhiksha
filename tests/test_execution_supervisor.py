@@ -1917,6 +1917,55 @@ def test_execution_supervisor_tracks_shadow_plan_as_paper_position(tmp_path) -> 
     assert json.loads(shadow_payload)["underlying_entry_price"] == 558.0
 
 
+def test_execution_supervisor_does_not_register_assumed_shadow_entry_as_broker_fill(tmp_path) -> None:
+    from unittest.mock import MagicMock
+    from bhiksha.config.loader import load_deployments
+
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    decision = SignalDecision(
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        timestamp=datetime(2026, 3, 30, 14, 30, tzinfo=UTC),
+        signal=True,
+        direction=SignalDirection.SHORT,
+        reason=["time_window_ok"],
+        features={"close": 558.0},
+    )
+
+    class ShadowPlanner(StubPlanner):
+        async def plan_entry(self, *args, **kwargs):
+            del args, kwargs
+            return TradePlan(
+                trade_id="SHADOW_EXIT_EDGE_1",
+                deployment_id=deployment.deployment_id,
+                symbol="QQQ",
+                direction=SignalDirection.SHORT,
+                option_symbol="QQQ260330P00558000",
+                quantity=2,
+                estimated_entry_price=3.25,
+                risk_reasons=["approved"],
+                dry_run=True,
+                order_id=None,
+                underlying_entry_price=558.0,
+                entry_timestamp=decision.timestamp,
+            )
+
+    mock_recorder = MagicMock()
+    repo = SQLiteEventRepository(str(tmp_path / "events.db"))
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "trades.db"))
+    supervisor = ExecutionSupervisor(
+        planner=ShadowPlanner(),
+        event_repository=repo,
+        trade_state_repository=trade_repo,
+        app_config=AppConfig(order_fill_poll_seconds=0, order_fill_timeout_seconds=1),
+        exit_edge_recorder=mock_recorder,
+    )
+
+    plan = asyncio.run(supervisor.handle_signal(deployment, decision, dry_run=True, simulate_only=True))
+    assert plan is not None
+    assert not mock_recorder.try_register_entry.called
+
+
 def test_execution_supervisor_does_not_open_shadow_position_when_risk_rejects(tmp_path) -> None:
     from bhiksha.config.loader import load_deployments
 

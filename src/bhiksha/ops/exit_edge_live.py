@@ -159,7 +159,10 @@ class ExitEdgeLiveRecorder:
                 entry_premium=entry_premium, quantity=quantity,
                 entry_context=entry_context,
             )
-            self._increment_health("confirmed_fill_attempts")
+            self._increment_health(
+                "modeled_fill_attempts" if (entry_context or {}).get("entry_fill_kind") == "modeled_ask_touch"
+                else "confirmed_fill_attempts"
+            )
             if payload is None:
                 self._increment_health("ineligible_fill_attempts")
             self._queue.put_nowait(_Register(attempt, payload))
@@ -747,15 +750,20 @@ class ExitEdgeLiveRecorder:
             "quote_feed": QUOTE_FEED,
         }
         try:
-            experiment["risk_envelope"] = build_risk_envelope_experiment(
-                dict(control_policy),
-                control_policy_hash=str(control_policy_hash),
-            )
+            if getattr(deployment.exit, "management_exit", None):
+                policies = list(getattr(deployment.exit, "compare_exit_policies", []) or [])
+                if not policies:
+                    attempt.update(eligible=False, cohort_id=None, outcome="disabled", reason="compare_exits_empty")
+                    return attempt, None
+                if policies[0] != control_policy:
+                    raise ValueError("comparison baseline differs from management snapshot")
+                experiment["named_profiles"] = policies
+            else:
+                experiment["risk_envelope"] = build_risk_envelope_experiment(
+                    dict(control_policy), control_policy_hash=str(control_policy_hash),
+                )
         except (KeyError, TypeError, ValueError) as exc:
-            attempt["eligible"] = False
-            attempt["cohort_id"] = None
-            attempt["outcome"] = "ineligible"
-            attempt["reason"] = f"invalid_canonical_exit_policy:{exc}"
+            attempt.update(eligible=False, cohort_id=None, outcome="ineligible", reason=f"invalid_canonical_exit_policy:{exc}")
             return attempt, None
         return attempt, {
             "cohort_id": cohort_id,
@@ -768,6 +776,9 @@ class ExitEdgeLiveRecorder:
             "entry_premium": float(entry_premium),
             "quantity": int(quantity),
             "cohort_dimensions": {
+                "entry_fill_kind": (entry_context or {}).get("entry_fill_kind", "broker_confirmed"),
+                "strategy_class": (getattr(getattr(deployment, "source", None), "metadata", {}) or {}).get("strategy_class")
+                    or getattr(getattr(deployment, "strategy", None), "key", None) or "unclassified",
                 "selected_dte": (entry_context or {}).get("selected_dte"),
                 "selected_abs_delta": (entry_context or {}).get(
                     "selected_abs_delta"
@@ -797,7 +808,7 @@ class ExitEdgeLiveRecorder:
                 ),
                 "authorization_mode": (
                     "shadow"
-                    if bool(
+                    if (entry_context or {}).get("entry_fill_kind") == "modeled_ask_touch" or bool(
                         getattr(
                             getattr(deployment, "execution", None),
                             "shadow_only",

@@ -851,6 +851,174 @@ def test_compile_active_plan_without_exit_profile_keeps_default_exit_spec(tmp_pa
         assert getattr(exit_spec, field_name) == getattr(defaults, field_name), field_name
 
 
+def _operator_exit_catalog():
+    from bhiksha.config.exit_catalog import load_exit_profiles_sheet_rows
+    return load_exit_profiles_sheet_rows([{
+        "exit_profile_id": name, "trade_archetype": "TREND_CONTINUATION", "exit_family": "staged_r_ladder",
+        "target_1_r": 1, "target_2_r": 2, "target_1_quantity": .6, "initial_stop_pct": .30,
+        "disaster_stop_pct": .35, "no_progress_seconds": 2700, "giveback_policy": "MODERATE",
+        "giveback_arm_r": 1.25, "giveback_retrace_fraction": .5,
+        "breakeven_after_t1": True, "eod_flat": True, "hard_flat_time_et": "15:55",
+    } for name in ("trend_continuation_balanced", "flash_reversal_fast_snap", "exhaustion_reversal_climax")])
+
+
+def test_compile_active_plan_with_management_exit_and_compare_exits(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_exit_rubric",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "management_exit": "trend_continuation_balanced",
+                "compare_exits": "flash_reversal_fast_snap, exhaustion_reversal_climax",
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+        exit_profiles_catalog=_operator_exit_catalog(),
+    )
+
+    assert compiled.plan.suppressed == []
+    assert len(compiled.plan.deployments) == 1
+    dep = compiled.plan.deployments[0]
+    exit_spec = dep.exit
+
+    assert exit_spec.management_exit == "trend_continuation_balanced"
+    assert exit_spec.profile_exit_id == "trend_continuation_balanced"
+    assert exit_spec.target_1_r == 1.0
+    assert exit_spec.target_2_r == 2.0
+    assert exit_spec.target_1_quantity == 0.60
+    assert exit_spec.high_water_giveback_policy == "MODERATE"
+    # Nonempty compare list automatically includes management_exit as baseline at index 0
+    assert exit_spec.compare_exits == [
+        "trend_continuation_balanced",
+        "flash_reversal_fast_snap",
+        "exhaustion_reversal_climax",
+    ]
+    assert len(exit_spec.compare_exit_policies) == 3
+    assert exit_spec.compare_exit_policies[0]["policy_id"] == "trend_continuation_balanced"
+    assert exit_spec.compare_exit_policies[1]["policy_id"] == "flash_reversal_fast_snap"
+    assert exit_spec.compare_exit_policies[2]["policy_id"] == "exhaustion_reversal_climax"
+
+
+def test_compile_active_plan_suppresses_unknown_management_exit(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_bad_mgmt",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "management_exit": "non_existent_moon_shot",
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+        exit_profiles_catalog=_operator_exit_catalog(),
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "Unknown management_exit profile 'non_existent_moon_shot'" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_suppresses_unknown_compare_exit(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_bad_compare",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "management_exit": "trend_continuation_balanced",
+                "compare_exits": "flash_reversal_fast_snap, imaginary_profile",
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+        exit_profiles_catalog=_operator_exit_catalog(),
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "Unknown compare_exits profile 'imaginary_profile'" in compiled.plan.suppressed[0]["reason"]
+
+
+def test_compile_active_plan_rejects_conflicting_dual_exit_authority(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "strategy_catalog"
+    catalog_root.mkdir()
+
+    sheet_path = tmp_path / "sheet.csv"
+    _write_csv(
+        sheet_path,
+        [
+            {
+                "row_id": "spy_manual_dual_authority",
+                "row_type": "manual",
+                "manual_setup_type": "manual_trigger",
+                "symbol": "SPY",
+                "authorization_mode": "shadow",
+                "direction": "long",
+                "trigger_price": "602.10",
+                "trigger_direction": "ABOVE",
+                "management_exit": "trend_continuation_balanced",
+                "exit_profile_spec": json.dumps(_exit_profile_spec(policy_id="flash_reversal_fast_snap")),
+            }
+        ],
+    )
+
+    compiled = compile_active_plan_from_sheet(
+        sheet_path=sheet_path,
+        strategy_catalog_path=catalog_root,
+        trading_date="2026-06-14",
+        exit_profiles_catalog=_operator_exit_catalog(),
+    )
+
+    assert compiled.plan.deployments == []
+    assert compiled.plan.summary["suppressed_count"] == 1
+    assert "Conflicting dual exit authority" in compiled.plan.suppressed[0]["reason"]
+
+
 def test_compile_active_plan_from_google_sheets_uses_catalog_active_and_manual_tabs(tmp_path: Path) -> None:
     catalog_root = tmp_path / "strategy_catalog"
     catalog_root.mkdir()

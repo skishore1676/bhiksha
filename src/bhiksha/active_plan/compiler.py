@@ -16,6 +16,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 import yaml
 
+from bhiksha.config.exit_catalog import (
+    ExitProfileConfig,
+    load_exit_profiles_sheet_rows,
+)
 from bhiksha.config.loader import load_strategy_catalog
 from bhiksha.config.models import ActivePlan, DeploymentManifest, StrategyCatalogEntry
 from bhiksha.cartographer_profiles import profile_bundle, validate_profile_bundle
@@ -191,6 +195,12 @@ class ActivePlanSheetRow(BaseModel):
     # profile-exit evaluator sees the operator's named exit DNA. ``None`` (the
     # default) reproduces pre-bridge behavior exactly: no v2 fields are set.
     exit_profile_spec: dict[str, Any] | None = None
+    # Operator exit management and comparison (Exit Strategy Rubric v1)
+    # ``management_exit`` is the primary policy governing the trade (alias: exit_strategy)
+    # ``compare_exits`` is a list of candidate exit profile IDs evaluated in parallel
+    management_exit: str | None = None
+    strategy_class: str | None = None
+    compare_exits: list[str] = Field(default_factory=list)
     source_metadata: dict[str, Any] = Field(default_factory=dict)
     # AUDIT VISIBILITY: populated by ``normalize_input`` when a row sets a
     # profile-exit live-dispatch-gate input through the ``execution``/``exit``
@@ -263,6 +273,31 @@ class ActivePlanSheetRow(BaseModel):
                     metadata_key: normalized[key],
                 }
                 normalized[key] = None
+
+        management_exit_val = normalized.get("management_exit") or normalized.get("exit_strategy")
+        if management_exit_val is not None:
+            normalized["management_exit"] = str(management_exit_val).strip().lower()
+
+        compare_exits_val = (
+            normalized.get("compare_exits")
+            or normalized.get("compare_exit_strategies")
+            or normalized.get("candidate_exit_strategies")
+            or normalized.get("candidate_exits")
+        )
+        if compare_exits_val is not None:
+            if isinstance(compare_exits_val, str):
+                parts = [p.strip().lower() for p in compare_exits_val.split(",") if p.strip()]
+            elif isinstance(compare_exits_val, (list, tuple)):
+                parts = [str(p).strip().lower() for p in compare_exits_val if str(p).strip()]
+            else:
+                raise ValueError("compare_exits must be comma-separated text or a list of profile names")
+            seen = set()
+            deduped = []
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    deduped.append(p)
+            normalized["compare_exits"] = deduped
         return normalized
 
     @model_validator(mode="after")
@@ -339,6 +374,7 @@ def compile_active_plan_from_sheet(
     active_plan_id: str | None = None,
     trading_date: str | None = None,
     source_name: str = "google_sheet_integration",
+    exit_profiles_catalog: dict[str, ExitProfileConfig] | None = None,
 ) -> CompiledActivePlan:
     validation = load_sheet_rows_with_report(sheet_path)
     expected_enabled_row_ids = [
@@ -350,6 +386,7 @@ def compile_active_plan_from_sheet(
     ]
     return compile_active_plan_from_rows(
         rows=validation.rows,
+        exit_profiles_catalog=exit_profiles_catalog,
         strategy_catalog_path=strategy_catalog_path,
         active_plan_id=active_plan_id,
         trading_date=trading_date,
@@ -372,6 +409,7 @@ def compile_active_plan_from_rows(
     operator_defaults: dict[str, Any] | None = None,
     suppressed: list[dict[str, Any]] | None = None,
     expected_enabled_row_ids_override: list[str] | None = None,
+    exit_profiles_catalog: dict[str, ExitProfileConfig] | None = None,
 ) -> CompiledActivePlan:
     suppressed_rows = list(suppressed or [])
     expected_enabled_row_ids = list(
@@ -428,6 +466,7 @@ def compile_active_plan_from_rows(
                 enforce_google_catalog,
                 operator_defaults=operator_defaults or {},
                 trading_date=effective_trading_date,
+                exit_catalog=exit_profiles_catalog,
             )
         except PolicyGateSuppression as exc:
             suppressed_rows.append(
@@ -542,10 +581,12 @@ def compile_active_plan_from_google_sheets(
     source_name: str = "google_sheets_control_plane",
     catalog_sheet_name: str = "strategy catalog",
     defaults_sheet_name: str | None = None,
+    exit_profiles_sheet_name: str | None = "Exit_Profiles_v1",
     strategy_client: GoogleSheetTableClient | None = None,
     manual_client: GoogleSheetTableClient | None = None,
     catalog_client: GoogleSheetTableClient | None = None,
     defaults_client: GoogleSheetTableClient | None = None,
+    exit_profiles_client: GoogleSheetTableClient | None = None,
 ) -> CompiledActivePlan:
     if catalog_client is None:
         catalog_client = GoogleSheetTableClient(
@@ -571,7 +612,6 @@ def compile_active_plan_from_google_sheets(
             sheet_name=defaults_sheet_name,
             credentials_path=Path(credentials_path),
         )
-
     catalog_validation = load_strategy_catalog_sheet_rows_with_report(
         catalog_client.read_rows(),
         sheet_name=catalog_client.sheet_name,
@@ -591,6 +631,19 @@ def compile_active_plan_from_google_sheets(
         row_type="manual",
         sheet_name=manual_client.sheet_name,
     )
+    exit_profiles_catalog: dict[str, ExitProfileConfig] = {}
+    if any(row.enabled and (row.management_exit or row.compare_exits)
+           for row in [*strategy_validation.rows, *manual_validation.rows]):
+        if exit_profiles_client is None:
+            if not exit_profiles_sheet_name:
+                raise ValueError("named exits require Exit_Profiles_v1")
+            exit_profiles_client = GoogleSheetTableClient(
+                spreadsheet_id=spreadsheet_id,
+                sheet_name=exit_profiles_sheet_name,
+                credentials_path=Path(credentials_path),
+            )
+        # A read/validation error must abort compilation, never invent policies.
+        exit_profiles_catalog = load_exit_profiles_sheet_rows(exit_profiles_client.read_rows())
     suppressed = [
         *catalog_validation.suppressed,
         *strategy_validation.suppressed,
@@ -615,6 +668,7 @@ def compile_active_plan_from_google_sheets(
             "spreadsheet_id": catalog_client.spreadsheet_id,
             "catalog_sheet_name": catalog_client.sheet_name,
             "defaults_sheet_name": defaults_client.sheet_name if defaults_client is not None else None,
+            "exit_profiles_sheet_name": exit_profiles_client.sheet_name if exit_profiles_client is not None else None,
             "strategy_sheet_name": strategy_client.sheet_name,
             "manual_sheet_name": manual_client.sheet_name,
         },
@@ -622,6 +676,7 @@ def compile_active_plan_from_google_sheets(
         operator_defaults=operator_defaults,
         suppressed=suppressed,
         expected_enabled_row_ids_override=expected_enabled_row_ids,
+        exit_profiles_catalog=exit_profiles_catalog,
     )
 
 
@@ -852,17 +907,27 @@ def _compile_row(
     *,
     operator_defaults: dict[str, Any] | None = None,
     trading_date: str | None = None,
+    exit_catalog: dict[str, ExitProfileConfig] | None = None,
 ) -> DeploymentManifest:
     if row.row_type == "strategy":
-        return _compile_strategy_row(row, catalog_by_id, google_catalog_by_id or {}, enforce_google_catalog)
+        return _compile_strategy_row(
+            row,
+            catalog_by_id,
+            google_catalog_by_id or {},
+            enforce_google_catalog,
+            exit_catalog=exit_catalog,
+        )
     manual_setup_type = _normalized_manual_setup_type(row.manual_setup_type)
     if manual_setup_type == "manual_trigger":
         if str(row.source_metadata.get("source_owner") or "") == "market_cartographer":
             return _compile_cartographer_manual_trigger_row(
-                row, operator_defaults=operator_defaults, trading_date=trading_date
+                row,
+                operator_defaults=operator_defaults,
+                trading_date=trading_date,
+                exit_catalog=exit_catalog,
             )
-        return _compile_manual_trigger_row(row)
-    return _compile_manual_breakout_row(row)
+        return _compile_manual_trigger_row(row, exit_catalog=exit_catalog)
+    return _compile_manual_breakout_row(row, exit_catalog=exit_catalog)
 
 
 def _compile_strategy_row(
@@ -870,6 +935,8 @@ def _compile_strategy_row(
     catalog_by_id: dict[str, StrategyCatalogEntry],
     google_catalog_by_id: dict[str, StrategyCatalogSheetRow],
     enforce_google_catalog: bool,
+    *,
+    exit_catalog: dict[str, ExitProfileConfig] | None = None,
 ) -> DeploymentManifest:
     strategy_id = row.strategy_id or ""
     google_catalog_entry = google_catalog_by_id.get(strategy_id)
@@ -906,7 +973,12 @@ def _compile_strategy_row(
     if relaxed_evidence_gates and row.authorization_mode == "live":  # pragma: no cover - defense in depth
         raise ValueError(f"Strategy {strategy_id!r}: evidence gates may not be relaxed for a live row")
     effective_row = row
-    if row.exit_profile_spec is None and google_catalog_entry is not None and google_catalog_entry.exit_profile_spec:
+    if (
+        row.exit_profile_spec is None
+        and not row.management_exit
+        and google_catalog_entry is not None
+        and google_catalog_entry.exit_profile_spec
+    ):
         effective_row = row.model_copy(update={"exit_profile_spec": google_catalog_entry.exit_profile_spec})
 
     payload = _catalog_entry_payload(entry)
@@ -916,7 +988,7 @@ def _compile_strategy_row(
         _apply_execution_overrides(payload["execution"], effective_row)
     )
     payload["risk"] = _apply_risk_overrides(payload["risk"], effective_row)
-    payload["exit"] = _apply_exit_overrides(payload["exit"], effective_row)
+    payload["exit"] = _apply_exit_overrides(payload["exit"], effective_row, exit_catalog=exit_catalog)
     payload["strategy"]["params"] = _deep_merge(payload["strategy"]["params"], effective_row.strategy_params_override)
     payload["source"] = _merge_source_metadata(
         payload["source"],
@@ -940,7 +1012,11 @@ def _cartographer_number(value: Any, field: str) -> float:
 
 
 def _compile_cartographer_manual_trigger_row(
-    row: ActivePlanSheetRow, *, operator_defaults: dict[str, Any] | None, trading_date: str | None
+    row: ActivePlanSheetRow,
+    *,
+    operator_defaults: dict[str, Any] | None,
+    trading_date: str | None,
+    exit_catalog: dict[str, ExitProfileConfig] | None = None,
 ) -> DeploymentManifest:
     """Compile the one frozen Cartographer lane; generic overrides are not authority."""
 
@@ -993,7 +1069,7 @@ def _compile_cartographer_manual_trigger_row(
         raise ValueError("Cartographer end_in_days must mirror the profile DTE maximum")
     management = dict(bundle["management"])
     provided_management = dict(row.exit_profile_spec or {})
-    if provided_management != management:
+    if not row.management_exit and provided_management != management:
         raise ValueError(
             "Cartographer management specification does not match its profile snapshot"
         )
@@ -1037,13 +1113,13 @@ def _compile_cartographer_manual_trigger_row(
                 "max_trade_premium_usd": effective_premium,
                 "max_contracts": execution["max_contracts"],
             },
-            "exit_profile_spec": {
+            "exit_profile_spec": row.exit_profile_spec if row.management_exit else {
                 key: value for key, value in management.items() if key != "management_hash"
             },
             "source_metadata": effective_metadata,
         }
     )
-    deployment = _compile_manual_trigger_row(effective_row)
+    deployment = _compile_manual_trigger_row(effective_row, exit_catalog=exit_catalog)
     deployment.strategy.params["cartographer_metadata"] = effective_metadata
     if deployment.execution.dte_min != execution["dte_min"] or deployment.execution.dte_max != execution["dte_max"]:
         raise ValueError("Cartographer compiled DTE values drifted from the profile bundle")
@@ -1052,7 +1128,11 @@ def _compile_cartographer_manual_trigger_row(
     return deployment
 
 
-def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:
+def _compile_manual_trigger_row(
+    row: ActivePlanSheetRow,
+    *,
+    exit_catalog: dict[str, ExitProfileConfig] | None = None,
+) -> DeploymentManifest:
     stop_loss_pct = row.stop_loss_pct if row.stop_loss_pct is not None else 0.45
     hard_flat_time_et = row.hard_flat_time_et or "15:55"
     use_profit_target = (
@@ -1117,12 +1197,16 @@ def _compile_manual_trigger_row(row: ActivePlanSheetRow) -> DeploymentManifest:
         _apply_execution_overrides(payload["execution"], row)
     )
     payload["risk"] = _apply_risk_overrides(payload["risk"], row)
-    payload["exit"] = _apply_exit_overrides(payload["exit"], row)
+    payload["exit"] = _apply_exit_overrides(payload["exit"], row, exit_catalog=exit_catalog)
     payload["source"] = _merge_source_metadata(payload["source"], row=row, origin="active_sheet_manual")
     return DeploymentManifest.model_validate(payload)
 
 
-def _compile_manual_breakout_row(row: ActivePlanSheetRow) -> DeploymentManifest:
+def _compile_manual_breakout_row(
+    row: ActivePlanSheetRow,
+    *,
+    exit_catalog: dict[str, ExitProfileConfig] | None = None,
+) -> DeploymentManifest:
     stop_loss_pct = row.stop_loss_pct if row.stop_loss_pct is not None else 0.35
     hard_flat_time_et = row.hard_flat_time_et or "15:53"
     profit_target_multiple = row.profit_target_multiple if row.profit_target_multiple is not None else 1.25
@@ -1186,7 +1270,7 @@ def _compile_manual_breakout_row(row: ActivePlanSheetRow) -> DeploymentManifest:
         _apply_execution_overrides(payload["execution"], row)
     )
     payload["risk"] = _apply_risk_overrides(payload["risk"], row)
-    payload["exit"] = _apply_exit_overrides(payload["exit"], row)
+    payload["exit"] = _apply_exit_overrides(payload["exit"], row, exit_catalog=exit_catalog)
     payload["source"] = _merge_source_metadata(payload["source"], row=row, origin="active_sheet_manual")
     return DeploymentManifest.model_validate(payload)
 
@@ -1592,6 +1676,14 @@ def _split_signal_window(value: Any) -> tuple[str | None, str | None]:
 def _apply_execution_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:
     updated = _deep_merge(section, row.execution_overrides)
     updated["shadow_only"] = row.authorization_mode != "live"
+    if row.management_exit:
+        mode = "live_approval_gated" if row.authorization_mode == "live" else "shadow"
+        explicit_mode = row.execution_overrides.get("runtime_mode")
+        if explicit_mode is not None:
+            normalized_explicit = "shadow" if explicit_mode in {"shadow", "shadow_only"} else explicit_mode
+            if row.authorization_mode == "live" and normalized_explicit != "live_approval_gated":
+                raise ValueError("management_exit runtime_mode conflicts with row authorization_mode")
+        updated["runtime_mode"] = mode
     if row.entry_window_start_et is not None:
         updated["entry_window_start_et"] = row.entry_window_start_et
     if row.entry_window_end_et is not None:
@@ -1621,7 +1713,58 @@ def _apply_risk_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> d
     return updated
 
 
-def _apply_exit_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:
+def _apply_exit_overrides(
+    section: dict[str, Any],
+    row: ActivePlanSheetRow,
+    *,
+    exit_catalog: dict[str, ExitProfileConfig] | None = None,
+) -> dict[str, Any]:
+    active_catalog = exit_catalog or {}
+    if row.compare_exits and not row.management_exit:
+        raise ValueError("compare_exits requires explicit management_exit")
+    if row.management_exit:
+        names = list(dict.fromkeys([row.management_exit, *row.compare_exits]))
+        for name in names:
+            if name not in active_catalog:
+                field = "management_exit" if name == row.management_exit else "compare_exits"
+                raise ValueError(f"Unknown {field} profile {name!r}")
+        # One source owns the settings. Do not merge legacy overrides after hashing.
+        legacy_exit_overrides = {
+            k: v for k, v in (row.exit_overrides or {}).items()
+            if k not in {"profile_exit_drives_live", "profile_exit_shadow_only"}
+        }
+        conflicts = {
+            "exit_profile_spec": row.exit_profile_spec,
+            "exit_overrides": legacy_exit_overrides,
+            "use_profit_target": row.use_profit_target,
+            "profit_target_multiple": row.profit_target_multiple,
+            "option_profit_target_pct": row.option_profit_target_pct,
+            "stop_loss_pct": row.stop_loss_pct,
+            "hard_flat_time_et": row.hard_flat_time_et,
+            "stop_to_breakeven_after_r_multiple": row.stop_to_breakeven_after_r_multiple,
+        }
+        if any(value is not None and value != {} for value in conflicts.values()):
+            raise ValueError("Conflicting dual exit authority: management_exit cannot be combined with legacy exit overrides")
+        if active_catalog[row.management_exit].risk_envelope_enabled:
+            raise ValueError("dynamic envelope is comparison-only here; existing canary authority remains separate")
+        resolved = [_exit_spec_fields_from_management_policy_spec(
+            active_catalog[name].to_management_policy_spec_dict()) for name in names]
+        updated = dict(section)
+        for key in _EXIT_PROFILE_SPEC_FIELD_MAP.values():
+            updated.pop(key, None)
+        updated.update(resolved[0])
+        updated.update(
+            management_exit=row.management_exit,
+            compare_exits=names if row.compare_exits else [],
+            compare_exit_policies=[item["exit_policy_snapshot"] for item in resolved] if row.compare_exits else [],
+            profile_exit_drives_live=row.authorization_mode == "live",
+            use_profit_target=False,
+            profit_target_multiple=None,
+            option_profit_target_pct=None,
+            stop_to_breakeven_after_r_multiple=None,
+        )
+        return updated
+
     updated = _deep_merge(section, row.exit_overrides)
     # Track every ExitSpec key the operator set explicitly — via the
     # ``exit_overrides`` deep-merge dict OR a dedicated typed column — so the
@@ -1647,6 +1790,7 @@ def _apply_exit_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> d
         updated["stop_to_breakeven_after_r_multiple"] = row.stop_to_breakeven_after_r_multiple
         explicit_keys.add("stop_to_breakeven_after_r_multiple")
     updated = _apply_exit_profile_spec(updated, row, explicit_keys=explicit_keys)
+
     return updated
 
 
@@ -1864,6 +2008,8 @@ def _merge_source_metadata(
     if row.notes:
         metadata["notes"] = row.notes
     metadata.update(row.source_metadata)
+    if row.strategy_class:
+        metadata["strategy_class"] = row.strategy_class.strip()
     if extra_metadata:
         metadata.update(extra_metadata)
     updated["origin"] = origin
@@ -2488,5 +2634,11 @@ _COLUMN_ALIASES = {
     "management_policy_spec": "exit_profile_spec",
     "exit_profile": "exit_profile_spec",
     "exit_profile_spec": "exit_profile_spec",
+    "management_exit": "management_exit",
+    "exit_strategy": "management_exit",
+    "compare_exits": "compare_exits",
+    "compare_exit_strategies": "compare_exits",
+    "candidate_exits": "compare_exits",
+    "candidate_exit_strategies": "compare_exits",
     "metadata": "source_metadata",
 }

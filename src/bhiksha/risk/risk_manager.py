@@ -134,6 +134,18 @@ def _is_open_live_trade(trade: TradeRecord) -> bool:
     return _is_live_trade(trade) and not _is_closed_trade(trade)
 
 
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _is_rail_b_eligible_trade(trade: TradeRecord) -> bool:
+    """Paper outcomes never authorize live risk."""
+    return _is_live_trade(trade)
+
+
+
 def _unrealized_pnl_usd(entry_price: float | None, current_mark: float | None, quantity: int | None) -> float | None:
     """Unrealized P&L for one open position, same shape as _realized_pnl_usd.
 
@@ -349,6 +361,7 @@ class RiskManager:
         # Session-latched ids, so a repeated signal cannot flap back to live
         # after Rail B has refused the first entry consult.
         self._session_blocked_ids: set[str] = set()
+        self._session_blocked_status: dict[str, RailBStatus] = {}
         self._notified_tier1 = False
         self._notified_tier2 = False
         # Operator audit P4: same "once per session" latch as tier1/tier2 --
@@ -765,31 +778,34 @@ class RiskManager:
             return RailBStatus(blocked=False, reason="rail_b_disabled")
 
         if deployment_id in self._session_blocked_ids:
-            return RailBStatus(blocked=True, reason=RAIL_B_SESSION_BLOCK_REASON)
+            return self._session_blocked_status.get(deployment_id, RailBStatus(blocked=True, reason=RAIL_B_SESSION_BLOCK_REASON))
 
         trades = await self.trade_state_repository.get_recent_trades(limit=1000)
-        deployment_live_closed = [
+        deployment_eligible_closed = [
             trade
             for trade in trades
-            if trade.deployment_id == deployment_id and _is_live_trade(trade) and _is_closed_trade(trade)
+            if trade.deployment_id == deployment_id and _is_rail_b_eligible_trade(trade) and _is_closed_trade(trade)
         ]
+        if self.settings.demote_reset_at is not None:
+            reset_at = _ensure_utc(self.settings.demote_reset_at)
+            filtered_trades = []
+            for trade in deployment_eligible_closed:
+                trade_time = trade.entry_timestamp
+                if trade_time is not None and _ensure_utc(trade_time) >= reset_at:
+                    filtered_trades.append(trade)
+            deployment_eligible_closed = filtered_trades
+
         # get_recent_trades is ordered by updated_at DESC. Build the rolling
         # window from the latest trades with complete realized economics,
         # rather than slicing raw ``status='closed'`` rows first. A legacy or
         # corrupt closed row with no exit truth must not permanently consume
         # an evidence slot and prevent Rail B from seeing older priced trades.
-        if len(deployment_live_closed) < self.settings.demote_min_n:
-            return RailBStatus(
-                blocked=False,
-                reason="insufficient_trade_count",
-                window_n=len(deployment_live_closed),
-            )
         partials_by_trade = await self.trade_state_repository.get_partial_fills_for_trades(
-            [trade.trade_id for trade in deployment_live_closed]
+            [trade.trade_id for trade in deployment_eligible_closed]
         )
         pnls = []
         priced_trade_ids = []
-        for trade in deployment_live_closed:
+        for trade in deployment_eligible_closed:
             partials = partials_by_trade.get(trade.trade_id, [])
             pnl = _complete_realized_pnl_usd(trade, partials)
             if pnl is not None:
@@ -798,14 +814,26 @@ class RiskManager:
                 if len(pnls) == self.settings.demote_window:
                     break
         if len(pnls) < self.settings.demote_min_n:
-            return RailBStatus(blocked=False, reason="insufficient_priced_trade_count", window_n=len(pnls))
+            return RailBStatus(blocked=False,
+                               reason="insufficient_trade_count" if len(pnls) == len(deployment_eligible_closed) else "insufficient_priced_trade_count",
+                               window_n=len(pnls))
 
         mean_pnl = round(sum(pnls) / len(pnls), 2)
         if mean_pnl >= self.settings.demote_threshold_usd:
-            return RailBStatus(blocked=False, reason=None, window_n=len(pnls), mean_pnl_usd=mean_pnl, threshold_usd=self.settings.demote_threshold_usd)
+            return RailBStatus(
+                blocked=False,
+                reason=None,
+                window_n=len(pnls),
+                mean_pnl_usd=mean_pnl,
+                threshold_usd=self.settings.demote_threshold_usd,
+            )
 
         blocked_at = self._now_fn().isoformat()
         self._session_blocked_ids.add(deployment_id)
+        self._session_blocked_status[deployment_id] = RailBStatus(
+            blocked=True, reason=RAIL_B_SESSION_BLOCK_REASON, window_n=len(pnls),
+            mean_pnl_usd=mean_pnl, threshold_usd=self.settings.demote_threshold_usd,
+        )
 
         await self.event_repository.append(
             "risk_manager_session_block",
@@ -824,7 +852,7 @@ class RiskManager:
             title=f"Rail B session block: {deployment_id}",
             body=(
                 f"Deployment {deployment_id} is blocked from live entry for the rest "
-                f"of this session. Its last {len(pnls)} priced closed live trades "
+                f"of this session. Its last {len(pnls)} priced closed trades "
                 f"averaged ${mean_pnl:.2f}/trade (threshold "
                 f"${self.settings.demote_threshold_usd:.2f}). The Google Sheet "
                 "authorization was not changed. If this lane should remain shadow in "
@@ -922,6 +950,8 @@ class RiskManager:
                 rail="B",
                 details={
                     "window_n": rail_b.window_n,
+                    "evidence_start_at": self.settings.demote_reset_at.isoformat() if self.settings.demote_reset_at else None,
+                    "minimum_priced_live_trades": self.settings.demote_min_n,
                     "mean_pnl_usd": rail_b.mean_pnl_usd,
                     "threshold_usd": rail_b.threshold_usd,
                 },
@@ -929,7 +959,12 @@ class RiskManager:
             await self._emit_entry_decision(deployment_id, decision)
             return decision
 
-        decision = EntryDecision(allowed=True, reason="approved")
+        decision = EntryDecision(allowed=True, reason="approved", details={
+            "rail_b": {"window_n": rail_b.window_n, "reason": rail_b.reason,
+                       "mean_pnl_usd": rail_b.mean_pnl_usd,
+                       "minimum_priced_live_trades": self.settings.demote_min_n,
+                       "evidence_start_at": self.settings.demote_reset_at.isoformat() if self.settings.demote_reset_at else None},
+        })
         await self._emit_entry_decision(deployment_id, decision)
         return decision
 

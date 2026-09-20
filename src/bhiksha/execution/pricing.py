@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+import math
 from typing import Any, Literal
 
 from bhiksha.execution.order_manager import PublicQuote, round_price
 
-EntryPricingMode = Literal["passive", "balanced", "urgent", "cross"]
+EntryPricingMode = Literal["passive", "balanced", "urgent", "cross", "price_seeking"]
 EntryExecutionProfileName = Literal["patient", "balanced", "urgent"]
 
 
@@ -37,6 +39,11 @@ class EntryPricingPolicy:
     spread_fraction: float | None = None
     require_two_sided_quote: bool = True
     require_open_interest: bool = True
+    preferred_min_open_interest: int | None = None
+    preferred_max_bid_ask_spread_pct: float | None = None
+    price_improvement_discount_pct: float = 0.10
+    price_improvement_max_pct: float = 0.35
+    price_improvement_curve: float = 0.85
 
     @classmethod
     def from_execution_params(cls, params: dict[str, Any] | None = None) -> "EntryPricingPolicy":
@@ -45,7 +52,7 @@ class EntryPricingPolicy:
         if isinstance(nested, dict):
             raw = {**raw, **nested}
         mode = str(raw.get("entry_pricing_mode") or raw.get("mode") or "urgent").strip().lower()
-        if mode not in {"passive", "balanced", "urgent", "cross"}:
+        if mode not in {"passive", "balanced", "urgent", "cross", "price_seeking"}:
             mode = "urgent"
         return cls(
             mode=mode,  # type: ignore[arg-type]
@@ -72,6 +79,18 @@ class EntryPricingPolicy:
                 _first_present(raw, "entry_pricing_require_open_interest", "require_open_interest"),
                 True,
             ),
+            preferred_min_open_interest=_optional_int(
+                _first_present(raw, "preferred_min_open_interest", "entry_pricing_preferred_min_open_interest")
+            ),
+            preferred_max_bid_ask_spread_pct=_optional_float(
+                _first_present(raw, "preferred_max_bid_ask_spread_pct", "entry_pricing_preferred_max_bid_ask_spread_pct")
+            ),
+            price_improvement_max_pct=_as_float(raw.get("price_improvement_max_pct"), 0.35),
+            price_improvement_curve=_as_float(raw.get("price_improvement_curve"), 0.85),
+            price_improvement_discount_pct=_as_float(
+                _first_present(raw, "price_improvement_discount_pct", "entry_pricing_price_improvement_discount_pct"),
+                0.10,
+            ),
         )
 
 
@@ -81,6 +100,7 @@ class EntryPricingResult:
     quote: PublicQuote
     limit_price: float | None
     block_reasons: list[str]
+    price_improvement_applied: bool = False
 
     @property
     def approved(self) -> bool:
@@ -95,6 +115,7 @@ class EntryPricingResult:
             "option_symbol": self.quote.symbol,
             "pricing_mode": self.policy.mode,
             "selected_limit_price": self.limit_price,
+            "price_improvement_applied": self.price_improvement_applied,
             "bid": bid,
             "ask": ask,
             "mid": mid,
@@ -126,7 +147,38 @@ def select_entry_limit(
     spread = ask - bid
     mid = (bid + ask) / 2.0
 
-    if active_policy.spread_fraction is not None:
+    requires_price_seeking = (
+        active_policy.mode == "price_seeking"
+        or (
+            active_policy.preferred_min_open_interest is not None
+            and quote.open_interest is not None
+            and quote.open_interest < active_policy.preferred_min_open_interest
+        )
+        or (
+            active_policy.preferred_max_bid_ask_spread_pct is not None
+            and quote.spread_pct is not None
+            and quote.spread_pct > active_policy.preferred_max_bid_ask_spread_pct
+        )
+    )
+
+    price_improvement_applied = False
+    if requires_price_seeking:
+        # Convex width improvement below midpoint based on Kamandal
+        normal = active_policy.preferred_max_bid_ask_spread_pct or 0.20
+        pressure = max((quote.spread_pct / normal) - 1.0, 0.0) if quote.spread_pct else 0.0
+        if active_policy.preferred_min_open_interest and quote.open_interest is not None:
+            pressure = max(pressure, 1.0 - quote.open_interest / active_policy.preferred_min_open_interest)
+        bump = (active_policy.price_improvement_max_pct - active_policy.price_improvement_discount_pct) * (
+            1.0 - math.exp(-active_policy.price_improvement_curve * pressure)
+        )
+        eff_discount_pct = min(
+            active_policy.price_improvement_max_pct,
+            active_policy.price_improvement_discount_pct + bump,
+        )
+        discount = spread * eff_discount_pct
+        limit_price = max(bid, mid - discount)
+        price_improvement_applied = True
+    elif active_policy.spread_fraction is not None:
         limit_price = bid + spread * active_policy.spread_fraction
     elif active_policy.mode == "cross" or (
         active_policy.mode == "urgent"
@@ -144,8 +196,10 @@ def select_entry_limit(
     return EntryPricingResult(
         policy=active_policy,
         quote=quote,
-        limit_price=round_price(max(0.01, min(limit_price, ask))),
+        limit_price=(math.floor(max(0.01, min(limit_price, ask)) * 100 + 1e-9) / 100
+                     if price_improvement_applied else round_price(max(0.01, min(limit_price, ask)))) ,
         block_reasons=[],
+        price_improvement_applied=price_improvement_applied,
     )
 
 
@@ -228,7 +282,21 @@ def scale_spread_fraction(base_fraction: float, *, enabled: bool, open_interest_
 
 def _quote_blocks(quote: PublicQuote, execution_params: dict[str, Any], policy: EntryPricingPolicy) -> list[str]:
     blocks: list[str] = []
-    if policy.require_two_sided_quote:
+    if any(value is not None and not math.isfinite(value) for value in (quote.bid, quote.ask, quote.open_interest)):
+        return ["public_quote_nonfinite"]
+    if policy.mode == "price_seeking" and not (0 <= policy.price_improvement_discount_pct <= policy.price_improvement_max_pct <= .5 and math.isfinite(policy.price_improvement_curve) and policy.price_improvement_curve > 0):
+        return ["invalid_price_improvement_policy"]
+    if (policy.mode == "price_seeking" or policy.preferred_min_open_interest is not None
+            or policy.preferred_max_bid_ask_spread_pct is not None):
+        from bhiksha.execution.quote_lineage import PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
+        try:
+            stamp = datetime.fromisoformat(str(quote.quote_timestamp).replace("Z", "+00:00"))
+            age = (datetime.now(UTC) - stamp).total_seconds()
+            if quote.quote_timestamp_field not in PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS or not 0 <= age <= 5:
+                blocks.append("public_quote_stale_or_unproven")
+        except (TypeError, ValueError):
+            blocks.append("public_quote_timestamp_missing")
+    if policy.require_two_sided_quote or policy.mode == "price_seeking" or policy.preferred_min_open_interest is not None or policy.preferred_max_bid_ask_spread_pct is not None:
         if quote.bid is None or quote.ask is None or quote.bid <= 0 or quote.ask <= 0:
             blocks.append("public_quote_missing_bid_ask")
         elif quote.ask < quote.bid:
@@ -290,3 +358,12 @@ def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None

@@ -142,6 +142,64 @@ def test_live_watchdog_requests_fresh_plan_before_recovery_start(
     ]
 
 
+def test_live_stop_exports_chart_evidence_only_after_successful_stop_stage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    payloads: list[dict] = []
+    calls: list[object] = []
+    runtime = SimpleNamespace(sqlite_path=str(tmp_path / "bhiksha.db"))
+
+    monkeypatch.setattr(
+        launchd_job, "_run_python_module",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "RUNTIME_STATUS={\"running\": false}\n", ""),
+    )
+    monkeypatch.setattr(launchd_job, "load_app_config", lambda path: runtime)
+    monkeypatch.setattr(
+        launchd_job,
+        "export_chart_evidence",
+        lambda db_path, **kwargs: calls.append((db_path, kwargs)) or SimpleNamespace(
+            packet={"id": "bhiksha-packet", "publication": {"schemaVersion": 1}},
+            path=tmp_path / "packet.json",
+            reused=False,
+        ),
+    )
+    monkeypatch.setattr(launchd_job, "_print_result", payloads.append)
+
+    result = launchd_job._stop_job(
+        SimpleNamespace(job="live-stop", active_plan="active-plan.json"), repo_root=tmp_path
+    )
+
+    assert result == 0
+    assert calls == [
+        (tmp_path / "bhiksha.db", {"output_dir": tmp_path / "artifacts" / "chart-workbench" / "publications"})
+    ]
+    assert payloads[0]["detail"] == "not_running"
+    assert payloads[0]["chart_evidence"]["packet_id"] == "bhiksha-packet"
+
+
+def test_live_stop_reports_export_failure_without_claiming_stop_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    payloads: list[dict] = []
+    monkeypatch.setattr(launchd_job, "load_app_config", lambda path: SimpleNamespace(
+        sqlite_path=str(tmp_path / "bhiksha.db")
+    ))
+    monkeypatch.setattr(
+        launchd_job, "export_chart_evidence", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("outbox conflict"))
+    )
+    monkeypatch.setattr(launchd_job, "_print_result", payloads.append)
+
+    result = launchd_job._export_chart_evidence_after_stop(
+        SimpleNamespace(job="live-stop", active_plan="active-plan.json"), repo_root=tmp_path, stop_detail="stopped"
+    )
+
+    assert result == 2
+    assert payloads == [{
+        "job": "live-stop", "status": "failed", "detail": "stopped; chart evidence export failed",
+        "runtime_stop_status": "ok", "chart_evidence": {"status": "failed", "reason": "chart_evidence_export_failed:ValueError"},
+    }]
+
+
 def test_recovered_google_retry_warning_does_not_alert(tmp_path: Path, monkeypatch) -> None:
     payloads: list[dict] = []
     monkeypatch.setattr(

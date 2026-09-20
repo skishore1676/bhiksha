@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
 
 
@@ -71,13 +72,17 @@ class RiskSettings:
     # so a directly-constructed ``RiskSettings`` (e.g. in tests) gets the
     # identical fallback as the ``resolve_risk_settings`` path.
     open_drawdown_warn_pct: float | None = None
+    # Operator-controlled trade counter reset timestamp (UTC). When set, trades
+    # with timestamp strictly before this cutoff are ignored by Rail B's
+    # rolling evaluation window, effectively setting the counter to 0.
+    demote_reset_at: datetime | None = None
     # Audit fix (2026-07-02): every rejected/clamped input is surfaced here and
     # carried into the ``risk_manager_startup`` event — a silent fallback hid
     # two reproducible live bugs (tier inversion; negative pct flipping the
     # threshold sign and flattening a healthy book).
     validation_warnings: tuple[str, ...] = ()
 
-    def to_dict(self) -> dict[str, float | int | bool | list[str]]:
+    def to_dict(self) -> dict[str, float | int | bool | list[str] | str | None]:
         return {
             "rail_a_enabled": self.rail_a_enabled,
             "rail_b_enabled": self.rail_b_enabled,
@@ -89,6 +94,7 @@ class RiskSettings:
             "prospective_loss_enabled": self.prospective_loss_enabled,
             "max_open_positions_per_cluster": self.max_open_positions_per_cluster,
             "open_drawdown_warn_pct": self.open_drawdown_warn_pct,
+            "demote_reset_at": self.demote_reset_at.isoformat() if self.demote_reset_at is not None else None,
             "validation_warnings": list(self.validation_warnings),
         }
 
@@ -98,6 +104,7 @@ _DEFAULT_FLATTEN_DAILY_DRAWDOWN_PCT = 3.0
 _DEFAULT_DEMOTE_WINDOW = 10
 _DEFAULT_DEMOTE_MIN_N = 10
 _DEFAULT_DEMOTE_THRESHOLD_USD = 0.0
+_DEFAULT_DEMOTE_RESET_AT = None
 _DEFAULT_PROSPECTIVE_LOSS_ENABLED = True
 _DEFAULT_MAX_OPEN_POSITIONS_PER_CLUSTER = 1
 # No hardcoded numeric default: unset resolves to max_daily_drawdown_pct (see
@@ -149,6 +156,13 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
     )
     open_drawdown_warn_pct = _resolve_optional_float(
         "BHIKSHA_RISK_OPEN_DRAWDOWN_WARN_PCT", _DEFAULT_OPEN_DRAWDOWN_WARN_PCT, settings_source, warnings
+    )
+    demote_reset_at = _resolve_optional_datetime(
+        "BHIKSHA_RISK_DEMOTE_RESET_AT",
+        _DEFAULT_DEMOTE_RESET_AT,
+        settings_source,
+        warnings,
+        alt_keys=("rail_b_reset_at", "demote_reset_at"),
     )
 
     if max_dd <= 0:
@@ -210,6 +224,7 @@ def resolve_risk_settings(*, settings_source: SettingsSource | None = None) -> R
         prospective_loss_enabled=prospective_loss_enabled,
         max_open_positions_per_cluster=max_open_positions_per_cluster,
         open_drawdown_warn_pct=open_drawdown_warn_pct,
+        demote_reset_at=demote_reset_at,
         validation_warnings=tuple(warnings),
     )
 
@@ -272,3 +287,38 @@ def _resolve_int(key: str, default: int, settings_source: SettingsSource | None,
     except ValueError:
         warnings.append(f"{key}={raw!r} is not a valid integer; using default {default}")
         return default
+
+
+def _resolve_optional_datetime(
+    key: str,
+    default: datetime | None,
+    settings_source: SettingsSource | None,
+    warnings: list[str],
+    alt_keys: tuple[str, ...] = (),
+) -> datetime | None:
+    raw = None
+    sheet_keys = (key.removeprefix("BHIKSHA_RISK_").lower(), *alt_keys)
+    if settings_source is not None:
+        values = {str(settings_source.get(k)).strip() for k in sheet_keys
+                  if settings_source.get(k) is not None and str(settings_source.get(k)).strip()}
+        if len(values) > 1:
+            raise ValueError("conflicting Rail B reset settings in operator defaults")
+        if values:
+            raw = values.pop()
+    if raw is None:
+        raw = os.getenv(key)
+    if raw is None:
+        for alt in alt_keys:
+            value = os.getenv(f"BHIKSHA_RISK_{alt.upper()}")
+            if value and value.strip():
+                raw = value
+                break
+    if raw is None:
+        return default
+    try:
+        dt = datetime.fromisoformat(str(raw).strip())
+        if dt.tzinfo is None:
+            raise ValueError("Rail B reset requires an explicit timezone")
+        return dt.astimezone(UTC)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{key} must be an ISO datetime with timezone") from exc
