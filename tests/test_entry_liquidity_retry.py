@@ -177,3 +177,22 @@ def test_live_infrastructure_block_is_not_retried(setup):
         assert p.calls==1
         assert not s.has_entry_liquidity_retry(d.deployment_id)
     asyncio.run(run())
+
+
+def test_restart_from_stale_plan_cannot_rearm_consumed_retry(setup, monkeypatch):
+    from bhiksha.active_plan.runtime import reconcile_cartographer_attempts
+    s,p,d,decision,events=setup
+    async def run():
+        await s.handle_signal(d,decision(),dry_run=True,simulate_only=True)
+        ledger=[{'event_type':kind,'payload':payload} for kind,payload in events]
+        monkeypatch.setattr('bhiksha.active_plan.runtime.load_attempt_events',lambda path:ledger)
+        restarted=ExecutionSupervisor(planner=p)
+        assert restarted.can_submit_deployment_entry(d)
+        result=await reconcile_cartographer_attempts(events_db_path='unused',event_repository=restarted.event_repository,
+            supervisor=restarted,deployments_by_id={d.deployment_id:d},trade_state_repository=None,
+            live=True,now=Clock.current,output=lambda line:None)
+        assert result['replayed']==0
+        assert not restarted.has_entry_liquidity_retry(d.deployment_id)
+        assert not restarted.can_submit_deployment_entry(d)
+        assert p.calls==1
+    asyncio.run(run())

@@ -2269,6 +2269,9 @@ class ExecutionSupervisor:
                 await self.event_repository.append("signal_outcome", _signal_outcome_payload(
                     deployment, decision, outcome="filled", plan=plan, mode="shadow"))
 
+    def consume_entry_intent(self, deployment_id: str) -> None:
+        self._disabled_entry_deployments.add(deployment_id)
+
     def has_entry_liquidity_retry(self, deployment_id: str) -> bool:
         return deployment_id in self._entry_liquidity_retries
 

@@ -131,6 +131,19 @@ async def reconcile_cartographer_attempts(
     """
 
     events = load_attempt_events(events_db_path)
+    # A process can restart from an older plan before Sheet sync observes the
+    # disabled row. Restore the consumed latch from the existing attempt ledger.
+    consumed_retries = set()
+    for event in events:
+        payload = event.get("payload") or {}
+        deployment_id = payload.get("deployment_id")
+        deployment = deployments_by_id.get(deployment_id)
+        if (event.get("event_type") == OUTCOME_EVENT
+            and payload.get("reason") == "liquidity_retry_scheduled"
+            and deployment is not None
+            and payload.get("signal_id") == deployment.source.metadata.get("signal_id")):
+            supervisor.consume_entry_intent(deployment_id)
+            consumed_retries.add(deployment_id)
     pending = unresolved_attempts(events)
     if not pending:
         return {"pending": 0, "replayed": 0, "censored": 0, "deferred": 0}
@@ -144,7 +157,12 @@ async def reconcile_cartographer_attempts(
     for attempt in pending:
         plans = attempt.get("trade_plans") or []
         if not plans:
-            remaining.append(attempt)
+            if attempt.get("deployment_id") in consumed_retries:
+                await event_repository.append(OUTCOME_EVENT, attempt_outcome_payload(
+                    attempt, outcome="infrastructure_censored",
+                    reason="entry_retry_abandoned_on_restart"))
+            else:
+                remaining.append(attempt)
             continue
         plan = plans[-1] if isinstance(plans[-1], Mapping) else {}
         try:
