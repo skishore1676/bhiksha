@@ -121,3 +121,38 @@ Review of the two pasted agent answers:
 
 No DTE expansion, new retry behavior, assumed-fill admission or native-order
 activation was applied as part of this recovery configuration change.
+
+## Entry follow-ups implemented — 2026-09-20
+
+Implemented and deployed source `afbf0fa`, completed by restart-latch fix
+`6863e32`. The existing Sheet controls the behavior in
+`Operator_Defaults_v1!A55:E57`, section `profile__trend_continuation`:
+
+- `dte_fallback_max=21` (preferred DTE remains 3–7).
+- `entry_liquidity_retry_seconds=600` (0 turns it off).
+- `entry_liquidity_retry_interval_seconds=60`.
+
+The profile/projector/compiler now preserve these controls. Only otherwise
+eligible contracts rejected on spread can start the bounded retry. Each attempt
+requires a fresh underlying observation, a still-true trigger and valid thesis,
+entry window, lifecycle and normal risk checks. The retry never extends its
+original deadline. A final guard blocks submission if cancellation/expiry occurs
+during selection or preflight, and releases cash/risk reservations. Consumed
+retry intents are restored from the existing attempt ledger on restart, even if
+the process reads a cached active plan. No new scheduler or database was added.
+
+Validation: **1,300 tests passed locally and 1,300 on oldmac**.
+Oldmac readback verified all 14 released file fingerprints. A zero-write synthetic
+Cartographer projection using the **actual Sheet defaults and exit profiles**
+compiled to the three controls above, the named primary, and six comparisons.
+Normal plan publication at `2026-09-20T13:27:43.142551+00:00` retained 28 scanner
+deployments and all five LIVE recovery opt-ins. All four historical manual rows
+remain disabled; new Cartographer projections inherit the new controls. The Sheet
+was visually verified at 100% zoom, with all new keys, values and descriptions
+readable. There was no running trading session and no manual/test order submitted.
+
+Release/rollback and Sheet preimage receipts live on oldmac under
+`artifacts/releases/entry-followup-afbf0fa/`, including `restart-completion/`.
+[Local readback](../artifacts/audits/2026-09-20-entry-followup/readback.json).
+Natural next-session retry/fill outcomes and accumulation of decision-grade exit
+comparison evidence remain to be observed; this release does not claim an exit winner.
