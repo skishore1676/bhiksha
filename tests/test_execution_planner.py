@@ -1201,3 +1201,44 @@ def _low_oi_get_chain(chain_service: StubChainService):
         ]
 
     return get_chain
+
+
+def test_liquidity_retry_cancelled_during_cash_reservation_never_submits():
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    manager = StubOrderManager()
+    cash = BlockingCashGuard()
+    risk = StubRiskManager()
+    planner = ExecutionPlanner(chain_service=StubChainService(dte=0, delta=-.31),
+        order_manager=manager, cash_guard=cash, risk_manager=risk)
+    decision = SignalDecision(deployment_id=deployment.deployment_id, symbol="QQQ",
+        timestamp=datetime(2026,3,30,14,30), signal=True, direction=SignalDirection.SHORT,
+        reason=["manual_trigger_met"], features={})
+    cancelled = False
+    async def run():
+        nonlocal cancelled
+        task = asyncio.create_task(planner.plan_entry(deployment, decision, dry_run=False,
+            entry_guard=lambda: "entry_retry_cancelled" if cancelled else None))
+        await cash.started.wait()
+        cancelled = True
+        cash.proceed.set()
+        return await task
+    plan = asyncio.run(run())
+    assert plan.quantity == 0
+    assert plan.risk_reasons == ["entry_retry_cancelled"]
+    assert manager.place_entry_order_calls == 0
+    assert cash.release_calls == [plan.trade_id]
+    assert risk.release_calls == [plan.trade_id]
+
+
+def test_expired_liquidity_retry_never_opens_simulated_position():
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    manager = StubOrderManager()
+    planner = ExecutionPlanner(chain_service=StubChainService(dte=0, delta=-.31),order_manager=manager)
+    decision = SignalDecision(deployment_id=deployment.deployment_id, symbol="QQQ",
+        timestamp=datetime(2026,3,30,14,30),signal=True,direction=SignalDirection.SHORT,
+        reason=["manual_trigger_met"],features={})
+    plan = asyncio.run(planner.plan_entry(deployment,decision,dry_run=True,
+        entry_guard=lambda:"entry_retry_expired"))
+    assert plan.quantity == 0
+    assert planner.position_tracker.active_positions() == []
+    assert manager.place_entry_order_calls == 0

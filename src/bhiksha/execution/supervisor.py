@@ -28,6 +28,7 @@ from bhiksha.domain.exit_state import (
     TradeExitPolicySnapshot,
 )
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
+from bhiksha.execution.entry_retry import EntryLiquidityRetry
 from bhiksha.execution.cartographer_excursions import option_mfe_mae, underlying_mfe_mae
 from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
 from bhiksha.execution.planner import ExecutionPlanner
@@ -271,6 +272,7 @@ class ExecutionSupervisor:
         }
         self.record_signal_outcomes = bool(record_signal_outcomes)
         self._paper_exit_deployments: dict[str, DeploymentManifest] = {}
+        self._entry_liquidity_retries: dict[str, EntryLiquidityRetry] = {}
         self._paper_entries: dict[str, tuple[DeploymentManifest, SignalDecision, TradePlan, datetime, datetime]] = {}
         self._entry_lock = asyncio.Lock()
         self._symbol_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -1719,6 +1721,17 @@ class ExecutionSupervisor:
         simulate_only: bool = False,
         live_entry_block_reason: str | None = None,
     ) -> TradePlan | None:
+        retry = self._entry_liquidity_retries.get(deployment.deployment_id)
+        if retry is not None:
+            now = datetime.now(UTC)
+            reason = retry.stop_reason(now)
+            if reason:
+                await self._finish_entry_retry(deployment.deployment_id, reason, now=now)
+                return None
+            price = _underlying_entry_price(decision)
+            if (not decision.signal or price is None or now < retry.next_attempt_at
+                or retry.observation_reason(price=price, timestamp=decision.timestamp, now=now)):
+                return None
         if deployment.exit.risk_envelope_live_mode == "canary":
             rollback = (
                 await self.exit_state_repository.get_risk_envelope_rollback(
@@ -1786,6 +1799,9 @@ class ExecutionSupervisor:
                     ),
                 )
             return None
+        if retry is not None:
+            retry.next_attempt_at = datetime.now(UTC) + timedelta(seconds=deployment.execution.entry_liquidity_retry_interval_seconds)
+            retry.attempts += 1
         if decision.signal:
             if _is_self_disarming_manual_deployment(deployment):
                 self._disabled_entry_deployments.add(deployment.deployment_id)
@@ -1801,6 +1817,8 @@ class ExecutionSupervisor:
         async with self._entry_lock:
             lifecycle = self.lifecycle_store.get(deployment.symbol, deployment.deployment_id)
             if not self.lifecycle_store.can_submit_entry(deployment.symbol, deployment.deployment_id):
+                if retry is not None:
+                    await self._finish_entry_retry(deployment.deployment_id, "lifecycle_blocked", now=datetime.now(UTC))
                 await self.event_repository.append(
                     "lifecycle_entry_blocked",
                     {
@@ -1859,13 +1877,25 @@ class ExecutionSupervisor:
                 )
             else:
                 try:
+                    def retry_guard():
+                        if self._entry_liquidity_retries.get(deployment.deployment_id) is not retry:
+                            return "entry_retry_cancelled"
+                        now = datetime.now(UTC)
+                        return retry.stop_reason(now) or retry.observation_reason(
+                            price=_underlying_entry_price(decision) or 0,
+                            timestamp=decision.timestamp, now=now)
+
                     plan = await self.planner.plan_entry(
                         deployment,
                         decision,
                         dry_run=dry_run,
                         simulate_only=simulate_only,
+                        **({"entry_guard": retry_guard} if retry is not None else {}),
                     )
                 except SelectorEmptyError as exc:
+                    if (retry is None or self._entry_liquidity_retries.get(deployment.deployment_id) is retry) and await self._schedule_entry_retry(deployment, decision, exc, attempt=attempt):
+                        return None
+                    self._entry_liquidity_retries.pop(deployment.deployment_id, None)
                     if decision.signal and self.record_signal_outcomes:
                         await self.event_repository.append(
                             "signal_outcome",
@@ -1879,12 +1909,25 @@ class ExecutionSupervisor:
                         )
                     raise
                 except Exception as exc:
+                    self._entry_liquidity_retries.pop(deployment.deployment_id, None)
                     if decision.signal and self.record_signal_outcomes:
                         await self.event_repository.append("signal_outcome", _signal_outcome_payload(
                             deployment, decision, outcome="selection_failure",
                             rejection_reasons=[f"entry_planning_error:{type(exc).__name__}"],
                             mode="shadow" if simulate_only else ("dry_run" if dry_run else "live")))
                     raise
+            completed_retry = self._entry_liquidity_retries.pop(deployment.deployment_id, None)
+            if completed_retry is not None:
+                await self.event_repository.append("entry_liquidity_retry_finished", {
+                    "deployment_id": deployment.deployment_id, "symbol": deployment.symbol,
+                    "reason": "selection_completed", "attempts": completed_retry.attempts})
+                if plan is not None and _entry_plan_approved(plan):
+                    await self._dispatch_manual_status(deployment, stage="retry_completed",
+                        writer_call=self.manual_status_writer._write_status(deployment,
+                            status="entry_planned", event_at=datetime.now(UTC),
+                            note="Liquidity retry selected a contract; fill still requires confirmation.",
+                            trade_id=plan.trade_id, disable_row=True)
+                        if self.manual_status_writer is not None else None)
             if plan is not None:
                 if (
                     _entry_plan_approved(plan)
@@ -1962,7 +2005,6 @@ class ExecutionSupervisor:
                     and plan.order_id is None
                 ):
                     if deployment.exit.management_exit or (deployment.execution.entry_pricing_mode == "price_seeking" or deployment.execution.preferred_min_open_interest is not None or deployment.execution.preferred_max_bid_ask_spread_pct is not None):
-                        from datetime import timedelta
                         started = datetime.now(UTC)
                         lifetime = _entry_reprice_cancel_after_seconds(self.app_config, deployment)
                         self._paper_entries[plan.trade_id] = (
@@ -2227,6 +2269,67 @@ class ExecutionSupervisor:
                 await self.event_repository.append("signal_outcome", _signal_outcome_payload(
                     deployment, decision, outcome="filled", plan=plan, mode="shadow"))
 
+    def has_entry_liquidity_retry(self, deployment_id: str) -> bool:
+        return deployment_id in self._entry_liquidity_retries
+
+    async def _schedule_entry_retry(self, deployment, decision, error, *, attempt) -> bool:
+        seconds = deployment.execution.entry_liquidity_retry_seconds
+        if (not seconds or not is_cartographer_deployment(deployment)
+            or not _is_self_disarming_manual_deployment(deployment)
+            or deployment.strategy.key != "manual_trigger"
+            or not error.diagnostics.get("liquidity_retry_candidates", 0)):
+            return False
+        now = datetime.now(UTC)
+        retry = self._entry_liquidity_retries.get(deployment.deployment_id)
+        if retry is None:
+            retry = EntryLiquidityRetry(deployment.model_copy(deep=True),
+                decision.timestamp + timedelta(seconds=seconds), now)
+        if retry.stop_reason(now):
+            return False
+        retry.next_attempt_at = now + timedelta(seconds=deployment.execution.entry_liquidity_retry_interval_seconds)
+        self._entry_liquidity_retries[deployment.deployment_id] = retry
+        # The selection attempt is fully accounted; a subsequent fresh signal
+        # produces its own existing attempt receipt. No unresolved attempt is
+        # replayed on restart and the Sheet's consumed latch stays FALSE.
+        if attempt is not None:
+            await self._record_cartographer_attempt_outcome(attempt,
+                outcome="blocked", reason="liquidity_retry_scheduled")
+        if self.record_signal_outcomes:
+            await self.event_repository.append("signal_outcome", _signal_outcome_payload(
+                deployment, decision, outcome="pending_execution",
+                rejection_reasons=["liquidity_retry_scheduled"],
+                mode="shadow" if deployment.execution.shadow_only else "live"))
+        await self.event_repository.append("entry_liquidity_retry_scheduled", {
+            "deployment_id": deployment.deployment_id, "symbol": deployment.symbol,
+            "deadline": retry.deadline.isoformat(), "next_attempt_at": retry.next_attempt_at.isoformat(),
+            "attempts": retry.attempts, "diagnostics": error.diagnostics})
+        await self._dispatch_manual_status(deployment, stage="liquidity_retry",
+            writer_call=self.manual_status_writer._write_status(deployment,
+                status="waiting_liquidity", event_at=now,
+                note=f"Spread rejected; retry until {retry.deadline.isoformat()} while setup remains valid.",
+                disable_row=True) if self.manual_status_writer is not None else None)
+        return True
+
+    async def _finish_entry_retry(self, deployment_id, reason, *, now):
+        retry = self._entry_liquidity_retries.pop(deployment_id, None)
+        if retry is None:
+            return
+        await self.event_repository.append("entry_liquidity_retry_finished", {
+            "deployment_id": deployment_id, "symbol": retry.deployment.symbol,
+            "reason": reason, "attempts": retry.attempts, "timestamp": now.isoformat()})
+        await self._dispatch_manual_status(retry.deployment, stage="liquidity_retry_finished",
+            writer_call=self.manual_status_writer.mark_entry_blocked(retry.deployment,
+                event_at=now, note=reason) if self.manual_status_writer is not None else None)
+
+    async def observe_entry_liquidity_retry(self, deployment, *, price, timestamp):
+        retry = self._entry_liquidity_retries.get(deployment.deployment_id)
+        if retry is None:
+            return
+        now = datetime.now(UTC)
+        reason = retry.stop_reason(now) or retry.observation_reason(price=price, timestamp=timestamp, now=now)
+        if reason and reason != "entry_retry_observation_unusable":
+            await self._finish_entry_retry(deployment.deployment_id, reason, now=now)
+
     def can_submit_deployment_entry(self, deployment: DeploymentManifest) -> bool:
         if not deployment.enabled:
             return False
@@ -2236,6 +2339,10 @@ class ExecutionSupervisor:
         ):
             return False
         if _is_self_disarming_manual_deployment(deployment):
+            retry = self._entry_liquidity_retries.get(deployment.deployment_id)
+            if retry is not None:
+                now = datetime.now(UTC)
+                return retry.next_attempt_at <= now and retry.stop_reason(now) is None
             return deployment.deployment_id not in self._disabled_entry_deployments
         return True
 
@@ -6852,6 +6959,10 @@ class ExecutionSupervisor:
     ) -> list[ExitPlan]:
         plans: list[ExitPlan] = []
         current_now = now or datetime.now(UTC)
+        for deployment_id, retry in list(self._entry_liquidity_retries.items()):
+            reason = retry.stop_reason(current_now)
+            if reason:
+                await self._finish_entry_retry(deployment_id, reason, now=current_now)
         await self.poll_paper_entries(now=current_now)
         for position in list(self.planner.position_tracker.active_positions()):
             if position.exit_mode is None and position.exit_order_id is None and position.exit_submitted_at is None:

@@ -233,7 +233,9 @@ class ExecutionSpec(BaseModel):
     dte_min: int = 0
     dte_max: int = 7
     dte_fallback_policy: Literal["strict", "allow_nearest_after"] = "strict"
-    dte_fallback_max: int | None = None
+    dte_fallback_max: int | None = Field(default=None, ge=1, le=90)
+    entry_liquidity_retry_seconds: int = Field(default=0, ge=0, le=900)
+    entry_liquidity_retry_interval_seconds: int = Field(default=60, ge=30, le=300)
     target_abs_delta_min: float | None = None
     target_abs_delta_max: float | None = None
     min_open_interest: int = 0
@@ -307,6 +309,8 @@ class ExecutionSpec(BaseModel):
     def validate_patient_entry_policy(self) -> "ExecutionSpec":
         if self.enable_native_bracket_route or self.enable_native_oto_route:
             raise ValueError("native order groups are unavailable until child reconciliation and recovery are implemented")
+        if self.entry_liquidity_retry_seconds and self.entry_liquidity_retry_interval_seconds > self.entry_liquidity_retry_seconds:
+            raise ValueError("liquidity retry interval must not exceed its window")
         if self.dte_fallback_max is not None and self.dte_fallback_max <= self.dte_max:
             raise ValueError("dte_fallback_max must be greater than dte_max")
         if self.price_improvement_max_pct < self.price_improvement_discount_pct:

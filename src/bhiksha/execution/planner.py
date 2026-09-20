@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import time, timedelta
 import uuid
 
@@ -69,6 +70,7 @@ class ExecutionPlanner:
         *,
         dry_run: bool,
         simulate_only: bool = False,
+        entry_guard: Callable[[], str | None] | None = None,
     ) -> TradePlan | None:
         if not decision.signal or decision.direction is None:
             return None
@@ -353,6 +355,20 @@ class ExecutionPlanner:
                 },
             )
 
+        def guarded_plan() -> TradePlan | None:
+            reason = entry_guard() if entry_guard is not None else None
+            if reason is None:
+                return None
+            return TradePlan(trade_id=trade_id, deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol, direction=decision.direction,
+                option_symbol=selection.option_symbol, quantity=0,
+                estimated_entry_price=entry_price, risk_reasons=[reason], dry_run=dry_run,
+                underlying_entry_price=underlying_entry_price, entry_timestamp=decision.timestamp,
+                risk_details=selection_details)
+
+        guarded = guarded_plan()
+        if guarded is not None:
+            return guarded
         if dry_run:
             if simulate_only:
                 return TradePlan(
@@ -563,6 +579,15 @@ class ExecutionPlanner:
                         **sized_risk_details,
                     },
                 )
+        # Recheck a queued entry intent after all awaited selection/preflight/
+        # reservation work and immediately before broker submission.
+        guarded = guarded_plan()
+        if guarded is not None:
+            if self.cash_guard is not None:
+                await self.cash_guard.release_entry(trade_id)
+            if self.risk_manager is not None:
+                await self.risk_manager.release_sized_entry(trade_id)
+            return guarded
         try:
             result: OrderResult = await self.order_manager.place_entry_order(
                 selection.option_symbol, final_limit_price, quantity, order_id=trade_id,

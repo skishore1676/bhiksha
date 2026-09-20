@@ -253,6 +253,7 @@ def test_single_leg_selector_strict_reports_nearest_after_without_selecting_it()
 
     assert excinfo.value.breakdown["dte_out_of_range"] == 2
     assert excinfo.value.diagnostics == {
+        "liquidity_retry_candidates": 0,
         "requested_dte_min": 3,
         "requested_dte_max": 7,
         "available_dtes": [1, 9],

@@ -119,10 +119,23 @@ class SingleLegOptionSelector:
                 fallback_policy_applied = dte_fallback_policy
 
         if not filtered:
+            # Count contracts that would pass if only the spread improved. This
+            # includes the allowed fallback expiries, without relaxing any gate.
+            spread_candidates = [c for c in desired_contracts
+                if dte_min <= c.dte <= dte_max and self._passes_non_dte_filters(
+                    c, delta_min=delta_min, delta_max=delta_max,
+                    min_open_interest=min_open_interest, max_spread_pct=None)]
+            if dte_fallback_policy == "allow_nearest_after":
+                later, _ = self._nearest_after_candidates(desired_contracts,
+                    dte_max=dte_max, fallback_dte_max=request.execution_params.get("dte_fallback_max"),
+                    delta_min=delta_min, delta_max=delta_max,
+                    min_open_interest=min_open_interest, max_spread_pct=None)
+                spread_candidates.extend(later)
             raise SelectorEmptyError(
                 request.deployment_id,
                 eliminated,
                 diagnostics={
+                    "liquidity_retry_candidates": len(spread_candidates),
                     "requested_dte_min": dte_min,
                     "requested_dte_max": dte_max,
                     "available_dtes": sorted(

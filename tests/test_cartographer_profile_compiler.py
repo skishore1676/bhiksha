@@ -355,3 +355,28 @@ async def test_terminal_owner_fact_emits_four_excursions_when_coverage_is_comple
     assert fact["underlying_mae_pct"] == -0.02
     assert fact["coverage"]["option"]["status"] == "complete"
     assert fact["coverage"]["underlying"]["status"] == "complete"
+
+
+def test_sheet_entry_controls_survive_profile_and_compilation(tmp_path):
+    defaults = _operator_defaults()
+    controls = {"dte_fallback_max": 21, "entry_liquidity_retry_seconds": 600,
+                "entry_liquidity_retry_interval_seconds": 60}
+    defaults["profile__trend_continuation"].update(controls)
+    row = _row(defaults)
+    deployment = _compile(tmp_path, row, defaults).plan.deployments[0]
+    for key, value in controls.items():
+        assert getattr(deployment.execution, key) == value
+        assert deployment.source.metadata["profile_bundle"]["execution"][key] == value
+
+
+@pytest.mark.parametrize("controls", [
+    {"dte_fallback_max": 7}, {"dte_fallback_max": 91},
+    {"entry_liquidity_retry_seconds": 901},
+    {"entry_liquidity_retry_interval_seconds": 0},
+    {"entry_liquidity_retry_seconds": 30, "entry_liquidity_retry_interval_seconds": 60},
+])
+def test_invalid_sheet_entry_controls_fail_before_projection(controls):
+    defaults = _operator_defaults()
+    defaults["profile__trend_continuation"].update(controls)
+    with pytest.raises(ValueError):
+        profile_bundle("TREND_CONTINUATION", defaults)

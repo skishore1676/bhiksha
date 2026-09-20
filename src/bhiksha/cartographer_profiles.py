@@ -202,6 +202,13 @@ def profile_bundle(
             values.get("max_contracts"), field="max_contracts", minimum=1
         ),
     }
+    # Optional Sheet controls are frozen into each projected row. Omitting them
+    # preserves old bundles; no code default expands the operator's DTE range.
+    for key in ("dte_fallback_max", "entry_liquidity_retry_seconds", "entry_liquidity_retry_interval_seconds"):
+        if values.get(key) not in (None, ""):
+            execution[key] = _integer(values[key], field=key)
+    from bhiksha.config.models import ExecutionSpec
+    ExecutionSpec.model_validate({"profile": "single_leg_long_premium_v1", **execution})
     execution["selection_hash"] = canonical_hash(execution)
     body: dict[str, Any] = {
         "bundle_id": f"operator_sheet:{section_name}",

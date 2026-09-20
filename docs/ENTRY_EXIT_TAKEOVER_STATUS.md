@@ -74,3 +74,50 @@ alone, identifies the installed source.
 - Native OCO/OTO is not activated. Proper child discovery, protection, cancellation,
   and restart adoption remain required before enabling a suitable fixed-exit use
   case. No native order was submitted during this cutover.
+
+## Recovery activation and follow-up review — 2026-09-20 13:09 UTC
+
+User authorized recovery activation. The Sheet now owns the full recovery object
+in `active_strategy.execution` for AMD, IWM, QQQ, SMH and NVDA (rows 2, 3, 5, 6, 7).
+Both alias columns existed; an initial write to `execution_overrides` was masked
+by the later `execution` column. Readback caught this before completion; the
+policy was moved into `execution`, preserving the existing settings and restoring
+the other column to its original empty value. No compiler/source change was needed.
+
+Normal publication produced `active_plan_2026-09-20` at
+`2026-09-20T13:09:08.504694+00:00`: 28 deployments, exactly five recovery opt-ins,
+zero research-shadow opt-ins. Each requires 20 fresh modeled trades, five ET
+sessions, a 14-day maximum age, session-weighted net mean >=0.10R and no negative
+session mean, after a configured $2 per-contract round-trip allowance. Each probe
+is at most one contract and 20% of the row premium cap: currently $400. No trade
+or session was manually started. P&L and existing Rail B settings were preserved.
+
+Oldmac receipts: `artifacts/releases/entry-exit-339d792/recovery-activation-20260920T130858Z.json`
+contains the exact Sheet preimage/write/readback; `recovery-readback.json` verifies
+the published effective settings. Earlier activation receipts record the masked
+intermediate writes. Activation is verified configuration, not natural recovery proof.
+
+Review of the two pasted agent answers:
+
+- Do not broaden experiment admission to assumed fills. Named shadow entries
+  already wait for a fresh later ask at or below the original limit; qualifying
+  modeled fills register with the recorder. Historical assumed fills cannot
+  establish executable exit performance or qualify recovery.
+- A larger premium cap removes some quantity-zero cases, not every affordability
+  or selection failure. No further budget increase is justified by these answers.
+- The selector supports a bounded later-expiry walk, but Cartographer
+  `profile_bundle` does not currently propagate `dte_fallback_max`. Merely adding
+  that Sheet key will not activate the proposed behavior. A small tested plumbing
+  change is the appropriate next implementation; expiry bounds remain Sheet-owned.
+- A short retry for transient liquidity failures is worth implementing in the
+  existing entry flow, with fresh trigger/invalidation/window checks, one pending
+  attempt and a fixed expiry. Do not retry permanent budget failures or bypass
+  hard quote guards. The claimed later MS spread tightening needs quote evidence.
+- `enabled=FALSE` means disabled, not necessarily successful session completion.
+  Read status/reason: entry errors can also disable rows.
+- The pasted historical P&L totals and automatic Cartographer challenger-promotion
+  claim were not independently established by this bounded configuration review.
+  Neither establishes readiness of the corrected six-exit experiment.
+
+No DTE expansion, new retry behavior, assumed-fill admission or native-order
+activation was applied as part of this recovery configuration change.

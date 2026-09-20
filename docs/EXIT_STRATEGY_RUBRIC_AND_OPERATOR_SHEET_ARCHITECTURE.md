@@ -130,8 +130,10 @@ The live-loss veto remains latched for the session. A blocked live attempt may
 produce a separately labeled paper observation. The Sheet's LIVE/SHADOW authority
 is never rewritten by a risk outcome.
 
-Automatic recovery is an optional per-lane `execution_overrides.rail_b_recovery`
-object. Its absence means OFF. Every field is explicit:
+Automatic recovery is an optional per-lane `execution.rail_b_recovery`
+object in the current Sheet. `execution` is the compiler alias for
+`execution_overrides`; use only the existing `execution` cell when both columns
+are present, because the later populated alias takes precedence. Its absence means OFF. Every field is explicit:
 
 ```json
 {
@@ -146,9 +148,11 @@ object. Its absence means OFF. Every field is explicit:
 }
 ```
 
-This is a reviewable example, not an activated setting or calibrated fee estimate.
-Before opting in, set a conservative round-trip cost/slippage allowance appropriate
-to the lane. The schema requires at least 20 trades and five sessions, positive
+Activated from the Sheet on 2026-09-20 for the five already-authorized LIVE
+lanes. The $2 round-trip cost/slippage allowance is an explicit configuration
+assumption, not a calibrated fee estimate. Edit these values in each row’s
+`execution` JSON; remove `rail_b_recovery` to disable that lane. Changes take
+effect after normal Sheet-to-plan publication and runtime plan adoption. The schema requires at least 20 trades and five sessions, positive
 net-R/cost limits, and a premium fraction no larger than 25%.
 
 A recovery probe requires all of the following:
@@ -206,3 +210,41 @@ vehicle selection and risk, and is outside this single-long-option cutover.
 - Source/Sheet/plan verification is not natural fill evidence. Confirm prospective
   registrations and independent terminal outcomes after market sessions; do not
   manufacture historical fills or infer success from a new plan alone.
+
+## Cartographer entry completion
+
+`Operator_Defaults_v1`, section `profile__trend_continuation`, owns three
+additional controls. New projected manual rows freeze them in their existing
+`execution` JSON and profile hash:
+
+| Control | Initial value | Meaning |
+|---|---:|---|
+| `dte_fallback_max` | 21 | With `allow_nearest_after`, walk actual listed expiries after the preferred 3–7 DTE range, stopping at this inclusive bound. |
+| `entry_liquidity_retry_seconds` | 600 | Maximum lifetime from the original trigger; 0 disables retry. |
+| `entry_liquidity_retry_interval_seconds` | 60 | Minimum interval between selection attempts. |
+
+No match starts a retry only when at least one contract in the permitted expiry
+set passes delta and open-interest filters but fails the spread filter. Budget,
+missing expiry, risk, lifecycle and infrastructure failures remain terminal.
+Each attempt uses the existing intrabar loop and per-symbol execution queue. It
+re-evaluates the trigger at a fresh underlying price (at most five seconds old),
+checks invalidation, signal validity and entry/hard-flat windows, then runs the
+normal selection, sizing and risk checks. Historical first-trigger suppression
+is bypassed only for that already-latched retry intent. Completed bars cannot
+authorize retries; observed adverse extremes can invalidate them.
+
+The supervisor holds one small session-local retry per deployment. No sleeping
+worker holds the symbol queue; exits retain their normal scheduling. The original
+deadline never slides. Selection/preflight cannot submit after a retry has been
+cancelled or expired: the planner rechecks the intent immediately before its
+broker call and releases reservations on refusal. Selection success (including
+a subsequent budget refusal) consumes the retry. A selected paper limit still
+requires the existing modeled ask-touch fill before experiment registration.
+
+The manual row remains consumed (`enabled=FALSE`) and displays
+`waiting_liquidity`, then the entry or terminal reason. Existing event/attempt
+receipts account for each selection attempt. A restart abandons the session-local
+retry rather than rearming a consumed row; no live order is replayed. Old disabled
+rows remain untouched. Defaults govern future projections; changing them does
+not rewrite already-frozen profile snapshots. Existing scanner lanes, their
+budgets, Rail B recovery, and native order switches are unaffected.

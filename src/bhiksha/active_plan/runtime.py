@@ -1408,6 +1408,12 @@ class BhikshaRuntime:
                 exited_deployments.add(evaluation.deployment.deployment_id)
 
         for deployment in deployments_by_symbol[bar.symbol]:
+            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+                # Completed-bar extremes can invalidate a setup even if the
+                # latest tick has recovered; they cannot authorize a retry.
+                price = bar.low if deployment.strategy.params.get("direction") == "long" else bar.high
+                await supervisor.observe_entry_liquidity_retry(deployment, price=price, timestamp=bar.timestamp + timedelta(minutes=1))
+                continue
             if not supervisor.can_submit_deployment_entry(deployment):
                 continue
             if deployment.deployment_id in exited_deployments:
@@ -1717,6 +1723,8 @@ class BhikshaRuntime:
         latest_bar = store.latest(symbol)
         if latest_bar is not None and snapshot_timestamp <= latest_bar.timestamp:
             return
+        for deployment in deployments:
+            await supervisor.observe_entry_liquidity_retry(deployment, price=price, timestamp=snapshot_timestamp)
         active_deployments = [
             deployment
             for deployment in deployments
@@ -1735,6 +1743,10 @@ class BhikshaRuntime:
             enriched = enriched_frames.get(deployment.deployment_id)
             if enriched is None:
                 continue
+            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+                # Re-evaluate today's trigger at the fresh current price. The
+                # first-trigger latch already fired for this bounded intent.
+                enriched = enriched.tail(1)
             decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
             await record_signal_evaluation(supervisor.event_repository, decision)
             if not decision.signal:
@@ -2131,6 +2143,9 @@ class BhikshaRuntime:
                         )
                 raise
             if plan is None:
+                if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+                    output(f"ENTRY_WAITING_LIQUIDITY deployment={deployment.deployment_id}")
+                    return
                 output(
                     f"ENTRY_FAILED deployment={deployment.deployment_id} "
                     f"symbol={deployment.symbol} reason=planner_returned_no_plan"
