@@ -142,6 +142,24 @@ class SQLiteEventRepository(EventRepository):
             conn.commit()
 
 
+# Explicit projection shared by every reader feeding the positional decoder.
+# Physical table order also contains updated_at and is not this contract.
+_TRADE_RECORD_COLUMNS = """trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
+                       entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
+                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
+                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
+                       active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
+                       evidence_artifact_uri, experiment_id, cohort_id, cohort_contract_sha256,
+                       deployment_contract_sha256, declared_option_selection_contract_id,
+                       declared_option_selection_contract_sha256, authorization_identity_status,
+                       exit_policy_id, exit_policy_sha256, option_selection_snapshot_id,
+                       option_selection_snapshot_persisted, option_candidate_set_sha256,
+                       actual_option_selection_sha256, canary_id, canary_authorization_sha256,
+                       canary_start_at, canary_expires_at, plan_revision_id,
+                       session_id, fact_receipt_id, frozen_entry_risk_usd,
+                       frozen_round_trip_cost_usd"""
+
+
 class SQLiteTradeStateRepository(TradeStateRepository):
     """SQLite-backed durable trade session store."""
 
@@ -224,7 +242,7 @@ class SQLiteTradeStateRepository(TradeStateRepository):
     def _get_closed_deployment_trades_sync(self, deployment_id: str) -> list[TradeRecord]:
         with closing(self.backend.connect()) as conn:
             rows = conn.execute(
-                "SELECT * FROM trade_sessions WHERE deployment_id = ? AND status = 'closed' "
+                f"SELECT {_TRADE_RECORD_COLUMNS} FROM trade_sessions WHERE deployment_id = ? AND status = 'closed' "
                 "ORDER BY COALESCE(exit_filled_at, updated_at) DESC, trade_id DESC",
                 (deployment_id,),
             ).fetchall()
@@ -861,21 +879,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
     def _get_open_trades_sync(self) -> list[TradeRecord]:
         with closing(self.backend.connect()) as conn:
             rows = conn.execute(
-                """
-                SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
-                       entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
-                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
-                       active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
-                       evidence_artifact_uri, experiment_id, cohort_id, cohort_contract_sha256,
-                       deployment_contract_sha256, declared_option_selection_contract_id,
-                       declared_option_selection_contract_sha256, authorization_identity_status,
-                       exit_policy_id, exit_policy_sha256, option_selection_snapshot_id,
-                       option_selection_snapshot_persisted, option_candidate_set_sha256,
-                       actual_option_selection_sha256, canary_id, canary_authorization_sha256,
-                       canary_start_at, canary_expires_at, plan_revision_id,
-                       session_id, fact_receipt_id, frozen_entry_risk_usd,
-                       frozen_round_trip_cost_usd
+                f"""
+                SELECT {_TRADE_RECORD_COLUMNS}
                 FROM trade_sessions
                 WHERE status != 'closed'
                 ORDER BY updated_at DESC
@@ -886,21 +891,8 @@ class SQLiteTradeStateRepository(TradeStateRepository):
     def _get_recent_trades_sync(self, limit: int) -> list[TradeRecord]:
         with closing(self.backend.connect()) as conn:
             rows = conn.execute(
-                """
-                SELECT trade_id, deployment_id, symbol, option_symbol, quantity, entry_price, underlying_entry_price,
-                       entry_timestamp, status, entry_order_id, stop_order_id, stop_price, target_order_id, target_price,
-                       exit_order_id, exit_limit_price, exit_submitted_at, exit_mode, exit_price, exit_filled_quantity,
-                       exit_filled_at, exit_order_status, exit_order_type, exit_broker_payload, exit_rule, can_ladder,
-                       active_plan_id, research_run_id, evidence_packet_id, evidence_artifact_sha256,
-                       evidence_artifact_uri, experiment_id, cohort_id, cohort_contract_sha256,
-                       deployment_contract_sha256, declared_option_selection_contract_id,
-                       declared_option_selection_contract_sha256, authorization_identity_status,
-                       exit_policy_id, exit_policy_sha256, option_selection_snapshot_id,
-                       option_selection_snapshot_persisted, option_candidate_set_sha256,
-                       actual_option_selection_sha256, canary_id, canary_authorization_sha256,
-                       canary_start_at, canary_expires_at, plan_revision_id,
-                       session_id, fact_receipt_id, frozen_entry_risk_usd,
-                       frozen_round_trip_cost_usd
+                f"""
+                SELECT {_TRADE_RECORD_COLUMNS}
                 FROM trade_sessions
                 ORDER BY updated_at DESC
                 LIMIT ?

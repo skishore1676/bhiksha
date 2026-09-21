@@ -327,3 +327,22 @@ def _open_fd_count() -> int | None:
         except OSError:
             continue
     return None
+
+
+def test_closed_lane_reader_matches_recent_projection_with_physical_schema(tmp_path):
+    repo = SQLiteTradeStateRepository(str(tmp_path / "trades.db"))
+    at = datetime(2026, 9, 21, 14, 0, tzinfo=UTC)
+    record = TradeRecord(trade_id="closed-1", deployment_id="iwm-live", symbol="IWM",
+        option_symbol="IWM_OPTION", quantity=2, entry_price=1.5,
+        underlying_entry_price=285, entry_timestamp=at, status="closed",
+        entry_order_id="entry-1", exit_limit_price=1.9, exit_submitted_at=at,
+        exit_price=1.85, exit_filled_quantity=2, exit_filled_at=at,
+        exit_rule="target", active_plan_id="today", exit_policy_id="primary",
+        frozen_entry_risk_usd=90, frozen_round_trip_cost_usd=4)
+    async def run():
+        await repo.upsert_trade(record)
+        closed = await repo.get_closed_trades_for_deployment("iwm-live")
+        recent = await repo.get_recent_trades(limit=10)
+        assert closed == recent == [record]
+        assert await repo.get_closed_trades_for_deployment("another-lane") == []
+    asyncio.run(run())
