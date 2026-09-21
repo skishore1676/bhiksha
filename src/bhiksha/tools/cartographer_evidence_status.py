@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -18,6 +18,8 @@ from bhiksha.experiments.cartographer_attempts import (
     signal_attempt_id,
     trigger_accounting,
 )
+from bhiksha.market_data.trading_calendar import CENTRAL, is_trading_day, previous_trading_day
+from bhiksha.ops.launchd_registry import job_by_runner
 
 
 def _read(path: Path) -> dict[str, Any] | None:
@@ -28,9 +30,11 @@ def _read(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _compiled_cartographer_ids(active_plan_path: Path, *, run_id: str) -> set[str] | None:
+def _compiled_cartographer_ids(active_plan_path: Path, *, run_id: str, trading_date: str = "") -> set[str] | None:
     plan = _read(active_plan_path)
     if plan is None:
+        return None
+    if trading_date and plan.get("trading_date") not in (None, trading_date):
         return None
     deployments = plan.get("deployments")
     if not isinstance(deployments, list):
@@ -58,6 +62,28 @@ def _after_compile_deadline(trading_date: str, *, now: datetime | None) -> bool:
         datetime.fromisoformat(trading_date).date(), time(8, 30), tzinfo=chicago
     )
     return current >= deadline
+
+
+def _projection_session(trading_date: str, *, now: datetime | None) -> str:
+    """Compare current evidence only after the owner's scheduled retry plus grace."""
+    current = (now or datetime.now(CENTRAL)).astimezone(CENTRAL)
+    try:
+        projected = date.fromisoformat(trading_date)
+    except ValueError:
+        return "invalid"
+    if projected > current.date() or not is_trading_day(projected):
+        return "invalid"
+    job = job_by_runner("cartographer-shadow")
+    assert job is not None
+    weekday = (current.weekday() + 1) % 7  # launchd uses Sunday=0.
+    fires = [datetime.combine(current.date(), time(e["Hour"], e["Minute"]), CENTRAL)
+             for e in job.schedule if e.get("Weekday") == weekday]
+    due = bool(is_trading_day(current.date()) and fires
+               and current >= max(fires) + timedelta(minutes=5))
+    required = current.date() if due else previous_trading_day(current.date())
+    if projected < required:
+        return "overdue"
+    return "current" if projected == current.date() else "awaiting_session"
 
 
 def build_status(
@@ -97,11 +123,18 @@ def build_status(
         if isinstance(action, dict) and action.get("action") in {"created", "preserved"}
     }
     compiled_ids = (
-        _compiled_cartographer_ids(active_plan_path, run_id=str(producer_run_id))
+        _compiled_cartographer_ids(
+            active_plan_path, run_id=str(producer_run_id), trading_date=trading_date
+        )
         if active_plan_path is not None and producer_run_id else None
     )
+    session = _projection_session(trading_date, now=now)
     if accounting is not None and accounting["status"] == "attention":
         status, compile_status = "blocked", "trigger_accounting_attention"
+    elif producer_ok and projection_ok and session == "awaiting_session":
+        status, compile_status = "awaiting_session", "not_due"
+    elif session in {"overdue", "invalid"}:
+        status, compile_status = "blocked", f"projection_{session}"
     elif producer_ok and projection_ok and compiled_ids is not None and compiled_ids == expected_ids:
         status, compile_status = "healthy", "matched"
     elif (
@@ -116,6 +149,20 @@ def build_status(
         "schema": "bhiksha.cartographer_evidence_status.v1",
         "status": status,
         "attention_required": status == "blocked",
+        "reason": (
+            "Awaiting the next scheduled session projection; prior-session evidence is retained."
+            if status == "awaiting_session" else
+            "Current-session projection is overdue after the scheduled retry and grace period."
+            if compile_status == "projection_overdue" else
+            "Projection trading date is missing, invalid, or in the future."
+            if compile_status == "projection_invalid" else
+            "Some triggered signals have no accounted outcome."
+            if compile_status == "trigger_accounting_attention" else
+            "Projected signals do not match the active plan for the same trading session."
+            if compile_status == "mismatch" else
+            "Producer or projection evidence is missing, failed, or does not match."
+            if compile_status == "unavailable" else compile_status
+        ),
         "producer": producer or {"status": "missing"},
         "projection": projection or {"status": "missing"},
         "compile": {

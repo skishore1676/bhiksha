@@ -147,7 +147,7 @@ def build_status_snapshot(
                 ),
             }
         if spec.runner_job == "cartographer-shadow":
-            semantic = _cartographer_semantic_status(repo_root)
+            semantic = _cartographer_semantic_status(repo_root, now=generated_at)
             if _cartographer_installed_pending_first_run(
                 semantic, launchd.get(spec.label, {})
             ):
@@ -157,15 +157,18 @@ def build_status_snapshot(
                     "attention_required": False,
                 }
                 job["declared_enabled"] = True
-            job["last"] = {"domain": semantic, "recorded_at": generated_at.isoformat()}
+            recorded_at = last.get("recorded_at") if isinstance(last, dict) else None
+            job["last"] = {"domain": semantic, "recorded_at": recorded_at}
             job["last_run_status"] = str(semantic["status"])
             job["last_run_at"] = (
                 None if semantic["status"] == "installed_pending_first_run"
-                else generated_at.isoformat()
+                else recorded_at
             )
-            quiet = {"healthy", "compile_pending", "installed_pending_first_run"}
+            quiet = {"healthy", "compile_pending", "awaiting_session", "installed_pending_first_run"}
             job["lifecycle"] = "armed" if semantic["status"] in quiet else "stuck"
-            job["findings"] = [] if semantic["status"] in quiet else ["cartographer_evidence_blocked"]
+            job["findings"] = [] if semantic["status"] in quiet else [
+                str(semantic.get("reason") or "cartographer_evidence_blocked")
+            ]
         details = _job_details(last)
         if details:
             job["details"] = details
@@ -193,7 +196,9 @@ def build_status_snapshot(
     }
 
 
-def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
+def _cartographer_semantic_status(
+    repo_root: Path, *, now: datetime | None = None
+) -> dict[str, Any]:
     output_root = Path(os.getenv("BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT", repo_root / "artifacts/cartographer-shadow"))
     projection_root = output_root / "projection"
     return cartographer_evidence_status(
@@ -201,6 +206,7 @@ def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
         projection_receipt_path=projection_root / "latest.json",
         active_plan_path=repo_root / "artifacts/playbook/active_plan.json",
         events_db_path=repo_root / "bhiksha.db",
+        now=now,
     )
 
 

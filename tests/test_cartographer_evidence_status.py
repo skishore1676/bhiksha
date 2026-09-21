@@ -7,6 +7,8 @@ from argparse import Namespace
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from bhiksha.cartographer_profiles import canonical_hash
 from bhiksha.tools import launchd_job
 from bhiksha.tools.cartographer_evidence_status import (
@@ -326,3 +328,87 @@ def test_fact_graph_keeps_emitted_signal_without_terminal_fact(tmp_path) -> None
     batch.write_text(json.dumps({"signals": [{"signal_id": "mc-1"}]}), encoding="utf-8")
     facts.write_text("[]", encoding="utf-8")
     assert build_fact_graph(signal_batch_path=batch, terminal_facts_path=facts)["nodes"][0]["lifecycle"] == "emitted_without_terminal_fact"
+
+
+@pytest.mark.parametrize(("now", "projected", "expected"), [
+    ("2026-09-20T10:00:00-05:00", "2026-09-18", "awaiting_session"),
+    ("2026-09-21T06:30:00-05:00", "2026-09-18", "awaiting_session"),
+    ("2026-09-21T07:44:59-05:00", "2026-09-18", "awaiting_session"),
+    ("2026-09-21T07:45:00-05:00", "2026-09-18", "blocked"),
+    ("2026-09-21T06:30:00-05:00", "2026-09-17", "blocked"),
+    ("2026-09-07T10:00:00-05:00", "2026-09-04", "awaiting_session"),
+    ("2026-09-21T06:30:00-05:00", "2026-09-22", "blocked"),
+    ("2026-09-21T06:30:00-05:00", "not-a-date", "blocked"),
+])
+def test_projection_status_respects_session_and_scheduled_retry(tmp_path, now, projected, expected):
+    producer = tmp_path / "producer.json"
+    projection = tmp_path / "projection.json"
+    plan = tmp_path / "active_plan.json"
+    producer.write_text(json.dumps({"lifecycle": "complete", "receipt": {
+        "run_id": "run-1", "signal_batch_hash": "sha256:batch",
+    }}))
+    body = {"status": "succeeded", "producer_run_id": "run-1",
+            "signal_batch_hash": "sha256:batch", "trading_date": projected,
+            "actions": [{"action": "preserved", "signal_id": "mc-1"}]}
+    projection.write_text(json.dumps({**body, "receipt_hash": canonical_hash(body)}))
+    plan.write_text(json.dumps({"trading_date": "2026-09-20", "deployments": []}))
+    result = build_status(producer_status_path=producer, projection_receipt_path=projection,
+                          active_plan_path=plan, now=datetime.fromisoformat(now))
+    assert result["status"] == expected
+    assert result["attention_required"] == (expected == "blocked")
+    # A prior-session grace period must never excuse a corrupted receipt.
+    projection.write_text(json.dumps({**body, "receipt_hash": "sha256:corrupt"}))
+    assert build_status(producer_status_path=producer, projection_receipt_path=projection,
+                        active_plan_path=plan, now=datetime.fromisoformat(now))["status"] == "blocked"
+
+
+def test_current_projection_cannot_match_another_sessions_plan(tmp_path):
+    producer = tmp_path / "producer.json"
+    projection = tmp_path / "projection.json"
+    plan = tmp_path / "active_plan.json"
+    producer.write_text(json.dumps({"lifecycle": "complete", "receipt": {
+        "run_id": "run-1", "signal_batch_hash": "sha256:batch",
+    }}))
+    body = {"status": "succeeded", "producer_run_id": "run-1",
+            "signal_batch_hash": "sha256:batch", "trading_date": "2026-09-21", "actions": []}
+    projection.write_text(json.dumps({**body, "receipt_hash": canonical_hash(body)}))
+    plan.write_text(json.dumps({"trading_date": "2026-09-18", "deployments": []}))
+    result = build_status(producer_status_path=producer, projection_receipt_path=projection,
+                          active_plan_path=plan,
+                          now=datetime.fromisoformat("2026-09-21T08:31:00-05:00"))
+    assert result["status"] == "blocked"
+    assert "same trading session" in result["reason"]
+
+
+@pytest.mark.parametrize("status", ["awaiting_session", "blocked"])
+def test_shadow_snapshot_keeps_owner_timestamp_and_precise_reason(tmp_path, monkeypatch, status):
+    from bhiksha.ops.launchd_registry import job_by_runner, latest_status_path
+    from bhiksha.tools import launchd_status
+
+    recorded = "2026-09-18T12:40:00+00:00"
+    now = datetime.fromisoformat("2026-09-21T06:30:00-05:00")
+    path = latest_status_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"jobs": {"cartographer-shadow": {
+        "recorded_at": recorded, "payload": {"status": "ok", "return_code": 0},
+    }}}))
+    monkeypatch.setattr(launchd_status, "registered_launchd_jobs",
+                        lambda: [job_by_runner("cartographer-shadow")])
+    monkeypatch.setattr(launchd_status, "_launchd_state", lambda **kw: {})
+    monkeypatch.setattr(launchd_status, "_runtime_status", lambda **kw: {})
+    observed = []
+
+    def semantic(repo_root, *, now):
+        observed.append(now)
+        return {"status": status, "reason": "Specific evidence failure",
+                "attention_required": status == "blocked"}
+
+    monkeypatch.setattr(launchd_status, "_cartographer_semantic_status", semantic)
+    snapshot = launchd_status.build_status_snapshot(
+        repo_root=tmp_path, active_plan_path=tmp_path / "active_plan.json", now=now,
+    )
+    job = snapshot["jobs"][0]
+    assert observed == [now]
+    assert job["last_run_at"] == recorded
+    assert job["lifecycle"] == ("armed" if status == "awaiting_session" else "stuck")
+    assert job["findings"] == ([] if status == "awaiting_session" else ["Specific evidence failure"])

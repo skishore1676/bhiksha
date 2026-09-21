@@ -281,3 +281,19 @@ com.bhiksha.schwab-guard
 com.bhiksha.session-report
 com.bhiksha.weekly-trading-decisions
 ```
+
+### Cartographer shadow status across sessions
+
+The status reader compares projection and active-plan evidence only within the same
+trading session. A valid prior-session receipt is `awaiting_session` over weekends,
+market holidays and before the current session's final registered projection fire plus
+five minutes (currently 07:45 CT). An older receipt remains blocked; once due, a missing
+current projection is overdue even if old signal IDs still match a retained plan.
+Current projection receipts allow compile completion until 08:30 CT. Invalid receipt
+hashes, same-session compile mismatches and unaccounted triggers remain attention.
+
+Control Tower uses the actual owner-run timestamp, not each status poll's timestamp,
+and carries the concrete evidence failure reason. The September 21 false alarm compared
+Friday's successful projection to Sunday's replacement active plan before Monday's job
+was due. The repair affects read-only status files; it does not rerun the projector or
+change Sheet rows, active plans, broker authority or schedules.
