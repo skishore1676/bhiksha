@@ -2229,7 +2229,8 @@ class ExecutionSupervisor:
 
         No global entry lock is held over quote IO. A pending lifecycle reserves the
         deployment slot. Profile reprices apply prospectively: a quote received for
-        repricing cannot also fill that new limit. Fixed concessions never chase.
+        repricing cannot also fill that new limit. Price-through reprices stay
+        anchored to the original midpoint and bounded concession.
         """
         from math import isfinite
         from bhiksha.execution.quote_lineage import PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
@@ -2285,7 +2286,7 @@ class ExecutionSupervisor:
 
     async def _reprice_paper_entry(self, deployment, decision, plan, started, expires, quote, received):
         """Model the configured ladder without submitting orders or inventing fills."""
-        if not _entry_reprice_enabled(self.app_config, deployment):
+        if not _entry_reprice_enabled(self.app_config, deployment, plan):
             return
         checkpoints = _entry_reprice_checkpoints(self.app_config, deployment)
         completed = int(plan.risk_details.get("paper_reprice_attempt", 0))
@@ -2695,7 +2696,7 @@ class ExecutionSupervisor:
         plan: TradePlan,
         deployment: DeploymentManifest,
     ) -> "_EntryWaitResult":
-        if not _entry_reprice_enabled(self.app_config, deployment):
+        if not _entry_reprice_enabled(self.app_config, deployment, plan):
             return await self._wait_for_entry_fill_once(
                 plan,
                 timeout_seconds=self.app_config.order_fill_timeout_seconds,
@@ -2890,6 +2891,20 @@ class ExecutionSupervisor:
             "preflight_buying_power_requirement": preflight.buying_power_requirement,
             "preflight_estimated_cost": preflight.estimated_cost,
         }
+        price_through_target = pricing_params.get("entry_price_through_target")
+        if price_through_target is not None and final_limit_price > float(price_through_target) + 1e-9:
+            await self.event_repository.append("entry_reprice_chase_guard_resting", {
+                "deployment_id": plan.deployment_id,
+                "trade_id": plan.trade_id,
+                "order_id": plan.order_id,
+                "attempt": attempt,
+                "decision": "rest_existing_order",
+                "current_limit_price": plan.estimated_entry_price,
+                "proposed_limit_price": final_limit_price,
+                "max_chase_price": price_through_target,
+                "pricing_evidence": pricing_evidence,
+            })
+            return _EntryRepriceResult(plan=plan)
         reference_limit_price = _entry_reprice_reference_limit_price(plan)
         max_chase_pct = resolve_entry_reprice_max_chase_pct(deployment.execution.model_dump())
         if reference_limit_price is not None and max_chase_pct is not None:
@@ -9189,6 +9204,18 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
 
 def _entry_reprice_pricing_params(app_config, deployment, plan, attempt):
     pricing_params = deployment.execution.model_dump()
+    initial_pricing = plan.risk_details.get("entry_pricing")
+    if isinstance(initial_pricing, dict) and initial_pricing.get("price_improvement_applied"):
+        try:
+            frozen_mid = float(initial_pricing.get("initial_mid") or initial_pricing["mid"])
+        except (KeyError, TypeError, ValueError):
+            frozen_mid = 0.0
+        if frozen_mid > 0:
+            from bhiksha.execution.pricing import PRICE_THROUGH_CONCESSION_USD
+            pricing_params["entry_price_through_target"] = round_price(
+                frozen_mid + (PRICE_THROUGH_CONCESSION_USD if attempt > 1 else 0.0)
+            )
+            return pricing_params
     spread_fraction = _entry_reprice_spread_fraction(deployment, attempt)
     if spread_fraction is None:
         pricing_params["entry_pricing_urgent_spread_pct"] = _entry_reprice_spread_pct(app_config, attempt)
@@ -9204,14 +9231,15 @@ def _entry_reprice_pricing_params(app_config, deployment, plan, attempt):
     return pricing_params
 
 
-def _entry_reprice_enabled(app_config: AppConfig, deployment: DeploymentManifest) -> bool:
-    if (deployment.execution.entry_pricing_mode == "price_seeking"
-            or deployment.execution.preferred_min_open_interest is not None
-            or deployment.execution.preferred_max_bid_ask_spread_pct is not None):
-        return False  # Fixed concession limit; never chase away the liquidity discount.
+def _entry_reprice_enabled(
+    app_config: AppConfig, deployment: DeploymentManifest, plan: TradePlan | None = None,
+) -> bool:
     lane_value = deployment.execution.entry_reprice_enabled
     if lane_value is not None:
         return lane_value
+    initial_pricing = plan.risk_details.get("entry_pricing") if plan is not None else None
+    if isinstance(initial_pricing, dict) and initial_pricing.get("price_improvement_applied"):
+        return True
     if get_entry_execution_profile(deployment.execution.entry_execution_profile) is not None:
         return True
     return app_config.entry_reprice_enabled
@@ -9275,8 +9303,13 @@ def _entry_pricing_evidence(
     initial_limit_price = (
         prior_pricing.get("initial_limit_price") if isinstance(prior_pricing, dict) else None
     )
+    initial_mid = (
+        prior_pricing.get("initial_mid", prior_pricing.get("mid"))
+        if isinstance(prior_pricing, dict) else None
+    )
     return {
         **pricing.evidence(),
+        "initial_mid": initial_mid,
         "entry_execution_profile": profile.name if profile is not None else "legacy",
         "entry_reprice_max_chase_pct": resolve_entry_reprice_max_chase_pct(
             deployment.execution.model_dump()

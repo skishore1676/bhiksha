@@ -68,11 +68,11 @@ shared_parameters:
     - id: min_open_interest
       bhiksha_path: execution.min_open_interest
       type: integer
-      description: Rejects option contracts whose open interest is below this threshold.
+      description: Preferred open interest; a lower positive value leads to a more patient entry price.
     - id: max_bid_ask_spread_pct
       bhiksha_path: execution.max_bid_ask_spread_pct
       type: float
-      description: Rejects option contracts whose quoted spread exceeds this percentage.
+      description: Preferred spread width; a wider sound quote leads to a more patient entry price.
     - id: entry_execution_profile
       bhiksha_path: execution.entry_execution_profile
       type: enum

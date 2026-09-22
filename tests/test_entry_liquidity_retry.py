@@ -119,7 +119,7 @@ def test_no_retry_for_non_liquidity_failures_or_unarmed_lanes(setup,kind):
     asyncio.run(run())
 
 
-def test_selector_spread_evidence_includes_bounded_later_expiry():
+def test_selector_accepts_wide_spread_in_bounded_later_expiry():
     request=OptionSelectionRequest(deployment_id='x',symbol='SPY',direction=SignalDirection.LONG,
         signal_timestamp=Clock.current,execution_profile='single_leg_long_premium_v1',execution_params={
             'dte_min':3,'dte_max':7,'dte_fallback_policy':'allow_nearest_after','dte_fallback_max':21,
@@ -128,9 +128,7 @@ def test_selector_spread_evidence_includes_bounded_later_expiry():
     contract=OptionContractSnapshot(option_symbol='x',underlying_symbol='SPY',contract_type='CALL',
         expiration_date='2026-08-28',dte=11,strike=600,delta=.3,bid=1,ask=2,open_interest=100)
     selector=SingleLegOptionSelector()
-    with pytest.raises(SelectorEmptyError) as exc:
-        selector.select(request,[contract])
-    assert exc.value.diagnostics['liquidity_retry_candidates']==1
+    assert selector.select(request,[contract]).dte==11
     with pytest.raises(SelectorEmptyError) as exc:
         selector.select(request,[replace(contract,open_interest=0)])
     assert exc.value.diagnostics['liquidity_retry_candidates']==0

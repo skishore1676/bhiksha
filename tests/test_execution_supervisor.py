@@ -16,6 +16,7 @@ from bhiksha.execution.supervisor import (
     _entry_reprice_cancel_after_seconds,
     _entry_reprice_checkpoints,
     _entry_reprice_enabled,
+    _entry_reprice_pricing_params,
     _entry_reprice_spread_fraction,
 )
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
@@ -586,6 +587,41 @@ def test_named_patient_profile_resolves_full_lane_policy_when_global_policy_is_o
         }
     )
     assert _entry_reprice_enabled(app_config, disabled) is False
+
+
+def test_price_through_replacement_uses_frozen_mid_and_respects_lane_disable() -> None:
+    app_config = AppConfig(entry_reprice_enabled=False)
+    deployment = _enabled_deployment("market_impulse_qqq_short_v1")
+    deployment = deployment.model_copy(update={
+        "execution": deployment.execution.model_copy(update={
+            "entry_execution_profile": None, "entry_reprice_enabled": None,
+        })
+    })
+    plan = TradePlan(
+        trade_id="PRICE_THROUGH",
+        deployment_id=deployment.deployment_id,
+        symbol="QQQ",
+        direction=SignalDirection.SHORT,
+        option_symbol="QQQ260330P00558000",
+        quantity=1,
+        estimated_entry_price=2.20,
+        risk_reasons=["approved"],
+        risk_details={"entry_pricing": {
+            "price_improvement_applied": True,
+            "mid": 2.70,
+            "initial_mid": 2.40,
+            "initial_limit_price": 2.20,
+        }},
+        dry_run=False,
+        order_id="ENTRY123",
+    )
+    assert _entry_reprice_enabled(app_config, deployment, plan) is True
+    assert _entry_reprice_pricing_params(app_config, deployment, plan, 1)["entry_price_through_target"] == 2.40
+    assert _entry_reprice_pricing_params(app_config, deployment, plan, 2)["entry_price_through_target"] == 2.50
+    disabled = deployment.model_copy(update={
+        "execution": deployment.execution.model_copy(update={"entry_reprice_enabled": False})
+    })
+    assert _entry_reprice_enabled(app_config, disabled, plan) is False
 
 
 def test_reprice_above_profile_chase_cap_leaves_existing_order_resting(tmp_path) -> None:
@@ -1327,7 +1363,7 @@ def test_execution_supervisor_cancels_unfilled_entry_after_reprice_ceiling(tmp_p
     assert "entry_reprice_cancel_after_timeout" in event_types
 
 
-def test_execution_supervisor_cancels_when_reprice_quote_is_too_wide(tmp_path) -> None:
+def test_execution_supervisor_cancels_when_wide_reprice_quote_has_no_proved_timestamp(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=2.00, quote_ask=2.90)
     supervisor = ExecutionSupervisor(
@@ -1372,7 +1408,7 @@ def test_execution_supervisor_cancels_when_reprice_quote_is_too_wide(tmp_path) -
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
     blocked_payload = next(json.loads(row[1]) for row in rows if row[0] == "entry_reprice_blocked")
-    assert "public_spread_above_maximum" in blocked_payload["reason"]
+    assert "public_quote_timestamp_missing" in blocked_payload["reason"]
 
 
 def test_execution_supervisor_records_live_entry_unprotected_when_initial_stop_fails(tmp_path) -> None:

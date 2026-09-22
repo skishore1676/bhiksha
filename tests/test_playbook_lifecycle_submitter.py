@@ -253,7 +253,7 @@ def test_playbook_lifecycle_records_reconciliation_when_entry_does_not_fill(tmp_
     assert trades.records[-1].status == "pending_entry_reconcile"
 
 
-def test_playbook_lifecycle_blocks_when_submit_quote_is_too_wide(tmp_path: Path) -> None:
+def test_playbook_lifecycle_blocks_wide_quote_without_proved_timestamp(tmp_path: Path) -> None:
     ticket_path = _write_live_ticket(tmp_path)
     packet_path = write_packet(tmp_path, _execution_packet())
     order_manager = StubOrderManager(quote_bid=2.00, quote_ask=2.90)
@@ -271,7 +271,7 @@ def test_playbook_lifecycle_blocks_when_submit_quote_is_too_wide(tmp_path: Path)
     )
 
     assert result.status == "blocked"
-    assert result.block_reasons == ["public_spread_above_maximum"]
+    assert result.block_reasons == ["public_quote_timestamp_missing"]
     assert order_manager.preflight_calls == 0
     assert order_manager.entry_calls == 0
 

@@ -33,6 +33,7 @@ import json
 from typing import TYPE_CHECKING
 
 from bhiksha.domain.models import OptionContractSnapshot, OptionSelectionRequest
+from bhiksha.options.selectors import hard_quote_reason
 
 if TYPE_CHECKING:
     from bhiksha.domain.models import OptionSelection
@@ -96,6 +97,9 @@ VERDICT_OI_BELOW_MIN = "open_interest_below_min"
 VERDICT_DELTA_BELOW_MIN = "delta_below_min"
 VERDICT_DELTA_ABOVE_MAX = "delta_above_max"
 VERDICT_SPREAD_ABOVE_MAX = "spread_above_max"
+VERDICT_OI_UNAVAILABLE = "open_interest_unavailable"
+VERDICT_QUOTE_INVALID = "quote_invalid"
+VERDICT_SPREAD_ABSURD = "spread_absurd"
 
 
 def build_chain_snapshot(
@@ -174,7 +178,7 @@ def build_chain_snapshot(
         {
             "schema_version": "bhiksha.actual_option_selection.v1",
             "selector_implementation": "bhiksha.options.selectors.SingleLegOptionSelector",
-            "selector_version": "1",
+            "selector_version": "2",
             "request": {
                 "deployment_id": request.deployment_id,
                 "symbol": request.symbol,
@@ -306,16 +310,13 @@ def _non_dte_verdict(
     # Mirrors selectors.SingleLegOptionSelector._passes_non_dte_filters'
     # cascade order (also identical to the tail of select()'s main loop,
     # after its DTE check).
-    if (contract.open_interest or 0) < min_open_interest:
-        return VERDICT_OI_BELOW_MIN
+    hard_reason = hard_quote_reason(contract)
+    if hard_reason is not None:
+        return hard_reason
     if delta_min is not None and (contract.abs_delta is None or contract.abs_delta < float(delta_min)):
         return VERDICT_DELTA_BELOW_MIN
     if delta_max is not None and (contract.abs_delta is None or contract.abs_delta > float(delta_max)):
         return VERDICT_DELTA_ABOVE_MAX
-    if max_spread_pct is not None and (
-        contract.spread_pct is None or contract.spread_pct > float(max_spread_pct)
-    ):
-        return VERDICT_SPREAD_ABOVE_MAX
     return VERDICT_ACCEPTED
 
 

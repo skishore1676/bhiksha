@@ -157,3 +157,43 @@ def test_price_seeking_triggers_when_oi_below_preferred_threshold() -> None:
     assert result.approved is True
     assert result.price_improvement_applied is True
     assert result.limit_price < 2.25
+
+
+def test_sheet_liquidity_thresholds_default_to_patient_price_not_veto() -> None:
+    quote = PublicQuote(
+        quote_timestamp=datetime.now(UTC).isoformat(),
+        quote_timestamp_field="quoteTimestamp",
+        symbol="HLT260925C00280000",
+        bid=2.00,
+        ask=2.80,
+        last=2.40,
+        open_interest=40,
+    )
+    params = {"min_open_interest": 100, "max_bid_ask_spread_pct": 0.20}
+    initial = select_entry_limit(quote, params)
+
+    assert initial.approved is True
+    assert initial.limit_price < 2.40
+    assert initial.evidence()["liquidity_warnings"] == [
+        "open_interest_below_preferred", "spread_above_preferred",
+    ]
+    assert initial.evidence()["liquidity_policy"] == "default_price_through_v1"
+    assert select_entry_limit(quote, {**params, "entry_price_through_target": 2.40}).limit_price == 2.40
+    assert select_entry_limit(quote, {**params, "entry_price_through_target": 2.50}).limit_price == 2.50
+
+
+def test_absurd_spread_still_blocks_entry() -> None:
+    result = select_entry_limit(
+        PublicQuote(
+            quote_timestamp=datetime.now(UTC).isoformat(),
+            quote_timestamp_field="quoteTimestamp",
+            symbol="HLT260925C00280000",
+            bid=0.10,
+            ask=2.00,
+            last=1.05,
+            open_interest=40,
+        ),
+        {"min_open_interest": 100, "max_bid_ask_spread_pct": 0.20},
+    )
+    assert result.approved is False
+    assert "public_spread_absurd" in result.block_reasons

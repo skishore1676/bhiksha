@@ -8,8 +8,7 @@ from bhiksha.options.chain_snapshot import (
     VERDICT_ACCEPTED,
     VERDICT_DELTA_ABOVE_MAX,
     VERDICT_DTE_OUT_OF_RANGE,
-    VERDICT_OI_BELOW_MIN,
-    VERDICT_SPREAD_ABOVE_MAX,
+    VERDICT_OI_UNAVAILABLE,
     build_chain_snapshot,
 )
 from bhiksha.options.selectors import SelectorEmptyError, SingleLegOptionSelector
@@ -99,38 +98,37 @@ def test_build_chain_snapshot_labels_accepted_and_selected_contract() -> None:
     assert repeated.actual_option_selection_sha256 == attempt.actual_option_selection_sha256
 
 
-def test_build_chain_snapshot_labels_each_filter_rejection() -> None:
+def test_build_chain_snapshot_labels_hard_rejections_and_soft_liquidity() -> None:
     request = _request()
     contracts = [
-        _contract("SMH_OI_LOW", open_interest=10),
+        _contract("SMH_OI_LOW", open_interest=0),
         _contract("SMH_DELTA_HIGH", delta=-0.60, open_interest=500),
         _contract("SMH_SPREAD_WIDE", bid=1.00, ask=2.00, open_interest=500),
         _contract("SMH_OUT_OF_WINDOW", dte=9, open_interest=500),
     ]
 
-    with pytest.raises(SelectorEmptyError):
-        SingleLegOptionSelector().select(request, contracts)
+    selection = SingleLegOptionSelector().select(request, contracts)
 
     attempt = build_chain_snapshot(
         request,
         contracts,
         lane="live",
         snapshot_id="snap-2",
-        selector_error=SelectorEmptyError("smh_short_lane", {}),
+        selection=selection,
     )
 
     verdicts = {row.option_symbol: row.verdict for row in attempt.rows}
-    assert verdicts["SMH_OI_LOW"] == VERDICT_OI_BELOW_MIN
+    assert verdicts["SMH_OI_LOW"] == VERDICT_OI_UNAVAILABLE
     assert verdicts["SMH_DELTA_HIGH"] == VERDICT_DELTA_ABOVE_MAX
-    assert verdicts["SMH_SPREAD_WIDE"] == VERDICT_SPREAD_ABOVE_MAX
+    assert verdicts["SMH_SPREAD_WIDE"] == VERDICT_ACCEPTED
     # SMH_OUT_OF_WINDOW's dte (9) is > dte_max (1) so it is the nearest-after
     # candidate: captured, primary verdict is dte_out_of_range, and it gets a
     # SEPARATE fallback_verdict computed on the non-DTE cascade only.
     assert verdicts["SMH_OUT_OF_WINDOW"] == VERDICT_DTE_OUT_OF_RANGE
     fallback_row = next(row for row in attempt.rows if row.option_symbol == "SMH_OUT_OF_WINDOW")
     assert fallback_row.fallback_verdict == VERDICT_ACCEPTED
-    assert attempt.selector_empty is True
-    assert attempt.selected_option_symbol is None
+    assert attempt.selector_empty is False
+    assert attempt.selected_option_symbol == "SMH_SPREAD_WIDE"
     assert attempt.nearest_after_dte == 9
 
 
@@ -187,7 +185,7 @@ def test_build_chain_snapshot_cross_check_against_real_selector_winner() -> None
     assert real_selection.option_symbol == "SMH260717P00610000"
 
 
-def test_build_chain_snapshot_records_only_the_bounded_nearest_fallback() -> None:
+def test_build_chain_snapshot_records_selected_nearest_fallback_despite_wide_spread() -> None:
     request = _request(
         dte_min=0,
         dte_max=3,
@@ -208,19 +206,18 @@ def test_build_chain_snapshot_records_only_the_bounded_nearest_fallback() -> Non
         ),
     ]
 
-    with pytest.raises(SelectorEmptyError) as excinfo:
-        SingleLegOptionSelector().select(request, contracts)
+    selection = SingleLegOptionSelector().select(request, contracts)
     attempt = build_chain_snapshot(
         request,
         contracts,
         lane="live",
         snapshot_id="snap-farther-fallback",
-        selector_error=excinfo.value,
+        selection=selection,
     )
 
     assert attempt.nearest_after_dte == 4
     assert {row.dte for row in attempt.rows} == {4}
-    assert [row for row in attempt.rows if row.is_selected] == []
+    assert [row.option_symbol for row in attempt.rows if row.is_selected] == ["SMH_NEAREST_ILLIQUID"]
 
 
 def test_build_chain_snapshot_handles_empty_chain() -> None:

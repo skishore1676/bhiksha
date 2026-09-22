@@ -72,3 +72,18 @@ execution-quality evidence. Preserve hard sanity bounds, turn relative quality
 into price or patience, expose the policy in the operator Sheet, and record the
 effective value on every order attempt. Roll a new profile out one lane at a
 time while recording counterfactuals for the rest.
+
+## 2026-09-22 default-policy update
+
+The bounded price-through policy now applies by default to every single-leg
+entry, including shadow. The Sheet's existing OI and spread values are preferred
+quality thresholds, not hard rejection thresholds. Positive OI and a fresh,
+valid two-sided Public quote remain hard entry requirements; an absurd spread
+remains a hard block. The selected contract starts below its midpoint when
+liquidity is weaker than preferred and may reprice to the original midpoint,
+then at most $0.10 above it, within the existing chase, premium, and time caps.
+This replaces the earlier opt-in rollout guidance for liquidity pressure.
+
+Shadow marks a fill only when a later fresh ask reaches the resting buy limit.
+Its report must show an unfilled order as modeled no-fill rather than claiming
+midpoint execution. Live fill evidence continues to come from broker status.

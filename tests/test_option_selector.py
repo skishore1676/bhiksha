@@ -98,7 +98,7 @@ def test_single_leg_selector_uses_normalized_option_symbol_as_final_tie_break() 
     assert selector.select(request, [alpha, omega]).option_symbol == alpha.option_symbol
 
 
-def test_single_leg_selector_empty_reports_filter_breakdown() -> None:
+def test_single_leg_selector_empty_reports_hard_filter_breakdown() -> None:
     selector = SingleLegOptionSelector()
     request = OptionSelectionRequest(
         deployment_id="amd_short_lane",
@@ -150,7 +150,7 @@ def test_single_leg_selector_empty_reports_filter_breakdown() -> None:
             delta=-0.25,
             bid=1.00,
             ask=1.40,
-            open_interest=300,
+            open_interest=0,
         ),
     ]
 
@@ -160,10 +160,9 @@ def test_single_leg_selector_empty_reports_filter_breakdown() -> None:
     breakdown = excinfo.value.breakdown
     assert breakdown["total_candidates"] == 3
     assert breakdown["dte_out_of_range"] == 1
-    assert breakdown["open_interest_below_min"] == 1
-    assert breakdown["spread_above_max"] == 1
+    assert breakdown["open_interest_unavailable"] == 2
     assert excinfo.value.deployment_id == "amd_short_lane"
-    assert "open_interest_below_min=1" in str(excinfo.value)
+    assert "open_interest_unavailable=2" in str(excinfo.value)
 
 
 def test_single_leg_selector_empty_with_no_candidates() -> None:
@@ -263,7 +262,7 @@ def test_single_leg_selector_strict_reports_nearest_after_without_selecting_it()
     }
 
 
-def test_single_leg_selector_fallback_uses_nearest_after_when_primary_has_no_eligible_contract() -> None:
+def test_single_leg_selector_keeps_wide_primary_contract_for_price_discovery() -> None:
     selector = SingleLegOptionSelector()
     request = OptionSelectionRequest(
         deployment_id="amd_short_lane",
@@ -305,11 +304,11 @@ def test_single_leg_selector_fallback_uses_nearest_after_when_primary_has_no_eli
         ],
     )
 
-    assert selected.option_symbol == "AMD260626P00150000"
-    assert selected.dte_fallback_policy == "allow_nearest_after"
+    assert selected.option_symbol == "AMD260622P00150000"
+    assert selected.dte_fallback_policy is None
 
 
-def test_single_leg_selector_fallback_never_skips_the_nearest_later_expiry() -> None:
+def test_single_leg_selector_fallback_uses_nearest_later_even_when_spread_is_wide() -> None:
     selector = SingleLegOptionSelector()
     request = OptionSelectionRequest(
         deployment_id="amd_short_lane",
@@ -329,8 +328,7 @@ def test_single_leg_selector_fallback_never_skips_the_nearest_later_expiry() -> 
         },
     )
 
-    with pytest.raises(SelectorEmptyError) as excinfo:
-        selector.select(
+    selected = selector.select(
             request,
             [
                 _contract(
@@ -352,10 +350,11 @@ def test_single_leg_selector_fallback_never_skips_the_nearest_later_expiry() -> 
             ],
         )
 
-    assert excinfo.value.diagnostics["nearest_after_dte"] == 9
+    assert selected.dte == 9
+    assert selected.dte_fallback_policy == "allow_nearest_after"
 
 
-def test_pdd_regression_selects_eligible_nearest_after_when_primary_window_is_empty_after_filters() -> None:
+def test_pdd_low_oi_primary_contract_is_available_for_price_discovery() -> None:
     selector = SingleLegOptionSelector()
     request = OptionSelectionRequest(
         deployment_id="strategy_triage_market_impulse_pdd_pdd_long_live_row_29",
@@ -401,9 +400,9 @@ def test_pdd_regression_selects_eligible_nearest_after_when_primary_window_is_em
         ],
     )
 
-    assert selected.option_symbol == "PDD260828C00095000"
-    assert selected.dte == 9
-    assert selected.dte_fallback_policy == "allow_nearest_after"
+    assert selected.option_symbol == "PDD260821C00095000"
+    assert selected.dte == 2
+    assert selected.dte_fallback_policy is None
 
 
 def _contract(

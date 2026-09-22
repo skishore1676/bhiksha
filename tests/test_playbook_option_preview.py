@@ -145,7 +145,7 @@ def test_option_preview_writes_ready_preview_without_order_submission(tmp_path: 
     assert Path(result.artifact_md).exists()
 
 
-def test_option_preview_blocks_on_quote_liquidity_risk(tmp_path: Path) -> None:
+def test_option_preview_blocks_wide_quote_without_proved_timestamp(tmp_path: Path) -> None:
     intent_path = _write_intent(tmp_path)
     packet_path = write_packet(tmp_path, _execution_packet())
 
@@ -161,7 +161,7 @@ def test_option_preview_blocks_on_quote_liquidity_risk(tmp_path: Path) -> None:
 
     assert result.status == "blocked"
     assert result.preview_ready is False
-    assert result.block_reasons == ["public_spread_above_maximum"]
+    assert result.block_reasons == ["public_quote_timestamp_missing"]
 
 
 def test_option_preview_requires_packet_preview_boundary(tmp_path: Path) -> None:

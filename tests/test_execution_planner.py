@@ -1053,9 +1053,7 @@ def test_execution_planner_records_chain_snapshot_on_successful_selection() -> N
 
 def test_execution_planner_records_chain_snapshot_on_selector_empty() -> None:
     deployment = _enabled_deployment("market_impulse_qqq_short_v1")
-    # min_open_interest is 100 for this fixture deployment (see
-    # tests/fixtures/config/deployments/market_impulse_qqq_short_v1.yaml) --
-    # open_interest=5 forces every candidate to fail that filter.
+    # Missing/nonpositive OI remains a hard rejection; low positive OI is priced.
     chain_service = StubChainService(symbol="QQQ", option_symbol="QQQ260330P00558000", dte=0, delta=-0.31)
     chain_service.get_chain = _low_oi_get_chain(chain_service)
     snapshot_repository = SpyChainSnapshotRepository()
@@ -1074,7 +1072,7 @@ def test_execution_planner_records_chain_snapshot_on_selector_empty() -> None:
     assert attempt.selector_empty is True
     assert attempt.selected_option_symbol is None
     assert len(attempt.rows) == 1
-    assert attempt.rows[0].verdict == "open_interest_below_min"
+    assert attempt.rows[0].verdict == "open_interest_unavailable"
     assert attempt.rows[0].is_selected is False
 
 
@@ -1195,7 +1193,7 @@ def _low_oi_get_chain(chain_service: StubChainService):
                 delta=contract.delta,
                 bid=contract.bid,
                 ask=contract.ask,
-                open_interest=5,
+                open_interest=0,
             )
             for contract in contracts
         ]

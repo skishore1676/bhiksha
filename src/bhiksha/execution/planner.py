@@ -192,8 +192,10 @@ class ExecutionPlanner:
                 open_interest_percentile=selection.open_interest_percentile,
             )
         pricing = select_entry_limit(quote, execution_params)
+        pricing_evidence = pricing.evidence()
         pricing_evidence = {
-            **pricing.evidence(),
+            **pricing_evidence,
+            "initial_mid": pricing_evidence.get("mid"),
             "entry_execution_profile": active_entry_profile.name if active_entry_profile is not None else "legacy",
             "entry_reprice_max_chase_pct": resolve_entry_reprice_max_chase_pct(
                 deployment.execution.model_dump()

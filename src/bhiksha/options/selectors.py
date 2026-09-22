@@ -9,6 +9,13 @@ from bhiksha.domain.models import (
 )
 
 
+def hard_quote_reason(contract: OptionContractSnapshot) -> str | None:
+    """Require OI evidence; a fresh option quote is validated after selection."""
+    if contract.open_interest is None or contract.open_interest <= 0:
+        return "open_interest_unavailable"
+    return None
+
+
 class SelectorEmptyError(ValueError):
     """No contract survived the execution-profile filters.
 
@@ -46,8 +53,6 @@ class SingleLegOptionSelector:
         dte_max = int(request.execution_params.get("dte_max", 7))
         delta_min = request.execution_params.get("target_abs_delta_min")
         delta_max = request.execution_params.get("target_abs_delta_max")
-        min_open_interest = int(request.execution_params.get("min_open_interest", 0))
-        max_spread_pct = request.execution_params.get("max_bid_ask_spread_pct")
         dte_fallback_policy = (
             str(request.execution_params.get("dte_fallback_policy") or "strict")
             .strip()
@@ -63,6 +68,7 @@ class SingleLegOptionSelector:
             "delta_below_min": 0,
             "delta_above_max": 0,
             "spread_above_max": 0,
+            "open_interest_unavailable": 0,
         }
         filtered: list[OptionContractSnapshot] = []
         desired_contracts: list[OptionContractSnapshot] = []
@@ -79,8 +85,9 @@ class SingleLegOptionSelector:
                 eliminated["dte_out_of_range"] += 1
                 continue
             dte_window_candidates += 1
-            if (contract.open_interest or 0) < min_open_interest:
-                eliminated["open_interest_below_min"] += 1
+            hard_reason = hard_quote_reason(contract)
+            if hard_reason:
+                eliminated[hard_reason] += 1
                 continue
             if delta_min is not None and (
                 contract.abs_delta is None or contract.abs_delta < float(delta_min)
@@ -91,12 +98,6 @@ class SingleLegOptionSelector:
                 contract.abs_delta is None or contract.abs_delta > float(delta_max)
             ):
                 eliminated["delta_above_max"] += 1
-                continue
-            if max_spread_pct is not None and (
-                contract.spread_pct is None
-                or contract.spread_pct > float(max_spread_pct)
-            ):
-                eliminated["spread_above_max"] += 1
                 continue
             filtered.append(contract)
 
@@ -112,30 +113,16 @@ class SingleLegOptionSelector:
                 fallback_dte_max=request.execution_params.get("dte_fallback_max"),
                 delta_min=delta_min,
                 delta_max=delta_max,
-                min_open_interest=min_open_interest,
-                max_spread_pct=max_spread_pct,
             )
             if filtered:
                 fallback_policy_applied = dte_fallback_policy
 
         if not filtered:
-            # Count contracts that would pass if only the spread improved. This
-            # includes the allowed fallback expiries, without relaxing any gate.
-            spread_candidates = [c for c in desired_contracts
-                if dte_min <= c.dte <= dte_max and self._passes_non_dte_filters(
-                    c, delta_min=delta_min, delta_max=delta_max,
-                    min_open_interest=min_open_interest, max_spread_pct=None)]
-            if dte_fallback_policy == "allow_nearest_after":
-                later, _ = self._nearest_after_candidates(desired_contracts,
-                    dte_max=dte_max, fallback_dte_max=request.execution_params.get("dte_fallback_max"),
-                    delta_min=delta_min, delta_max=delta_max,
-                    min_open_interest=min_open_interest, max_spread_pct=None)
-                spread_candidates.extend(later)
             raise SelectorEmptyError(
                 request.deployment_id,
                 eliminated,
                 diagnostics={
-                    "liquidity_retry_candidates": len(spread_candidates),
+                    "liquidity_retry_candidates": 0,
                     "requested_dte_min": dte_min,
                     "requested_dte_max": dte_max,
                     "available_dtes": sorted(
@@ -215,8 +202,6 @@ class SingleLegOptionSelector:
         fallback_dte_max: int | None = None,
         delta_min: float | None,
         delta_max: float | None,
-        min_open_interest: int,
-        max_spread_pct: float | None,
     ) -> tuple[list[OptionContractSnapshot], int]:
         later_dtes = sorted(
             {
@@ -231,10 +216,12 @@ class SingleLegOptionSelector:
         # Preserve unmigrated nearest-only behavior; explicit bound opts into a walk.
         attempts = later_dtes if fallback_dte_max is not None else later_dtes[:1]
         for count, dte in enumerate(attempts, start=1):
-            candidates = [contract for contract in contracts
-                          if contract.dte == dte and self._passes_non_dte_filters(
-                              contract, delta_min=delta_min, delta_max=delta_max,
-                              min_open_interest=min_open_interest, max_spread_pct=max_spread_pct)]
+            candidates = [
+                contract for contract in contracts
+                if contract.dte == dte and self._passes_non_dte_filters(
+                    contract, delta_min=delta_min, delta_max=delta_max,
+                )
+            ]
             if candidates:
                 return candidates, count
         return [], len(attempts)
@@ -245,10 +232,8 @@ class SingleLegOptionSelector:
         *,
         delta_min: float | None,
         delta_max: float | None,
-        min_open_interest: int,
-        max_spread_pct: float | None,
     ) -> bool:
-        if (contract.open_interest or 0) < min_open_interest:
+        if hard_quote_reason(contract):
             return False
         if delta_min is not None and (
             contract.abs_delta is None or contract.abs_delta < float(delta_min)
@@ -258,13 +243,7 @@ class SingleLegOptionSelector:
             contract.abs_delta is None or contract.abs_delta > float(delta_max)
         ):
             return False
-        return not (
-            max_spread_pct is not None
-            and (
-                contract.spread_pct is None
-                or contract.spread_pct > float(max_spread_pct)
-            )
-        )
+        return True
 
     @staticmethod
     def _nearest_after_dte(

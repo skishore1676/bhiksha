@@ -144,7 +144,8 @@ def test_price_seeking_keeps_hard_guards_and_rounds_down():
                         quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp")
     result = select_entry_limit(quote, {"entry_pricing_mode": "price_seeking", "min_open_interest": 10})
     assert result.approved and result.limit_price < quote.mid
-    assert not select_entry_limit(quote, {"entry_pricing_mode": "price_seeking", "min_open_interest": 200}).approved
+    pressured = select_entry_limit(quote, {"entry_pricing_mode": "price_seeking", "min_open_interest": 200})
+    assert pressured.approved and "open_interest_below_preferred" in pressured.evidence()["liquidity_warnings"]
     assert not select_entry_limit(replace(quote, ask=float("nan")), {"entry_pricing_mode": "price_seeking"}).approved
 
 
