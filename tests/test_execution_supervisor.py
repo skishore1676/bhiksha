@@ -450,6 +450,7 @@ def test_execution_supervisor_reprices_unfilled_entry_before_protection(tmp_path
     supervisor = ExecutionSupervisor(
         planner=RecordingPlanner(order_manager),
         event_repository=repo,
+        record_signal_outcomes=True,
         app_config=AppConfig(
             order_fill_poll_seconds=0,
             order_fill_timeout_seconds=1,
@@ -471,6 +472,7 @@ def test_execution_supervisor_reprices_unfilled_entry_before_protection(tmp_path
         risk_reasons=["approved"],
         dry_run=False,
         order_id="ENTRY123",
+        risk_details={"entry_signal_identity": {"signal_id": "original-signal", "signal_timestamp": "2026-09-22T13:48:00+00:00", "direction": "short"}},
     )
 
     protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
@@ -484,6 +486,14 @@ def test_execution_supervisor_reprices_unfilled_entry_before_protection(tmp_path
         event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
     assert "entry_order_repriced" in event_types
     assert "protective_stop_submission" in event_types
+
+
+    with sqlite3.connect(tmp_path / "events.db") as conn:
+        outcomes = [json.loads(row[0]) for row in conn.execute("SELECT payload FROM events WHERE event_type='signal_outcome'")]
+    filled = next(row for row in outcomes if row['outcome']=='filled')
+    assert filled['signal_id'] == 'original-signal'
+    assert filled['signal_timestamp'] == '2026-09-22T13:48:00+00:00'
+    assert filled['attempted_price'] == 2.88
 
 
 def test_execution_supervisor_uses_lane_patient_reprice_policy_when_global_policy_is_off(tmp_path) -> None:

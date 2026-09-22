@@ -1732,6 +1732,9 @@ class ExecutionSupervisor:
             if (not decision.signal or price is None or now < retry.next_attempt_at
                 or retry.observation_reason(price=price, timestamp=decision.timestamp, now=now)):
                 return None
+            # A new eligible signal advances the bounded intent. Close the
+            # previous selection attempt so no older signal stays pending forever.
+            await self._close_retry_signal(retry, "liquidity_retry_continues", outcome="selection_failure")
         if deployment.exit.risk_envelope_live_mode == "canary":
             rollback = (
                 await self.exit_state_repository.get_risk_envelope_rollback(
@@ -1929,6 +1932,11 @@ class ExecutionSupervisor:
                             trade_id=plan.trade_id, disable_row=True)
                         if self.manual_status_writer is not None else None)
             if plan is not None:
+                plan.risk_details["entry_signal_identity"] = {
+                    "signal_id": _signal_outcome_payload(deployment, decision, outcome="pending_execution")["signal_id"],
+                    "signal_timestamp": decision.timestamp.isoformat(),
+                    "direction": decision.direction.value if decision.direction else None,
+                }
                 if (
                     _entry_plan_approved(plan)
                     and plan.quantity > 0
@@ -2338,6 +2346,7 @@ class ExecutionSupervisor:
                 decision.timestamp + timedelta(seconds=seconds), now)
         if retry.stop_reason(now):
             return False
+        retry.pending_decision = decision
         retry.next_attempt_at = now + timedelta(seconds=deployment.execution.entry_liquidity_retry_interval_seconds)
         self._entry_liquidity_retries[deployment.deployment_id] = retry
         # The selection attempt is fully accounted; a subsequent fresh signal
@@ -2362,10 +2371,20 @@ class ExecutionSupervisor:
                 disable_row=True) if self.manual_status_writer is not None else None)
         return True
 
+    async def _close_retry_signal(self, retry, reason, *, outcome="expired_invalidated"):
+        decision = retry.pending_decision
+        if decision is None:
+            return
+        if self.record_signal_outcomes:
+            await self.event_repository.append("signal_outcome", _signal_outcome_payload(
+                retry.deployment, decision, outcome=outcome, rejection_reasons=[reason]))
+        retry.pending_decision = None
+
     async def _finish_entry_retry(self, deployment_id, reason, *, now):
         retry = self._entry_liquidity_retries.pop(deployment_id, None)
         if retry is None:
             return
+        await self._close_retry_signal(retry, reason)
         await self.event_repository.append("entry_liquidity_retry_finished", {
             "deployment_id": deployment_id, "symbol": retry.deployment.symbol,
             "reason": reason, "attempts": retry.attempts, "timestamp": now.isoformat()})
@@ -2427,6 +2446,7 @@ class ExecutionSupervisor:
                     await self.event_repository.append(
                         "signal_outcome",
                         {
+                            **plan.risk_details.get("entry_signal_identity", {}),
                             "deployment_id": deployment.deployment_id,
                             "symbol": deployment.symbol,
                             "timestamp": datetime.now(UTC).isoformat(),
@@ -2463,6 +2483,7 @@ class ExecutionSupervisor:
                     await self.event_repository.append(
                         "signal_outcome",
                         {
+                            **plan.risk_details.get("entry_signal_identity", {}),
                             "deployment_id": deployment.deployment_id,
                             "symbol": deployment.symbol,
                             "timestamp": datetime.now(UTC).isoformat(),
@@ -2535,6 +2556,7 @@ class ExecutionSupervisor:
             await self.event_repository.append(
                 "signal_outcome",
                 {
+                    **plan.risk_details.get("entry_signal_identity", {}),
                     "deployment_id": deployment.deployment_id,
                     "symbol": deployment.symbol,
                     "timestamp": confirmed_at.isoformat() if confirmed_at else datetime.now(UTC).isoformat(),

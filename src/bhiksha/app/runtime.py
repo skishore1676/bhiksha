@@ -540,6 +540,12 @@ class BhikshaRuntime:
                 output(f"RUNTIME_ISSUE ALL stage=session_manifest_receipt error={exc}")
             output("STARTUP_CONFIG " + json.dumps(startup_snapshot, sort_keys=True))
             await event_repository.append("startup_config", startup_snapshot)
+            from bhiksha.experiments.cartographer_attempts import load_attempt_events
+            from bhiksha.execution.entry_retry import restore_consumed_retry_intents
+            consumed_retries = restore_consumed_retry_intents(
+                load_attempt_events(self.app_config.sqlite_path), deployments_by_id, supervisor)
+            await event_repository.append("entry_liquidity_retry_restart_consumed", {
+                "deployment_ids": sorted(consumed_retries), "count": len(consumed_retries)})
             await self._refresh_reconciliation(
                 broker=broker,
                 supervisor=supervisor,
@@ -1175,6 +1181,13 @@ class BhikshaRuntime:
                 exited_deployments.add(evaluation.deployment.deployment_id)
 
         for deployment in deployments_by_symbol[bar.symbol]:
+            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+                # Completed bars can invalidate a waiting intent; only fresh
+                # intrabar observations may authorize its next attempt.
+                price = bar.low if deployment.strategy.params.get("direction") == "long" else bar.high
+                await supervisor.observe_entry_liquidity_retry(
+                    deployment, price=price, timestamp=bar.timestamp + timedelta(minutes=1))
+                continue
             if not supervisor.can_submit_deployment_entry(deployment):
                 continue
             if deployment.deployment_id in exited_deployments:
@@ -1484,6 +1497,8 @@ class BhikshaRuntime:
         latest_bar = store.latest(symbol)
         if latest_bar is not None and snapshot_timestamp <= latest_bar.timestamp:
             return
+        for deployment in deployments:
+            await supervisor.observe_entry_liquidity_retry(deployment, price=price, timestamp=snapshot_timestamp)
         active_deployments = [
             deployment
             for deployment in deployments
@@ -1502,6 +1517,10 @@ class BhikshaRuntime:
             enriched = enriched_frames.get(deployment.deployment_id)
             if enriched is None:
                 continue
+            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+                # This bounded intent has already fired its one-shot trigger.
+                # Recheck only the fresh price, preserving trigger/invalidation gates.
+                enriched = enriched.tail(1)
             decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
             await record_signal_evaluation(supervisor.event_repository, decision)
             if not decision.signal:
@@ -1898,6 +1917,9 @@ class BhikshaRuntime:
                         )
                 raise
             if plan is None:
+                if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+                    output(f"ENTRY_WAITING_LIQUIDITY deployment={deployment.deployment_id}")
+                    return
                 output(f"ENTRY_BLOCKED deployment={deployment.deployment_id} symbol={deployment.symbol} reason=lifecycle")
                 return
             if plan.quantity > 0 and plan.option_symbol and (plan.order_id is not None or plan.dry_run):

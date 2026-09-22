@@ -48,7 +48,7 @@ def setup(tmp_path, monkeypatch):
         async def append(self, kind, payload):
             events.append((kind, payload))
     planner = Planner()
-    supervisor = ExecutionSupervisor(planner=planner, event_repository=Events(), app_config=AppConfig())
+    supervisor = ExecutionSupervisor(planner=planner, event_repository=Events(), app_config=AppConfig(), record_signal_outcomes=True)
     def decision(**kwargs):
         return SignalDecision(deployment_id=deployment.deployment_id, symbol='SPY',
             timestamp=kwargs.get('timestamp', Clock.current), signal=kwargs.get('signal', True),
@@ -77,6 +77,7 @@ def test_retry_is_bounded_spaced_and_budget_is_terminal(setup):
         p.error = None
         plan = await s.handle_signal(d, decision(), dry_run=True, simulate_only=True)
         assert plan.quantity == 0
+        assert plan.risk_details["entry_signal_identity"]["signal_id"] == f"{d.deployment_id}:{Clock.current.isoformat()}:long"
         assert not s.has_entry_liquidity_retry(d.deployment_id)
         assert not s.can_submit_deployment_entry(d)
         await s.handle_signal(d, decision(), dry_run=True, simulate_only=True)
@@ -195,4 +196,69 @@ def test_restart_from_stale_plan_cannot_rearm_consumed_retry(setup, monkeypatch)
         assert not restarted.has_entry_liquidity_retry(d.deployment_id)
         assert not restarted.can_submit_deployment_entry(d)
         assert p.calls==1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('price,expected_calls,state', [(602., 2, 'retry'), (599., 1, 'retry'), (589., 1, 'retry'), (602., 0, 'never_armed'), (602., 1, 'before_due'), (602., 1, 'stale'), (602., 1, 'expired')])
+def test_production_runtime_retries_current_trigger_not_historical_first_trigger(setup, monkeypatch, price, expected_calls, state):
+    from bhiksha.app.bootstrap import BhikshaRuntime
+    from bhiksha.app.replay import ReplaySignalEvaluator
+    from bhiksha.app.runtime import ReconciliationSnapshot
+    from bhiksha.market_data.bar_store import RollingBarStore
+    from bhiksha.market_data.feature_service import FeatureService
+    from bhiksha.strategy.registry import default_strategy_registry
+    from bhiksha.domain.models import Bar
+    assert BhikshaRuntime.__module__ == 'bhiksha.app.runtime'
+    s,p,d,decision,events = setup
+    monkeypatch.setattr('bhiksha.execution.cartographer_invalidation.datetime', Clock)
+    runtime = object.__new__(BhikshaRuntime)
+    monkeypatch.setattr(BhikshaRuntime, "_reconciliation_live_entry_block_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(BhikshaRuntime, '_instrument_execution_runner', lambda *args, **kwargs: kwargs['inner'])
+    def runner(supervisor, deployment, current, **kwargs):
+        async def execute():
+            await supervisor.handle_signal(deployment, current, dry_run=True, simulate_only=True)
+        return execute
+    monkeypatch.setattr(BhikshaRuntime, "_make_entry_runner", lambda self, *args, **kwargs: runner(*args, **kwargs))
+    queued = []
+    dispatcher = SimpleNamespace(submit=lambda *args, **kwargs: queued.append(kwargs['runner']) or True)
+    evaluator = ReplaySignalEvaluator(FeatureService(), default_strategy_registry())
+    store = RollingBarStore()
+    store.append(Bar('SPY', Clock.current-timedelta(minutes=1),601.,601.,601.,601.,100.))
+    async def run():
+        if state != 'never_armed':
+            await s.handle_signal(d, decision(), dry_run=True, simulate_only=True)
+        Clock.current += timedelta(seconds=30 if state == 'before_due' else (601 if state == 'expired' else 61))
+        await runtime._handle_manual_intrabar_price(symbol='SPY', price=price,
+            snapshot_timestamp=Clock.current-timedelta(seconds=6 if state == "stale" else 0), store=store, supervisor=s, evaluator=evaluator,
+            execution_dispatcher=dispatcher, deployments=[d], reconciliation_snapshot=ReconciliationSnapshot(),
+            sync_lock=asyncio.Lock(), reconcile_trigger=asyncio.Event(), live=False, output=lambda line:None)
+        for execute in queued:
+            await execute()
+        assert p.calls == expected_calls
+        if price == 589:
+            assert not s.has_entry_liquidity_retry(d.deployment_id)
+        elif expected_calls == 2:
+            assert s._entry_liquidity_retries[d.deployment_id].attempts == 2
+        Clock.current += timedelta(minutes=10)
+        await s.manage_pending_exits({d.deployment_id:d}, now=Clock.current)
+        latest = {}
+        for kind, payload in events:
+            if kind == 'signal_outcome':latest[payload['signal_id']] = payload
+        if state != 'never_armed':
+            assert latest
+        assert all(p['outcome'] != 'pending_execution' for p in latest.values())
+    asyncio.run(run())
+
+
+def test_retry_deadline_closes_original_signal_once(setup):
+    s,p,d,decision,events = setup
+    async def run():
+        await s.handle_signal(d,decision(),dry_run=True,simulate_only=True)
+        original = next(v['signal_id'] for k,v in events if k=='signal_outcome')
+        Clock.current += timedelta(minutes=10)
+        await s.manage_pending_exits({d.deployment_id:d},now=Clock.current)
+        await s.manage_pending_exits({d.deployment_id:d},now=Clock.current)
+        terminal = [v for k,v in events if k=='signal_outcome' and v['signal_id']==original and v['outcome']!='pending_execution']
+        assert len(terminal)==1
+        assert terminal[0]['rejection_reasons']==['liquidity_retry_deadline_reached']
     asyncio.run(run())

@@ -133,17 +133,8 @@ async def reconcile_cartographer_attempts(
     events = load_attempt_events(events_db_path)
     # A process can restart from an older plan before Sheet sync observes the
     # disabled row. Restore the consumed latch from the existing attempt ledger.
-    consumed_retries = set()
-    for event in events:
-        payload = event.get("payload") or {}
-        deployment_id = payload.get("deployment_id")
-        deployment = deployments_by_id.get(deployment_id)
-        if (event.get("event_type") == OUTCOME_EVENT
-            and payload.get("reason") == "liquidity_retry_scheduled"
-            and deployment is not None
-            and payload.get("signal_id") == deployment.source.metadata.get("signal_id")):
-            supervisor.consume_entry_intent(deployment_id)
-            consumed_retries.add(deployment_id)
+    from bhiksha.execution.entry_retry import restore_consumed_retry_intents
+    consumed_retries = restore_consumed_retry_intents(events, deployments_by_id, supervisor)
     pending = unresolved_attempts(events)
     if not pending:
         return {"pending": 0, "replayed": 0, "censored": 0, "deferred": 0}
