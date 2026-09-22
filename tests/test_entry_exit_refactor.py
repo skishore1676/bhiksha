@@ -299,3 +299,66 @@ def test_load_exit_profiles_sheet_rows_handles_reader_format_and_aliases():
     assert dyn.risk_envelope_curvature == 1.5
     assert dyn.risk_envelope_activation_r == 0.5
     assert dyn.risk_envelope_initial_floor_r == -1.0
+
+
+@pytest.mark.parametrize("case", ["fill", "chase_guard", "premium_cap", "fixed_concession", "disabled", "stale"])
+def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
+    async def run():
+        dep = deployment()
+        dep.execution = dep.execution.model_copy(update={
+            "entry_reprice_enabled": case != "disabled", "entry_reprice_checkpoints_seconds": [2, 4],
+            "entry_reprice_cancel_after_seconds": 10, "entry_reprice_spread_fractions": [1.0, 1.0],
+            "entry_reprice_max_chase_pct": .15, "entry_pricing_oi_percentile_scale": False,
+            "entry_execution_profile": None,
+            "entry_pricing_mode": "price_seeking" if case == "fixed_concession" else "patient",
+        })
+        dep.risk = dep.risk.model_copy(update={"max_trade_premium_usd": 1000})
+        now = datetime(2026, 9, 21, 14, tzinfo=UTC)
+        decision = SignalDecision(deployment_id=dep.deployment_id, symbol=dep.symbol, timestamp=now,
+                                  signal=True, direction=SignalDirection.SHORT, reason=[], features={})
+        plan = TradePlan("repriced-paper", dep.deployment_id, dep.symbol, SignalDirection.SHORT,
+                         "QQQ260925P00500000", 2, 2.0, ["approved"], entry_timestamp=now,
+                         risk_details={"effective_max_trade_premium_usd": 400 if case == "premium_cap" else 1000})
+        quote = PublicQuote(plan.option_symbol, bid=2.0, ask=2.2, open_interest=1000,
+                            quote_timestamp=(now + timedelta(seconds=2)).isoformat(), quote_timestamp_field="quoteTimestamp")
+        manager = SimpleNamespace(get_option_quote=AsyncMock(return_value=quote), close=AsyncMock())
+        planner = SimpleNamespace(position_tracker=PositionTracker(), order_manager=manager, close=AsyncMock())
+        recorder = MagicMock()
+        events = SimpleNamespace(append=AsyncMock())
+        supervisor = ExecutionSupervisor(planner=planner, exit_edge_recorder=recorder, event_repository=events)
+        supervisor._paper_entries[plan.trade_id] = (dep, decision, plan, now, now + timedelta(seconds=10))
+        supervisor.lifecycle_store.begin_entry(dep.symbol, dep.deployment_id, order_id="PAPER_PENDING")
+        if case == "stale":
+            quote.quote_timestamp = now.isoformat()
+        await supervisor.poll_paper_entries(now=now + timedelta(seconds=3))
+        assert not recorder.try_register_entry.called  # Repricing quote cannot fill the new limit.
+        if case == "premium_cap":
+            assert not supervisor._paper_entries
+            assert "paper_reprice_above_max_trade_premium" in str(events.append.call_args_list)
+            return
+        active = supervisor._paper_entries[plan.trade_id][2]
+        assert active.quantity == 2
+        if case in {"fixed_concession", "disabled", "stale"}:
+            assert active.estimated_entry_price == 2.0
+            return
+        assert active.estimated_entry_price == 2.2
+        assert active.risk_details["entry_pricing"]["initial_limit_price"] == 2.0
+        assert "paper_entry_repriced" in str(events.append.call_args_list)
+        await supervisor.poll_paper_entries(now=now + timedelta(seconds=3.5))
+        assert not recorder.try_register_entry.called  # Same quote still cannot fill.
+        if case == "chase_guard":
+            quote.bid, quote.ask = 2.2, 2.4
+            quote.quote_timestamp = (now + timedelta(seconds=5)).isoformat()
+            await supervisor.poll_paper_entries(now=now + timedelta(seconds=5))
+            assert supervisor._paper_entries[plan.trade_id][2].estimated_entry_price == 2.2
+            assert "paper_entry_reprice_chase_guard_resting" in str(events.append.call_args_list)
+            await supervisor.poll_paper_entries(now=now + timedelta(seconds=11))
+            assert not supervisor._paper_entries
+            assert not recorder.try_register_entry.called
+            return
+        quote.quote_timestamp = (now + timedelta(seconds=4)).isoformat()
+        await supervisor.poll_paper_entries(now=now + timedelta(seconds=4))
+        assert recorder.try_register_entry.call_count == 1
+        assert not supervisor._paper_entries
+        assert recorder.try_register_entry.call_args.kwargs["entry_premium"] == 2.2
+    asyncio.run(run())

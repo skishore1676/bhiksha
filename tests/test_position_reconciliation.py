@@ -637,3 +637,22 @@ def test_reconcile_gross_price_divergence_still_contradicts() -> None:
     assert len(tracked) == 1
     assert tracked[0].trade_id != "TRADE123"
     assert tracked[0].source == "broker_recovered"
+
+
+def test_shadow_lane_cannot_adopt_unmatched_or_synthetic_broker_position():
+    positions, deployments, known_trades = _matched_open_trade_fixture(None)
+    deployments[0].execution = deployments[0].execution.model_copy(update={"shadow_only": True})
+    assert reconcile_public_positions(positions, deployments) == []
+    assert reconcile_public_positions(positions, deployments, known_trades=known_trades) == []
+    from dataclasses import replace
+    known_trades[0] = replace(known_trades[0], entry_order_id="SHADOW_ENTRY")
+    assert reconcile_public_positions(positions, deployments, known_trades=known_trades) == []
+
+
+def test_demoted_shadow_lane_keeps_proved_live_position_ownership():
+    positions, deployments, known_trades = _matched_open_trade_fixture("REAL-BROKER-ENTRY")
+    deployments[0].execution = deployments[0].execution.model_copy(update={"shadow_only": True})
+    tracked = reconcile_public_positions(positions, deployments, known_trades=known_trades)
+    assert len(tracked) == 1
+    assert tracked[0].source == "live_open"
+    assert tracked[0].trade_id == known_trades[0].trade_id

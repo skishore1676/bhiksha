@@ -108,7 +108,8 @@ def reconcile_public_positions(
                 )
         else:
             symbol_deployments = deployments_by_symbol.get(symbol, [])
-            if len(symbol_deployments) == 1:
+            # A symbol match alone cannot give a shadow lane ownership of real money.
+            if len(symbol_deployments) == 1 and not symbol_deployments[0].execution.shadow_only:
                 deployment = symbol_deployments[0]
                 trade_id = _synthetic_trade_id(
                     deployment_id=deployment.deployment_id,
@@ -121,6 +122,12 @@ def reconcile_public_positions(
             else:
                 continue
         if deployment is None:
+            continue
+        # Preserve genuine live ownership after a lane is demoted, but neither a
+        # paper entry nor a synthetic orphan record proves broker ownership.
+        if deployment.execution.shadow_only and not (
+            matched_trade is not None and _is_live_entry_order_id(matched_trade.entry_order_id)
+        ):
             continue
         quantity = _parse_quantity(position)
         if quantity <= 0:

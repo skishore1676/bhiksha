@@ -678,6 +678,7 @@ def test_runtime_refresh_reconciliation_retries_timeout_and_recovers() -> None:
     runtime = build_runtime()
     deployment = _runtime_deployment(runtime, symbol="SPY", fallback_id="market_impulse_spy_short_v1")
     deployment.enabled = True
+    deployment.execution = deployment.execution.model_copy(update={"shadow_only": False})
     snapshot = ReconciliationSnapshot()
 
     class StubBroker:

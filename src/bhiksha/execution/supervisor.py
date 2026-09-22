@@ -2220,8 +2220,8 @@ class ExecutionSupervisor:
         """One bounded read per pending entry, on the existing monitor loop.
 
         No global entry lock is held over quote IO. A pending lifecycle reserves the
-        deployment slot. The original limit stays fixed: crossing a later ask is
-        required, and no liquidity/size/price assumptions are improved retroactively.
+        deployment slot. Profile reprices apply prospectively: a quote received for
+        repricing cannot also fill that new limit. Fixed concessions never chase.
         """
         from math import isfinite
         from bhiksha.execution.quote_lineage import PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
@@ -2248,11 +2248,17 @@ class ExecutionSupervisor:
                         continue
                     if quote.bid is None or quote.ask is None or not all(isfinite(v) for v in (quote.bid, quote.ask)):
                         continue
-                    if not (0 < quote.bid <= quote.ask <= plan.estimated_entry_price):
+                    if not (0 < quote.bid <= quote.ask):
                         continue
                     # Check hard quote gates again at fill; preferred liquidity is not a veto.
                     from bhiksha.execution.pricing import select_entry_limit
                     if not select_entry_limit(quote, deployment.execution.model_dump()).approved:
+                        continue
+                    effective_at = datetime.fromisoformat(plan.risk_details.get("paper_limit_effective_at", started.isoformat()))
+                    if quote_at <= effective_at:
+                        continue
+                    if quote.ask > plan.estimated_entry_price:
+                        await self._reprice_paper_entry(deployment, decision, plan, started, expires, quote, received)
                         continue
                 except Exception as exc:
                     await self.event_repository.append("paper_entry_quote_unavailable", {
@@ -2268,6 +2274,49 @@ class ExecutionSupervisor:
                 self._paper_entries.pop(trade_id, None)
                 await self.event_repository.append("signal_outcome", _signal_outcome_payload(
                     deployment, decision, outcome="filled", plan=plan, mode="shadow"))
+
+    async def _reprice_paper_entry(self, deployment, decision, plan, started, expires, quote, received):
+        """Model the configured ladder without submitting orders or inventing fills."""
+        if not _entry_reprice_enabled(self.app_config, deployment):
+            return
+        checkpoints = _entry_reprice_checkpoints(self.app_config, deployment)
+        completed = int(plan.risk_details.get("paper_reprice_attempt", 0))
+        if completed >= len(checkpoints) or (received - started).total_seconds() < checkpoints[completed]:
+            return
+        attempt = completed + 1
+        plan.risk_details["paper_reprice_attempt"] = attempt
+        pricing = select_entry_limit(quote, _entry_reprice_pricing_params(self.app_config, deployment, plan, attempt))
+        if not pricing.approved or pricing.limit_price is None:
+            await self._finish_paper_no_fill(plan.trade_id, "paper_reprice_quote_blocked")
+            return
+        proposed = round_price(pricing.limit_price)
+        evidence = _entry_pricing_evidence(pricing, deployment, plan)
+        reference = _entry_reprice_reference_limit_price(plan)
+        chase = resolve_entry_reprice_max_chase_pct(deployment.execution.model_dump())
+        if (reference is not None and chase is not None and proposed > plan.estimated_entry_price
+                and proposed > round_price(reference * (1 + chase)) + 1e-9):
+            await self.event_repository.append("paper_entry_reprice_chase_guard_resting", {
+                "trade_id": plan.trade_id, "deployment_id": deployment.deployment_id, "attempt": attempt,
+                "current_limit_price": plan.estimated_entry_price, "proposed_limit_price": proposed,
+                "reference_limit_price": reference, "max_chase_pct": chase, "mode": "shadow"})
+            return
+        cap = deployment.risk.max_trade_premium_usd or 300.0
+        effective_cap = plan.risk_details.get("effective_max_trade_premium_usd")
+        if isinstance(effective_cap, (int, float)) and effective_cap > 0:
+            cap = min(cap, effective_cap)
+        if proposed * plan.quantity * 100 > cap:
+            await self._finish_paper_no_fill(plan.trade_id, "paper_reprice_above_max_trade_premium")
+            return
+        if proposed == plan.estimated_entry_price:
+            return
+        updated = replace(plan, estimated_entry_price=proposed, risk_details={
+            **plan.risk_details, "entry_pricing": evidence, "paper_limit_effective_at": received.isoformat()})
+        self._paper_entries[plan.trade_id] = (deployment, decision, updated, started, expires)
+        await self.event_repository.append("paper_entry_repriced", {
+            "trade_id": plan.trade_id, "deployment_id": deployment.deployment_id, "attempt": attempt,
+            "previous_limit_price": plan.estimated_entry_price, "limit_price": proposed,
+            "quantity": plan.quantity, "effective_at": received.isoformat(), "mode": "shadow",
+            "pricing_evidence": evidence})
 
     def consume_entry_intent(self, deployment_id: str) -> None:
         self._disabled_entry_deployments.add(deployment_id)
@@ -2783,19 +2832,7 @@ class ExecutionSupervisor:
         *,
         attempt: int,
     ) -> "_EntryRepriceResult":
-        pricing_params = deployment.execution.model_dump()
-        spread_fraction = _entry_reprice_spread_fraction(deployment, attempt)
-        if spread_fraction is None:
-            pricing_params["entry_pricing_urgent_spread_pct"] = _entry_reprice_spread_pct(self.app_config, attempt)
-        else:
-            pricing_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
-                spread_fraction,
-                enabled=(
-                    deployment.execution.entry_pricing_oi_percentile_scale
-                    or get_entry_execution_profile(deployment.execution.entry_execution_profile) is not None
-                ),
-                open_interest_percentile=_risk_open_interest_percentile(plan),
-            )
+        pricing_params = _entry_reprice_pricing_params(self.app_config, deployment, plan, attempt)
         try:
             quote = await self.planner.order_manager.get_option_quote(plan.option_symbol)
             pricing = select_entry_limit(quote, pricing_params)
@@ -9126,6 +9163,23 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
     if candidate <= 0:
         return None
     return round_price(candidate)
+
+
+def _entry_reprice_pricing_params(app_config, deployment, plan, attempt):
+    pricing_params = deployment.execution.model_dump()
+    spread_fraction = _entry_reprice_spread_fraction(deployment, attempt)
+    if spread_fraction is None:
+        pricing_params["entry_pricing_urgent_spread_pct"] = _entry_reprice_spread_pct(app_config, attempt)
+    else:
+        pricing_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
+            spread_fraction,
+            enabled=(
+                deployment.execution.entry_pricing_oi_percentile_scale
+                or get_entry_execution_profile(deployment.execution.entry_execution_profile) is not None
+            ),
+            open_interest_percentile=_risk_open_interest_percentile(plan),
+        )
+    return pricing_params
 
 
 def _entry_reprice_enabled(app_config: AppConfig, deployment: DeploymentManifest) -> bool:
