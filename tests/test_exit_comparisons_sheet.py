@@ -62,6 +62,9 @@ def test_scorecard_sheet_write_is_scoped_and_keeps_live_age_formula():
     assert block["rows"][6]["values"][0]["userEnteredValue"]["stringValue"] == "Mode"
     assert block["rows"][7]["values"][7]["userEnteredValue"]["numberValue"] == 1
     assert "formulaValue" in block["rows"][2]["values"][1]["userEnteredValue"]
+    age_format = next(request["repeatCell"] for request in requests
+                      if "repeatCell" in request and request["repeatCell"].get("fields") == "userEnteredFormat.numberFormat")
+    assert age_format["cell"]["userEnteredFormat"]["numberFormat"]["type"] == "NUMBER"
 
 
 def test_failed_sheet_publication_retains_last_success_receipt(tmp_path, monkeypatch):
