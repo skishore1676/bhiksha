@@ -21,8 +21,10 @@ fi
 exit_edge_marker="$REPO_ROOT/artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled"
 if [ -f "$exit_edge_marker" ]; then
   export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=true
+  export BHIKSHA_EXIT_EDGE_OBSERVER_EXTERNAL_ENABLED=true
 else
   export BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED=false
+  export BHIKSHA_EXIT_EDGE_OBSERVER_EXTERNAL_ENABLED=false
 fi
 
 set +e

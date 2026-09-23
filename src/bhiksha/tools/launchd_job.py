@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -29,6 +30,8 @@ from bhiksha.ops.daily_report import (
     render_daily_report_ryg_telegram_text,
     write_daily_report,
 )
+from bhiksha.ops.exit_edge_observer import run_observer
+from bhiksha.ops.exit_comparisons_sheet import publish_exit_comparisons_best_effort
 from bhiksha.ops.chart_evidence_export import export_chart_evidence
 from bhiksha.ops.launchd_status_store import write_latest_status
 from bhiksha.ops.reconciliation_supervision import run_reconciliation_supervisor
@@ -56,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
             "session-report",
             "weekly-trading-decisions",
             "cartographer-shadow",
+            "exit-edge-observer",
         ],
     )
     parser.add_argument(
@@ -171,6 +175,8 @@ def main(argv: list[str] | None = None) -> int:
             return _weekly_trading_decisions_job(args, repo_root=repo_root)
         if args.job == "cartographer-shadow":
             return _cartographer_shadow_job(args, repo_root=repo_root)
+        if args.job == "exit-edge-observer":
+            return _exit_edge_observer_job(repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001 - scheduled jobs must alert and fail closed.
         alert = _send_failure_alert(
             args, title=f"Bhiksha launchd job failed: {args.job}", detail=str(exc)
@@ -391,6 +397,11 @@ def _session_report_job(args: argparse.Namespace) -> int:
         ),
     )
     review = _publish_session_report_review(args, result, report_label)
+    exit_comparisons_sheet = publish_exit_comparisons_best_effort(
+        db_path=getattr(runtime.app_config, "exit_edge_live_shadow_db_path",
+                        Path(runtime.app_config.playbook_artifacts_dir).parent / "observations/exit_edge_live.sqlite3"),
+        receipt_dir=Path(runtime.app_config.playbook_artifacts_dir) / "exit_comparisons_sheet",
+    )
     payload: dict = {
         "job": args.job,
         # Report generation and transport delivery are separate contracts. A
@@ -404,6 +415,7 @@ def _session_report_job(args: argparse.Namespace) -> int:
         "app_status": app_status,
         "transport_status": alert.transport_status,
         "alert": alert.to_dict(),
+        "exit_comparisons_sheet": exit_comparisons_sheet,
     }
     if review is not None:
         payload["obsidian_review"] = review.to_dict()
@@ -433,6 +445,16 @@ def _reconciliation_supervisor_job(args: argparse.Namespace, *, repo_root: Path)
     }
     _print_result(payload)
     return 2 if receipt["attention_required"] else 0
+
+
+def _exit_edge_observer_job(*, repo_root: Path) -> int:
+    config = load_app_config(repo_root / "config" / "app.yaml")
+    asyncio.run(run_observer(
+        db_path=repo_root / config.exit_edge_live_shadow_db_path,
+        status_path=repo_root / config.exit_edge_live_shadow_status_path,
+        enable_marker=repo_root / "artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled",
+    ))
+    return 0
 
 
 def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) -> int:
@@ -486,6 +508,10 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             }
         )
         return 2
+    exit_comparisons_sheet = publish_exit_comparisons_best_effort(
+        db_path=runtime.app_config.exit_edge_live_shadow_db_path,
+        receipt_dir=Path(runtime.app_config.playbook_artifacts_dir) / "exit_comparisons_sheet",
+    )
     review: ReviewPublishResult | None = None
     if args.weekly_review_mode == "on":
         review = publish_lathi_review(
@@ -512,6 +538,7 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
             "experiment_status": str(result.experiment_status_path),
             "exit_edge_evidence": str(result.exit_edge_path),
             "workbook_update": workbook,
+            "exit_comparisons_sheet": exit_comparisons_sheet,
             "obsidian_review": review.to_dict() if review else None,
             "telegram_sent": False,
         }
@@ -634,7 +661,7 @@ def _should_skip_for_calendar(job: str, *, force: bool) -> bool:
     # live-stop must always run so a stale process cannot survive; the weekly
     # scorecard is the week's verdict and must publish even when the Friday it
     # fires is itself a market holiday (the Mon-Fri window still had trading).
-    if job in {"live-stop", "weekly-trading-decisions"}:
+    if job in {"live-stop", "weekly-trading-decisions", "exit-edge-observer"}:
         return False
     today = datetime.now(CENTRAL).date()
     return not is_trading_day(today)

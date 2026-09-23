@@ -29,6 +29,8 @@ class LaunchdJobSpec:
     install_opt_in_env: str | None = None
     process_type: str | None = None
     low_priority_io: bool = False
+    run_at_load: bool = False
+    keep_alive: bool = False
 
     def install_enabled(self) -> bool:
         if self.install_opt_in_env is None:
@@ -79,11 +81,16 @@ class LaunchdJobSpec:
         payload: dict[str, Any] = {
             "Label": self.label,
             "ProgramArguments": self.program_arguments(repo_root),
-            "StartCalendarInterval": [dict(item) for item in self.schedule],
             "WorkingDirectory": str(repo_root),
             "StandardOutPath": str(stdout_log),
             "StandardErrorPath": str(stderr_log),
         }
+        if self.schedule:
+            payload["StartCalendarInterval"] = [dict(item) for item in self.schedule]
+        if self.run_at_load:
+            payload["RunAtLoad"] = True
+        if self.keep_alive:
+            payload["KeepAlive"] = True
         if self.process_type is not None:
             payload["ProcessType"] = self.process_type
         if self.low_priority_io:
@@ -132,6 +139,19 @@ def every_10_minutes(start_hour: int, start_minute: int, end_hour: int, end_minu
 
 
 ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
+    LaunchdJobSpec(
+        label="com.bhiksha.exit-edge-observer",
+        runner_job="exit-edge-observer",
+        schedule=(),
+        schedule_label="Continuous; quotes only during regular trading hours",
+        purpose="Observe registered exit comparisons independently of executor restarts.",
+        skips_non_trading_days=False,
+        risk_class="market_data_observer",
+        run_at_load=True,
+        keep_alive=True,
+        process_type="Background",
+        low_priority_io=True,
+    ),
     LaunchdJobSpec(
         label="com.bhiksha.cartographer-shadow",
         runner_job="cartographer-shadow",
@@ -201,8 +221,8 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
     LaunchdJobSpec(
         label="com.bhiksha.session-report",
         runner_job="session-report",
-        schedule=weekdays(9, 10) + weekdays(11, 45) + weekdays(14, 45),
-        schedule_label="Weekdays 09:10, 11:45, and 14:45 CT",
+        schedule=weekdays(9, 10) + weekdays(11, 45) + weekdays(14, 45) + weekdays(15, 15),
+        schedule_label="Weekdays 09:10, 11:45, 14:45, and 15:15 CT",
         purpose="Send an intraday session report early enough for manual action.",
         skips_non_trading_days=True,
         risk_class="operator_report",

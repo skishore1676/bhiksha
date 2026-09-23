@@ -24,7 +24,7 @@ def test_stale_status_uses_central_calendar_at_sunday_utc_rollover() -> None:
     last_at = {
         "live-start": "2026-08-07T13:20:00+00:00",
         "live-watchdog": "2026-08-07T20:00:00+00:00",
-        "session-report": "2026-08-07T19:45:00+00:00",
+        "session-report": "2026-08-07T20:15:00+00:00",
         "live-stop": "2026-08-07T20:10:00+00:00",
     }
 
@@ -40,7 +40,7 @@ def test_stale_status_waits_for_monday_schedule_before_flagging() -> None:
     last_at = {
         "live-start": "2026-08-07T13:20:00+00:00",
         "live-watchdog": "2026-08-07T20:00:00+00:00",
-        "session-report": "2026-08-07T19:45:00+00:00",
+        "session-report": "2026-08-07T20:15:00+00:00",
         "live-stop": "2026-08-07T20:10:00+00:00",
     }
     before_first_fire = datetime(2026, 8, 10, 12, 31, tzinfo=UTC)  # 07:31 CT
@@ -1467,3 +1467,23 @@ def test_manual_recovery_watermark_does_not_hide_new_scheduler_failure():
     launchd["runs"] = "6"
     assert _launchd_exit_findings("weekly", launchd, last, now=datetime.now(UTC))
     assert _launchd_exit_findings("weekly", launchd, {"status": "ok"}, now=datetime.now(UTC))
+
+
+def test_exit_edge_observer_status_uses_live_heartbeat_and_enable_marker(tmp_path):
+    status_path = tmp_path / "artifacts/observations/exit_edge_live_status.json"
+    status_path.parent.mkdir(parents=True)
+    marker = tmp_path / "artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    now = datetime(2026, 9, 23, 15, 0, tzinfo=UTC)
+    status_path.write_text(json.dumps({"role": "observer", "ready": True,
+        "worker_alive": True, "updated_at": now.isoformat(),
+        "active_cohorts": 6, "observation_polls": 4}))
+    loaded = {"loaded": True}
+    healthy = launchd_status._exit_edge_observer_status(tmp_path, loaded, now)
+    assert healthy["status"] == "healthy" and healthy["active_cohorts"] == 6
+    stale = launchd_status._exit_edge_observer_status(tmp_path, loaded, now + timedelta(minutes=5))
+    assert stale["status"] == "observer_heartbeat_stale"
+    marker.unlink()
+    idle = launchd_status._exit_edge_observer_status(tmp_path, loaded, now + timedelta(minutes=5))
+    assert idle["status"] == "idle_disabled"

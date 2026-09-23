@@ -303,7 +303,7 @@ class ExecutionSupervisor:
     def due_exit_edge_continuation_options(
         self, *, held_option_symbols: set[str], now: datetime
     ) -> tuple[str, ...]:
-        if self.exit_edge_recorder is None:
+        if self.exit_edge_recorder is None or self.exit_edge_recorder.role == "registration":
             return ()
         return self.exit_edge_recorder.continuation_option_symbols(
             held_option_symbols=held_option_symbols,

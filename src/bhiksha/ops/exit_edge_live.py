@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
+import time
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,7 @@ from bhiksha.execution.profile_exit import ProfileExitFields
 from bhiksha.ops.exit_edge_lab import (
     EVALUATOR_VERSION,
     FILL_MODEL_VERSION,
+    CURRENT_MEASUREMENT_GENERATION,
     ProspectiveQuoteTapeRepository,
     QuoteTapeMark,
     ShadowEnvelopeState,
@@ -39,6 +41,7 @@ from bhiksha.ops.exit_edge_lab import (
 ET = ZoneInfo("America/New_York")
 QUOTE_SOURCE = "public_api"
 QUOTE_FEED = "order_manager_reused_quote_with_bounded_retry_v2"
+INDEPENDENT_QUOTE_FEED = str(CURRENT_MEASUREMENT_GENERATION["quote_feed"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,9 +74,13 @@ class ExitEdgeLiveRecorder:
         max_freshness_ms: int = 5_000,
         max_sequence_gap: int = 1,
         continuation_min_interval_seconds: float = 30.0,
+        role: str = "embedded",
         repository_factory: Callable[[str | Path], ProspectiveQuoteTapeRepository]
         | None = None,
     ) -> None:
+        if role not in {"embedded", "registration", "observer"}:
+            raise ValueError("unknown exit observation role")
+        self.role = role
         self.db_path = Path(db_path)
         self.status_path = Path(status_path)
         self.fill_latency_ms = int(fill_latency_ms)
@@ -85,17 +92,22 @@ class ExitEdgeLiveRecorder:
         self._queue: Queue[_Register | _ObservedQuote] = Queue(
             maxsize=max(int(queue_capacity), 1)
         )
-        self._repository_factory = repository_factory or ProspectiveQuoteTapeRepository
+        self._repository_factory = repository_factory or (
+            (lambda path: ProspectiveQuoteTapeRepository(path, write_timeout_seconds=0.25))
+            if role in {"registration", "observer"} else ProspectiveQuoteTapeRepository
+        )
         self._stop_after_drain = Event()
         self._lock = Lock()
         self._active_by_option: dict[str, set[str]] = {}
         self._pending_censors: dict[str, str] = {}
         self._pending_registration_attempts: dict[str, dict[str, Any]] = {}
         self._last_continuation_request: dict[str, datetime] = {}
+        self._seen_cohort_ids: set[str] = set()
         self._health: dict[str, Any] = {
             "schema_version": 3,
             "enabled": True,
             "mode": "observational_shadow_only",
+            "role": role,
             "enforcement_authority": False,
             "promotion_eligible": False,
             "inference_eligible": False,
@@ -106,7 +118,8 @@ class ExitEdgeLiveRecorder:
             "continuation_quote_calls_added": 0,
             "continuation_quote_failures": 0,
             "quote_source": QUOTE_SOURCE,
-            "quote_feed": QUOTE_FEED,
+            "quote_feed": (INDEPENDENT_QUOTE_FEED if role == "registration"
+                           else "frozen_per_cohort" if role == "observer" else QUOTE_FEED),
             "observed_quote_timestamp_fields": {},
             "db_path": str(self.db_path),
             "queue_capacity": self._queue.maxsize,
@@ -118,6 +131,7 @@ class ExitEdgeLiveRecorder:
             "cohorts_recovered": 0,
             "active_cohorts": 0,
             "paired_cohorts": 0,
+            "diagnostic_completed_cohorts": 0,
             "censored_cohorts": 0,
             "rejected_quotes": 0,
             "rejected_quote_reasons": {},
@@ -126,6 +140,11 @@ class ExitEdgeLiveRecorder:
             "registration_failures": 0,
             "last_error": None,
             "worker_alive": False,
+            "ready": False,
+            "observation_polls": 0,
+            "observation_quote_requests": 0,
+            "observation_quote_results": 0,
+            "observation_errors": 0,
             "updated_at": datetime.now(UTC).isoformat(),
         }
         self._thread = Thread(
@@ -166,7 +185,7 @@ class ExitEdgeLiveRecorder:
             if payload is None:
                 self._increment_health("ineligible_fill_attempts")
             self._queue.put_nowait(_Register(attempt, payload))
-            if payload is not None:
+            if payload is not None and self.role != "registration":
                 # Make queue-overflow censoring race-free: the identity is known
                 # before the persistence worker activates the cohort.
                 self._activate(str(payload["option_symbol"]), str(payload["cohort_id"]))
@@ -246,7 +265,7 @@ class ExitEdgeLiveRecorder:
             self._increment_health("continuation_quote_failures", error=error)
 
     def close(self, *, join_timeout_seconds: float = 1.0) -> None:
-        """Drain queued facts and censor unfinished cohorts at session shutdown."""
+        """Drain queued facts; only legacy embedded collection censors on shutdown."""
         self._stop_after_drain.set()
         if self._thread.is_alive():
             self._thread.join(timeout=max(float(join_timeout_seconds), 0.0))
@@ -265,12 +284,47 @@ class ExitEdgeLiveRecorder:
             snapshot["inference_blockers"] = list(self._health["inference_blockers"])
             return snapshot
 
+    def active_option_symbols(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._active_by_option))
+
+    def heartbeat(self) -> None:
+        self._set_health()
+        self._write_status_best_effort()
+
+    def record_observation_poll(self, requested: int, received: int) -> None:
+        with self._lock:
+            self._health["observation_polls"] += 1
+            self._health["observation_quote_requests"] += int(requested)
+            self._health["observation_quote_results"] += int(received)
+            self._health["updated_at"] = datetime.now(UTC).isoformat()
+        self._write_status_best_effort()
+
+    def record_observation_error(self, reason: str) -> None:
+        self._increment_health("observation_errors", error=f"observation:{reason}")
+        self._write_status_best_effort()
+
+    def refresh_active_from_store(self) -> None:
+        """Adopt newly registered cohorts without involving the executor process."""
+        if self.role != "observer":
+            raise ValueError("only the independent observer may refresh cohorts")
+        repository = self._repository_factory(self.db_path)
+        for cohort_id in repository.list_cohort_ids():
+            self._adopt_cohort(repository, cohort_id)
+
     def _run(self) -> None:
         repository = self._repository_factory(self.db_path)
         self._set_health(worker_alive=True)
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            if not repository.try_initialize():
+            initialized = repository.try_initialize()
+            if not initialized and self.role in {"registration", "observer"}:
+                for _ in range(20):
+                    time.sleep(0.05)
+                    initialized = repository.try_initialize()
+                    if initialized:
+                        break
+            if not initialized:
                 self._increment_health("storage_failures", error="repository_initialize_failed")
                 return
             denominator = repository.registration_summary()
@@ -285,7 +339,10 @@ class ExitEdgeLiveRecorder:
                     denominator["missing_or_ineligible_registrations"],
                 ),
             )
-            self._recover(repository)
+            if self.role != "registration":
+                self._recover(repository)
+            self._set_health(ready=True)
+            self._write_status_best_effort()
             while True:
                 try:
                     item = self._queue.get(timeout=0.05)
@@ -307,10 +364,11 @@ class ExitEdgeLiveRecorder:
                 self._flush_pending_censors(repository)
             self._flush_pending_registration_attempts(repository)
             self._flush_pending_censors(repository)
-            self._censor_all_active(
-                repository,
-                "no_post_exit_quote_source_session_shutdown_before_virtual_arms_terminal",
-            )
+            if self.role == "embedded":
+                self._censor_all_active(
+                    repository,
+                    "no_post_exit_quote_source_session_shutdown_before_virtual_arms_terminal",
+                )
         except Exception as exc:  # the sidecar must never take down trading
             self._increment_health("storage_failures", error=f"worker_crash:{type(exc).__name__}:{exc}")
         finally:
@@ -319,28 +377,39 @@ class ExitEdgeLiveRecorder:
 
     def _recover(self, repository: ProspectiveQuoteTapeRepository) -> None:
         for cohort_id in repository.list_cohort_ids():
-            try:
-                case = repository.load_case(cohort_id)
-                row = analyze_cases([case])["cases"][0]
-                states = tuple(
-                    ShadowEnvelopeState(**state)
-                    for state in row.get("shadow_envelope_states", [])
-                )
-                if states:
-                    repository.persist_shadow_envelope_states(states)
-                if row["status"] == "paired":
-                    self._increment_health("paired_cohorts")
-                    continue
-                if case.persisted_censor_reason:
-                    self._increment_health("censored_cohorts")
-                    continue
-                # A process restart creates an unobserved interval in the tape.
-                # Never silently resume with a sequence-contiguous fiction.
-                self._censor(repository, cohort_id, "restart_gap_unobserved_quotes")
-                self._increment_health("cohorts_recovered")
-            except Exception as exc:
-                self._increment_health("storage_failures", error=f"recovery:{cohort_id}:{exc}")
+            self._adopt_cohort(repository, cohort_id)
         self._write_status_best_effort()
+
+    def _adopt_cohort(self, repository: ProspectiveQuoteTapeRepository, cohort_id: str) -> None:
+        with self._lock:
+            if cohort_id in self._seen_cohort_ids:
+                return
+        try:
+            case = repository.load_case(cohort_id)
+            row = analyze_cases([case])["cases"][0]
+            states = tuple(
+                ShadowEnvelopeState(**state)
+                for state in row.get("shadow_envelope_states", [])
+            )
+            if states:
+                repository.persist_shadow_envelope_states(states)
+            with self._lock:
+                self._seen_cohort_ids.add(cohort_id)
+            if _all_arms_terminal(row):
+                self._increment_health(
+                    "paired_cohorts" if row["status"] == "paired" else "diagnostic_completed_cohorts"
+                )
+                return
+            if case.persisted_censor_reason:
+                self._increment_health("censored_cohorts")
+                return
+            if self.role == "observer":
+                self._activate(case.option_symbol, cohort_id)
+            else:
+                self._censor(repository, cohort_id, "restart_gap_unobserved_quotes")
+            self._increment_health("cohorts_recovered")
+        except Exception as exc:
+            self._increment_health("storage_failures", error=f"recovery:{cohort_id}:{exc}")
 
     def _persist_registration(
         self, repository: ProspectiveQuoteTapeRepository,
@@ -366,7 +435,8 @@ class ExitEdgeLiveRecorder:
         if not repository.try_record_registration_attempt(attempt):
             self._retain_registration_attempt(attempt)
             self._increment_health("storage_failures", error=f"attempt_persist_failed:{cohort_id}")
-        self._activate(str(payload["option_symbol"]), cohort_id)
+        if self.role != "registration":
+            self._activate(str(payload["option_symbol"]), cohort_id)
         self._increment_health("cohorts_registered")
         self._write_status_best_effort()
 
@@ -409,7 +479,7 @@ class ExitEdgeLiveRecorder:
                 mark = QuoteTapeMark(
                     sequence=sequence,
                     source=QUOTE_SOURCE,
-                    feed=QUOTE_FEED,
+                    feed=str(case.experiment["quote_feed"]),
                     quote_at=observed.quote_at,
                     received_at=observed.received_at,
                     bid=observed.bid,
@@ -418,7 +488,6 @@ class ExitEdgeLiveRecorder:
                 )
                 if not repository.try_append_quote(cohort_id, mark):
                     self._increment_health("storage_failures", error=f"append_failed:{cohort_id}")
-                    self._censor(repository, cohort_id, "quote_persistence_failure")
                     continue
                 case = repository.load_case(cohort_id)
                 row = analyze_cases([case])["cases"][0]
@@ -428,9 +497,11 @@ class ExitEdgeLiveRecorder:
                 )
                 if states:
                     repository.persist_shadow_envelope_states(states)
-                if row["status"] == "paired":
+                if _all_arms_terminal(row):
                     self._deactivate(case.option_symbol, cohort_id)
-                    self._increment_health("paired_cohorts")
+                    self._increment_health(
+                        "paired_cohorts" if row["status"] == "paired" else "diagnostic_completed_cohorts"
+                    )
                 else:
                     reason = str(row.get("insufficient_reason") or "")
                     if reason and not (
@@ -440,7 +511,6 @@ class ExitEdgeLiveRecorder:
                         self._censor(repository, cohort_id, reason)
             except Exception as exc:
                 self._increment_health("storage_failures", error=f"quote_processing:{cohort_id}:{exc}")
-                self._censor(repository, cohort_id, "quote_processing_failure")
         self._write_status_best_effort()
 
     def _quote_rejection_reason(
@@ -488,7 +558,7 @@ class ExitEdgeLiveRecorder:
         if repository.try_record_quote_rejection(
             cohort_id,
             source=QUOTE_SOURCE,
-            feed=QUOTE_FEED,
+            feed=str(repository.load_case(cohort_id).experiment["quote_feed"]),
             reason=reason,
             quote_timestamp_field=observed.quote_timestamp_field,
             quote_at=observed.quote_at,
@@ -607,6 +677,7 @@ class ExitEdgeLiveRecorder:
         normalized = _normalize_option_symbol(option_symbol)
         with self._lock:
             return tuple(self._active_by_option.get(normalized, ()))
+
 
     def _increment_health(self, key: str, *, error: str | None = None) -> None:
         with self._lock:
@@ -747,8 +818,10 @@ class ExitEdgeLiveRecorder:
             "evaluator_version": EVALUATOR_VERSION,
             "fill_model_version": FILL_MODEL_VERSION,
             "quote_source": QUOTE_SOURCE,
-            "quote_feed": QUOTE_FEED,
+            "quote_feed": INDEPENDENT_QUOTE_FEED if self.role == "registration" else QUOTE_FEED,
         }
+        if self.role == "registration":
+            experiment["max_observation_gap_seconds"] = CURRENT_MEASUREMENT_GENERATION["max_observation_gap_seconds"]
         try:
             if getattr(deployment.exit, "management_exit", None):
                 policies = list(getattr(deployment.exit, "compare_exit_policies", []) or [])
@@ -828,6 +901,18 @@ class ExitEdgeLiveRecorder:
             "experiment": experiment,
             "experiment_spec_hash": experiment_spec_hash(profile, legacy, experiment),
         }
+
+
+def _all_arms_terminal(row: dict[str, Any]) -> bool:
+    if row.get("status") == "paired":
+        return True
+    if row.get("status") != "gap_affected":
+        return False
+    statuses = row.get("arm_evidence_status") or {}
+    return bool(statuses) and all(
+        value in {"complete_clean", "gap_affected_diagnostic"}
+        for value in statuses.values()
+    )
 
 
 def _aware_utc(value: datetime) -> datetime:

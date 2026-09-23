@@ -293,17 +293,22 @@ class BhikshaRuntime:
         # already makes.
         exit_edge_recorder = None
         if self.app_config.exit_edge_live_shadow_enabled:
+            external_observer = os.getenv("BHIKSHA_EXIT_EDGE_OBSERVER_EXTERNAL_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+            status_path = Path(self.app_config.exit_edge_live_shadow_status_path)
             exit_edge_recorder = ExitEdgeLiveRecorder(
                 db_path=self.app_config.exit_edge_live_shadow_db_path,
-                status_path=self.app_config.exit_edge_live_shadow_status_path,
+                status_path=(status_path.with_name("exit_edge_registration_status.json")
+                             if external_observer else status_path),
                 queue_capacity=self.app_config.exit_edge_live_shadow_queue_capacity,
                 fill_latency_ms=self.app_config.exit_edge_live_shadow_fill_latency_ms,
                 max_freshness_ms=self.app_config.exit_edge_live_shadow_max_freshness_ms,
                 max_sequence_gap=self.app_config.exit_edge_live_shadow_max_sequence_gap,
+                role="registration" if external_observer else "embedded",
             )
             exit_edge_recorder.start()
         order_manager = OrderManager(
-            quote_observer=exit_edge_recorder.observe_quote if exit_edge_recorder else None
+            quote_observer=(exit_edge_recorder.observe_quote if exit_edge_recorder
+                            and exit_edge_recorder.role == "embedded" else None)
         )
 
         async def _mark_price_provider(option_symbol: str) -> float | None:

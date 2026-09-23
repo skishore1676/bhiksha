@@ -11,7 +11,7 @@ Nothing here imports a broker/order manager or mutates runtime/profile state.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 import hashlib
 import json
 import math
@@ -20,6 +20,8 @@ import sqlite3
 from statistics import fmean
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from bhiksha.market_data.trading_calendar import is_trading_day
 
 from bhiksha.execution.profile_exit import (
     ProfileExitFields,
@@ -58,18 +60,19 @@ FILL_MODEL = (
 )
 EVALUATOR_VERSION = "profile-evaluator-v1"
 FILL_MODEL_VERSION = "next-fresh-natural-bid-v2"
-# Generation 4 — current measurement protocol (frozen 2026-08-08).
+# Generation 5 keeps the quote tape alive outside the execution process.
 # Any change to these dimensions must create a new generation id.
 # Includes freshness/sequence/latency which materially affect pairing.
 CURRENT_MEASUREMENT_GENERATION = {
-    "generation_id": "gen4-freshness5s-bounded_retry_v2-2026-08-08",
-    "quote_feed": "order_manager_reused_quote_with_bounded_retry_v2",
+    "generation_id": "gen5-independent-public-observer-2026-09-23",
+    "quote_feed": "independent_public_option_observer_v1",
     "quote_source": "public_api",
     "fill_model_version": FILL_MODEL_VERSION,
     "evaluator_version": EVALUATOR_VERSION,
     "max_freshness_ms": 5_000,
     "max_sequence_gap": 1,
     "fill_latency_ms": 0,
+    "max_observation_gap_seconds": 65,
 }
 LEGACY_RISK_ENVELOPE_EXPERIMENT_SCHEMA_VERSION = "exit-edge-risk-envelope.v1"
 LEGACY_RISK_ENVELOPE_EXPERIMENT_ID = "trend-continuation-control-a-b.v1"
@@ -100,6 +103,17 @@ class QuoteTapeMark:
 
 
 @dataclass(slots=True, frozen=True)
+class ObservationGap:
+    last_sequence: int | None
+    first_resumed_sequence: int
+    last_quote_at: datetime | None
+    last_received_at: datetime | None
+    first_quote_at: datetime
+    first_received_at: datetime
+    reason: str
+
+
+@dataclass(slots=True, frozen=True)
 class ExitEdgeCase:
     cohort_id: str
     trade_id: str
@@ -118,6 +132,7 @@ class ExitEdgeCase:
     quotes: tuple[QuoteTapeMark, ...]
     persisted_censor_reason: str | None = None
     cohort_dimensions: dict[str, Any] = field(default_factory=dict)
+    observation_gaps: tuple[ObservationGap, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -152,15 +167,18 @@ class ProspectiveQuoteTapeRepository:
     censoring and are never raised into the caller's live decision path.
     """
 
-    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False,
+                 write_timeout_seconds: float = SQLITE_NONBLOCKING_TIMEOUT_SECONDS) -> None:
         self.path = Path(path)
         self.read_only = bool(read_only)
+        self.write_timeout_seconds = max(float(write_timeout_seconds), 0.0)
 
     def _connect(
         self,
         *,
-        timeout_seconds: float = SQLITE_NONBLOCKING_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
     ) -> sqlite3.Connection:
+        timeout_seconds = self.write_timeout_seconds if timeout_seconds is None else timeout_seconds
         if self.read_only:
             uri = f"file:{self.path.resolve()}?mode=ro"
             conn = sqlite3.connect(
@@ -196,6 +214,19 @@ class ProspectiveQuoteTapeRepository:
                   quote_at TEXT NOT NULL, received_at TEXT NOT NULL,
                   bid REAL, ask REAL, last REAL, spread_pct REAL, freshness_ms REAL NOT NULL,
                   PRIMARY KEY (cohort_id, sequence),
+                  FOREIGN KEY (cohort_id) REFERENCES exit_edge_cohorts(cohort_id)
+                );
+                CREATE TABLE IF NOT EXISTS exit_edge_observation_gaps (
+                  cohort_id TEXT NOT NULL,
+                  first_resumed_sequence INTEGER NOT NULL,
+                  last_sequence INTEGER,
+                  last_quote_at TEXT,
+                  last_received_at TEXT,
+                  first_quote_at TEXT NOT NULL,
+                  first_received_at TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  recorded_at TEXT NOT NULL,
+                  PRIMARY KEY (cohort_id, first_resumed_sequence),
                   FOREIGN KEY (cohort_id) REFERENCES exit_edge_cohorts(cohort_id)
                 );
                 CREATE TABLE IF NOT EXISTS exit_edge_censors (
@@ -325,11 +356,12 @@ class ProspectiveQuoteTapeRepository:
         )
         with self._connect() as conn:
             cohort = conn.execute(
-                "SELECT quote_source,quote_feed FROM exit_edge_cohorts WHERE cohort_id=?", (cohort_id,)
+                "SELECT quote_source,quote_feed,entry_timestamp,experiment_spec "
+                "FROM exit_edge_cohorts WHERE cohort_id=?", (cohort_id,)
             ).fetchone()
             if cohort is None:
                 raise ValueError("orphan quote: cohort is not registered")
-            if tuple(cohort) != (quote.source, quote.feed):
+            if tuple(cohort[:2]) != (quote.source, quote.feed):
                 raise ValueError("quote source/feed lineage changed")
             existing = conn.execute(
                 "SELECT source,feed,quote_at,received_at,bid,ask,last,spread_pct,freshness_ms "
@@ -345,6 +377,23 @@ class ProspectiveQuoteTapeRepository:
             ).fetchone()[0]
             if last_seq is not None and quote.sequence <= int(last_seq):
                 raise ValueError("out-of-order quote sequence")
+            prior = conn.execute(
+                "SELECT sequence,quote_at,received_at FROM exit_edge_quote_tape "
+                "WHERE cohort_id=? ORDER BY sequence DESC LIMIT 1", (cohort_id,)
+            ).fetchone()
+            experiment = json.loads(cohort[3])
+            gap_limit = experiment.get("max_observation_gap_seconds")
+            if gap_limit is not None:
+                anchor = _parse_datetime(prior[2] if prior else cohort[2])
+                if _observable_seconds(anchor, quote.received_at) > float(gap_limit):
+                    conn.execute(
+                        "INSERT INTO exit_edge_observation_gaps VALUES (?,?,?,?,?,?,?,?,?)",
+                        (cohort_id, quote.sequence, int(prior[0]) if prior else None,
+                         prior[1] if prior else None, prior[2] if prior else None,
+                         quote.quote_at.isoformat(), quote.received_at.isoformat(),
+                         "observation_interval_exceeded" if prior else "initial_observation_late",
+                         datetime.now(UTC).isoformat()),
+                    )
             conn.execute("INSERT INTO exit_edge_quote_tape VALUES (?,?,?,?,?,?,?,?,?,?,?)", values)
 
     def try_record_censor(self, cohort_id: str, reason: str) -> bool:
@@ -487,6 +536,19 @@ class ProspectiveQuoteTapeRepository:
                     "WHERE cohort_id=? AND julianday(censored_at)<=julianday(?)",
                     (cohort_id, cutoff),
                 ).fetchone()
+            try:
+                gap_filter = "" if cutoff is None else " AND julianday(first_received_at)<=julianday(?)"
+                gap_args = (cohort_id,) if cutoff is None else (cohort_id, cutoff)
+                gaps = conn.execute(
+                    "SELECT last_sequence,first_resumed_sequence,last_quote_at,last_received_at,"
+                    "first_quote_at,first_received_at,reason FROM exit_edge_observation_gaps "
+                    f"WHERE cohort_id=?{gap_filter} ORDER BY first_resumed_sequence",
+                    gap_args,
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table: exit_edge_observation_gaps" not in str(exc):
+                    raise
+                gaps = []
         mapping = {
             "cohort_id": cohort["cohort_id"], "trade_id": cohort["trade_id"],
             "cluster_id": cohort["cluster_id"], "deployment_id": cohort["deployment_id"],
@@ -501,6 +563,7 @@ class ProspectiveQuoteTapeRepository:
             ),
             "persisted_censor_reason": censor[0] if censor else None,
             "quotes": [dict(row) for row in quotes],
+            "observation_gaps": [dict(row) for row in gaps],
         }
         return _case_from_mapping(mapping)
 
@@ -1218,7 +1281,10 @@ def _analyze_named_case(case: ExitEdgeCase) -> dict[str, Any]:
             "cluster_id": case.cluster_id, "deployment_id": case.deployment_id,
             "symbol": case.symbol, "cohort_dimensions": dict(case.cohort_dimensions),
             "experiment_spec": case.experiment, "experiment_spec_hash": case.experiment_spec_hash,
-            "quote_count": len(case.quotes)}
+            "quote_count": len(case.quotes),
+            "entry_timestamp": case.entry_timestamp.isoformat(),
+            "latest_quote_at": case.quotes[-1].quote_at.isoformat() if case.quotes else None,
+            "observation_gaps": [_gap_dict(gap) for gap in case.observation_gaps]}
     problem = (f"persisted_censor:{case.persisted_censor_reason}" if case.persisted_censor_reason else
                _tape_problem(case, int(case.experiment["max_freshness_ms"]), int(case.experiment["max_sequence_gap"])))
     if problem:
@@ -1239,13 +1305,53 @@ def _analyze_named_case(case: ExitEdgeCase) -> dict[str, Any]:
     missing = [name for name, outcome in outcomes.items() if outcome is None]
     baseline = case.experiment["named_profiles"][0]["policy_id"]
     common_risk = case.entry_premium * case.quantity * 100 * case.profile.stop_pct
-    return {**base, "status": "insufficient_data" if missing else "paired",
+    arm_status = {
+        name: (
+            "gap_affected_diagnostic" if outcome is not None and _gap_before_exit(case, outcome["exit_timestamp"])
+            else "complete_clean" if outcome is not None
+            else "gap_affected_collecting" if case.observation_gaps
+            else "still_collecting"
+        )
+        for name, outcome in outcomes.items()
+    }
+    clean_deltas = {
+        name: round(outcome["realized_pnl_usd"] - outcomes[baseline]["realized_pnl_usd"], 2)
+        for name, outcome in outcomes.items()
+        if name != baseline and outcome is not None and outcomes[baseline] is not None
+        and arm_status[name] == arm_status[baseline] == "complete_clean"
+    }
+    fully_clean = not missing and all(value == "complete_clean" for value in arm_status.values())
+    return {**base, "status": "paired" if fully_clean else "gap_affected" if case.observation_gaps else "insufficient_data",
             "insufficient_reason": "right_censored:" + ",".join(missing) if missing else None,
             "management_exit": baseline, "named_exit_outcomes": outcomes,
+            "arm_evidence_status": arm_status,
+            "diagnostic_continuation_label": (
+                "diagnostic continuation—assumes survival through the gap"
+                if case.observation_gaps else None
+            ),
+            "clean_candidate_delta_pnl_usd": clean_deltas,
             "common_entry_risk_usd": common_risk,
-            "candidate_delta_pnl_usd": {} if missing else {
-                name: round(outcome["realized_pnl_usd"] - outcomes[baseline]["realized_pnl_usd"], 2)
-                for name, outcome in outcomes.items() if name != baseline}}
+            "candidate_delta_pnl_usd": clean_deltas if fully_clean else {}}
+
+
+def _gap_before_exit(case: ExitEdgeCase, exit_timestamp: str) -> bool:
+    exit_at = _parse_datetime(exit_timestamp)
+    return any(
+        (gap.last_received_at or case.entry_timestamp) < exit_at
+        for gap in case.observation_gaps
+    )
+
+
+def _gap_dict(gap: ObservationGap) -> dict[str, Any]:
+    return {
+        "last_sequence": gap.last_sequence,
+        "first_resumed_sequence": gap.first_resumed_sequence,
+        "last_quote_at": gap.last_quote_at.isoformat() if gap.last_quote_at else None,
+        "last_received_at": gap.last_received_at.isoformat() if gap.last_received_at else None,
+        "first_quote_at": gap.first_quote_at.isoformat(),
+        "first_received_at": gap.first_received_at.isoformat(),
+        "reason": gap.reason,
+    }
 
 
 def _named_comparison_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1263,15 +1369,39 @@ def _named_comparison_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]
         paired = [row for row in members if row["status"] == "paired"]
         clusters = {row["cluster_id"] for row in paired if row["cluster_id"]}
         candidates = [p["policy_id"] for p in members[0]["experiment_spec"]["named_profiles"]][1:]
+        clean_by_candidate = {
+            name: [row for row in members if name in row.get("clean_candidate_delta_pnl_usd", {})]
+            for name in candidates
+        }
         result.append({"strategy_class": strategy_class, "entry_fill_kind": fill_kind,
                        "deployment_id": deployment_id, "config_hash": config_hash,
                        "registered": len(members), "paired": len(paired), "unfinished_or_censored": len(members)-len(paired),
                        "independent_clusters": len(clusters),
+                       "independent_trading_sessions": len({
+                           _parse_datetime(row["entry_timestamp"]).astimezone(ET).date().isoformat()
+                           for row in members if row.get("entry_timestamp")
+                       }),
+                       "still_collecting": sum(row["status"] == "insufficient_data" and
+                           (str(row.get("insufficient_reason") or "").startswith("right_censored:") or
+                            row.get("insufficient_reason") == "quote_tape_too_short_for_next_tick_fill")
+                           for row in members),
+                       "gap_affected": sum(row["status"] == "gap_affected" for row in members),
+                       "other_unusable": sum(row["status"] == "insufficient_data" and not
+                           (str(row.get("insufficient_reason") or "").startswith("right_censored:") or
+                            row.get("insufficient_reason") == "quote_tape_too_short_for_next_tick_fill")
+                           for row in members),
+                       "primary_exit": members[0]["experiment_spec"]["named_profiles"][0]["policy_id"],
+                       "latest_quote_at": max((row.get("latest_quote_at") or "" for row in members), default="") or None,
                        "decision": "descriptive_only_no_automatic_promotion",
                        "pnl_basis": "gross_modeled_premium_pnl_before_fees_and_extra_slippage",
                        "candidate_vs_management": {name: {
-                           "mean_delta_pnl_usd": fmean(row["candidate_delta_pnl_usd"][name] for row in paired) if paired else None,
-                           "mean_delta_common_r": fmean(row["candidate_delta_pnl_usd"][name]/row["common_entry_risk_usd"] for row in paired) if paired else None,
+                           "clean_pair_count": len(clean_by_candidate[name]),
+                           "independent_trading_sessions": len({
+                               _parse_datetime(row["entry_timestamp"]).astimezone(ET).date().isoformat()
+                               for row in clean_by_candidate[name]
+                           }),
+                           "mean_delta_pnl_usd": fmean(row["clean_candidate_delta_pnl_usd"][name] for row in clean_by_candidate[name]) if clean_by_candidate[name] else None,
+                           "mean_delta_common_r": fmean(row["clean_candidate_delta_pnl_usd"][name]/row["common_entry_risk_usd"] for row in clean_by_candidate[name]) if clean_by_candidate[name] else None,
                        } for name in candidates}})
     return result
 
@@ -1288,7 +1418,10 @@ def _analyze_case(case: ExitEdgeCase) -> dict[str, Any]:
             "cohort_dimensions": dict(case.cohort_dimensions),
             "experiment_spec": case.experiment,
             "experiment_spec_hash": case.experiment_spec_hash,
-            "quote_count": len(case.quotes)}
+            "quote_count": len(case.quotes),
+            "entry_timestamp": case.entry_timestamp.isoformat(),
+            "latest_quote_at": case.quotes[-1].quote_at.isoformat() if case.quotes else None,
+            "observation_gaps": [_gap_dict(gap) for gap in case.observation_gaps]}
     if case.persisted_censor_reason:
         return {**base, "status": "insufficient_data",
                 "insufficient_reason": f"persisted_censor:{case.persisted_censor_reason}"}
@@ -1374,30 +1507,47 @@ def _analyze_case(case: ExitEdgeCase) -> dict[str, Any]:
                ),
            }}
     all_outcomes = {"legacy": legacy, **envelope_outcomes}
-    if any(value is None for value in all_outcomes.values()):
-        missing = [name for name, value in all_outcomes.items() if value is None]
-        return {**row, "status": "insufficient_data",
-                "insufficient_reason": "right_censored:" + ",".join(missing),
-                "profile_outcome": asdict(profile) if profile else None,
-                "legacy_outcome": asdict(legacy) if legacy else None,
-                "risk_envelope_outcomes": {
-                    name: asdict(value) if value else None
-                    for name, value in envelope_outcomes.items()
-                }}
-    control_pnl = float(profile.realized_pnl_usd)
-    return {**row, "status": "paired", "insufficient_reason": None,
-            "profile_outcome": asdict(profile), "legacy_outcome": asdict(legacy),
+    missing = [name for name, value in all_outcomes.items() if value is None]
+    arm_status = {
+        name: (
+            "gap_affected_diagnostic" if value is not None and _gap_before_exit(case, value.exit_timestamp)
+            else "complete_clean" if value is not None
+            else "gap_affected_collecting" if case.observation_gaps
+            else "still_collecting"
+        ) for name, value in all_outcomes.items()
+    }
+    clean_deltas = {
+        name: round(value.realized_pnl_usd - profile.realized_pnl_usd, 2)
+        for name, value in envelope_outcomes.items()
+        if name != "control" and value is not None and profile is not None
+        and arm_status[name] == arm_status["control"] == "complete_clean"
+    }
+    if legacy is not None and profile is not None and arm_status["legacy"] == arm_status["control"] == "complete_clean":
+        clean_deltas["legacy"] = round(legacy.realized_pnl_usd - profile.realized_pnl_usd, 2)
+    fully_clean = not missing and all(value == "complete_clean" for value in arm_status.values())
+    return {**row, "status": "paired" if fully_clean else "gap_affected" if case.observation_gaps else "insufficient_data",
+            "insufficient_reason": "right_censored:" + ",".join(missing) if missing else None,
+            "arm_evidence_status": arm_status,
+            "diagnostic_continuation_label": (
+                "diagnostic continuation—assumes survival through the gap"
+                if case.observation_gaps else None
+            ),
+            "clean_candidate_delta_pnl_usd": clean_deltas,
+            "profile_outcome": asdict(profile) if profile else None,
+            "legacy_outcome": asdict(legacy) if legacy else None,
             "risk_envelope_outcomes": {
-                name: asdict(value)
+                name: asdict(value) if value else None
                 for name, value in envelope_outcomes.items()
             },
-            "candidate_delta_pnl_usd": {
-                name: round(float(value.realized_pnl_usd) - control_pnl, 2)
-                for name, value in envelope_outcomes.items()
-                if name != "control"
-            },
-            "paired_delta_pnl_usd": round(profile.realized_pnl_usd-legacy.realized_pnl_usd, 2),
-            "paired_delta_time_in_trade_seconds": round(profile.time_in_trade_seconds-legacy.time_in_trade_seconds, 3)}
+            "candidate_delta_pnl_usd": clean_deltas if fully_clean else {},
+            "paired_delta_pnl_usd": (
+                round(profile.realized_pnl_usd-legacy.realized_pnl_usd, 2)
+                if fully_clean else None
+            ),
+            "paired_delta_time_in_trade_seconds": (
+                round(profile.time_in_trade_seconds-legacy.time_in_trade_seconds, 3)
+                if fully_clean else None
+            )}
 
 
 def _replay(case: ExitEdgeCase, policy: str, latency_ms: int, max_freshness_ms: int) -> PolicyOutcome | None:
@@ -1984,7 +2134,32 @@ def _case_from_mapping(item: dict[str, Any]) -> ExitEdgeCase:
             _parse_datetime(q["received_at"]),_float_or_none(q.get("bid")),_float_or_none(q.get("ask")),
             _float_or_none(q.get("last"))) for q in item.get("quotes",[])),
         str(item["persisted_censor_reason"]) if item.get("persisted_censor_reason") else None,
-        dict(item.get("cohort_dimensions") or {}))
+        dict(item.get("cohort_dimensions") or {}),
+        tuple(ObservationGap(
+            int(g["last_sequence"]) if g.get("last_sequence") is not None else None,
+            int(g["first_resumed_sequence"]),
+            _parse_datetime(g["last_quote_at"]) if g.get("last_quote_at") else None,
+            _parse_datetime(g["last_received_at"]) if g.get("last_received_at") else None,
+            _parse_datetime(g["first_quote_at"]),
+            _parse_datetime(g["first_received_at"]),
+            str(g["reason"]),
+        ) for g in item.get("observation_gaps", [])))
+
+
+def _observable_seconds(start: datetime, end: datetime) -> float:
+    """Elapsed regular-market time; overnight closure cannot trigger a virtual exit."""
+    if end <= start:
+        return 0.0
+    current = start.astimezone(ET).date()
+    final = end.astimezone(ET).date()
+    total = 0.0
+    while current <= final:
+        if is_trading_day(current):
+            opened = datetime.combine(current, time(9, 30), tzinfo=ET).astimezone(UTC)
+            closed = datetime.combine(current, time(16, 0), tzinfo=ET).astimezone(UTC)
+            total += max(0.0, (min(end, closed) - max(start, opened)).total_seconds())
+        current += timedelta(days=1)
+    return total
 
 
 def _normalized_experiment(value: dict[str, Any]) -> dict[str, Any]:
@@ -1997,6 +2172,11 @@ def _normalized_experiment(value: dict[str, Any]) -> dict[str, Any]:
         "quote_source": str(value["quote_source"]),
         "quote_feed": str(value["quote_feed"]),
     }
+    if "max_observation_gap_seconds" in value:
+        gap_limit = float(value["max_observation_gap_seconds"])
+        if gap_limit <= 0:
+            raise ValueError("max_observation_gap_seconds must be positive")
+        normalized["max_observation_gap_seconds"] = gap_limit
     if "named_profiles" in value:
         policies = value["named_profiles"]
         if not isinstance(policies, list) or not policies:
@@ -2167,6 +2347,7 @@ def classify_measurement_generation(experiment: dict[str, Any]) -> str:
         and int(exp.get("max_freshness_ms", cur["max_freshness_ms"])) == int(cur["max_freshness_ms"])
         and int(exp.get("max_sequence_gap", cur["max_sequence_gap"])) == int(cur["max_sequence_gap"])
         and int(exp.get("fill_latency_ms", cur["fill_latency_ms"])) == int(cur["fill_latency_ms"])
+        and float(exp.get("max_observation_gap_seconds", 0)) == float(cur["max_observation_gap_seconds"])
         and catalog_ok
         and core_ok
     ):
@@ -2187,7 +2368,7 @@ def _parse_datetime(value:Any)->datetime:
 def _optional_datetime(value:Any)->datetime|None:return None if value in (None,"") else _parse_datetime(value)
 
 
-__all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","ShadowEnvelopeState","analyze_cases",
+__all__=["ProspectiveQuoteTapeRepository","QuoteTapeMark","ObservationGap","ShadowEnvelopeState","analyze_cases",
          "analyze_prospective_repository","build_historical_coverage_report","classify_measurement_generation","measurement_generation_id","CURRENT_MEASUREMENT_GENERATION",
          "build_risk_envelope_experiment","experiment_spec_hash","load_fixture_cases",
          "policy_config_hash","render_markdown","write_exit_edge_report"]

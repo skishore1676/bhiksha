@@ -24,6 +24,7 @@ def test_bhiksha_launchd_installer_owns_non_openclaw_labels() -> None:
     assert "com.bhiksha.live-stop" in script
     assert "com.bhiksha.schwab-guard" in script
     assert "com.bhiksha.session-report" in script
+    assert "com.bhiksha.exit-edge-observer" in script
     assert "ai.openclaw.bhiksha" not in script
 
 
@@ -71,6 +72,11 @@ def test_installer_persists_stable_plan_id_only_for_live_restart_jobs(
 
     for path in launchd_dir.glob("*.plist"):
         payload = plistlib.loads(path.read_bytes())
+        if payload["Label"] == "com.bhiksha.exit-edge-observer":
+            assert payload["RunAtLoad"] is True
+            assert payload["KeepAlive"] is True
+            assert "StartCalendarInterval" not in payload
+            assert payload["ProgramArguments"][-1] == "exit-edge-observer"
         if payload["Label"] in {
             "com.bhiksha.live-start",
             "com.bhiksha.live-watchdog",

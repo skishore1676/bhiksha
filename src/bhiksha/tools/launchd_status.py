@@ -147,7 +147,7 @@ def build_status_snapshot(
                 ),
             }
         if spec.runner_job == "cartographer-shadow":
-            semantic = _cartographer_semantic_status(repo_root)
+            semantic = _cartographer_semantic_status(repo_root, now=generated_at)
             if _cartographer_installed_pending_first_run(
                 semantic, launchd.get(spec.label, {})
             ):
@@ -157,15 +157,27 @@ def build_status_snapshot(
                     "attention_required": False,
                 }
                 job["declared_enabled"] = True
-            job["last"] = {"domain": semantic, "recorded_at": generated_at.isoformat()}
+            recorded_at = last.get("recorded_at") if isinstance(last, dict) else None
+            job["last"] = {"domain": semantic, "recorded_at": recorded_at}
             job["last_run_status"] = str(semantic["status"])
             job["last_run_at"] = (
                 None if semantic["status"] == "installed_pending_first_run"
-                else generated_at.isoformat()
+                else recorded_at
             )
-            quiet = {"healthy", "compile_pending", "installed_pending_first_run"}
+            quiet = {"healthy", "compile_pending", "awaiting_session", "installed_pending_first_run"}
             job["lifecycle"] = "armed" if semantic["status"] in quiet else "stuck"
-            job["findings"] = [] if semantic["status"] in quiet else ["cartographer_evidence_blocked"]
+            job["findings"] = [] if semantic["status"] in quiet else [
+                str(semantic.get("reason") or "cartographer_evidence_blocked")
+            ]
+        if spec.runner_job == "exit-edge-observer":
+            semantic = _exit_edge_observer_status(
+                repo_root, launchd.get(spec.label, {}), generated_at,
+            )
+            job["last"] = {"domain": semantic, "recorded_at": semantic.get("updated_at")}
+            job["last_run_status"] = semantic["status"]
+            job["last_run_at"] = semantic.get("updated_at")
+            job["lifecycle"] = "armed" if semantic["status"] in {"healthy", "idle_disabled"} else "stuck"
+            job["findings"] = [] if job["lifecycle"] == "armed" else [str(semantic["status"])]
         details = _job_details(last)
         if details:
             job["details"] = details
@@ -193,7 +205,9 @@ def build_status_snapshot(
     }
 
 
-def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
+def _cartographer_semantic_status(
+    repo_root: Path, *, now: datetime | None = None
+) -> dict[str, Any]:
     output_root = Path(os.getenv("BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT", repo_root / "artifacts/cartographer-shadow"))
     projection_root = output_root / "projection"
     return cartographer_evidence_status(
@@ -201,7 +215,35 @@ def _cartographer_semantic_status(repo_root: Path) -> dict[str, Any]:
         projection_receipt_path=projection_root / "latest.json",
         active_plan_path=repo_root / "artifacts/playbook/active_plan.json",
         events_db_path=repo_root / "bhiksha.db",
+        now=now,
     )
+
+
+def _exit_edge_observer_status(
+    repo_root: Path, launchd: dict[str, Any], now: datetime,
+) -> dict[str, Any]:
+    marker = repo_root / "artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled"
+    health = _read_json(repo_root / "artifacts/observations/exit_edge_live_status.json")
+    updated_at = _parse_timestamp(health.get("updated_at"))
+    enabled = marker.is_file()
+    loaded = launchd.get("loaded") is True
+    fresh = updated_at is not None and 0 <= (now - updated_at).total_seconds() <= 90
+    if not enabled and loaded:
+        status = "idle_disabled"
+    elif not loaded:
+        status = "observer_not_loaded"
+    elif health.get("role") != "observer" or not health.get("ready") or not health.get("worker_alive"):
+        status = "observer_not_ready"
+    elif not fresh:
+        status = "observer_heartbeat_stale"
+    else:
+        status = "healthy"
+    return {"status": status, "ok": status in {"healthy", "idle_disabled"},
+            "updated_at": updated_at.isoformat() if updated_at else None,
+            "enabled": enabled, "loaded": loaded,
+            "active_cohorts": health.get("active_cohorts"),
+            "observation_polls": health.get("observation_polls"),
+            "observation_errors": health.get("observation_errors")}
 
 
 def _cartographer_installed_pending_first_run(

@@ -17,7 +17,7 @@ from bhiksha.ops.exit_edge_lab import (
     SHADOW_CANDIDATE_IDS,
     analyze_prospective_repository,
 )
-from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
+from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder, INDEPENDENT_QUOTE_FEED
 from bhiksha.execution.exit_policy import canonical_policy_hash
 
 
@@ -325,6 +325,91 @@ def test_restart_gap_censors_unfinished_persisted_cohort(tmp_path: Path) -> None
     restarted.close()
     case = repository.load_case("exit-edge:T1")
     assert case.persisted_censor_reason == "restart_gap_unobserved_quotes"
+
+
+def test_independent_observer_keeps_six_arm_cohorts_through_executor_restart(tmp_path: Path) -> None:
+    db = tmp_path / "edge.db"
+    repository = ProspectiveQuoteTapeRepository(db, write_timeout_seconds=0.25)
+    first_executor = _recorder(tmp_path, role="registration")
+    observer = _recorder(tmp_path, role="observer")
+    first_executor.start()
+    observer.start()
+    _wait_until(lambda: first_executor.snapshot()["ready"] and observer.snapshot()["ready"])
+    for index in range(6):
+        assert first_executor.try_register_entry(
+            deployment=_deployment(), trade_id=f"T-{index}", option_symbol=OPTION,
+            entry_timestamp=ENTRY, entry_premium=2.0, quantity=10,
+        )
+    _wait_until(lambda: len(repository.list_cohort_ids()) == 6)
+    observer.refresh_active_from_store()
+    assert observer.snapshot()["active_cohorts"] == 6
+    def all_at(sequence: int) -> bool:
+        try:
+            return all(repository.latest_sequence(f"exit-edge:T-{index}") == sequence for index in range(6))
+        except sqlite3.OperationalError:
+            return False
+    first_at = ENTRY + timedelta(seconds=15)
+    observer.observe_quote(OPTION, _quote(first_at, 2.1), first_at)
+    _wait_until(lambda: all_at(1))
+    first_executor.close()
+
+    restarted_executor = _recorder(tmp_path, role="registration")
+    restarted_executor.start()
+    _wait_until(lambda: restarted_executor.snapshot()["ready"])
+    for index in range(6):
+        assert restarted_executor.try_register_entry(
+            deployment=_deployment(), trade_id=f"T-{index}", option_symbol=OPTION,
+            entry_timestamp=ENTRY, entry_premium=2.0, quantity=10,
+        )
+    second_at = ENTRY + timedelta(seconds=30)
+    observer.observe_quote(OPTION, _quote(second_at, 2.1), second_at)
+    _wait_until(lambda: all_at(2))
+    restarted_executor.close()
+    observer.close()
+    assert len(repository.list_cohort_ids()) == 6
+    for index in range(6):
+        case = repository.load_case(f"exit-edge:T-{index}")
+        assert case.persisted_censor_reason is None
+        assert not case.observation_gaps
+        assert case.experiment["quote_feed"] == INDEPENDENT_QUOTE_FEED
+
+
+def test_observer_restart_resumes_with_explicit_five_minute_gap(tmp_path: Path) -> None:
+    db = tmp_path / "edge.db"
+    registration = _recorder(tmp_path, role="registration")
+    _, payload = registration._registration_payloads(
+        deployment=_deployment(), trade_id="gap", option_symbol=OPTION,
+        entry_timestamp=ENTRY, entry_premium=2.0, quantity=10,
+    )
+    repository = ProspectiveQuoteTapeRepository(db, write_timeout_seconds=0.25)
+    repository.initialize()
+    repository.register_cohort(payload)
+    first = _recorder(tmp_path, role="observer")
+    first.start()
+    _wait_until(lambda: first.snapshot()["ready"])
+    first_at = ENTRY + timedelta(seconds=15)
+    first.observe_quote(OPTION, _quote(first_at, 2.1), first_at)
+    _wait_until(lambda: repository.latest_sequence(payload["cohort_id"]) == 1)
+    first.close()
+    assert repository.load_case(payload["cohort_id"]).persisted_censor_reason is None
+
+    resumed = _recorder(tmp_path, role="observer")
+    resumed.start()
+    _wait_until(lambda: resumed.snapshot()["ready"])
+    assert resumed.snapshot()["active_cohorts"] == 1
+    next_at = first_at + timedelta(minutes=5)
+    resumed.observe_quote(OPTION, _quote(next_at, 2.1), next_at)
+    _wait_until(lambda: repository.latest_sequence(payload["cohort_id"]) == 2)
+    resumed.close()
+    case = repository.load_case(payload["cohort_id"])
+    assert case.persisted_censor_reason is None
+    assert len(case.observation_gaps) == 1
+    gap = case.observation_gaps[0]
+    assert gap.last_sequence == 1 and gap.first_resumed_sequence == 2
+    assert gap.last_received_at == first_at and gap.first_received_at == next_at
+    row = analyze_prospective_repository(repository)["cases"][0]
+    assert row["status"] == "gap_affected"
+    assert row["candidate_delta_pnl_usd"] == {}
 
 
 def test_flag_defaults_off_and_env_explicitly_enables(monkeypatch, tmp_path: Path) -> None:

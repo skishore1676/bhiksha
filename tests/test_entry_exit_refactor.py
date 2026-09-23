@@ -16,7 +16,8 @@ from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.execution.supervisor import ExecutionSupervisor
 from bhiksha.execution.pricing import select_entry_limit
 from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository, QuoteTapeMark, analyze_cases
-from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder, QUOTE_SOURCE, QUOTE_FEED
+from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder, QUOTE_SOURCE, QUOTE_FEED, INDEPENDENT_QUOTE_FEED
+from bhiksha.ops.exit_comparisons_sheet import build_exit_comparisons_scorecard
 from bhiksha.state.position_tracker import PositionTracker
 from historical_config import historical_deployment
 
@@ -101,6 +102,77 @@ def test_named_comparisons_persist_continue_after_baseline_and_keep_entry_mode(t
     # Later edits do not change the stored management or candidate settings.
     dep.exit.compare_exit_policies[1]["no_progress_seconds"] = 10
     assert repo.load_case(payload["cohort_id"]).experiment["named_profiles"][1]["no_progress_seconds"] == 180
+
+
+def test_clean_named_pair_survives_later_gap_while_third_arm_continues(tmp_path):
+    dep = deployment()
+    later = profile("very_patient", no_progress_seconds=500)
+    third = _exit_spec_fields_from_management_policy_spec(later.to_management_policy_spec_dict())["exit_policy_snapshot"]
+    dep.exit.compare_exit_policies.append(third)
+    entry = datetime(2026, 9, 23, 14, tzinfo=UTC)
+    registration = ExitEdgeLiveRecorder(db_path=tmp_path / "edge.db", status_path=tmp_path / "register.json", role="registration")
+    _, payload = registration._registration_payloads(
+        deployment=dep, trade_id="three", option_symbol="QQQ260925P00500000",
+        entry_timestamp=entry, entry_premium=2.0, quantity=2,
+        entry_context={"entry_fill_kind": "modeled_ask_touch"},
+    )
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    repo.initialize()
+    repo.register_cohort(payload)
+    seconds = [30, 61, 62, 90, 120, 150, 181, 182, 210, 510, 525]
+    for seq, elapsed in enumerate(seconds, start=1):
+        at = entry + timedelta(seconds=elapsed)
+        repo.append_quote(payload["cohort_id"], QuoteTapeMark(
+            seq, QUOTE_SOURCE, INDEPENDENT_QUOTE_FEED, at, at, 2.0, 2.05,
+        ))
+    case = repo.load_case(payload["cohort_id"])
+    assert len(case.observation_gaps) == 1
+    assert case.observation_gaps[0].last_sequence == 9
+    assert case.observation_gaps[0].first_resumed_sequence == 10
+    row = analyze_cases([case])["cases"][0]
+    assert row["status"] == "gap_affected"
+    assert row["arm_evidence_status"]["baseline"] == "complete_clean"
+    assert row["arm_evidence_status"]["patient"] == "complete_clean"
+    assert row["arm_evidence_status"]["very_patient"] == "gap_affected_diagnostic"
+    assert "patient" in row["clean_candidate_delta_pnl_usd"]
+    assert "very_patient" not in row["clean_candidate_delta_pnl_usd"]
+    summary = analyze_cases([case])["summary"]["named_comparisons"][0]
+    assert summary["candidate_vs_management"]["patient"]["clean_pair_count"] == 1
+    assert summary["candidate_vs_management"]["very_patient"]["clean_pair_count"] == 0
+    scorecard = build_exit_comparisons_scorecard(tmp_path / "edge.db")
+    by_candidate = {row[5]: row for row in scorecard["rows"]}
+    assert by_candidate["patient"][6:11] == [1, 1, 0, 0, 0]
+    assert by_candidate["very_patient"][6:11] == [1, 0, 0, 1, 0]
+    assert scorecard["detail"][0]["trade_id"] == "three"
+
+
+def test_post_gap_replay_retains_partial_leg_and_original_holding_clock(tmp_path):
+    dep = deployment()
+    entry = datetime(2026, 9, 23, 14, tzinfo=UTC)
+    registration = ExitEdgeLiveRecorder(db_path=tmp_path / "edge.db", status_path=tmp_path / "register.json", role="registration")
+    _, payload = registration._registration_payloads(
+        deployment=dep, trade_id="partial", option_symbol="QQQ260925P00500000",
+        entry_timestamp=entry, entry_premium=2.0, quantity=2,
+        entry_context={"entry_fill_kind": "broker_confirmed"},
+    )
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "edge.db")
+    repo.initialize()
+    repo.register_cohort(payload)
+    for seq, (elapsed, bid) in enumerate([(15, 2.0), (30, 2.7), (45, 2.75),
+                                           (345, 1.9), (360, 1.85)], start=1):
+        at = entry + timedelta(seconds=elapsed)
+        repo.append_quote(payload["cohort_id"], QuoteTapeMark(
+            seq, QUOTE_SOURCE, INDEPENDENT_QUOTE_FEED, at, at, bid, bid + .05,
+        ))
+    case = repo.load_case(payload["cohort_id"])
+    row = analyze_cases([case])["cases"][0]
+    primary = row["named_exit_outcomes"]["baseline"]
+    assert row["status"] == "gap_affected"
+    assert primary is not None
+    assert len(primary["legs"]) == 2
+    assert primary["legs"][0]["fill_at"] == (entry + timedelta(seconds=45)).isoformat()
+    assert primary["time_in_trade_seconds"] == 360
+    assert row["arm_evidence_status"]["baseline"] == "gap_affected_diagnostic"
 
 
 def test_paper_limit_needs_later_fresh_ask_and_expires_without_fill():

@@ -118,6 +118,7 @@ PY
       echo "RETIRED $retired_label"
     done
     for label in \
+      com.bhiksha.exit-edge-observer \
       com.bhiksha.live-start \
       com.bhiksha.live-watchdog \
       com.bhiksha.reconciliation-supervisor \
@@ -136,6 +137,7 @@ PY
   uninstall)
     uid="$(id -u)"
     for label in \
+      com.bhiksha.exit-edge-observer \
       com.bhiksha.live-start \
       com.bhiksha.live-watchdog \
       com.bhiksha.reconciliation-supervisor \
