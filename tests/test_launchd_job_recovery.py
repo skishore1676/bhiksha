@@ -12,9 +12,11 @@ from bhiksha.tools import launchd_job
 
 def test_scheduled_close_report_is_named_as_a_pre_close_snapshot() -> None:
     observed_at = datetime.fromisoformat("2026-08-17T14:45:00-05:00")
+    after_close = datetime.fromisoformat("2026-08-17T15:15:00-05:00")
 
     assert launchd_job._report_label("scheduled", now=observed_at) == "pre-close"
     assert launchd_job._report_label("close", now=observed_at) == "close"
+    assert launchd_job._report_label("scheduled", now=after_close) == "close"
 
 
 def test_report_warning_without_attention_uses_normal_receipt_level() -> None:

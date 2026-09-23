@@ -799,7 +799,9 @@ def _report_label(raw: str, *, now: datetime | None = None) -> str:
         return "morning"
     if current.hour < 14:
         return "midday"
-    return "pre-close"
+    if current.hour < 15:
+        return "pre-close"
+    return "close"
 
 
 def _parse_runtime_status(stdout: str) -> dict | None:
