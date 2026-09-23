@@ -1,5 +1,6 @@
 """Regression cases for the source-only entry/exit takeover."""
 import asyncio
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -139,11 +140,17 @@ def test_clean_named_pair_survives_later_gap_while_third_arm_continues(tmp_path)
     summary = analyze_cases([case])["summary"]["named_comparisons"][0]
     assert summary["candidate_vs_management"]["patient"]["clean_pair_count"] == 1
     assert summary["candidate_vs_management"]["very_patient"]["clean_pair_count"] == 0
-    scorecard = build_exit_comparisons_scorecard(tmp_path / "edge.db")
-    by_candidate = {row[5]: row for row in scorecard["rows"]}
-    assert by_candidate["patient"][6:11] == [1, 1, 0, 0, 0]
-    assert by_candidate["very_patient"][6:11] == [1, 0, 0, 1, 0]
-    assert scorecard["detail"][0]["trade_id"] == "three"
+    signal_db = tmp_path / "signals.db"
+    with sqlite3.connect(signal_db) as conn:
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, created_at TEXT, event_type TEXT, payload TEXT)")
+    scorecard = build_exit_comparisons_scorecard(
+        tmp_path / "edge.db", signal_db_path=signal_db, trading_date=entry.date())
+    assert scorecard["exits"]["registered"] == 1
+    assert scorecard["exits"]["clean"] == 1
+    assert scorecard["exits"]["censored"] == 1
+    assert scorecard["exits"]["rows"][0][3] == "Baseline"
+    assert scorecard["exits"]["rows"][0][4] == "1 / 1"
+    assert scorecard["exits"]["detail"][0][0] == "three"
 
 
 def test_post_gap_replay_retains_partial_leg_and_original_holding_clock(tmp_path):

@@ -401,6 +401,9 @@ def _session_report_job(args: argparse.Namespace) -> int:
         db_path=getattr(runtime.app_config, "exit_edge_live_shadow_db_path",
                         Path(runtime.app_config.playbook_artifacts_dir).parent / "observations/exit_edge_live.sqlite3"),
         receipt_dir=Path(runtime.app_config.playbook_artifacts_dir) / "exit_comparisons_sheet",
+        signal_db_path=db_path,
+        active_plan_path=args.active_plan,
+        trading_date=result.report.get("trading_date"),
     )
     payload: dict = {
         "job": args.job,
@@ -511,6 +514,9 @@ def _weekly_trading_decisions_job(args: argparse.Namespace, *, repo_root: Path) 
     exit_comparisons_sheet = publish_exit_comparisons_best_effort(
         db_path=runtime.app_config.exit_edge_live_shadow_db_path,
         receipt_dir=Path(runtime.app_config.playbook_artifacts_dir) / "exit_comparisons_sheet",
+        signal_db_path=runtime.app_config.sqlite_path,
+        active_plan_path=args.active_plan,
+        trading_date=result.report.get("week_end"),
     )
     review: ReviewPublishResult | None = None
     if args.weekly_review_mode == "on":
