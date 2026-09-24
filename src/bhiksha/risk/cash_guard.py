@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, TradeRecord
 from bhiksha.persistence.repository import CashBudgetRepository, NullCashBudgetRepository
-from bhiksha.state.position_tracker import TrackedPosition
+from bhiksha.state.position_tracker import NON_LIVE_POSITION_SOURCES, TrackedPosition
 
 ET = ZoneInfo("America/New_York")
 ACTIVE_RESERVATION_STATUSES = frozenset({"reserved", "consumed"})
@@ -88,6 +88,7 @@ class CashGuard:
                 )
                 await self.repository.upsert_day(day)
 
+            await self.repository.release_synthetic_reservations(trade_date)
             totals = await self.repository.reservation_totals(trade_date)
             consumed_cash = sum(totals.get(status, 0.0) for status in ACTIVE_RESERVATION_STATUSES)
             remaining_budget = round(max(0.0, day.usable_budget - consumed_cash), 2)
@@ -148,8 +149,12 @@ class CashGuard:
         account_type = await self.account_type()
         if not _should_enforce(mode, account_type):
             return
+        await self.repository.release_synthetic_reservations(trade_date_et(datetime.now(UTC)))
         for position in positions:
-            if position.trade_id is None:
+            if position.trade_id is None or _synthetic_order(position.order_id):
+                continue
+            # A real broker order remains cash-backed even after its lane is shadowed.
+            if position.source in NON_LIVE_POSITION_SOURCES and not position.order_id:
                 continue
             reservation = await self.repository.get_reservation(position.trade_id)
             if reservation is None:
@@ -170,7 +175,7 @@ class CashGuard:
             if reservation.status == "reserved":
                 await self.repository.mark_reservation_status(position.trade_id, "consumed")
         for trade in trades:
-            if trade.trade_id is None or trade.entry_timestamp is None:
+            if trade.trade_id is None or trade.entry_timestamp is None or _synthetic_order(trade.entry_order_id):
                 continue
             if trade.status not in {"pending_entry", "pending_entry_reconcile"}:
                 continue
@@ -294,3 +299,7 @@ def _trade_cash_cost(trade: TradeRecord) -> float | None:
     if trade.entry_price is None or trade.quantity <= 0:
         return None
     return round(trade.entry_price * trade.quantity * 100, 2)
+
+
+def _synthetic_order(order_id: str | None) -> bool:
+    return bool(order_id and (order_id == "SHADOW_ENTRY" or order_id.startswith("DRY_RUN")))

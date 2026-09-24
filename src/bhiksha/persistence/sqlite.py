@@ -1089,6 +1089,10 @@ class SQLiteCashBudgetRepository(CashBudgetRepository):
         await self._ensure_initialized()
         return await self.backend.run_read(self._reservation_totals_sync, trade_date)
 
+    async def release_synthetic_reservations(self, trade_date: str) -> int:
+        await self._ensure_initialized()
+        return await self.backend.run_write(self._release_synthetic_reservations_sync, trade_date)
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -1249,6 +1253,28 @@ class SQLiteCashBudgetRepository(CashBudgetRepository):
             if status in totals:
                 totals[status] = float(amount or 0.0)
         return totals
+
+    def _release_synthetic_reservations_sync(self, trade_date: str) -> int:
+        with closing(self.backend.connect()) as conn:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trade_sessions'"
+            ).fetchone() is None:
+                return 0
+            cursor = conn.execute(
+                """
+                UPDATE cash_budget_reservations
+                SET status = 'released', updated_at = ?
+                WHERE trade_date = ? AND status IN ('reserved', 'consumed')
+                  AND trade_id IN (
+                      SELECT trade_id FROM trade_sessions
+                      WHERE entry_order_id = 'SHADOW_ENTRY'
+                         OR substr(entry_order_id, 1, 7) = 'DRY_RUN'
+                  )
+                """,
+                (datetime.now(UTC).isoformat(), trade_date),
+            )
+            conn.commit()
+            return cursor.rowcount
 
 
 class SQLiteChainSnapshotRepository(ChainSnapshotRepository):

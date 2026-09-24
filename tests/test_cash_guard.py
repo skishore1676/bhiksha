@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 
 from bhiksha.domain.models import CashBudgetDay, CashBudgetReservation, TradeRecord
 from bhiksha.persistence.repository import CashBudgetRepository
-from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository
+from bhiksha.persistence.sqlite import SQLiteBackend, SQLiteCashBudgetRepository, SQLiteTradeStateRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.state.position_tracker import TrackedPosition
 
@@ -204,6 +204,72 @@ def test_cash_guard_serializes_concurrent_reservations(monkeypatch) -> None:
     assert repository.active_total("2026-04-20") == 600.0
 
 
+def test_cash_guard_sync_excludes_paper_but_keeps_broker_backed_positions(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "on")
+    guard = _guard(tmp_path)
+    timestamp = datetime(2026, 4, 20, 15, 0, tzinfo=UTC)
+
+    async def run() -> None:
+        await guard.sync_positions(
+            [
+                TrackedPosition(
+                    symbol="QQQ", deployment_id="shadow", trade_id="paper", quantity=1,
+                    entry_price=4.0, entry_timestamp=timestamp, source="shadow", order_id="SHADOW_ENTRY",
+                ),
+                TrackedPosition(
+                    symbol="QQQ", deployment_id="demoted", trade_id="broker", quantity=1,
+                    entry_price=3.0, entry_timestamp=timestamp, source="shadow", order_id="broker-order-1",
+                ),
+            ],
+            [
+                TradeRecord(
+                    trade_id="pending-paper", deployment_id="shadow", symbol="QQQ", quantity=1,
+                    entry_price=2.0, entry_timestamp=timestamp, status="pending_entry",
+                    entry_order_id="DRY_RUN_ENTRY",
+                ),
+            ],
+        )
+
+    asyncio.run(run())
+    assert asyncio.run(guard.repository.get_reservation("paper")) is None
+    assert asyncio.run(guard.repository.get_reservation("pending-paper")) is None
+    assert asyncio.run(guard.repository.get_reservation("broker")).status == "consumed"
+    assert asyncio.run(guard.repository.reservation_totals("2026-04-20"))["consumed"] == 300.0
+
+
+def test_cash_guard_releases_existing_paper_reservations_before_live_decision(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("BHIKSHA_CASH_GUARD_MODE", "on")
+    guard = _guard(tmp_path)
+    timestamp = datetime(2026, 4, 20, 15, 0, tzinfo=UTC)
+    trade_repo = SQLiteTradeStateRepository(str(tmp_path / "bhiksha.db"), backend=guard.repository.backend)
+
+    async def seed() -> None:
+        for trade_id, order_id, status, amount in (
+            ("paper-open", "SHADOW_ENTRY", "open", 400.0),
+            ("paper-closed", "SHADOW_ENTRY", "closed", 200.0),
+            ("dry-run", "DRY_RUN_ENTRY", "open", 100.0),
+            ("live", "broker-order-1", "open", 300.0),
+        ):
+            await trade_repo.upsert_trade(TradeRecord(
+                trade_id=trade_id, deployment_id="dep1", symbol="QQQ", quantity=1,
+                entry_price=amount / 100, entry_timestamp=timestamp, status=status,
+                entry_order_id=order_id,
+            ))
+            await guard.repository.upsert_reservation(CashBudgetReservation(
+                trade_id=trade_id, trade_date="2026-04-20", amount=amount, status="consumed",
+            ))
+
+    asyncio.run(seed())
+    result = asyncio.run(guard.reserve_entry(trade_id="new-live", required_cash=600.0, timestamp=timestamp))
+
+    assert result.blocked is False
+    assert result.details["remaining_budget"] == 50.0
+    for trade_id in ("paper-open", "paper-closed", "dry-run"):
+        assert asyncio.run(guard.repository.get_reservation(trade_id)).status == "released"
+    assert asyncio.run(guard.repository.get_reservation("live")).status == "consumed"
+    assert asyncio.run(guard.repository.release_synthetic_reservations("2026-04-20")) == 0
+
+
 class SlowInMemoryCashBudgetRepository(CashBudgetRepository):
     def __init__(self) -> None:
         self.days: dict[str, CashBudgetDay] = {}
@@ -245,6 +311,10 @@ class SlowInMemoryCashBudgetRepository(CashBudgetRepository):
                 if reservation.trade_date == trade_date and reservation.status == "consumed"
             ),
         }
+
+    async def release_synthetic_reservations(self, trade_date: str) -> int:
+        del trade_date
+        return 0
 
     def active_total(self, trade_date: str) -> float:
         return sum(

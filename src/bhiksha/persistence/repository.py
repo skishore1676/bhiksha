@@ -339,6 +339,10 @@ class CashBudgetRepository(ABC):
     async def reservation_totals(self, trade_date: str) -> dict[str, float]:
         """Return summed reservation amounts by status for the trading date."""
 
+    @abstractmethod
+    async def release_synthetic_reservations(self, trade_date: str) -> int:
+        """Release active reservations backed by paper entry orders for this date."""
+
 
 class NullCashBudgetRepository(CashBudgetRepository):
     async def get_day(self, trade_date: str) -> CashBudgetDay | None:
@@ -364,6 +368,10 @@ class NullCashBudgetRepository(CashBudgetRepository):
     async def reservation_totals(self, trade_date: str) -> dict[str, float]:
         del trade_date
         return {"reserved": 0.0, "consumed": 0.0}
+
+    async def release_synthetic_reservations(self, trade_date: str) -> int:
+        del trade_date
+        return 0
 
 
 class ChainSnapshotRepository(ABC):
