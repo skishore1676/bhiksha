@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from bhiksha.experiments.cartographer_attempts import (
     ATTEMPT_EVENT,
     OUTCOME_EVENT,
+    RECOVERY_EVENT,
     attempt_outcome_payload,
     attempt_start_payload,
     load_attempt_events,
@@ -109,6 +110,45 @@ def test_attempt_slice_cannot_be_aged_out_by_later_signal_evaluations(tmp_path) 
     events = load_attempt_events(database)
     assert any(event["event_type"] == ATTEMPT_EVENT for event in events)
     assert not any(event["event_type"] == "signal_evaluation" for event in events)
+
+
+def test_existing_event_ledger_gains_index_for_bounded_attempt_status(tmp_path) -> None:
+    database = tmp_path / "events.db"
+    timestamp = datetime(2026, 8, 18, 13, 35, tzinfo=UTC)
+    context = _context(timestamp=timestamp)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, created_at TEXT, event_type TEXT, payload TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO events(created_at, event_type, payload) VALUES (?, ?, ?)",
+            (timestamp.isoformat(), ATTEMPT_EVENT, json.dumps(attempt_start_payload(context))),
+        )
+        connection.executemany(
+            "INSERT INTO events(created_at, event_type, payload) VALUES (?, ?, ?)",
+            [(timestamp.isoformat(), "signal_evaluation", "{}") for _ in range(2_500)],
+        )
+
+    # The normal event writer initializes existing databases as well as new ones.
+    asyncio.run(SQLiteEventRepository(str(database)).append("status_index_test", {}))
+
+    with sqlite3.connect(database) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(events)")}
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT id, created_at, event_type, payload FROM events "
+            "WHERE event_type IN (?, ?, ?, ?, ?) ORDER BY id DESC LIMIT ?",
+            (
+                ATTEMPT_EVENT,
+                OUTCOME_EVENT,
+                RECOVERY_EVENT,
+                "signal_decision",
+                "trade_plan",
+                2_000,
+            ),
+        ).fetchall()
+    assert "idx_events_event_type_id" in indexes
+    assert any("SEARCH events USING INDEX idx_events_event_type_id" in row[3] for row in plan)
+    assert [event["event_type"] for event in load_attempt_events(database)] == [ATTEMPT_EVENT]
 
 
 def test_sqlite_attempt_start_and_outcome_are_idempotent(tmp_path) -> None:

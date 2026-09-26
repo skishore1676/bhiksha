@@ -105,6 +105,13 @@ class SQLiteEventRepository(EventRepository):
                 )
                 """
             )
+            # Cartographer status reads the newest attempt-related event types.
+            # Without this index it scans the entire append-only ledger before
+            # applying its 2,000-event limit.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_event_type_id "
+                "ON events(event_type, id DESC)"
+            )
             conn.commit()
 
     def _append_sync(self, event_type: str, payload: dict[str, Any]) -> None:

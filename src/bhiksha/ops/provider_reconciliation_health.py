@@ -13,6 +13,23 @@ from typing import Any
 
 RECOVERY_EVENT_TYPE = "reconciliation_recovered"
 SUCCESS_METRIC = "portfolio_sync_ms"
+_RECENT_RECONCILIATION_SQL = """
+    SELECT created_at, event_type, payload
+    FROM events NOT INDEXED
+    WHERE event_type IN (?, ?)
+       OR (
+           event_type = ?
+           AND json_valid(payload)
+           AND json_extract(payload, '$.stage') = ?
+       )
+       OR (
+           event_type = ?
+           AND json_valid(payload)
+           AND json_extract(payload, '$.metric') = ?
+       )
+    ORDER BY id DESC
+    LIMIT ?
+"""
 
 
 def summarize_provider_reconciliation(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -111,24 +128,11 @@ def inspect_provider_reconciliation(db_path: str | Path, *, limit: int = 500) ->
             tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if "events" not in tables:
                 return empty_provider_reconciliation(available=False, reason="events_missing")
+            # This is a newest-first, limited read. With an event_type index,
+            # SQLite may instead materialize millions of runtime_metric rows
+            # for the OR branches before applying LIMIT. Scan rowids backward.
             rows = conn.execute(
-                """
-                SELECT created_at, event_type, payload
-                FROM events
-                WHERE event_type IN (?, ?)
-                   OR (
-                       event_type = ?
-                       AND json_valid(payload)
-                       AND json_extract(payload, '$.stage') = ?
-                   )
-                   OR (
-                       event_type = ?
-                       AND json_valid(payload)
-                       AND json_extract(payload, '$.metric') = ?
-                   )
-                ORDER BY id DESC
-                LIMIT ?
-                """,
+                _RECENT_RECONCILIATION_SQL,
                 (
                     "reconciliation_health",
                     RECOVERY_EVENT_TYPE,

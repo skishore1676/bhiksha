@@ -1,11 +1,54 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+
 from bhiksha.ops.daily_report import _report_status
-from bhiksha.ops.provider_reconciliation_health import summarize_provider_reconciliation
+from bhiksha.ops.provider_reconciliation_health import (
+    _RECENT_RECONCILIATION_SQL,
+    inspect_provider_reconciliation,
+    summarize_provider_reconciliation,
+)
 
 
 def _event(event_type: str, payload: dict, created_at: str) -> dict:
     return {"event_type": event_type, "payload": payload, "created_at": created_at}
+
+
+def test_indexed_ledger_status_uses_bounded_rowid_tail(tmp_path) -> None:
+    database = tmp_path / "events.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, created_at TEXT, event_type TEXT, payload TEXT)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_events_event_type_id ON events(event_type, id DESC)"
+        )
+        connection.executemany(
+            "INSERT INTO events(created_at, event_type, payload) VALUES (?, ?, ?)",
+            [
+                ("2026-07-17T14:11:11+00:00", "reconciliation_health", json.dumps({"severity": "warning"})),
+                ("2026-07-17T14:11:12+00:00", "runtime_metric", json.dumps({"metric": "signal_evaluation_ms"})),
+                ("2026-07-17T14:11:26+00:00", "runtime_metric", json.dumps({"metric": "portfolio_sync_ms"})),
+            ],
+        )
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN " + _RECENT_RECONCILIATION_SQL,
+            (
+                "reconciliation_health",
+                "reconciliation_recovered",
+                "runtime_issue",
+                "reconciliation",
+                "runtime_metric",
+                "portfolio_sync_ms",
+                2,
+            ),
+        ).fetchall()
+    assert any("SCAN events" in row[3] for row in plan)
+    assert not any("USE TEMP B-TREE" in row[3] for row in plan)
+    summary = inspect_provider_reconciliation(database, limit=2)
+    assert summary["state"] == "recovered"
+    assert summary["active_warning_count"] == 0
 
 
 def test_success_after_warning_preserves_history_but_clears_attention() -> None:
