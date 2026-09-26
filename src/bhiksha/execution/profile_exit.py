@@ -45,7 +45,7 @@ from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from bhiksha.market_data.trading_calendar import is_trading_day
+import exchange_calendars
 
 UTC = timezone.utc
 ET = ZoneInfo("America/New_York")
@@ -936,11 +936,12 @@ def _elapsed_regular_session_seconds(entry_time: datetime | None, now: datetime)
         return 0.0
     day = entry.astimezone(ET).date()
     last_day = reference.astimezone(ET).date()
+    calendar = exchange_calendars.get_calendar("XNYS")
     total = 0.0
     while day <= last_day:
-        if is_trading_day(day):
-            opened = datetime.combine(day, dt_time(9, 30), ET).astimezone(UTC)
-            closed = datetime.combine(day, dt_time(16), ET).astimezone(UTC)
+        if calendar.is_session(day.isoformat()):
+            opened = calendar.session_open(day.isoformat()).to_pydatetime()
+            closed = calendar.session_close(day.isoformat()).to_pydatetime()
             total += max(0.0, (min(reference, closed) - max(entry, opened)).total_seconds())
         day += timedelta(days=1)
     return total

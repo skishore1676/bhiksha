@@ -169,6 +169,7 @@ async def run_observer(
                         )
                     recorder.refresh_active_from_store()
                     now = datetime.now(UTC)
+                    recorder.censor_expired_options(now)
                     symbols = recorder.active_option_symbols()
                     if symbols and _regular_session(now):
                         started = clock.monotonic()

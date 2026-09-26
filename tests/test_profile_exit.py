@@ -30,6 +30,7 @@ from bhiksha.execution.profile_exit import (
     evaluate_profile_exit,
     profile_decision_to_exit_decision,
     profile_exit_dispatch_allowed,
+    _elapsed_regular_session_seconds,
 )
 from bhiksha.execution.profile_exit_shadow import evaluate_and_record_profile_exit
 from bhiksha.shared_kernel import ensure_kernel_on_path
@@ -92,6 +93,14 @@ def test_overnight_profile_timer_counts_regular_session_only() -> None:
         entry_time=entry, now=datetime(2026, 9, 28, 13, 45, tzinfo=UTC), state=state,
     )
     assert due.rule is ProfileLadderRule.MAX_HOLD
+
+
+def test_overnight_clock_uses_actual_early_close() -> None:
+    # Thanksgiving Friday 2026 ends at 13:00 ET per the XNYS calendar.
+    entry = datetime(2026, 11, 25, 20, 0, tzinfo=UTC)  # Wednesday 15:00 ET
+    friday_close = datetime(2026, 11, 27, 18, 0, tzinfo=UTC)
+    assert _elapsed_regular_session_seconds(entry, friday_close) == 270 * 60
+    assert _elapsed_regular_session_seconds(entry, friday_close.replace(hour=20)) == 270 * 60
 
 
 # --------------------------------------------------------------------------- #

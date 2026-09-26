@@ -12,10 +12,11 @@ never calls an order or position endpoint.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread, get_ident
@@ -319,6 +320,20 @@ class ExitEdgeLiveRecorder:
     def active_option_symbols(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(sorted(self._active_by_option))
+
+    def censor_expired_options(self, now: datetime) -> None:
+        """Stop collecting an unfinished counterfactual after contract expiry."""
+        if self.role != "observer":
+            return
+        today_et = _aware_utc(now).astimezone(ET).date()
+        with self._lock:
+            active = {symbol: tuple(ids) for symbol, ids in self._active_by_option.items()}
+        repository = self._repository_factory(self.db_path)
+        for symbol, cohort_ids in active.items():
+            expiry = _option_expiry(symbol)
+            if expiry is not None and today_et > expiry:
+                for cohort_id in cohort_ids:
+                    self._censor(repository, cohort_id, "option_expired_before_candidate_completed")
 
     def heartbeat(self) -> None:
         self._set_health()
@@ -989,6 +1004,17 @@ def _maybe_float(value: Any) -> float | None:
 def _normalize_option_symbol(value: Any) -> str:
     symbol = str(value or "").strip().upper().replace(" ", "")
     return symbol[:-7] if symbol.endswith("-OPTION") else symbol
+
+
+def _option_expiry(option_symbol: str) -> date | None:
+    match = re.fullmatch(r"[A-Z.]+(\d{2})(\d{2})(\d{2})[CP]\d{8}", option_symbol)
+    if match is None:
+        return None
+    try:
+        year, month, day = (int(part) for part in match.groups())
+        return date(2000 + year, month, day)
+    except ValueError:
+        return None
 
 
 __all__ = ["ExitEdgeLiveRecorder", "QUOTE_FEED", "QUOTE_SOURCE"]

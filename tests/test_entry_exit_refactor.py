@@ -69,6 +69,29 @@ def test_range_expansion_sheet_can_freeze_an_overnight_three_session_policy():
     assert frozen["max_hold_seconds"] == 70_200
 
 
+def test_expired_option_censors_unfinished_candidate_without_new_quote(tmp_path):
+    dep = deployment()
+    entry = datetime(2026, 9, 25, 14, tzinfo=UTC)
+    recorder = ExitEdgeLiveRecorder(
+        db_path=tmp_path / "tape.db", status_path=tmp_path / "status.json", role="observer",
+    )
+    _, payload = recorder._registration_payloads(
+        deployment=dep, trade_id="expired", option_symbol="QQQ260925P00500000",
+        entry_timestamp=entry, entry_premium=2.0, quantity=2,
+        entry_context={"entry_fill_kind": "modeled_ask_touch"},
+    )
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "tape.db")
+    repo.initialize()
+    repo.register_cohort(payload)
+    recorder.refresh_active_from_store()
+    recorder.censor_expired_options(datetime(2026, 9, 25, 21, tzinfo=UTC))
+    assert recorder.active_option_symbols() == ("QQQ260925P00500000",)
+    recorder.censor_expired_options(datetime(2026, 9, 28, 13, 30, tzinfo=UTC))
+    assert recorder.active_option_symbols() == ()
+    assert repo.load_case(payload["cohort_id"]).persisted_censor_reason == "option_expired_before_candidate_completed"
+    assert analyze_cases([repo.load_case(payload["cohort_id"])])["cases"][0]["status"] != "paired"
+
+
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_named_comparisons_persist_continue_after_baseline_and_keep_entry_mode(tmp_path, dynamic):
     dep = deployment()
