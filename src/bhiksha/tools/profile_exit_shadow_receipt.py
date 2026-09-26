@@ -123,7 +123,7 @@ def _range_expansion() -> ProfileExitFields:
         initial_stop_pct=0.35,
         premium_disaster_stop_pct=0.40,
         no_progress_seconds=2 * 60 * 60,
-        max_hold_seconds=5 * 24 * 60 * 60,
+        max_hold_seconds=3 * 390 * 60,
         high_water_giveback_policy="LOOSE",
         breakeven_after_t1=True,
         eod_flat=False,  # the one profile allowed to ride overnight
@@ -260,7 +260,7 @@ def _scenarios() -> list[_Scenario]:
 
     # 5) RANGE_EXPANSION: R=0.35*2.0=0.70. Rise to T1 (2.70), bank 40%, breakeven,
     #    then hold a runner for days (LOOSE giveback needs 1.5R arm and the runner
-    #    stays modest) until elapsed >= max_hold (5 days) -> max-hold time stop.
+    #    stays modest) until elapsed >= max_hold (3 regular sessions) -> time stop.
     #    eod_flat is False so the EOD rung never pre-empts.
     five_days_min = 5 * 24 * 60
     scenarios.append(
@@ -274,10 +274,10 @@ def _scenarios() -> list[_Scenario]:
                 _Tick(2, 2.75, dt_time(10, 0)),                 # >= T1 (2.70) -> bank 40%
                 _Tick(5, 2.80, dt_time(15, 56)),                # hold; eod_flat=False -> NO EOD
                 _Tick(60, 2.72, dt_time(11, 0)),                # next session, holding runner
-                _Tick(five_days_min + 1, 2.74, dt_time(11, 0)), # elapsed >= 5d -> max-hold
+                _Tick(five_days_min + 1, 2.74, dt_time(11, 0)), # elapsed >= 3 sessions -> max-hold
             ],
             expected_terminal="max_hold",
-            narrative="T1 + breakeven, ride the runner overnight, exit at the 5-day max-hold.",
+            narrative="T1 + breakeven, ride the runner overnight, exit at the 3-session max-hold.",
         )
     )
 

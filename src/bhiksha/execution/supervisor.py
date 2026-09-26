@@ -2150,6 +2150,41 @@ class ExecutionSupervisor:
                     )
             return plan
 
+    async def _register_exit_edge_entry(
+        self, *, deployment: DeploymentManifest, trade_id: str,
+        option_symbol: str, entry_timestamp: datetime | None,
+        entry_premium: float | None, quantity: int | None,
+        entry_context: dict[str, Any],
+    ) -> None:
+        """Record a recoverable frozen intent; observation never controls trading."""
+        recorder = self.exit_edge_recorder
+        if recorder is None:
+            return
+        try:
+            prepared = recorder.prepare_registration(
+                deployment=deployment, trade_id=trade_id,
+                option_symbol=option_symbol, entry_timestamp=entry_timestamp,
+                entry_premium=entry_premium, quantity=quantity,
+                entry_context=entry_context,
+            )
+        except Exception as exc:
+            recorder.record_registration_intent_failure(f"prepare:{type(exc).__name__}")
+            return
+        recorder.try_queue_registration(prepared)
+        # Order protection must not wait on an observational SQLite append.
+        # The main fill ledger remains the denominator if this task fails.
+        task = asyncio.create_task(self.event_repository.append(
+            "exit_edge_registration_intent", {
+                "attempt": prepared.attempt, "cohort": prepared.payload,
+            },
+        ))
+        def record_intent_result(done: asyncio.Task) -> None:
+            if done.cancelled():
+                recorder.record_registration_intent_failure("persist:cancelled")
+            elif (error := done.exception()) is not None:
+                recorder.record_registration_intent_failure(f"persist:{type(error).__name__}")
+        task.add_done_callback(record_intent_result)
+
     async def _open_shadow_entry(self, deployment: DeploymentManifest, plan: TradePlan) -> None:
         if deployment.exit.management_exit:
             self._paper_exit_deployments[plan.trade_id] = deployment.model_copy(deep=True)
@@ -2203,8 +2238,8 @@ class ExecutionSupervisor:
                 "risk_reasons": list(plan.risk_reasons),
             },
         )
-        if self.exit_edge_recorder is not None and plan.risk_details.get("entry_fill_kind") == "modeled_ask_touch":
-            self.exit_edge_recorder.try_register_entry(
+        if plan.risk_details.get("entry_fill_kind") == "modeled_ask_touch":
+            await self._register_exit_edge_entry(
                 deployment=deployment,
                 trade_id=plan.trade_id,
                 option_symbol=plan.option_symbol,
@@ -2571,19 +2606,17 @@ class ExecutionSupervisor:
                 },
             )
         # Freeze the observational cohort only from CONFIRMED broker fill
-        # truth. This is a bounded queue write: no SQLite, await, replay, or
-        # broker call occurs on the entry/money path. Failure only affects the
-        # experiment's health/censor state.
-        if self.exit_edge_recorder is not None:
-            self.exit_edge_recorder.try_register_entry(
-                deployment=deployment,
-                trade_id=plan.trade_id,
-                option_symbol=plan.option_symbol,
-                entry_timestamp=confirmed_at,
-                entry_premium=confirmed_price,
-                quantity=confirmed_quantity,
-                entry_context=dict(plan.risk_details),
-            )
+        # truth. Registration only queues frozen facts and schedules a durable
+        # intent; no observational SQLite write delays protection.
+        await self._register_exit_edge_entry(
+            deployment=deployment,
+            trade_id=plan.trade_id,
+            option_symbol=plan.option_symbol,
+            entry_timestamp=confirmed_at,
+            entry_premium=confirmed_price,
+            quantity=confirmed_quantity,
+            entry_context=dict(plan.risk_details),
+        )
         stop_result, stop_price, target_order_id, target_price = await self._arm_position_protection(
             deployment,
             option_symbol=plan.option_symbol,

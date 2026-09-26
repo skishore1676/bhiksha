@@ -21,7 +21,7 @@ class ExitProfileConfig(BaseModel):
     structural_buffer: float | None = None
     structural_buffer_unit: str | None = None
     reference_timeframe: str | None = None
-    no_progress_seconds: int = Field(gt=0)
+    no_progress_seconds: int | None = Field(default=None, gt=0)
     no_progress_min_r: float | None = Field(default=None, ge=0)
     profit_lock_arm_r: float | None = Field(default=None, gt=0)
     profit_lock_floor_r: float | None = Field(default=None, ge=0)
@@ -36,7 +36,7 @@ class ExitProfileConfig(BaseModel):
     risk_envelope_floor_at_t1_r: float | None = None
     risk_envelope_ratchet_step_r: float | None = Field(default=None, gt=0)
     breakeven_after_t1: bool
-    eod_flat: Literal[True]
+    eod_flat: bool
     hard_flat_time_et: str
     description: str = ""
 
@@ -47,6 +47,13 @@ class ExitProfileConfig(BaseModel):
             raise ValueError("target_2_r must be >= target_1_r")
         if self.disaster_stop_pct < self.initial_stop_pct:
             raise ValueError("disaster_stop_pct must be >= initial_stop_pct")
+        if not self.eod_flat and self.trade_archetype != "RANGE_EXPANSION":
+            raise ValueError("only range expansion supports overnight holding")
+        if self.trade_archetype == "RANGE_EXPANSION" and not self.eod_flat:
+            if self.max_hold_seconds is None:
+                raise ValueError("overnight range expansion needs a maximum hold")
+        elif self.no_progress_seconds is None:
+            raise ValueError("intraday profiles need a no-progress timer")
         if self.giveback_policy != "OFF" and (self.giveback_arm_r is None or self.giveback_retrace_fraction is None):
             raise ValueError("giveback needs explicit arm and retrace values")
         if self.giveback_policy == "OFF" and (self.giveback_arm_r is not None or self.giveback_retrace_fraction is not None):
@@ -94,7 +101,7 @@ class ExitProfileConfig(BaseModel):
             "target_1_quantity": float(self.target_1_quantity),
             "initial_stop_pct": float(self.initial_stop_pct),
             "premium_disaster_stop_pct": float(self.disaster_stop_pct),
-            "no_progress_seconds": int(self.no_progress_seconds),
+            "no_progress_seconds": int(self.no_progress_seconds) if self.no_progress_seconds is not None else None,
             "max_hold_seconds": int(self.max_hold_seconds) if self.max_hold_seconds is not None else None,
             "high_water_giveback_policy": str(self.giveback_policy).upper(),
             "giveback_arm_r": float(self.giveback_arm_r) if self.giveback_arm_r is not None else None,
@@ -178,4 +185,3 @@ def load_exit_profiles_sheet_rows(rows: list[dict[str, Any]]) -> dict[str, ExitP
             raise ValueError(f"Exit_Profiles_v1 row {index}: duplicate profile {profile.exit_profile_id}")
         catalog[profile.exit_profile_id] = profile
     return catalog
-

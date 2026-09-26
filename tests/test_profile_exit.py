@@ -14,6 +14,7 @@ All market data is mocked — no live API, no broker, no order placement.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, time as dt_time, timezone
 
 import pytest
@@ -72,6 +73,25 @@ def _eval(fields, premium, *, quantity=4, state=None, bar_time=dt_time(10, 0), m
         now=ENTRY_TIME.replace(minute=minutes),
         state=state,
     ), state
+
+
+def test_overnight_profile_timer_counts_regular_session_only() -> None:
+    fields = replace(_flash_reversal_fields(), eod_flat=False,
+                     no_progress_seconds=None, max_hold_seconds=4500)
+    entry = datetime(2026, 9, 25, 19, 0, tzinfo=UTC)  # Friday 15:00 ET
+    state = ProfileExitState.new(1.0)
+    monday = evaluate_profile_exit(
+        fields=fields, entry_premium=1.0, quantity=4,
+        market=_market(1.0, bar_time=dt_time(9, 44)),
+        entry_time=entry, now=datetime(2026, 9, 28, 13, 44, tzinfo=UTC), state=state,
+    )
+    assert monday.exit is False
+    due = evaluate_profile_exit(
+        fields=fields, entry_premium=1.0, quantity=4,
+        market=_market(1.0, bar_time=dt_time(9, 45)),
+        entry_time=entry, now=datetime(2026, 9, 28, 13, 45, tzinfo=UTC), state=state,
+    )
+    assert due.rule is ProfileLadderRule.MAX_HOLD
 
 
 # --------------------------------------------------------------------------- #

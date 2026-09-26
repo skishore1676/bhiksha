@@ -77,9 +77,10 @@ def test_sheet_is_scoped_report_and_clears_old_dump():
     assert block["range"]["sheetId"] == 42
     assert block["range"]["endColumnIndex"] == 19
     rows = block["rows"]
-    assert rows[6]["values"][0]["userEnteredValue"]["stringValue"] == "SIGNAL CAPTURE"
-    assert rows[8]["values"][2]["userEnteredValue"]["numberValue"] == 2
+    assert any(row["values"][0]["userEnteredValue"].get("stringValue") == "SIGNAL CAPTURE" for row in rows)
+    assert any(row["values"][2]["userEnteredValue"].get("numberValue") == 2 for row in rows)
     assert any(row["values"][0]["userEnteredValue"].get("stringValue", "").startswith("EXIT CHOICES") for row in rows)
+    assert any(row["values"][0]["userEnteredValue"].get("stringValue", "").startswith("ROLLING 10 SESSIONS") for row in rows)
     assert "formulaValue" in rows[2]["values"][3]["userEnteredValue"]
     assert any(request.get("updateDimensionProperties", {}).get("properties", {}).get("hiddenByUser") for request in requests)
 
@@ -105,6 +106,23 @@ def test_recorded_signal_count_deduplicates_transitions_and_explains_misses(tmp_
     assert result["rows"][0][6] == "DTE out of range (1)"
 
 
+def test_active_plan_report_uses_strategy_key_and_effective_cartographer_policy(tmp_path):
+    plan_path = tmp_path / "active_plan.json"
+    plan_path.write_text(json.dumps({"deployments": [{
+        "deployment_id": "mc-v1-example", "strategy": {"key": "manual_trigger", "params": {
+            "cartographer_metadata": {"large_evidence": "must not appear in report"}}},
+        "source": {"metadata": {"source_owner": "market_cartographer"}},
+        "execution": {"shadow_only": True, "entry_execution_profile": None,
+                      "dte_min": 3, "dte_max": 7, "dte_fallback_max": 21},
+        "exit": {"exit_policy_id": "trend_continuation_balanced"},
+    }]}))
+    plan = sheet._plan(plan_path)
+    assert plan["mc-v1-example"]["strategy"] == "manual_trigger"
+    assert "large_evidence" not in str(plan)
+    assert "legacy (implicit)" in sheet._entry_policy(plan)
+    assert "fallback ceiling 21 DTE" in sheet._entry_policy(plan)
+
+
 def test_gap_case_cannot_become_clean_winner_and_censor_is_retained():
     result = sheet._exit_review([_case("clean", delta=45), _case("affected", gap=True, censor=True)],
                                 date(2026, 9, 22))
@@ -113,6 +131,29 @@ def test_gap_case_cannot_become_clean_winner_and_censor_is_retained():
     assert result["rows"][0][4] == "1 / 2"
     assert "provisional" in result["rows"][0][7].lower()
     assert result["detail"][0][6] == "Historical censor; unchanged"
+
+
+def test_registration_review_uses_filled_trade_ids_not_attempt_denominator(tmp_path):
+    db = tmp_path / "edge.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE exit_edge_registration_attempts (trade_id TEXT, outcome TEXT, reason TEXT)")
+        conn.execute("INSERT INTO exit_edge_registration_attempts VALUES ('failed','registration_persistence_failure','locked')")
+    result = sheet._registration_review(db, ["clean", "failed", "silent"], [{"trade_id": "clean"}])
+    assert (result["filled"], result["registered"], result["missing"]) == (3, 1, 2)
+    assert any("locked" in reason for reason in result["detail"])
+    assert any("no registration attempt" in reason for reason in result["detail"])
+
+
+def test_cumulative_pairs_keep_frozen_versions_separate():
+    first = _case("first", delta=45)
+    second = _case("second", delta=-10)
+    second["entry_timestamp"] = "2026-09-23T14:00:00+00:00"
+    different = _case("new-policy", delta=100)
+    different["experiment_spec_hash"] = "new-frozen-policy"
+    result = sheet._cumulative_exit_review([first, second, different], date(2026, 9, 25))
+    assert len(result["rows"]) == 2
+    old = next(row for row in result["rows"] if row[9] == "frozen-policy")
+    assert old[4:8] == [2, 2, 17.5, -10.0]
 
 
 def test_failed_publication_preserves_last_success(tmp_path, monkeypatch):

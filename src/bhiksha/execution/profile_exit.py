@@ -40,11 +40,15 @@ adverse — so unlike the underlying policy there is no separate short branch.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from bhiksha.market_data.trading_calendar import is_trading_day
 
 UTC = timezone.utc
+ET = ZoneInfo("America/New_York")
 
 # High-water giveback tiers mirror kernel ``GIVEBACK_POLICIES``. Each tier maps to
 # (arm_r, retrace_frac): arm once peak favorable excursion reaches arm_r (in R),
@@ -512,7 +516,12 @@ def evaluate_profile_exit(
     if risk <= 0:
         return _hold(profile_id, reason="profile_no_risk")
 
-    elapsed_seconds = _elapsed_seconds(entry_time, now)
+    # Overnight profiles measure time stops in observable regular-session time.
+    # Wall time would exhaust a multi-day hold over a night or weekend.
+    elapsed_seconds = (
+        _elapsed_seconds(entry_time, now) if fields.eod_flat
+        else _elapsed_regular_session_seconds(entry_time, now)
+    )
 
     # 0. EOD hard flat — highest precedence when enabled. M1: do NOT silently
     #    skip when the bar clock is missing. If EOD is required but no bar time
@@ -916,6 +925,25 @@ def _elapsed_seconds(entry_time: datetime | None, now: datetime) -> float | None
     reference = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
     delta = (reference - entry).total_seconds()
     return delta if delta >= 0 else 0.0
+
+
+def _elapsed_regular_session_seconds(entry_time: datetime | None, now: datetime) -> float | None:
+    if entry_time is None:
+        return None
+    entry = entry_time if entry_time.tzinfo is not None else entry_time.replace(tzinfo=UTC)
+    reference = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    if reference <= entry:
+        return 0.0
+    day = entry.astimezone(ET).date()
+    last_day = reference.astimezone(ET).date()
+    total = 0.0
+    while day <= last_day:
+        if is_trading_day(day):
+            opened = datetime.combine(day, dt_time(9, 30), ET).astimezone(UTC)
+            closed = datetime.combine(day, dt_time(16), ET).astimezone(UTC)
+            total += max(0.0, (min(reference, closed) - max(entry, opened)).total_seconds())
+        day += timedelta(days=1)
+    return total
 
 
 def _parse_time(value: str) -> dt_time:

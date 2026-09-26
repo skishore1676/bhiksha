@@ -11,6 +11,8 @@ import asyncio
 from datetime import UTC, datetime, time
 import json
 from pathlib import Path
+import sqlite3
+import time as clock
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -22,6 +24,7 @@ from bhiksha.execution.brokers.public.settings import PublicBrokerSettings
 from bhiksha.execution.quote_lineage import extract_public_quote_timestamp
 from bhiksha.market_data.trading_calendar import is_trading_day
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
+from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository
 
 CENTRAL = ZoneInfo("America/Chicago")
 POLL_SECONDS = 15.0
@@ -93,9 +96,49 @@ def _regular_session(now: datetime) -> bool:
     return is_trading_day(local.date()) and time(8, 30) <= local.time() <= time(15, 0)
 
 
+def recover_registration_intents(
+    event_db_path: str | Path, edge_db_path: str | Path, after_id: int,
+) -> int:
+    """Idempotently deliver frozen fill intents missed by the executor queue."""
+    source = Path(event_db_path).resolve()
+    if not source.is_file():
+        return after_id
+    with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=0.25) as conn:
+        rows = conn.execute(
+            "SELECT id,payload FROM events WHERE event_type='exit_edge_registration_intent' "
+            "AND id>? ORDER BY id LIMIT 100", (after_id,),
+        ).fetchall()
+    repository = ProspectiveQuoteTapeRepository(edge_db_path, write_timeout_seconds=0.25)
+    for event_id, raw in rows:
+        item: dict[str, Any] = {}
+        try:
+            item = json.loads(raw)
+            attempt = dict(item["attempt"])
+            cohort = item.get("cohort")
+            if cohort is not None:
+                repository.register_cohort(cohort)
+                attempt.update(outcome="registered", reason=None)
+            if not repository.try_record_registration_attempt(attempt):
+                break
+        except sqlite3.OperationalError:
+            break  # transient writer lock; retry this event next poll
+        except (KeyError, TypeError, ValueError) as exc:
+            # A malformed frozen intent is evidence of a real failure, not a
+            # reason to stall every later trade behind it.
+            attempt = item.get("attempt") if isinstance(item, dict) else None
+            if isinstance(attempt, dict):
+                attempt.update(outcome="registration_persistence_failure",
+                               reason=f"invalid_frozen_intent:{type(exc).__name__}:{exc}"[:240])
+                if not repository.try_record_registration_attempt(attempt):
+                    break
+        after_id = int(event_id)
+    return after_id
+
+
 async def run_observer(
     *,
     db_path: str | Path,
+    event_db_path: str | Path | None = None,
     status_path: str | Path,
     enable_marker: str | Path,
     reader: Any | None = None,
@@ -108,21 +151,30 @@ async def run_observer(
     stop = stop or asyncio.Event()
     recorder = ExitEdgeLiveRecorder(db_path=db_path, status_path=status_path, role="observer")
     recorder.start()
+    last_intent_id = 0
     try:
         while not stop.is_set():
             if recorder.snapshot().get("ready") and marker.is_file():
                 try:
+                    if event_db_path is not None:
+                        last_intent_id = recover_registration_intents(
+                            event_db_path, db_path, last_intent_id,
+                        )
                     recorder.refresh_active_from_store()
                     now = datetime.now(UTC)
                     symbols = recorder.active_option_symbols()
                     if symbols and _regular_session(now):
+                        started = clock.monotonic()
                         quotes = await reader.quotes(symbols)
                         received = datetime.now(UTC)
                         for symbol in symbols:
                             quote = quotes.get(symbol)
                             if quote is not None:
                                 recorder.observe_quote(symbol, quote, received)
-                        recorder.record_observation_poll(len(symbols), len(quotes))
+                        recorder.record_observation_poll(
+                            len(symbols), len(quotes),
+                            quote_request_ms=(clock.monotonic() - started) * 1000,
+                        )
                     else:
                         recorder.heartbeat()
                 except Exception as exc:

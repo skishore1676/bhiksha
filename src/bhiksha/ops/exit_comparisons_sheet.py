@@ -23,6 +23,7 @@ VISIBLE_COLUMNS = 8
 SHEET_COLUMNS = 11
 SIGNAL_HEADERS = ["Strategy", "Lane", "Signals", "Captured", "Missed", "Pending / unknown", "Main miss reason", "Default exit", "Deployments"]
 EXIT_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Observed leader", "Clean / registered", "Sessions", "Δ $ / trade", "Why / evidence", "Frozen evaluator", "Frozen hash", "Deployments"]
+CUMULATIVE_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Candidate", "Clean pairs", "Sessions", "Mean Δ $", "Worst Δ $", "Frozen evaluator", "Frozen hash", "Window"]
 GAP_HEADERS = ["Trade", "Strategy", "Lane / entry", "Last good quote CT", "Resumed CT", "Reason", "Evidence state", "", "Full trade ID"]
 
 
@@ -67,10 +68,16 @@ def _plan(path: str | Path | None) -> dict[str, dict[str, str]]:
         source = item.get("source") or {}
         meta = source.get("metadata") or {}
         execution = item.get("execution") or {}
+        strategy = item.get("strategy") or {}
+        strategy_key = strategy.get("key") if isinstance(strategy, dict) else strategy
         result[item["deployment_id"]] = {
-            "strategy": str(meta.get("strategy_class") or meta.get("strategy_family") or item.get("strategy") or "unclassified"),
+            "strategy": str(meta.get("strategy_class") or meta.get("strategy_family") or strategy_key or "unclassified"),
             "lane": "Shadow" if execution.get("shadow_only") else "Live",
             "default_exit": str((item.get("exit") or {}).get("exit_policy_id") or "unknown"),
+            "entry_profile": str(execution.get("entry_execution_profile") or "legacy (implicit)"),
+            "dte_min": execution.get("dte_min"), "dte_max": execution.get("dte_max"),
+            "dte_fallback_max": execution.get("dte_fallback_max"),
+            "source_owner": str(meta.get("source_owner") or ""),
         }
     return result
 
@@ -111,7 +118,8 @@ def _signals(db_path: str | Path | None, day: date, plan: dict[str, dict[str, st
             previous = row.get("outcome")
             if previous != "filled" and (outcome == "filled" or previous in {None, "pending_execution", "unknown"} or outcome != "pending_execution"):
                 row.update(outcome=outcome, reasons=payload.get("rejection_reasons") or [], mode=payload.get("mode"),
-                           policy=(payload.get("evidence_identity") or {}).get("exit_policy_id"))
+                           policy=(payload.get("evidence_identity") or {}).get("exit_policy_id"),
+                           trade_id=payload.get("trade_id"))
         elif "decision" not in row:
             row["decision"] = True
             row["policy"] = (payload.get("evidence_identity") or {}).get("exit_policy_id")
@@ -139,7 +147,76 @@ def _signals(db_path: str | Path | None, day: date, plan: dict[str, dict[str, st
     return {"rows": rows, "recorded": len(signals), "captured": sum(row.get("outcome") == "filled" for row in signals.values()),
             "missed": sum(row.get("outcome") not in {None, "filled", "pending_execution", "unknown"} for row in signals.values()),
             "pending": sum(row.get("outcome") in {None, "pending_execution", "unknown"} for row in signals.values()),
-            "latest": latest or None}
+            "latest": latest or None,
+            "filled_trade_ids": sorted({str(row["trade_id"]) for row in signals.values()
+                                        if row.get("outcome") == "filled" and row.get("trade_id")})}
+
+
+def _entry_policy(plan: dict[str, dict[str, Any]]) -> str:
+    cartographer = [row for row in plan.values() if row.get("source_owner") == "market_cartographer"]
+    if not cartographer:
+        return "No Cartographer rows in current plan"
+    settings = {(row.get("entry_profile"), row.get("dte_min"), row.get("dte_max"),
+                 row.get("dte_fallback_max")) for row in cartographer}
+    if len(settings) != 1:
+        return f"{len(cartographer)} Cartographer rows · mixed entry settings; inspect active plan"
+    profile, low, high, fallback = settings.pop()
+    return (f"Cartographer · {len(cartographer)} rows · {profile} patience · preferred {low}–{high} DTE · "
+            f"fallback ceiling {fallback if fallback is not None else 'none'} DTE · "
+            "control: Operator_Defaults_v1/profile__trend_continuation")
+
+
+def _registration_review(
+    db_path: str | Path, filled_trade_ids: list[str], cases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    registered = {str(case["trade_id"]) for case in cases}
+    missing = [trade_id for trade_id in filled_trade_ids if trade_id not in registered]
+    reasons: dict[str, str] = {}
+    if missing:
+        with sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                "SELECT trade_id,outcome,reason FROM exit_edge_registration_attempts "
+                f"WHERE trade_id IN ({','.join('?' for _ in missing)})", missing,
+            ).fetchall()
+        reasons = {trade_id: f"{outcome}: {reason or 'unspecified'}" for trade_id, outcome, reason in rows}
+    return {"filled": len(filled_trade_ids), "registered": len(filled_trade_ids) - len(missing),
+            "missing": len(missing), "detail": [f"{trade_id[:12]} {reasons.get(trade_id, 'no registration attempt')}"
+                                               for trade_id in missing]}
+
+
+def _cumulative_exit_review(cases: list[dict[str, Any]], day: date) -> dict[str, Any]:
+    start = day
+    for _ in range(9):
+        start = previous_trading_day(start)
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for case in cases:
+        entry_day = datetime.fromisoformat(case["entry_timestamp"].replace("Z", "+00:00")).astimezone(CENTRAL).date()
+        if not start <= entry_day <= day:
+            continue
+        dims, spec = case.get("cohort_dimensions") or {}, case.get("experiment_spec") or {}
+        profiles = spec.get("named_profiles") or []
+        if not profiles:
+            continue
+        key = (str(dims.get("strategy_class") or "unknown"), str(dims.get("runtime_mode") or "unknown"),
+               str(dims.get("entry_fill_kind") or "unknown"), str(profiles[0]["policy_id"]),
+               str(case.get("experiment_spec_hash") or "unknown"))
+        groups[key].append(case)
+    rows: list[list[Any]] = []
+    for (strategy, mode, kind, primary, frozen_hash), members in sorted(groups.items()):
+        candidates = sorted({name for case in members for name in
+                             (case.get("clean_candidate_delta_pnl_usd") or {})})
+        for candidate in candidates:
+            paired = [(case, float(case["clean_candidate_delta_pnl_usd"][candidate]))
+                      for case in members if candidate in (case.get("clean_candidate_delta_pnl_usd") or {})]
+            deltas = [value for _, value in paired]
+            sessions = len({datetime.fromisoformat(case["entry_timestamp"].replace("Z", "+00:00"))
+                            .astimezone(CENTRAL).date() for case, _ in paired})
+            rows.append([_label(strategy), f"{_label(mode)} / {'Broker confirmed' if kind == 'broker_confirmed' else 'Modeled entry'}",
+                         _label(primary), _label(candidate), len(paired), sessions,
+                         round(fmean(deltas), 2), round(min(deltas), 2),
+                         str((members[0].get("experiment_spec") or {}).get("evaluator_version") or "unknown"),
+                         frozen_hash, f"{start}–{day}"])
+    return {"rows": rows, "start": start.isoformat(), "end": day.isoformat()}
 
 
 def _exit_review(cases: list[dict[str, Any]], day: date) -> dict[str, Any]:
@@ -157,6 +234,7 @@ def _exit_review(cases: list[dict[str, Any]], day: date) -> dict[str, Any]:
         latest = max(latest, case.get("latest_quote_at") or "")
     rows, detail = [], []
     clean_total = 0
+    fully_clean_total = 0
     censored_total = 0
     collecting_total = 0
     unusable_total = 0
@@ -169,6 +247,7 @@ def _exit_review(cases: list[dict[str, Any]], day: date) -> dict[str, Any]:
         best_name = max(candidates, key=lambda name: fmean(delta for _, delta in candidates[name])) if candidates else None
         paired = candidates[best_name] if best_name else []
         clean_total += len({case["trade_id"] for pairs in candidates.values() for case, _ in pairs})
+        fully_clean_total += sum(case.get("status") == "paired" for case in members)
         affected = [case for case in members if case.get("observation_gaps") or str(case.get("insufficient_reason") or "").startswith("persisted_censor:")]
         censored_total += len(affected)
         for case in members:
@@ -215,7 +294,8 @@ def _exit_review(cases: list[dict[str, Any]], day: date) -> dict[str, Any]:
                      sessions, delta, why, version, spec_hash,
                      ", ".join(sorted({case["deployment_id"] for case in members}))])
     return {"rows": rows, "detail": detail[:DETAIL_LIMIT], "registered": sum(len(m) for m in groups.values()),
-            "clean": clean_total, "censored": censored_total, "collecting": collecting_total,
+            "clean": clean_total, "fully_clean": fully_clean_total,
+            "censored": censored_total, "collecting": collecting_total,
             "unusable": unusable_total, "latest": latest or None,
             "reasons": ", ".join(f"{_label(k)} ({v})" for k, v in reasons_total.most_common(2)) or "None recorded"}
 
@@ -225,11 +305,16 @@ def build_exit_comparisons_scorecard(
     active_plan_path: str | Path | None = None, trading_date: date | str | None = None,
 ) -> dict[str, Any]:
     day = _day(trading_date)
-    signals = _signals(signal_db_path, day, _plan(active_plan_path))
+    plan = _plan(active_plan_path)
+    signals = _signals(signal_db_path, day, plan)
     repository = ProspectiveQuoteTapeRepository(db_path, read_only=True, write_timeout_seconds=0.25)
-    exits = _exit_review(analyze_prospective_repository(repository)["cases"], day)
+    cases = analyze_prospective_repository(repository)["cases"]
+    exits = _exit_review(cases, day)
     return {"schema": "bhiksha.exit_comparisons_sheet.v2", "trading_date": day.isoformat(),
-            "generated_at": datetime.now(UTC).isoformat(), "signals": signals, "exits": exits}
+            "generated_at": datetime.now(UTC).isoformat(), "signals": signals, "exits": exits,
+            "entry_policy": _entry_policy(plan),
+            "registration": _registration_review(db_path, signals["filled_trade_ids"], cases),
+            "cumulative": _cumulative_exit_review(cases, day)}
 
 
 def _cell(value: Any) -> dict[str, Any]:
@@ -254,20 +339,30 @@ def publish_exit_comparisons_scorecard(
         match = created["replies"][0]["addSheet"]["properties"]
     sheet_id = int(match["sheetId"])
     signals, exits = scorecard["signals"], scorecard["exits"]
+    registration = scorecard.get("registration") or {}
+    cumulative = scorecard.get("cumulative") or {}
     values: list[list[Any]] = [
         [f"Bhiksha session review · {scorecard['trading_date']}"],
         ["Recorded signals", signals["recorded"], "Captured", signals["captured"], "Missed", signals["missed"], "Pending / unknown", signals["pending"]],
         ["Published CT", _ct(scorecard["generated_at"]), "Age (hours)", '=ROUND((NOW()-DATEVALUE(LEFT(B3,10))-TIMEVALUE(MID(B3,12,8)))*24,1)',
          "Last signal CT", _ct(signals["latest"]), "Last exit quote CT", _ct(exits["latest"])],
-        [f"Exit evidence: {exits['registered']} registered · {exits['clean']} clean · {exits['collecting']} collecting · {exits['censored']} gap/censored · {exits['unusable']} other unusable"],
+        [f"Exit evidence: {exits['registered']} registered · {exits.get('fully_clean', 0)} fully complete · "
+         f"{exits['clean']} with a clean pair · {exits['collecting']} collecting · "
+         f"{exits['censored']} gap/censored · {exits['unusable']} other unusable; pair and gap counts may overlap"],
+        [f"Fill → comparison: {registration.get('filled', signals['captured'])} filled · {registration.get('registered', exits['registered'])} registered · "
+         f"{registration.get('missing', 0)} missing | {'; '.join(registration.get('detail') or []) or 'No missing cohorts'}"],
         ["One-session leaders are provisional. Recorded signals only; downtime opportunities unknown. Shadow captures are modeled."],
+        [scorecard.get("entry_policy") or "Entry patience and DTE: active-plan readback unavailable"],
         [], ["SIGNAL CAPTURE"], SIGNAL_HEADERS, *signals["rows"], [],
         ["EXIT CHOICES · same-trade clean pairs"], EXIT_HEADERS, *exits["rows"], [],
+        [f"ROLLING 10 SESSIONS · {cumulative.get('start', '')} to {cumulative.get('end', '')} · gross modeled matched pairs"],
+        CUMULATIVE_HEADERS, *(cumulative.get("rows") or []), [],
         [f"EVIDENCE GAPS · {exits['reasons']}"], GAP_HEADERS, *exits["detail"], [],
         ["Method: gross modeled natural-bid exits, before fees and extra slippage. No automatic policy promotion; frozen version/hash are in hidden columns."],
     ]
     sections = [i for i, row in enumerate(values) if row and isinstance(row[0], str) and
-                (row[0] == "SIGNAL CAPTURE" or row[0].startswith("EXIT CHOICES") or row[0].startswith("EVIDENCE GAPS"))]
+                (row[0] == "SIGNAL CAPTURE" or row[0].startswith("EXIT CHOICES")
+                 or row[0].startswith("ROLLING 10 SESSIONS") or row[0].startswith("EVIDENCE GAPS"))]
     headers = [i + 1 for i in sections]
     height = len(values)
     old_rows = int(match.get("gridProperties", {}).get("rowCount", 100))
@@ -292,7 +387,8 @@ def publish_exit_comparisons_scorecard(
             "startColumnIndex": 0, "endColumnIndex": VISIBLE_COLUMNS}, "cell": {"userEnteredFormat": pale}, "fields": "userEnteredFormat"}})
     requests.append({"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 3,
         "startColumnIndex": 0, "endColumnIndex": VISIBLE_COLUMNS}, "cell": {"userEnteredFormat": pale}, "fields": "userEnteredFormat"}})
-    for section, following, column in ((sections[0], sections[1], 6), (sections[1], sections[2], 7)):
+    for section, following, column in ((sections[0], sections[1], 6), (sections[1], sections[2], 7),
+                                       (sections[2], sections[3], 7)):
         if section + 2 < following - 1:
             requests.append({"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": section + 2,
                 "endRowIndex": following - 1, "startColumnIndex": column, "endColumnIndex": column + 1},

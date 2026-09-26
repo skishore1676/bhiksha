@@ -14,9 +14,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 import json
+import os
 from pathlib import Path
+import sqlite3
 from queue import Empty, Full, Queue
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, get_ident
 import time
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -145,6 +147,9 @@ class ExitEdgeLiveRecorder:
             "observation_quote_requests": 0,
             "observation_quote_results": 0,
             "observation_errors": 0,
+            "last_quote_request_ms": None,
+            "max_quote_request_ms": 0,
+            "last_observation_queue_depth": 0,
             "updated_at": datetime.now(UTC).isoformat(),
         }
         self._thread = Thread(
@@ -172,14 +177,38 @@ class ExitEdgeLiveRecorder:
     ) -> bool:
         """Freeze actual entry identity and both policies without waiting on I/O."""
         try:
-            attempt, payload = self._registration_payloads(
+            registration = self.prepare_registration(
                 deployment=deployment, trade_id=trade_id,
                 option_symbol=option_symbol, entry_timestamp=entry_timestamp,
                 entry_premium=entry_premium, quantity=quantity,
                 entry_context=entry_context,
             )
+            return self.try_queue_registration(registration)
+        except Exception as exc:
+            self._increment_health("registration_failures", error=f"registration_payload:{exc}")
+            return False
+
+    def prepare_registration(
+        self, *, deployment: Any, trade_id: str, option_symbol: str,
+        entry_timestamp: datetime | None, entry_premium: float | None,
+        quantity: int | None, entry_context: dict[str, Any] | None = None,
+    ) -> _Register:
+        """Build the frozen handoff before it is recorded in the event ledger."""
+        attempt, payload = self._registration_payloads(
+            deployment=deployment, trade_id=trade_id,
+            option_symbol=option_symbol, entry_timestamp=entry_timestamp,
+            entry_premium=entry_premium, quantity=quantity,
+            entry_context=entry_context,
+        )
+        return _Register(attempt, payload)
+
+    def try_queue_registration(self, registration: _Register) -> bool:
+        attempt, payload = registration.attempt, registration.payload
+        trade_id = str(attempt["trade_id"])
+        option_symbol = str(attempt["option_symbol"])
+        try:
             self._increment_health(
-                "modeled_fill_attempts" if (entry_context or {}).get("entry_fill_kind") == "modeled_ask_touch"
+                "modeled_fill_attempts" if (payload or {}).get("cohort_dimensions", {}).get("entry_fill_kind") == "modeled_ask_touch"
                 else "confirmed_fill_attempts"
             )
             if payload is None:
@@ -200,8 +229,11 @@ class ExitEdgeLiveRecorder:
             self._record_drop(option_symbol, "cohort_registration_queue_full")
             return False
         except Exception as exc:
-            self._increment_health("registration_failures", error=f"registration_payload:{exc}")
+            self._increment_health("registration_failures", error=f"registration_queue:{exc}")
             return False
+
+    def record_registration_intent_failure(self, reason: str) -> None:
+        self._increment_health("storage_failures", error=f"registration_intent:{reason}")
 
     def observe_quote(self, option_symbol: str, quote: Any, received_at: datetime) -> None:
         """Enqueue a completed existing quote fetch; never raise or wait."""
@@ -292,11 +324,20 @@ class ExitEdgeLiveRecorder:
         self._set_health()
         self._write_status_best_effort()
 
-    def record_observation_poll(self, requested: int, received: int) -> None:
+    def record_observation_poll(
+        self, requested: int, received: int, *, quote_request_ms: float | None = None,
+    ) -> None:
         with self._lock:
             self._health["observation_polls"] += 1
             self._health["observation_quote_requests"] += int(requested)
             self._health["observation_quote_results"] += int(received)
+            self._health["last_observation_queue_depth"] = self._queue.qsize()
+            if quote_request_ms is not None:
+                elapsed = round(max(float(quote_request_ms), 0.0), 1)
+                self._health["last_quote_request_ms"] = elapsed
+                self._health["max_quote_request_ms"] = max(
+                    float(self._health["max_quote_request_ms"]), elapsed,
+                )
             self._health["updated_at"] = datetime.now(UTC).isoformat()
         self._write_status_best_effort()
 
@@ -422,13 +463,28 @@ class ExitEdgeLiveRecorder:
             self._write_status_best_effort()
             return
         cohort_id = str(payload["cohort_id"])
-        if not repository.try_register_cohort(payload):
+        failure: Exception | None = None
+        for retry in range(3):
+            try:
+                repository.register_cohort(payload)
+                failure = None
+                break
+            except sqlite3.OperationalError as exc:
+                failure = exc
+                if "locked" in str(exc).lower() and retry < 2:
+                    time.sleep(0.05 * (retry + 1))
+                    continue
+                break
+            except Exception as exc:
+                failure = exc
+                break
+        if failure is not None:
             attempt["outcome"] = "registration_persistence_failure"
-            attempt["reason"] = "cohort_repository_rejected"
+            attempt["reason"] = f"{type(failure).__name__}:{failure}"[:240]
             if not repository.try_record_registration_attempt(attempt):
                 self._retain_registration_attempt(attempt)
             self._deactivate(str(payload["option_symbol"]), cohort_id)
-            self._increment_health("registration_failures", error=f"register_failed:{cohort_id}")
+            self._increment_health("registration_failures", error=f"register_failed:{cohort_id}:{type(failure).__name__}")
             return
         attempt["outcome"] = "registered"
         attempt["reason"] = None
@@ -704,7 +760,9 @@ class ExitEdgeLiveRecorder:
         try:
             self.status_path.parent.mkdir(parents=True, exist_ok=True)
             payload = self.snapshot()
-            temporary = self.status_path.with_suffix(self.status_path.suffix + ".tmp")
+            temporary = self.status_path.with_name(
+                f"{self.status_path.name}.{os.getpid()}.{get_ident()}.tmp"
+            )
             temporary.write_text(
                 json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )

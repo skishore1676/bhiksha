@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 import inspect
+import json
 import sqlite3
 from threading import Event, Thread
 import time
@@ -18,6 +19,7 @@ from bhiksha.ops.exit_edge_lab import (
     analyze_prospective_repository,
 )
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder, INDEPENDENT_QUOTE_FEED
+from bhiksha.ops.exit_edge_observer import recover_registration_intents
 from bhiksha.execution.exit_policy import canonical_policy_hash
 
 
@@ -372,6 +374,55 @@ def test_independent_observer_keeps_six_arm_cohorts_through_executor_restart(tmp
         assert case.persisted_censor_reason is None
         assert not case.observation_gaps
         assert case.experiment["quote_feed"] == INDEPENDENT_QUOTE_FEED
+
+
+def test_frozen_registration_intent_recovers_failed_executor_handoff(tmp_path: Path, monkeypatch) -> None:
+    edge = tmp_path / "edge.db"
+    events = tmp_path / "events.db"
+    recorder = _recorder(tmp_path, role="registration")
+    prepared = recorder.prepare_registration(
+        deployment=_deployment(), trade_id="recovered", option_symbol=OPTION,
+        entry_timestamp=ENTRY, entry_premium=2.0, quantity=10,
+    )
+    with sqlite3.connect(events) as conn:
+        conn.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, event_type TEXT, payload TEXT)")
+        conn.execute("INSERT INTO events(event_type,payload) VALUES (?,?)", (
+            "exit_edge_registration_intent",
+            json.dumps({"attempt": prepared.attempt, "cohort": prepared.payload}),
+        ))
+    repository = ProspectiveQuoteTapeRepository(edge, write_timeout_seconds=0.25)
+    repository.initialize()
+    original = ProspectiveQuoteTapeRepository.register_cohort
+    failures = iter([True, False])
+    def sometimes_locked(self, payload):
+        if next(failures):
+            raise sqlite3.OperationalError("database is locked")
+        return original(self, payload)
+    monkeypatch.setattr(ProspectiveQuoteTapeRepository, "register_cohort", sometimes_locked)
+    assert recover_registration_intents(events, edge, 0) == 0
+    assert recover_registration_intents(events, edge, 0) == 1
+    assert repository.registration_summary()["registered_cohorts"] == 1
+    assert len(repository.list_cohort_ids()) == 1
+    # A delayed first observation remains a gap, never a fabricated clean tape.
+    late = ENTRY + timedelta(minutes=5)
+    from bhiksha.ops.exit_edge_lab import QuoteTapeMark
+    repository.append_quote(prepared.payload["cohort_id"], QuoteTapeMark(
+        sequence=1, source="public_api", feed=INDEPENDENT_QUOTE_FEED,
+        quote_at=late, received_at=late, bid=2.1, ask=2.2, last=2.1,
+    ))
+    assert repository.load_case(prepared.payload["cohort_id"]).observation_gaps[0].reason == "initial_observation_late"
+
+
+def test_concurrent_status_writes_do_not_share_a_temporary_file(tmp_path: Path) -> None:
+    recorder = _recorder(tmp_path, role="observer")
+    threads = [Thread(target=lambda: [recorder.heartbeat() for _ in range(10)]) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert recorder.snapshot()["storage_failures"] == 0
+    assert recorder.status_path.is_file()
+    assert json.loads(recorder.status_path.read_text())["role"] == "observer"
 
 
 def test_observer_restart_resumes_with_explicit_five_minute_gap(tmp_path: Path) -> None:

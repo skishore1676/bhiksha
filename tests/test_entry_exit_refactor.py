@@ -59,6 +59,16 @@ def test_catalog_has_no_fallback_and_rejects_invalid_or_unsupported_rows():
         load_exit_profiles_sheet_rows([{"exit_profile_id": "empty"}])
 
 
+def test_range_expansion_sheet_can_freeze_an_overnight_three_session_policy():
+    raw = profile("range_expansion_swing", trade_archetype="RANGE_EXPANSION",
+                  eod_flat=False, no_progress_seconds=None,
+                  max_hold_seconds=int(19.5 * 3600)).model_dump()
+    frozen = load_exit_profiles_sheet_rows([raw])["range_expansion_swing"].to_management_policy_spec_dict()
+    assert frozen["eod_flat"] is False
+    assert frozen["no_progress_seconds"] is None
+    assert frozen["max_hold_seconds"] == 70_200
+
+
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_named_comparisons_persist_continue_after_baseline_and_keep_entry_mode(tmp_path, dynamic):
     dep = deployment()
@@ -200,7 +210,7 @@ def test_paper_limit_needs_later_fresh_ask_and_expires_without_fill():
         supervisor.lifecycle_store.begin_entry(dep.symbol, dep.deployment_id, order_id="PAPER_PENDING")
         await supervisor.poll_paper_entries(now=now + timedelta(seconds=2))
         assert planner.position_tracker.total_open_positions == 0
-        assert not recorder.try_register_entry.called
+        assert not recorder.prepare_registration.called
         quote.ask = 2.0
         quote.quote_timestamp = now.isoformat()  # reused entry quote cannot fill
         await supervisor.poll_paper_entries(now=now + timedelta(seconds=3))
@@ -208,13 +218,14 @@ def test_paper_limit_needs_later_fresh_ask_and_expires_without_fill():
         quote.quote_timestamp = (now + timedelta(seconds=4)).isoformat()
         await supervisor.poll_paper_entries(now=now + timedelta(seconds=5))
         assert planner.position_tracker.total_open_positions == 1
-        assert recorder.try_register_entry.call_args.kwargs["entry_context"]["entry_fill_kind"] == "modeled_ask_touch"
+        assert recorder.prepare_registration.call_args.kwargs["entry_context"]["entry_fill_kind"] == "modeled_ask_touch"
         assert not supervisor._paper_entries
         second = replace(plan, trade_id="expired")
         supervisor._paper_entries[second.trade_id] = (dep, decision, second, now, now + timedelta(seconds=1))
         await supervisor.poll_paper_entries(now=now + timedelta(seconds=11))
         assert not supervisor._paper_entries
-        assert recorder.try_register_entry.call_count == 1
+        assert recorder.prepare_registration.call_count == 1
+        assert recorder.try_queue_registration.call_count == 1
     asyncio.run(run())
 
 
@@ -411,7 +422,7 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
         if case == "stale":
             quote.quote_timestamp = now.isoformat()
         await supervisor.poll_paper_entries(now=now + timedelta(seconds=3))
-        assert not recorder.try_register_entry.called  # Repricing quote cannot fill the new limit.
+        assert not recorder.prepare_registration.called  # Repricing quote cannot fill the new limit.
         if case == "premium_cap":
             assert not supervisor._paper_entries
             assert "paper_reprice_above_max_trade_premium" in str(events.append.call_args_list)
@@ -425,7 +436,7 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
         assert active.risk_details["entry_pricing"]["initial_limit_price"] == 2.0
         assert "paper_entry_repriced" in str(events.append.call_args_list)
         await supervisor.poll_paper_entries(now=now + timedelta(seconds=3.5))
-        assert not recorder.try_register_entry.called  # Same quote still cannot fill.
+        assert not recorder.prepare_registration.called  # Same quote still cannot fill.
         if case == "chase_guard":
             quote.bid, quote.ask = 2.2, 2.4
             quote.quote_timestamp = (now + timedelta(seconds=5)).isoformat()
@@ -434,11 +445,12 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
             assert "paper_entry_reprice_chase_guard_resting" in str(events.append.call_args_list)
             await supervisor.poll_paper_entries(now=now + timedelta(seconds=11))
             assert not supervisor._paper_entries
-            assert not recorder.try_register_entry.called
+            assert not recorder.prepare_registration.called
             return
         quote.quote_timestamp = (now + timedelta(seconds=4)).isoformat()
         await supervisor.poll_paper_entries(now=now + timedelta(seconds=4))
-        assert recorder.try_register_entry.call_count == 1
+        assert recorder.prepare_registration.call_count == 1
+        assert recorder.try_queue_registration.call_count == 1
         assert not supervisor._paper_entries
-        assert recorder.try_register_entry.call_args.kwargs["entry_premium"] == 2.2
+        assert recorder.prepare_registration.call_args.kwargs["entry_premium"] == 2.2
     asyncio.run(run())

@@ -454,6 +454,7 @@ def _exit_edge_observer_job(*, repo_root: Path) -> int:
     config = load_app_config(repo_root / "config" / "app.yaml")
     asyncio.run(run_observer(
         db_path=repo_root / config.exit_edge_live_shadow_db_path,
+        event_db_path=repo_root / config.sqlite_path,
         status_path=repo_root / config.exit_edge_live_shadow_status_path,
         enable_marker=repo_root / "artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled",
     ))
