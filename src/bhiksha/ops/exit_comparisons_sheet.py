@@ -166,6 +166,18 @@ def _entry_policy(plan: dict[str, dict[str, Any]]) -> str:
             "control: Operator_Defaults_v1/profile__trend_continuation")
 
 
+def _strategy_entry_policy(plan: dict[str, dict[str, Any]]) -> str:
+    profiles = Counter(
+        row.get("entry_profile") or "legacy (implicit)"
+        for row in plan.values() if row.get("source_owner") != "market_cartographer"
+    )
+    if not profiles:
+        return "No strategy rows in current plan"
+    return "Strategy entry patience · " + " · ".join(
+        f"{count} {_label(profile).lower()}" for profile, count in profiles.most_common()
+    )
+
+
 def _registration_review(
     db_path: str | Path, filled_trade_ids: list[str], cases: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -313,6 +325,7 @@ def build_exit_comparisons_scorecard(
     return {"schema": "bhiksha.exit_comparisons_sheet.v2", "trading_date": day.isoformat(),
             "generated_at": datetime.now(UTC).isoformat(), "signals": signals, "exits": exits,
             "entry_policy": _entry_policy(plan),
+            "strategy_entry_policy": _strategy_entry_policy(plan),
             "registration": _registration_review(db_path, signals["filled_trade_ids"], cases),
             "cumulative": _cumulative_exit_review(cases, day)}
 
@@ -353,6 +366,7 @@ def publish_exit_comparisons_scorecard(
          f"{registration.get('missing', 0)} missing | {'; '.join(registration.get('detail') or []) or 'No missing cohorts'}"],
         ["One-session leaders are provisional. Recorded signals only; downtime opportunities unknown. Shadow captures are modeled."],
         [scorecard.get("entry_policy") or "Entry patience and DTE: active-plan readback unavailable"],
+        [scorecard.get("strategy_entry_policy") or "Strategy entry patience: active-plan readback unavailable"],
         [], ["SIGNAL CAPTURE"], SIGNAL_HEADERS, *signals["rows"], [],
         ["EXIT CHOICES · same-trade clean pairs"], EXIT_HEADERS, *exits["rows"], [],
         [f"ROLLING 10 SESSIONS · {cumulative.get('start', '')} to {cumulative.get('end', '')} · gross modeled matched pairs"],

@@ -121,6 +121,9 @@ def test_active_plan_report_uses_strategy_key_and_effective_cartographer_policy(
     assert "large_evidence" not in str(plan)
     assert "legacy (implicit)" in sheet._entry_policy(plan)
     assert "fallback ceiling 21 DTE" in sheet._entry_policy(plan)
+    plan["strategy-balanced"] = {"source_owner": "", "entry_profile": "balanced"}
+    plan["strategy-patient"] = {"source_owner": "", "entry_profile": "patient"}
+    assert sheet._strategy_entry_policy(plan) == "Strategy entry patience · 1 balanced · 1 patient"
 
 
 def test_gap_case_cannot_become_clean_winner_and_censor_is_retained():
