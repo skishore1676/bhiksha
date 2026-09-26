@@ -20,11 +20,13 @@ CENTRAL = ZoneInfo("America/Chicago")
 TAB = "Exit_Comparisons"
 DETAIL_LIMIT = 8
 VISIBLE_COLUMNS = 8
-SHEET_COLUMNS = 11
+SHEET_COLUMNS = 12
 SIGNAL_HEADERS = ["Strategy", "Lane", "Signals", "Captured", "Missed", "Pending / unknown", "Main miss reason", "Default exit", "Deployments"]
 EXIT_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Observed leader", "Clean / registered", "Sessions", "Δ $ / trade", "Why / evidence", "Frozen evaluator", "Frozen hash", "Deployments"]
-CUMULATIVE_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Candidate", "Clean pairs", "Sessions", "Mean Δ $", "Worst Δ $", "Frozen evaluator", "Frozen hash", "Window"]
+CUMULATIVE_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Candidate", "Clean pairs", "Sessions", "Mean net Δ $", "Mean net Δ R", "Mean gross Δ $", "Frozen hash", "Window", "Deployment"]
 GAP_HEADERS = ["Trade", "Strategy", "Lane / entry", "Last good quote CT", "Resumed CT", "Reason", "Evidence state", "", "Full trade ID"]
+ASSUMED_EXIT_CONTRACT_COST_USD = 0.10
+ASSUMED_EXIT_LEG_COST_USD = 1.00
 
 
 def _ct(value: str | None) -> str:
@@ -82,7 +84,46 @@ def _plan(path: str | Path | None) -> dict[str, dict[str, str]]:
     return result
 
 
-def _signals(db_path: str | Path | None, day: date, plan: dict[str, dict[str, str]]) -> dict[str, Any]:
+def _actual_fills(db_path: str | Path, day: date) -> dict[str, Any]:
+    """Independent trade-store denominator; shadow needs its modeled-fill event."""
+    start = datetime.combine(day, time.min, CENTRAL).astimezone(UTC).isoformat()
+    end = datetime.combine(date.fromordinal(day.toordinal() + 1), time.min, CENTRAL).astimezone(UTC).isoformat()
+    with sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True) as conn:
+        trades = conn.execute(
+            "SELECT trade_id,entry_order_id,status FROM trade_sessions "
+            "WHERE entry_timestamp>=? AND entry_timestamp<? AND option_symbol IS NOT NULL "
+            "AND entry_price>0 AND quantity>0", (start, end),
+        ).fetchall()
+        modeled = conn.execute(
+            "SELECT payload FROM events WHERE created_at>=? AND created_at<? "
+            "AND event_type='shadow_entry_modeled'", (start, end),
+        ).fetchall()
+    modeled_ids = set()
+    for (raw,) in modeled:
+        try:
+            trade_id = json.loads(raw).get("trade_id")
+            if trade_id:
+                modeled_ids.add(str(trade_id))
+        except (TypeError, ValueError):
+            continue
+    confirmed, modeled_fills, ambiguous_shadow = set(), set(), set()
+    for trade_id, order_id, status in trades:
+        trade_id, order_id = str(trade_id), str(order_id or "")
+        if str(status or "").startswith("pending"):
+            continue
+        if order_id == "SHADOW_ENTRY":
+            (modeled_fills if trade_id in modeled_ids else ambiguous_shadow).add(trade_id)
+        elif order_id:
+            confirmed.add(trade_id)
+    ids = confirmed | modeled_fills
+    return {"ids": sorted(ids), "broker_confirmed": len(confirmed),
+            "modeled": len(modeled_fills), "ambiguous_shadow": sorted(ambiguous_shadow)}
+
+
+def _signals(
+    db_path: str | Path | None, day: date, plan: dict[str, dict[str, str]],
+    *, actual_fill_ids: set[str] | None = None,
+) -> dict[str, Any]:
     if db_path is None:
         raise ValueError("signal event database path unavailable")
     start = datetime.combine(day, time.min, CENTRAL).astimezone(UTC).isoformat()
@@ -91,7 +132,7 @@ def _signals(db_path: str | Path | None, day: date, plan: dict[str, dict[str, st
     with sqlite3.connect(uri, uri=True) as conn:
         events = conn.execute(
             "SELECT created_at,event_type,payload FROM events WHERE created_at>=? AND created_at<? "
-            "AND event_type IN ('signal_decision','signal_outcome') ORDER BY id", (start, end)
+            "AND event_type IN ('signal_evaluation','signal_decision','signal_outcome') ORDER BY id", (start, end)
         ).fetchall()
     signals: dict[str, dict[str, Any]] = {}
     latest = ""
@@ -100,7 +141,7 @@ def _signals(db_path: str | Path | None, day: date, plan: dict[str, dict[str, st
             payload = json.loads(raw)
         except (TypeError, ValueError):
             continue
-        if event_type == "signal_decision" and payload.get("signal") is not True:
+        if event_type in {"signal_evaluation", "signal_decision"} and payload.get("signal") is not True:
             continue
         timestamp = str(payload.get("timestamp") or created_at)
         try:
@@ -120,9 +161,13 @@ def _signals(db_path: str | Path | None, day: date, plan: dict[str, dict[str, st
                 row.update(outcome=outcome, reasons=payload.get("rejection_reasons") or [], mode=payload.get("mode"),
                            policy=(payload.get("evidence_identity") or {}).get("exit_policy_id"),
                            trade_id=payload.get("trade_id"))
-        elif "decision" not in row:
-            row["decision"] = True
+        else:
+            row["evaluation" if event_type == "signal_evaluation" else "decision"] = True
             row["policy"] = (payload.get("evidence_identity") or {}).get("exit_policy_id")
+    if actual_fill_ids is not None:
+        for row in signals.values():
+            if row.get("outcome") == "filled" and str(row.get("trade_id") or "") not in actual_fill_ids:
+                row["outcome"] = "fill_unverified"
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in signals.values():
         config = plan.get(row["deployment"], {})
@@ -133,20 +178,24 @@ def _signals(db_path: str | Path | None, day: date, plan: dict[str, dict[str, st
     rows = []
     for (strategy, lane), members in sorted(groups.items()):
         captured = sum(item.get("outcome") == "filled" for item in members)
-        pending = sum(item.get("outcome") in {None, "pending_execution", "unknown"} for item in members)
-        misses = [item for item in members if item.get("outcome") not in {None, "filled", "pending_execution", "unknown"}]
+        pending = sum(item.get("outcome") in {None, "pending_execution", "unknown", "fill_unverified"} for item in members)
+        misses = [item for item in members if item.get("outcome") not in {None, "filled", "pending_execution", "unknown", "fill_unverified"}]
         reasons = Counter(
             str(reason).split(":", 1)[0] for item in misses
             for reason in (item.get("reasons") or [item.get("outcome")])
         )
-        reason = ", ".join(f"{_reason_label(name)} ({count})" for name, count in reasons.most_common(2)) or "—"
+        reason = ", ".join(f"{_reason_label(name)} ({count})" for name, count in reasons.most_common(2)) or (f"Unresolved ({pending})" if pending else "—")
         policies = Counter(str(item["default_exit"]) for item in members)
         default = ", ".join(_label(name) for name, _ in policies.most_common(2))
         rows.append([_label(strategy), lane, len(members), captured, len(misses), pending, reason, default,
                      ", ".join(sorted({item["deployment"] for item in members}))])
     return {"rows": rows, "recorded": len(signals), "captured": sum(row.get("outcome") == "filled" for row in signals.values()),
-            "missed": sum(row.get("outcome") not in {None, "filled", "pending_execution", "unknown"} for row in signals.values()),
-            "pending": sum(row.get("outcome") in {None, "pending_execution", "unknown"} for row in signals.values()),
+            "missed": sum(row.get("outcome") not in {None, "filled", "pending_execution", "unknown", "fill_unverified"} for row in signals.values()),
+            "pending": sum(row.get("outcome") in {None, "pending_execution", "unknown", "fill_unverified"} for row in signals.values()),
+            "evaluated": sum(bool(row.get("evaluation")) for row in signals.values()),
+            "decided": sum(bool(row.get("decision")) for row in signals.values()),
+            "missing_outcome": sum(row.get("outcome") in {None, "pending_execution", "unknown"} for row in signals.values()),
+            "unverified_fill_outcomes": sum(row.get("outcome") == "fill_unverified" for row in signals.values()),
             "latest": latest or None,
             "filled_trade_ids": sorted({str(row["trade_id"]) for row in signals.values()
                                         if row.get("outcome") == "filled" and row.get("trade_id")})}
@@ -196,14 +245,25 @@ def _registration_review(
                                                for trade_id in missing]}
 
 
+def _net_comparison_delta(case: dict[str, Any], primary: str, candidate: str) -> tuple[float, float, float] | None:
+    outcomes = case.get("named_exit_outcomes") or {}
+    baseline, alternative = outcomes.get(primary) or {}, outcomes.get(candidate) or {}
+    baseline_legs, alternative_legs = baseline.get("legs") or [], alternative.get("legs") or []
+    risk = float(case.get("common_entry_risk_usd") or 0)
+    if not baseline_legs or not alternative_legs or risk <= 0:
+        return None
+    def cost(legs: list[dict[str, Any]]) -> float:
+        return ASSUMED_EXIT_CONTRACT_COST_USD * sum(float(leg["quantity"]) for leg in legs) + ASSUMED_EXIT_LEG_COST_USD * len(legs)
+    gross = float(case["clean_candidate_delta_pnl_usd"][candidate])
+    net = gross - (cost(alternative_legs) - cost(baseline_legs))
+    return round(net, 2), round(net / risk, 4), gross
+
+
 def _cumulative_exit_review(cases: list[dict[str, Any]], day: date) -> dict[str, Any]:
-    start = day
-    for _ in range(9):
-        start = previous_trading_day(start)
-    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for case in cases:
         entry_day = datetime.fromisoformat(case["entry_timestamp"].replace("Z", "+00:00")).astimezone(CENTRAL).date()
-        if not start <= entry_day <= day:
+        if entry_day > day:
             continue
         dims, spec = case.get("cohort_dimensions") or {}, case.get("experiment_spec") or {}
         profiles = spec.get("named_profiles") or []
@@ -211,23 +271,30 @@ def _cumulative_exit_review(cases: list[dict[str, Any]], day: date) -> dict[str,
             continue
         key = (str(dims.get("strategy_class") or "unknown"), str(dims.get("runtime_mode") or "unknown"),
                str(dims.get("entry_fill_kind") or "unknown"), str(profiles[0]["policy_id"]),
-               str(case.get("experiment_spec_hash") or "unknown"))
+               str(case.get("experiment_spec_hash") or "unknown"), str(case.get("deployment_id") or "unknown"))
         groups[key].append(case)
     rows: list[list[Any]] = []
-    for (strategy, mode, kind, primary, frozen_hash), members in sorted(groups.items()):
+    for (strategy, mode, kind, primary, frozen_hash, deployment), members in sorted(groups.items()):
         candidates = sorted({name for case in members for name in
                              (case.get("clean_candidate_delta_pnl_usd") or {})})
         for candidate in candidates:
-            paired = [(case, float(case["clean_candidate_delta_pnl_usd"][candidate]))
+            paired = [(case, _net_comparison_delta(case, primary, candidate))
                       for case in members if candidate in (case.get("clean_candidate_delta_pnl_usd") or {})]
-            deltas = [value for _, value in paired]
+            paired = [(case, value) for case, value in paired if value is not None]
+            if not paired:
+                continue
             sessions = len({datetime.fromisoformat(case["entry_timestamp"].replace("Z", "+00:00"))
                             .astimezone(CENTRAL).date() for case, _ in paired})
+            start = min(datetime.fromisoformat(case["entry_timestamp"].replace("Z", "+00:00"))
+                        .astimezone(CENTRAL).date() for case in members)
             rows.append([_label(strategy), f"{_label(mode)} / {'Broker confirmed' if kind == 'broker_confirmed' else 'Modeled entry'}",
                          _label(primary), _label(candidate), len(paired), sessions,
-                         round(fmean(deltas), 2), round(min(deltas), 2),
-                         str((members[0].get("experiment_spec") or {}).get("evaluator_version") or "unknown"),
-                         frozen_hash, f"{start}–{day}"])
+                         round(fmean(value[0] for _, value in paired), 2),
+                         round(fmean(value[1] for _, value in paired), 4),
+                         round(fmean(value[2] for _, value in paired), 2),
+                         frozen_hash, f"{start}–{day}", deployment])
+    start = min((datetime.fromisoformat(case["entry_timestamp"].replace("Z", "+00:00"))
+                 .astimezone(CENTRAL).date() for case in cases if case.get("entry_timestamp")), default=day)
     return {"rows": rows, "start": start.isoformat(), "end": day.isoformat()}
 
 
@@ -318,7 +385,9 @@ def build_exit_comparisons_scorecard(
 ) -> dict[str, Any]:
     day = _day(trading_date)
     plan = _plan(active_plan_path)
-    signals = _signals(signal_db_path, day, plan)
+    fills = _actual_fills(signal_db_path, day)
+    signals = _signals(signal_db_path, day, plan, actual_fill_ids=set(fills["ids"]))
+    fills["without_filled_outcome"] = sorted(set(fills["ids"]) - set(signals["filled_trade_ids"]))
     repository = ProspectiveQuoteTapeRepository(db_path, read_only=True, write_timeout_seconds=0.25)
     cases = analyze_prospective_repository(repository)["cases"]
     exits = _exit_review(cases, day)
@@ -326,7 +395,8 @@ def build_exit_comparisons_scorecard(
             "generated_at": datetime.now(UTC).isoformat(), "signals": signals, "exits": exits,
             "entry_policy": _entry_policy(plan),
             "strategy_entry_policy": _strategy_entry_policy(plan),
-            "registration": _registration_review(db_path, signals["filled_trade_ids"], cases),
+            "registration": _registration_review(db_path, fills["ids"], cases),
+            "fills": fills,
             "cumulative": _cumulative_exit_review(cases, day)}
 
 
@@ -353,6 +423,7 @@ def publish_exit_comparisons_scorecard(
     sheet_id = int(match["sheetId"])
     signals, exits = scorecard["signals"], scorecard["exits"]
     registration = scorecard.get("registration") or {}
+    fills = scorecard.get("fills") or {}
     cumulative = scorecard.get("cumulative") or {}
     values: list[list[Any]] = [
         [f"Bhiksha session review · {scorecard['trading_date']}"],
@@ -364,19 +435,25 @@ def publish_exit_comparisons_scorecard(
          f"{exits['censored']} gap/censored · {exits['unusable']} other unusable; pair and gap counts may overlap"],
         [f"Fill → comparison: {registration.get('filled', signals['captured'])} filled · {registration.get('registered', exits['registered'])} registered · "
          f"{registration.get('missing', 0)} missing | {'; '.join(registration.get('detail') or []) or 'No missing cohorts'}"],
+        [f"Independent fills: {fills.get('broker_confirmed', 0)} broker confirmed · {fills.get('modeled', 0)} modeled · "
+         f"{len(fills.get('ambiguous_shadow') or [])} shadow classification unknown | "
+         f"positive evaluations {signals.get('evaluated', 0)} · decisions {signals.get('decided', 0)} · "
+         f"missing outcomes {signals.get('missing_outcome', 0)} · unverified fill outcomes {signals.get('unverified_fill_outcomes', 0)} · "
+         f"fills without outcome {len(fills.get('without_filled_outcome') or [])}"],
         ["One-session leaders are provisional. Recorded signals only; downtime opportunities unknown. Shadow captures are modeled."],
         [scorecard.get("entry_policy") or "Entry patience and DTE: active-plan readback unavailable"],
         [scorecard.get("strategy_entry_policy") or "Strategy entry patience: active-plan readback unavailable"],
         [], ["SIGNAL CAPTURE"], SIGNAL_HEADERS, *signals["rows"], [],
         ["EXIT CHOICES · same-trade clean pairs"], EXIT_HEADERS, *exits["rows"], [],
-        [f"ROLLING 10 SESSIONS · {cumulative.get('start', '')} to {cumulative.get('end', '')} · gross modeled matched pairs"],
+        [f"EXPERIMENT TO DATE · {cumulative.get('start', '')} to {cumulative.get('end', '')} · same-trade matched pairs by frozen policy"],
         CUMULATIVE_HEADERS, *(cumulative.get("rows") or []), [],
         [f"EVIDENCE GAPS · {exits['reasons']}"], GAP_HEADERS, *exits["detail"], [],
-        ["Method: gross modeled natural-bid exits, before fees and extra slippage. No automatic policy promotion; frozen version/hash are in hidden columns."],
+        ["Method: next-fresh natural-bid modeled exits. Net delta assumes $0.10 per exit contract plus $1 per exit leg; "
+         "this is a stress assumption, not broker fees. Shared entry costs cancel. No automatic policy promotion; frozen hashes are in supporting columns."],
     ]
     sections = [i for i, row in enumerate(values) if row and isinstance(row[0], str) and
                 (row[0] == "SIGNAL CAPTURE" or row[0].startswith("EXIT CHOICES")
-                 or row[0].startswith("ROLLING 10 SESSIONS") or row[0].startswith("EVIDENCE GAPS"))]
+                 or row[0].startswith("EXPERIMENT TO DATE") or row[0].startswith("EVIDENCE GAPS"))]
     headers = [i + 1 for i in sections]
     height = len(values)
     old_rows = int(match.get("gridProperties", {}).get("rowCount", 100))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 import inspect
@@ -8,10 +9,13 @@ import json
 import sqlite3
 from threading import Event, Thread
 import time
+from unittest.mock import AsyncMock
 
 from bhiksha.config.loader import load_app_config
 from bhiksha.execution.order_manager import OrderManager
 from bhiksha.execution.supervisor import _confirmed_entry_fill_facts
+from bhiksha.execution.supervisor import ExecutionSupervisor
+from bhiksha.persistence.sqlite import SQLiteEventRepository
 from bhiksha.ops import exit_edge_live
 from bhiksha.ops.exit_edge_lab import (
     ProspectiveQuoteTapeRepository,
@@ -413,6 +417,54 @@ def test_frozen_registration_intent_recovers_failed_executor_handoff(tmp_path: P
     assert repository.load_case(prepared.payload["cohort_id"]).observation_gaps[0].reason == "initial_observation_late"
 
 
+def test_fill_event_recovers_registration_when_executor_dies_before_queue_write(tmp_path: Path, monkeypatch) -> None:
+    edge, events = tmp_path / "edge.db", tmp_path / "events.db"
+    recorder = ExitEdgeLiveRecorder(db_path=edge, status_path=tmp_path / "status.json", role="registration")
+    monkeypatch.setattr(recorder, "try_queue_registration", lambda prepared: False)
+    supervisor = ExecutionSupervisor(
+        event_repository=SQLiteEventRepository(str(events)), exit_edge_recorder=recorder,
+    )
+    deployment = _deployment()
+    import asyncio
+    asyncio.run(supervisor._record_filled_entry(
+        event_type="signal_outcome",
+        event_payload={"outcome": "filled", "trade_id": "crashed-before-queue", "mode": "live"},
+        deployment=deployment, trade_id="crashed-before-queue", option_symbol=OPTION,
+        entry_timestamp=ENTRY, entry_premium=2.0, quantity=10, entry_context={},
+    ))
+    with sqlite3.connect(events) as conn:
+        event_type, raw = conn.execute("SELECT event_type,payload FROM events").fetchone()
+    assert event_type == "signal_outcome"
+    assert json.loads(raw)["exit_edge_registration"]["cohort"]["entry_premium"] == 2.0
+    assert not edge.exists()  # no worker or queued write ran before process termination
+    deployment.exit.exit_policy_snapshot["target_2_r"] = 999  # later policy drift is irrelevant
+    repository = ProspectiveQuoteTapeRepository(edge, write_timeout_seconds=0.25)
+    repository.initialize()
+    assert recover_registration_intents(events, edge, 0) == 1
+    case = repository.load_case("exit-edge:crashed-before-queue")
+    assert case.profile_config["target_2_r"] == 2.0
+    assert recover_registration_intents(events, edge, 0) == 1
+    assert len(repository.list_cohort_ids()) == 1
+
+
+def test_failed_fill_event_persistence_does_not_raise_into_protection_path(tmp_path: Path, monkeypatch) -> None:
+    recorder = _recorder(tmp_path, role="registration")
+    queued = []
+    monkeypatch.setattr(recorder, "try_queue_registration", lambda prepared: queued.append(prepared) or True)
+    supervisor = ExecutionSupervisor(
+        event_repository=SimpleNamespace(append=AsyncMock(side_effect=sqlite3.OperationalError("locked"))),
+        exit_edge_recorder=recorder,
+    )
+    import asyncio
+    asyncio.run(supervisor._record_filled_entry(
+        event_type="signal_outcome", event_payload={"outcome": "filled"},
+        deployment=_deployment(), trade_id="protection-continues", option_symbol=OPTION,
+        entry_timestamp=ENTRY, entry_premium=2.0, quantity=10, entry_context={},
+    ))
+    assert len(queued) == 1
+    assert recorder.snapshot()["storage_failures"] == 1
+
+
 def test_concurrent_status_writes_do_not_share_a_temporary_file(tmp_path: Path) -> None:
     recorder = _recorder(tmp_path, role="observer")
     threads = [Thread(target=lambda: [recorder.heartbeat() for _ in range(10)]) for _ in range(4)]
@@ -461,6 +513,60 @@ def test_observer_restart_resumes_with_explicit_five_minute_gap(tmp_path: Path) 
     row = analyze_prospective_repository(repository)["cases"][0]
     assert row["status"] == "gap_affected"
     assert row["candidate_delta_pnl_usd"] == {}
+
+
+def test_observer_continues_after_primary_exit_and_executor_restart_then_marks_interruption(tmp_path: Path) -> None:
+    deployment = _deployment()
+    deployment.exit.no_progress_seconds = 30
+    deployment.exit.exit_policy_snapshot["no_progress_seconds"] = 30
+    deployment.exit.exit_policy_hash = canonical_policy_hash(deployment.exit.exit_policy_snapshot)
+    candidate = deepcopy(deployment.exit.exit_policy_snapshot)
+    candidate.update(policy_id="patient_candidate", no_progress_seconds=120)
+    deployment.exit.management_exit = "baseline"
+    deployment.exit.compare_exit_policies = [deployment.exit.exit_policy_snapshot, candidate]
+    registrar = _recorder(tmp_path, role="registration")
+    observer = _recorder(tmp_path, role="observer")
+    registrar.start()
+    observer.start()
+    _wait_until(lambda: registrar.snapshot()["ready"] and observer.snapshot()["ready"])
+    assert registrar.try_register_entry(
+        deployment=deployment, trade_id="primary-first", option_symbol=OPTION,
+        entry_timestamp=ENTRY, entry_premium=2.0, quantity=2,
+    )
+    repository = ProspectiveQuoteTapeRepository(tmp_path / "edge.db", write_timeout_seconds=0.25)
+    _wait_until(lambda: len(repository.list_cohort_ids()) == 1)
+    observer.refresh_active_from_store()
+    for seconds in (15, 30, 45):
+        at = ENTRY + timedelta(seconds=seconds)
+        observer.observe_quote(OPTION, _quote(at, 2.0), at)
+        _wait_until(lambda seconds=seconds: repository.latest_sequence("exit-edge:primary-first") == seconds // 15)
+    before = analyze_prospective_repository(repository)["cases"][0]
+    assert before["arm_evidence_status"][deployment.exit.exit_policy_id] == "complete_clean"
+    assert before["arm_evidence_status"]["patient_candidate"] == "still_collecting"
+    registrar.close()  # executor restarts; observer retains the unfinished arm
+    resumed_registrar = _recorder(tmp_path, role="registration")
+    resumed_registrar.start()
+    at = ENTRY + timedelta(seconds=60)
+    observer.observe_quote(OPTION, _quote(at, 2.0), at)
+    _wait_until(lambda: repository.latest_sequence("exit-edge:primary-first") == 4)
+    resumed_registrar.close()
+    observer.close()
+
+    resumed_observer = _recorder(tmp_path, role="observer")
+    resumed_observer.start()
+    _wait_until(lambda: resumed_observer.snapshot()["ready"])
+    at = ENTRY + timedelta(seconds=360)
+    resumed_observer.observe_quote(OPTION, _quote(at, 2.0), at)
+    _wait_until(lambda: repository.latest_sequence("exit-edge:primary-first") == 5)
+    resumed_observer.close()
+    case = repository.load_case("exit-edge:primary-first")
+    assert len(case.observation_gaps) == 1
+    assert case.observation_gaps[0].last_received_at == ENTRY + timedelta(seconds=60)
+    assert case.observation_gaps[0].first_received_at == at
+    after = analyze_prospective_repository(repository)["cases"][0]
+    assert after["arm_evidence_status"][deployment.exit.exit_policy_id] == "complete_clean"
+    assert after["arm_evidence_status"]["patient_candidate"] == "gap_affected_collecting"
+    assert after["clean_candidate_delta_pnl_usd"] == {}
 
 
 def test_flag_defaults_off_and_env_explicitly_enables(monkeypatch, tmp_path: Path) -> None:

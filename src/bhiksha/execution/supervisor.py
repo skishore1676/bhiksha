@@ -2150,40 +2150,44 @@ class ExecutionSupervisor:
                     )
             return plan
 
-    async def _register_exit_edge_entry(
-        self, *, deployment: DeploymentManifest, trade_id: str,
+    async def _record_filled_entry(
+        self, *, event_type: str, event_payload: dict[str, Any],
+        deployment: DeploymentManifest, trade_id: str,
         option_symbol: str, entry_timestamp: datetime | None,
         entry_premium: float | None, quantity: int | None,
         entry_context: dict[str, Any],
     ) -> None:
-        """Record a recoverable frozen intent; observation never controls trading."""
+        """Freeze observation in the already-durable fill event before queueing it."""
         recorder = self.exit_edge_recorder
-        if recorder is None:
-            return
-        try:
-            prepared = recorder.prepare_registration(
-                deployment=deployment, trade_id=trade_id,
-                option_symbol=option_symbol, entry_timestamp=entry_timestamp,
-                entry_premium=entry_premium, quantity=quantity,
-                entry_context=entry_context,
-            )
-        except Exception as exc:
-            recorder.record_registration_intent_failure(f"prepare:{type(exc).__name__}")
-            return
-        recorder.try_queue_registration(prepared)
-        # Order protection must not wait on an observational SQLite append.
-        # The main fill ledger remains the denominator if this task fails.
-        task = asyncio.create_task(self.event_repository.append(
-            "exit_edge_registration_intent", {
+        prepared = None
+        if recorder is not None:
+            try:
+                prepared = recorder.prepare_registration(
+                    deployment=deployment, trade_id=trade_id,
+                    option_symbol=option_symbol, entry_timestamp=entry_timestamp,
+                    entry_premium=entry_premium, quantity=quantity,
+                    entry_context=entry_context,
+                )
+            except Exception as exc:
+                recorder.record_registration_intent_failure(f"prepare:{type(exc).__name__}")
+        if prepared is not None:
+            event_payload = {**event_payload, "exit_edge_registration": {
                 "attempt": prepared.attempt, "cohort": prepared.payload,
-            },
-        ))
-        def record_intent_result(done: asyncio.Task) -> None:
-            if done.cancelled():
-                recorder.record_registration_intent_failure("persist:cancelled")
-            elif (error := done.exception()) is not None:
-                recorder.record_registration_intent_failure(f"persist:{type(error).__name__}")
-        task.add_done_callback(record_intent_result)
+            }}
+        # This is the existing fill-event write, not an extra observational
+        # write. If it fails, the order-protection path still proceeds and the
+        # independent trade ledger exposes any missing observation later.
+        try:
+            await self.event_repository.append(event_type, event_payload)
+        except Exception as exc:
+            logger.error(
+                "filled entry event persistence failed for trade {} ({}); protection continues",
+                trade_id, type(exc).__name__,
+            )
+            if recorder is not None:
+                recorder.record_registration_intent_failure(f"fill_event:{type(exc).__name__}")
+        if prepared is not None:
+            recorder.try_queue_registration(prepared)
 
     async def _open_shadow_entry(self, deployment: DeploymentManifest, plan: TradePlan) -> None:
         if deployment.exit.management_exit:
@@ -2224,9 +2228,8 @@ class ExecutionSupervisor:
             protected=False,
         )
         await self._emit_lifecycle_transition(transition, reason="shadow_entry_open")
-        await self.event_repository.append(
-            "shadow_entry_modeled" if plan.risk_details.get("entry_fill_kind") == "modeled_ask_touch" else "shadow_entry_assumed",
-            {
+        entry_event = "shadow_entry_modeled" if plan.risk_details.get("entry_fill_kind") == "modeled_ask_touch" else "shadow_entry_assumed"
+        entry_payload = {
                 "deployment_id": deployment.deployment_id,
                 "symbol": deployment.symbol,
                 "trade_id": plan.trade_id,
@@ -2236,10 +2239,10 @@ class ExecutionSupervisor:
                 "underlying_entry_price": plan.underlying_entry_price,
                 "entry_timestamp": plan.entry_timestamp.isoformat() if plan.entry_timestamp else None,
                 "risk_reasons": list(plan.risk_reasons),
-            },
-        )
+            }
         if plan.risk_details.get("entry_fill_kind") == "modeled_ask_touch":
-            await self._register_exit_edge_entry(
+            await self._record_filled_entry(
+                event_type=entry_event, event_payload=entry_payload,
                 deployment=deployment,
                 trade_id=plan.trade_id,
                 option_symbol=plan.option_symbol,
@@ -2248,6 +2251,8 @@ class ExecutionSupervisor:
                 quantity=plan.quantity,
                 entry_context=dict(plan.risk_details),
             )
+        else:
+            await self.event_repository.append(entry_event, entry_payload)
 
     async def _finish_paper_no_fill(self, trade_id: str, reason: str) -> None:
         item = self._paper_entries.pop(trade_id, None)
@@ -2588,10 +2593,10 @@ class ExecutionSupervisor:
         }
         plan = replace(plan, estimated_entry_price=filled_entry_price, risk_details=risk_details)
         confirmed_price, confirmed_quantity, confirmed_at = _confirmed_entry_fill_facts(payload)
-        if self.record_signal_outcomes:
-            await self.event_repository.append(
-                "signal_outcome",
-                {
+        if self.record_signal_outcomes or self.exit_edge_recorder is not None:
+            await self._record_filled_entry(
+                event_type="signal_outcome",
+                event_payload={
                     **plan.risk_details.get("entry_signal_identity", {}),
                     "deployment_id": deployment.deployment_id,
                     "symbol": deployment.symbol,
@@ -2604,19 +2609,14 @@ class ExecutionSupervisor:
                     "trade_id": plan.trade_id,
                     "mode": "live",
                 },
+                deployment=deployment,
+                trade_id=plan.trade_id,
+                option_symbol=plan.option_symbol,
+                entry_timestamp=confirmed_at,
+                entry_premium=confirmed_price,
+                quantity=confirmed_quantity,
+                entry_context=dict(plan.risk_details),
             )
-        # Freeze the observational cohort only from CONFIRMED broker fill
-        # truth. Registration only queues frozen facts and schedules a durable
-        # intent; no observational SQLite write delays protection.
-        await self._register_exit_edge_entry(
-            deployment=deployment,
-            trade_id=plan.trade_id,
-            option_symbol=plan.option_symbol,
-            entry_timestamp=confirmed_at,
-            entry_premium=confirmed_price,
-            quantity=confirmed_quantity,
-            entry_context=dict(plan.risk_details),
-        )
         stop_result, stop_price, target_order_id, target_price = await self._arm_position_protection(
             deployment,
             option_symbol=plan.option_symbol,

@@ -153,6 +153,8 @@ def test_clean_named_pair_survives_later_gap_while_third_arm_continues(tmp_path)
     signal_db = tmp_path / "signals.db"
     with sqlite3.connect(signal_db) as conn:
         conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, created_at TEXT, event_type TEXT, payload TEXT)")
+        conn.execute("CREATE TABLE trade_sessions (trade_id TEXT, entry_order_id TEXT, status TEXT, "
+                     "entry_timestamp TEXT, option_symbol TEXT, entry_price REAL, quantity INTEGER)")
     scorecard = build_exit_comparisons_scorecard(
         tmp_path / "edge.db", signal_db_path=signal_db, trading_date=entry.date())
     assert scorecard["exits"]["registered"] == 1

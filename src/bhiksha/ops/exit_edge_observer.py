@@ -103,35 +103,42 @@ def recover_registration_intents(
     source = Path(event_db_path).resolve()
     if not source.is_file():
         return after_id
-    with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=0.25) as conn:
-        rows = conn.execute(
-            "SELECT id,payload FROM events WHERE event_type='exit_edge_registration_intent' "
-            "AND id>? ORDER BY id LIMIT 100", (after_id,),
-        ).fetchall()
     repository = ProspectiveQuoteTapeRepository(edge_db_path, write_timeout_seconds=0.25)
-    for event_id, raw in rows:
-        item: dict[str, Any] = {}
-        try:
-            item = json.loads(raw)
-            attempt = dict(item["attempt"])
-            cohort = item.get("cohort")
-            if cohort is not None:
-                repository.register_cohort(cohort)
-                attempt.update(outcome="registered", reason=None)
-            if not repository.try_record_registration_attempt(attempt):
-                break
-        except sqlite3.OperationalError:
-            break  # transient writer lock; retry this event next poll
-        except (KeyError, TypeError, ValueError) as exc:
-            # A malformed frozen intent is evidence of a real failure, not a
-            # reason to stall every later trade behind it.
-            attempt = item.get("attempt") if isinstance(item, dict) else None
-            if isinstance(attempt, dict):
-                attempt.update(outcome="registration_persistence_failure",
-                               reason=f"invalid_frozen_intent:{type(exc).__name__}:{exc}"[:240])
-                if not repository.try_record_registration_attempt(attempt):
-                    break
-        after_id = int(event_id)
+    with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=0.25) as conn:
+        for _ in range(5):  # bounded catch-up; quote polling resumes after this pass
+            rows = conn.execute(
+                "SELECT id,event_type,payload FROM events WHERE id>? AND event_type IN "
+                "('exit_edge_registration_intent','signal_outcome','shadow_entry_modeled') "
+                "ORDER BY id LIMIT 1000", (after_id,),
+            ).fetchall()
+            for event_id, event_type, raw in rows:
+                item: dict[str, Any] = {}
+                try:
+                    event = json.loads(raw)
+                    item = event if event_type == "exit_edge_registration_intent" else event.get("exit_edge_registration")
+                    if item is not None:
+                        attempt = dict(item["attempt"])
+                        cohort = item.get("cohort")
+                        if cohort is not None:
+                            repository.register_cohort(cohort)
+                            attempt.update(outcome="registered", reason=None)
+                        if not repository.try_record_registration_attempt(attempt):
+                            return after_id
+                except sqlite3.OperationalError:
+                    return after_id  # transient writer lock; retry this event next poll
+                except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                    # Bad frozen data is evidence of a failure; preserve it if
+                    # an attempt identity exists, then continue to later fills.
+                    attempt = item.get("attempt") if isinstance(item, dict) else None
+                    if isinstance(attempt, dict):
+                        attempt.update(outcome="registration_persistence_failure",
+                                       reason=f"invalid_frozen_intent:{type(exc).__name__}:{exc}"[:240])
+                        if not repository.try_record_registration_attempt(attempt):
+                            return after_id
+                after_id = int(event_id)
+            if len(rows) < 1000:
+                # Do not rescan the same irrelevant event tail every 15 seconds.
+                return int(conn.execute("SELECT COALESCE(MAX(id),?) FROM events", (after_id,)).fetchone()[0])
     return after_id
 
 
