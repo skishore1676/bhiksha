@@ -127,6 +127,32 @@ def test_false_signal_has_no_chart_marker_and_terminal_live_trade_is_a_fill(tmp_
     assert live_fill["extensions"]["bhiksha:trade"]["tradeId"] == "live-trade-1"
 
 
+def test_positive_evaluation_and_decision_keep_distinct_source_types(tmp_path: Path) -> None:
+    db = _db(tmp_path / "bhiksha.db")
+    signal = {
+        "deployment_id": "qqq-shadow-v1", "symbol": "QQQ",
+        "timestamp": "2026-09-01T14:35:00+00:00", "signal": True, "direction": "short",
+    }
+    with sqlite3.connect(db) as conn:
+        conn.executemany(
+            "INSERT INTO events VALUES (?, ?, ?, ?)",
+            [
+                (6, "2026-09-01T14:36:00+00:00", "signal_evaluation", json.dumps(signal)),
+                (7, "2026-09-01T14:36:01+00:00", "signal_decision", json.dumps(signal)),
+            ],
+        )
+
+    packet = export_chart_evidence(db, output_dir=tmp_path / "out", trading_date=DAY).packet
+    records = {record["id"]: record for record in packet["records"]}
+    evaluation = records["bhiksha-event-6"]
+    decision = records["bhiksha-event-7"]
+    assert evaluation["label"] == "positive signal evaluation recorded"
+    assert decision["label"] == "signal decision recorded"
+    assert evaluation["extensions"]["bhiksha:execution"]["eventType"] == "signal_evaluation"
+    assert decision["extensions"]["bhiksha:execution"]["eventType"] == "signal_decision"
+    assert evaluation["visuals"] and decision["visuals"]
+
+
 def test_source_completion_can_certify_complete_and_revision_changes_packet(tmp_path: Path) -> None:
     db = _db(tmp_path / "bhiksha.db", complete=True)
     first = export_chart_evidence(db, output_dir=tmp_path / "out", trading_date=DAY)

@@ -385,7 +385,7 @@ def _records(
         }
         if domain == "fill" or occurred is not None:
             record["occurredAt"] = occurred if occurred is not None else known
-        extension = _event_extension(payload)
+        extension = _event_extension(payload, event_type=event["event_type"])
         if extension:
             record["extensions"] = {"bhiksha:execution": extension}
         corroborates_trade_exit = (
@@ -484,9 +484,11 @@ def _records(
 
 
 def _event_shape(event_type: str, payload: dict[str, Any]) -> tuple[str, str, str]:
-    if event_type in {"signal_evaluation", "signal_decision"}:
-        label = "non-signal evaluation recorded" if event_type == "signal_evaluation" and payload.get("signal") is False else "signal decision recorded"
+    if event_type == "signal_evaluation":
+        label = "positive signal evaluation recorded" if payload.get("signal") is True else "non-signal evaluation recorded"
         return "signal", "recorded", label
+    if event_type == "signal_decision":
+        return "signal", "recorded", "signal decision recorded"
     if event_type == "trade_plan":
         return "order", "recorded", "order attempt recorded"
     if event_type == "shadow_entry_assumed":
@@ -570,7 +572,7 @@ def _allowlisted_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _event_extension(payload: dict[str, Any]) -> dict[str, Any]:
+def _event_extension(payload: dict[str, Any], *, event_type: str) -> dict[str, Any]:
     option_symbol = _identity(payload.get("option_symbol"))
     values = {
         "tradeId": _identity(payload.get("trade_id")), "attemptId": _identity(payload.get("signal_attempt_id")),
@@ -579,6 +581,7 @@ def _event_extension(payload: dict[str, Any]) -> dict[str, Any]:
         "signal": payload.get("signal") if isinstance(payload.get("signal"), bool) else None,
         "entryReceiptId": _opaque_identity(payload.get("order_id") or payload.get("entry_order_id")),
         "exitReceiptId": _opaque_identity(payload.get("exit_order_id")),
+        "eventType": event_type if event_type in {"signal_evaluation", "signal_decision"} else None,
     }
     return {key: value for key, value in values.items() if value is not None}
 
