@@ -196,17 +196,7 @@ def main(argv: list[str] | None = None) -> int:
 def _cartographer_shadow_job(args: argparse.Namespace, *, repo_root: Path) -> int:
     """Run the existing 07:30 owner path; configuration failures stay visible."""
 
-    cartographer_root = os.environ.get("CARTOGRAPHER_REPO_ROOT", "/Users/sunny/Documents/market-cartographer")
-    recommendation_root = os.environ.get("CARTOGRAPHER_ALPHA_OUTPUT_ROOT", f"{cartographer_root}/artifacts/alpha-lab")
-    data_root = os.environ.get(
-        "CARTOGRAPHER_MALA_DATA_ROOT",
-        "/Users/sunny/Documents/mala_v2/research/results/cache_recovery/market_cartographer/mcse-2026w33-v2",
-    )
-    output_root = os.environ.get("BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT", str(repo_root / "artifacts/cartographer-shadow"))
-    completed = subprocess.run(
-        ["/bin/bash", str(repo_root / "scripts/launchd/run_cartographer_shadow.sh"), str(repo_root), recommendation_root, data_root, output_root],
-        text=True, capture_output=True, check=False, env=os.environ.copy(), cwd=repo_root,
-    )
+    completed = _run_python_module(["bhiksha.tools.cartographer_weekly"], repo_root=repo_root)
     payload = {"job": args.job, "status": "ok" if completed.returncode == 0 else "failed", "return_code": completed.returncode, "stdout_tail": _tail(completed.stdout), "stderr_tail": _tail(completed.stderr)}
     _print_result(payload)
     return 0 if completed.returncode == 0 else 2
@@ -405,6 +395,8 @@ def _session_report_job(args: argparse.Namespace) -> int:
         active_plan_path=args.active_plan,
         trading_date=result.report.get("trading_date"),
     )
+    from bhiksha.tools.cartographer_weekly import publish_status_best_effort
+    weekly_sheet = publish_status_best_effort(db_path=db_path)
     payload: dict = {
         "job": args.job,
         # Report generation and transport delivery are separate contracts. A
@@ -418,6 +410,7 @@ def _session_report_job(args: argparse.Namespace) -> int:
         "app_status": app_status,
         "transport_status": alert.transport_status,
         "alert": alert.to_dict(),
+        "cartographer_weekly_sheet": weekly_sheet,
         "exit_comparisons_sheet": exit_comparisons_sheet,
     }
     if review is not None:

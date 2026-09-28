@@ -1186,6 +1186,10 @@ class BhikshaRuntime:
                 exited_deployments.add(evaluation.deployment.deployment_id)
 
         for deployment in deployments_by_symbol[bar.symbol]:
+            if deployment.strategy.key == "weekly_chart":
+                # Pending entries still need completed-bar invalidation and fresh-price checks.
+                from bhiksha.strategy.weekly_chart import observe
+                observe(frame, deployment.strategy.params, datetime.now(UTC))
             if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
                 # Completed bars can invalidate a waiting intent; only fresh
                 # intrabar observations may authorize its next attempt.

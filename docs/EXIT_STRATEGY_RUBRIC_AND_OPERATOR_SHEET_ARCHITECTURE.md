@@ -1,6 +1,6 @@
 # Bhiksha entry and exit architecture
 
-Updated 2026-09-20. This is the implementation contract, not a discussion draft.
+Updated 2026-09-26. This is the implementation contract, not a discussion draft.
 Production cutover was explicitly authorized by Suman on September 20. See the
 [cutover receipt](ENTRY_EXIT_TAKEOVER_STATUS.md) for verification and remaining limits.
 
@@ -60,8 +60,10 @@ the protective stop remains at the broker. These virtual floors do not promise
 broker-side execution while Bhiksha is unavailable.
 
 Required common values: archetype, targets, T1 fraction, initial/disaster premium
-stops, no-progress duration, giveback choice and applicable numeric settings,
-breakeven choice, and same-day hard-flat time. Friendly Sheet columns
+stops, giveback choice and applicable numeric settings, and breakeven choice.
+Intraday profiles require a no-progress duration and same-day hard-flat time.
+The overnight range-expansion profile may omit the no-progress timer but must
+have a maximum hold. Friendly Sheet columns
 `target_1_fraction`, `no_progress_minutes`, and `max_hold_minutes` map to canonical
 fraction/seconds fields. `no_progress_min_r` is retained, including an explicit 0.
 
@@ -77,10 +79,29 @@ activation 0.5R, initial floor -1R, curvature 1.5, floor at T1 0R, step 0.1R.
 The profit-lock row explicitly locks 0.25R after a peak of 0.75R, as described by
 the operator. Giveback remains an additional configured protection.
 
-Structural/underlying-bar stops and overnight holding remain unsupported on
-this named path. The current structural row is commented out; the range-expansion
-profile is explicitly intraday. Do not label an unsupported strategy as an
-implemented variation of the ladder.
+Structural/underlying-bar stops remain unsupported on this named path; the
+current structural row is commented out.
+
+### Intended swing comparison horizon
+
+Suman confirmed on September 26 that `range_expansion_swing` is intentionally
+an overnight comparison, with up to three regular trading sessions of holding
+time. The Sheet-owned configuration is `eod_flat=false` and
+`max_hold_seconds=70200` (1,170 minutes, three standard 6.5-hour sessions).
+This is accumulated regular-session time from entry, not three calendar days
+or an unconditional exit at the third closing bell. Nights, weekends and market
+holidays do not consume the timer; early-close days contribute only their actual
+session time. Stops, targets and other configured exits can finish the arm sooner.
+
+Observation continues after the primary exit and across observer restarts.
+Missing observable quotes remain explicit gaps; recovery does not fabricate
+fills. If the option expires before the comparison finishes, mark it
+`option_expired_before_candidate_completed`, rather than inventing an expiry
+fill or continuing to poll an expired contract.
+
+This confirmed intention applies to the swing comparison. The five current
+live primary profiles retain their intraday settings. Freeze the resolved
+comparison definition at entry so subsequent Sheet edits do not rewrite history.
 
 ## 3. Entry sources converge on the same compiler
 

@@ -147,6 +147,7 @@ def build_chart_evidence_packet(snapshot: dict[str, Any], *, revision: int) -> d
                         "deploymentId": deployment_id,
                         "mode": mode,
                         "strategy": strategy,
+                        **({"weeklyPlan": deployment["weekly_plan"]} if deployment.get("weekly_plan") else {}),
                     }
                 },
             }
@@ -336,7 +337,14 @@ def _deployments_from_startup(events: list[dict[str, Any]]) -> tuple[list[dict[s
         execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
         strategy_raw = raw.get("strategy")
         strategy = strategy_raw.get("key") if isinstance(strategy_raw, dict) else strategy_raw
+        params = strategy_raw.get("params", {}) if isinstance(strategy_raw, dict) else {}
+        weekly = {key: params[key] for key in (
+            "pack_id", "scenario_id", "scenario_key", "branch_id", "publication_hash",
+            "published_at", "admitted_at", "trigger", "tactical_invalidation", "structural_invalidation",
+            "valid_through", "author_profile", "setup_type",
+        ) if key in params} if strategy == "weekly_chart" else {}
         result.append({
+            "weekly_plan": weekly,
             "deployment_id": deployment_id, "symbol": symbol, "enabled": raw.get("enabled") is not False,
             "strategy": _identity(strategy) or "strategy-unavailable",
             "execution": {

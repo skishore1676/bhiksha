@@ -631,9 +631,11 @@ def compile_active_plan_from_google_sheets(
         row_type="manual",
         sheet_name=manual_client.sheet_name,
     )
+    from bhiksha.integrations.cartographer_weekly import build_rows
+    weekly_rows = build_rows(operator_defaults) if 'cartographer_weekly' in operator_defaults else []
     exit_profiles_catalog: dict[str, ExitProfileConfig] = {}
     if any(row.enabled and (row.management_exit or row.compare_exits)
-           for row in [*strategy_validation.rows, *manual_validation.rows]):
+           for row in [*strategy_validation.rows, *manual_validation.rows, *weekly_rows]):
         if exit_profiles_client is None:
             if not exit_profiles_sheet_name:
                 raise ValueError("named exits require Exit_Profiles_v1")
@@ -651,7 +653,7 @@ def compile_active_plan_from_google_sheets(
     ]
     expected_enabled_row_ids = [
         row.row_id
-        for row in [*strategy_validation.rows, *manual_validation.rows]
+        for row in [*strategy_validation.rows, *manual_validation.rows, *weekly_rows]
         if row.enabled
     ] + [
         str(item["row_id"])
@@ -659,7 +661,7 @@ def compile_active_plan_from_google_sheets(
         if item.get("row_id")
     ]
     return compile_active_plan_from_rows(
-        rows=[*strategy_validation.rows, *manual_validation.rows],
+        rows=[*strategy_validation.rows, *manual_validation.rows, *weekly_rows],
         strategy_catalog_path=strategy_catalog_path,
         active_plan_id=active_plan_id,
         trading_date=trading_date,
@@ -1199,6 +1201,14 @@ def _compile_manual_trigger_row(
     payload["risk"] = _apply_risk_overrides(payload["risk"], row)
     payload["exit"] = _apply_exit_overrides(payload["exit"], row, exit_catalog=exit_catalog)
     payload["source"] = _merge_source_metadata(payload["source"], row=row, origin="active_sheet_manual")
+    if row.source_metadata.get("source_owner") == "cartographer_weekly":
+        if row.authorization_mode != "shadow" or not payload["exit"].get("eod_flat", True):
+            raise ValueError("weekly route requires SHADOW with intraday primary management")
+        payload["strategy"] = {"key": "weekly_chart", "version": 1, "params": row.source_metadata["weekly_plan"]}
+        payload["source"]["origin"] = "cartographer_weekly"
+        payload["exit"]["use_algorithmic_exit"] = True
+        from bhiksha.strategy.weekly_chart import frozen_deployment
+        payload = frozen_deployment(payload["strategy"]["params"]) or payload
     return DeploymentManifest.model_validate(payload)
 
 

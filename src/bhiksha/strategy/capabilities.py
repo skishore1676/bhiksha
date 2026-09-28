@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 
-NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS = frozenset({"manual_breakout", "market_impulse"})
+NATIVE_ALGORITHMIC_EXIT_STRATEGY_KEYS = frozenset({"manual_breakout", "market_impulse", "weekly_chart"})
 DEFAULT_CAPABILITY_MANIFEST_PATH = (
     Path(__file__).resolve().parents[3] / "config" / "capabilities" / "bhiksha_capabilities_v1.yaml"
 )

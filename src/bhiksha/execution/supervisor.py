@@ -1712,7 +1712,31 @@ class ExecutionSupervisor:
 
         return position
 
-    async def handle_signal(
+    async def handle_signal(self, deployment, decision, *, dry_run, simulate_only=False,
+                            live_entry_block_reason=None):
+        if deployment.strategy.key != "weekly_chart" or not decision.signal:
+            return await self._handle_signal_impl(deployment, decision, dry_run=dry_run,
+                simulate_only=simulate_only, live_entry_block_reason=live_entry_block_reason)
+        from bhiksha.strategy.weekly_chart import reserve, transition
+        open_count = sum(p.deployment_id.startswith("cw-") for p in self.planner.position_tracker.active_positions())
+        reason = reserve(deployment, datetime.now(UTC), open_count)
+        if reason:
+            await self.event_repository.append("signal_outcome", _signal_outcome_payload(
+                deployment, decision, outcome="risk_block", rejection_reasons=[reason], mode="shadow"))
+            return None
+        try:
+            plan = await self._handle_signal_impl(deployment, decision, dry_run=True,
+                simulate_only=True, live_entry_block_reason=live_entry_block_reason)
+        except Exception:
+            # Shadow selection has no external order effect; retain an actual pending intent.
+            if not any(item[0].deployment_id == deployment.deployment_id for item in self._paper_entries.values()):
+                transition(deployment, "waiting")
+            raise
+        if plan is None or plan.trade_id not in self._paper_entries:
+            transition(deployment, "waiting")
+        return plan
+
+    async def _handle_signal_impl(
         self,
         deployment: DeploymentManifest,
         decision: SignalDecision,
@@ -2158,6 +2182,11 @@ class ExecutionSupervisor:
         entry_context: dict[str, Any],
     ) -> None:
         """Freeze observation in the already-durable fill event before queueing it."""
+        from bhiksha.strategy.weekly_chart import transition
+        try:
+            transition(deployment, "filled", trade_id)
+        except Exception as exc:
+            logger.error("weekly consumption write failed for {} ({}); ledger recovery remains authoritative", trade_id, type(exc).__name__)
         recorder = self.exit_edge_recorder
         prepared = None
         if recorder is not None:
@@ -2259,6 +2288,8 @@ class ExecutionSupervisor:
         if item is None:
             return
         deployment, decision, plan, _, _ = item
+        from bhiksha.strategy.weekly_chart import transition as weekly_transition
+        weekly_transition(deployment, "waiting")
         transition = self.lifecycle_store.mark_closed(deployment.symbol, deployment.deployment_id)
         await self._emit_lifecycle_transition(transition, reason=reason)
         await self.event_repository.append("signal_outcome", _signal_outcome_payload(
@@ -2281,6 +2312,12 @@ class ExecutionSupervisor:
             async with self._symbol_locks[deployment.symbol]:
                 if trade_id not in self._paper_entries:
                     continue
+                if deployment.strategy.key == "weekly_chart":
+                    from bhiksha.strategy.weekly_chart import pending_block
+                    reason = pending_block(deployment, observed)
+                    if reason:
+                        await self._finish_paper_no_fill(trade_id, reason)
+                        continue
                 if observed >= expires or not _entry_window_allows(deployment, observed):
                     await self._finish_paper_no_fill(trade_id, "paper_limit_expired")
                     continue
@@ -2315,6 +2352,11 @@ class ExecutionSupervisor:
                         "reason": type(exc).__name__,
                     })
                     continue
+                if deployment.strategy.key == "weekly_chart":
+                    reason = pending_block(deployment, received)
+                    if reason:
+                        await self._finish_paper_no_fill(trade_id, reason)
+                        continue
                 plan = replace(plan, entry_timestamp=received)
                 # Conservative fill at submitted limit, even when the later ask is better.
                 plan.risk_details.update(entry_fill_kind="modeled_ask_touch", paper_entry_status="filled",

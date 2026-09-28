@@ -74,6 +74,8 @@ def effective_warmup_trading_days_by_deployment(
 def required_warmup_trading_days_for_strategy(strategy_key: str, params: dict[str, Any]) -> int:
     """Estimate the feature-state lookback required by a strategy."""
 
+    if strategy_key == "weekly_chart":
+        return 15  # Retain the entire initial weekly plan window, including missed closes.
     if strategy_key == "market_impulse":
         return _market_impulse_warmup_days(params)
     if strategy_key == "opening_drive_classifier":

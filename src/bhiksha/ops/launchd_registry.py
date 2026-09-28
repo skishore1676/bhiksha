@@ -158,7 +158,7 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
         schedule=(*weekdays(7, 30), *weekdays(7, 40)),
         schedule_label="Weekdays 07:30 and 07:40 CT",
         purpose=(
-            "Project fresh Cartographer shadow signals and make one bounded "
+            "Import verified Cartographer weekly plans and publish execution status; "
             "idempotent retry before the 08:20 compiler."
         ),
         skips_non_trading_days=True,

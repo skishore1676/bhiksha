@@ -11,6 +11,7 @@ from bhiksha.strategy.intraday_mean_reversion import IntradayMeanReversionStrate
 from bhiksha.strategy.jerk_pivot_momentum import JerkPivotMomentumStrategy
 from bhiksha.strategy.manual_breakout import ManualBreakoutStrategy
 from bhiksha.strategy.manual_trigger import ManualTriggerStrategy
+from bhiksha.strategy.weekly_chart import WeeklyChartStrategy
 from bhiksha.strategy.market_impulse import MarketImpulseStrategy
 from bhiksha.strategy.opening_drive_classifier import OpeningDriveClassifierStrategy
 
@@ -37,6 +38,7 @@ def default_strategy_registry() -> StrategyRegistry:
     registry.register(JerkPivotMomentumStrategy())
     registry.register(ManualBreakoutStrategy())
     registry.register(ManualTriggerStrategy())
+    registry.register(WeeklyChartStrategy())
     registry.register(MarketImpulseStrategy())
     registry.register(OpeningDriveClassifierStrategy())
     return registry
