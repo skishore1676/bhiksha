@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, time
 import json
+import os
+import sys
+from threading import Event, Thread
 from pathlib import Path
 import sqlite3
 import time as clock
@@ -29,6 +32,55 @@ from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository
 CENTRAL = ZoneInfo("America/Chicago")
 POLL_SECONDS = 15.0
 MAX_BATCH = 20
+QUOTE_DEADLINE_SECONDS = 45.0
+PROGRESS_DEADLINE_SECONDS = 180.0
+
+
+class ObserverProgressWatchdog:
+    """Exit only this quote-only process on stalled progress; launchd owns restart."""
+
+    def __init__(self, status_path, *, deadline=PROGRESS_DEADLINE_SECONDS,
+                 monotonic=clock.monotonic, terminate=os._exit):
+        self.status_path = Path(status_path)
+        self.deadline = deadline
+        self.monotonic = monotonic
+        self.terminate = terminate
+        self.progress = (monotonic(), 'starting')
+        self.stopped = Event()
+        self.thread = Thread(target=self._run, name='exit-observer-watchdog', daemon=True)
+
+    def advance(self, stage):
+        self.progress = (self.monotonic(), stage)
+
+    def check(self):
+        at, stage = self.progress
+        if self.monotonic() - at <= self.deadline:
+            return False
+        failure = {'status': 'stalled', 'stage': stage,
+                   'detected_at': datetime.now(UTC).isoformat(),
+                   'reason': 'observer_progress_deadline_exceeded'}
+        try:
+            path = self.status_path.with_suffix('.watchdog.json')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix('.tmp')
+            temp.write_text(json.dumps(failure) + '\n')
+            temp.replace(path)
+            print(json.dumps(failure), file=sys.stderr, flush=True)
+        finally:
+            # No broker/order client exists in this owner. Avoid a hung cleanup
+            # hiding failure from launchd's existing KeepAlive restart policy.
+            self.terminate(1)
+        return True
+
+    def _run(self):
+        while not self.stopped.wait(5):
+            if self.check():
+                return
+
+    def close(self):
+        self.stopped.set()
+        self.thread.join(timeout=1)
+
 
 
 class PublicOptionQuoteReader:
@@ -157,23 +209,33 @@ async def run_observer(
     reader = reader or PublicOptionQuoteReader()
     stop = stop or asyncio.Event()
     recorder = ExitEdgeLiveRecorder(db_path=db_path, status_path=status_path, role="observer")
+    watchdog = ObserverProgressWatchdog(status_path)
+    watchdog.thread.start()
     recorder.start()
     last_intent_id = 0
     try:
         while not stop.is_set():
+            health = recorder.snapshot()
+            if health.get("ready") and not health.get("worker_alive"):
+                raise RuntimeError("exit_observer_writer_stopped")
             if recorder.snapshot().get("ready") and marker.is_file():
                 try:
+                    watchdog.advance('recover_registration_intents')
                     if event_db_path is not None:
                         last_intent_id = recover_registration_intents(
                             event_db_path, db_path, last_intent_id,
                         )
+                    watchdog.advance('refresh_cohorts')
                     recorder.refresh_active_from_store()
                     now = datetime.now(UTC)
                     recorder.censor_expired_options(now)
                     symbols = recorder.active_option_symbols()
                     if symbols and _regular_session(now):
                         started = clock.monotonic()
-                        quotes = await reader.quotes(symbols)
+                        watchdog.advance('request_quotes')
+                        async with asyncio.timeout(QUOTE_DEADLINE_SECONDS):
+                            quotes = await reader.quotes(symbols)
+                        watchdog.advance('persist_quotes')
                         received = datetime.now(UTC)
                         for symbol in symbols:
                             quote = quotes.get(symbol)
@@ -187,10 +249,16 @@ async def run_observer(
                         recorder.heartbeat()
                 except Exception as exc:
                     recorder.record_observation_error(type(exc).__name__)
+                watchdog.advance('poll_complete')
+            elif recorder.snapshot().get('ready'):
+                recorder.heartbeat()  # Disabled is observable, not a silent stale owner.
+                watchdog.advance('disabled')
             try:
                 await asyncio.wait_for(stop.wait(), timeout=max(float(poll_seconds), 1.0))
             except TimeoutError:
                 pass
     finally:
+        watchdog.advance('shutdown')
         recorder.close(join_timeout_seconds=5.0)
         await reader.close()
+        watchdog.close()

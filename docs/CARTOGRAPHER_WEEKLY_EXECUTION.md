@@ -136,3 +136,18 @@ is not zero P&L. Compare timing/underlying movement separately from option resul
 and explain no-fill reasons before interpreting profitability. Existing quote-gap
 quality rules still govern clean exit comparisons. No automatic winner selection
 or live promotion; natural market evidence begins after this deployment.
+
+## Exit observer recovery
+
+The independent quote-only owner has a 45-second deadline for the complete quote
+request and a 180-second progress watchdog covering startup and synchronous work.
+A timed-out request is recorded and retried on the next poll. A stalled owner or
+stopped writer exits; its existing launchd KeepAlive restarts it. The watchdog
+writes the last stage to `exit_edge_live_status.watchdog.json` before exiting.
+No trading executor restart or order action is part of observer recovery.
+
+Recovery resumes existing cohorts. Late first quotes and gaps between quotes stay
+marked in the evidence and excluded from clean comparisons; no missing prices are
+invented. Process existence alone is not acceptance: verify advancing status,
+quote timestamps/counts, registration coverage and recorded gaps in the SQLite
+store. A disabled marker still produces heartbeats.
