@@ -1718,7 +1718,9 @@ class ExecutionSupervisor:
             return await self._handle_signal_impl(deployment, decision, dry_run=dry_run,
                 simulate_only=simulate_only, live_entry_block_reason=live_entry_block_reason)
         from bhiksha.strategy.weekly_chart import reserve, transition
-        open_count = sum(p.deployment_id.startswith("cw-") for p in self.planner.position_tracker.active_positions())
+        from bhiksha.integrations.cartographer_weekly import arm_for_id
+        open_count = sum(p.deployment_id.startswith("cw-") and arm_for_id(p.deployment_id) == arm_for_id(deployment.deployment_id)
+                         for p in self.planner.position_tracker.active_positions())
         reason = reserve(deployment, datetime.now(UTC), open_count)
         if reason:
             await self.event_repository.append("signal_outcome", _signal_outcome_payload(

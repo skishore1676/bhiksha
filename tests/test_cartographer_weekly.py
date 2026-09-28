@@ -142,13 +142,17 @@ def test_compiler_preserves_weekly_identity_and_named_exits(tmp_path, params):
     from bhiksha.active_plan.compiler import compile_active_plan_from_rows
     from bhiksha.config.exit_catalog import ExitProfileConfig
     root=tmp_path/'admissions';root.mkdir()
-    p={**params,'author_profile':'TREND_CONTINUATION','setup_type':'upside_breakout'}
+    p={**params,'author_profile':'TREND_CONTINUATION','setup_type':'upside_breakout','early_admitted_at':params['admitted_at']}
     atomic_json(root/'admissions.json',{'plans':[p]})
     control={**DEFAULTS,'compare_exits':'trend_continuation_balanced'}
     rows=build_rows({'cartographer_weekly':control},root,str(tmp_path/'db'))
     name='trend_continuation_balanced'
     catalog={name:ExitProfileConfig(exit_profile_id=name,trade_archetype='TREND_CONTINUATION',exit_family='staged_r_ladder',target_1_r=1,target_2_r=2,target_1_quantity=.6,initial_stop_pct=.3,disaster_stop_pct=.35,no_progress_seconds=2700,giveback_policy='OFF',breakeven_after_t1=True,eod_flat=True,hard_flat_time_et='15:55')}
-    d=compile_active_plan_from_rows(rows=rows,strategy_catalog_path=tmp_path/'catalog',exit_profiles_catalog=catalog).plan.deployments[0]
+    deployments=compile_active_plan_from_rows(rows=rows,strategy_catalog_path=tmp_path/'catalog',exit_profiles_catalog=catalog).plan.deployments
+    d,early=deployments
+    assert early.exit==d.exit and early.risk==d.risk and early.execution==d.execution
+    assert early.strategy.params['entry_arm']=='early_1m'
+    assert early.source.metadata['strategy_class'].endswith('__early_1m')
     assert d.strategy.key=='weekly_chart' and d.execution.shadow_only
     assert d.source.origin=='cartographer_weekly' and d.exit.use_algorithmic_exit
     assert d.risk.max_trade_premium_usd==400 and d.execution.min_open_interest==0
@@ -178,9 +182,71 @@ def test_receipt_hashes_and_revision_block(tmp_path):
     a=import_publication(root/'latest.json',target,first)
     b=import_publication(root/'latest.json',target,first+timedelta(hours=1))
     assert a['plans'][0]['admitted_at']==b['plans'][0]['admitted_at']
+    paired=import_publication(root/'latest.json',target,first+timedelta(minutes=90),policy={**DEFAULTS,'entry_timing_comparison':'PAIRED'})
+    again=import_publication(root/'latest.json',target,first+timedelta(minutes=100),policy={**DEFAULTS,'entry_timing_comparison':'PAIRED'})
+    assert paired['plans'][0]['early_admitted_at']==again['plans'][0]['early_admitted_at']
+    assert paired['plans'][0]['admitted_at']==a['plans'][0]['admitted_at']
     (run/'weekly-book.json').write_text('{}')
     with pytest.raises(ValueError,match='receipt mismatch'): import_publication(root/'latest.json',target,first)
     book['scenarios'][0]['thesis']='updated';publish()
     revised=import_publication(root/'latest.json',target,first+timedelta(hours=2))
     assert revised['plans'][0]['admission_block']=='weekly_source_revision_requires_readmission'
     assert revised['plans'][0]['deployment_id']==a['plans'][0]['deployment_id']
+
+
+def test_parallel_arms_are_independent_and_keep_same_author_rule(params):
+    from bhiksha.integrations.cartographer_weekly import execution_plans
+    params['early_admitted_at']=params['admitted_at']
+    params['controls']['entry_timing_comparison']='PAIRED'
+    baseline,early=execution_plans({'plans':[params]})
+    assert baseline['deployment_id']==params['deployment_id']
+    assert early['author_trigger']==baseline['trigger']
+    assert early['tactical_invalidation']==baseline['tactical_invalidation']
+    first=datetime(2026,9,28,13,31,tzinfo=UTC)
+    assert observe(frame(minutes=1),early,first)[0]['reason']=='weekly_confirmed'
+    assert observe(frame(minutes=1),baseline,first)[0]['reason']=='weekly_waiting_confirmation'
+    assert reserve(deployment(early),first,0) is None
+    transition(deployment(early),'filled','early-trade')
+    later=datetime(2026,9,28,14,9,tzinfo=UTC)
+    assert observe(frame(),baseline,later)[0]['reason']=='weekly_confirmed'
+    assert reserve(deployment(baseline),later,0) is None
+    sibling=deepcopy(early);sibling['deployment_id']='cw-sibling-early1m'
+    observe(frame(minutes=1),sibling,first)
+    assert reserve(deployment(sibling),first,0)=='weekly_scenario_already_reserved_or_consumed'
+
+
+def test_pending_capacity_is_per_arm(params):
+    now=datetime(2026,9,28,14,9,tzinfo=UTC)
+    params['controls']['max_open_positions']=1
+    observe(frame(),params,now)
+    assert reserve(deployment(params),now,0) is None
+    other=deepcopy(params)
+    other.update(deployment_id='cw-other-early1m',scenario_key='cw-other',entry_arm='early_1m')
+    other['controls']['entry_timing_comparison']='PAIRED'
+    observe(frame(),other,now)
+    assert reserve(deployment(other),now,0) is None
+
+
+def test_early_arm_switch_revision_and_prospective_boundary(params):
+    from bhiksha.integrations.cartographer_weekly import execution_plans
+    from bhiksha.strategy.weekly_chart import source_block
+    from pathlib import Path
+    params['early_admitted_at']='2026-09-28T13:35:30+00:00'
+    baseline,early=execution_plans({'plans':[params]})
+    now=datetime(2026,9,28,13,36,tzinfo=UTC)
+    assert source_block(early,now)=='weekly_early_arm_off'
+    assert source_block(baseline,now) is None
+    early['controls']['entry_timing_comparison']='PAIRED'
+    assert observe(frame(minutes=6),early,now)[0]['reason']=='weekly_waiting_confirmation'
+    assert observe(frame(minutes=7),early,now+timedelta(minutes=1))[0]['reason']=='weekly_confirmed'
+    atomic_json(Path(params['source_health_path']),{'ok':True,'checked_at':now.isoformat(),'blocked_deployments':[params['deployment_id']]})
+    assert source_block(early,now)=='weekly_source_revision_requires_readmission'
+
+
+def test_status_keeps_untriggered_arm_visible(tmp_path,params):
+    from bhiksha.tools.cartographer_weekly import status_rows,HEADERS
+    params.update(early_admitted_at=params['admitted_at'],author_profile='TREND_CONTINUATION')
+    rows=status_rows({'plans':[params]},DEFAULTS,db_path=str(tmp_path/'absent'))
+    assert len(rows)==2 and all(len(r)==len(HEADERS) for r in rows)
+    assert [r[17] for r in rows]==['baseline','early_1m']
+    assert all(r[12]=='' for r in rows) # no invented trades or P&L

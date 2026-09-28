@@ -9,14 +9,14 @@ import sqlite3
 
 from bhiksha.active_plan.compiler import load_operator_defaults_sheet_rows
 from bhiksha.config.environment import load_dotenv
-from bhiksha.integrations.cartographer_weekly import ROOT, controls, import_publication, atomic_json
+from bhiksha.integrations.cartographer_weekly import ROOT, controls, import_publication, atomic_json, execution_plans
 from bhiksha.integrations.google_sheets import GoogleSheetTableClient
 
 TAB = 'Cartographer_Status'
 HEADERS = ['Symbol', 'State', 'Reason / last outcome', 'Entry condition', 'Tactical invalidation',
            'Valid through UTC', 'Author profile', 'Effective primary exit', 'Configured mode',
            'Loaded mode', 'Last evaluation UTC', 'Confirmation UTC', 'Trade ID', 'Scenario / branch',
-           'Publication hash', 'Admitted UTC', 'As of UTC']
+           'Publication hash', 'Admitted UTC', 'As of UTC', 'Entry arm', 'Author confirmation']
 
 
 def _condition(c):
@@ -44,7 +44,7 @@ def status_rows(admissions, policy, *, db_path='bhiksha.db', active_plan_path='a
                     if str(data.get('deployment_id', '')).startswith('cw-'):
                         outcomes.setdefault(data['deployment_id'], data)
     rows = []
-    for p in [*admissions.get('plans', []), *admissions.get('unsupported', [])]:
+    for p in [*execution_plans(admissions), *admissions.get('unsupported', [])]:
         deployment_id = p.get('deployment_id', '')
         state = states.get(deployment_id, {})
         observed = json.loads(state.get('payload', '{}'))
@@ -58,7 +58,7 @@ def status_rows(admissions, policy, *, db_path='bhiksha.db', active_plan_path='a
             p.get('author_profile', ''), runtime.get('exit', {}).get('management_exit') or configured_exit,
             policy['mode'], runtime_params.get('controls', {}).get('mode', 'not loaded'), observed.get('last_evaluation', ''),
             observed.get('confirmation_at', ''), state.get('trade_id') or '',
-            f"{p.get('pack_id', '')}/{p.get('scenario_id', '')}/{p.get('branch_id', '')}", p.get('publication_hash', ''), p.get('admitted_at', ''), now])
+            f"{p.get('pack_id', '')}/{p.get('scenario_id', '')}/{p.get('branch_id', '')}", p.get('publication_hash', ''), p.get('admitted_at', ''), now, p.get('entry_arm', ''), _condition(p.get('author_trigger'))])
     return rows
 
 
@@ -70,7 +70,7 @@ def publish_status(*, root=ROOT, db_path='bhiksha.db'):
     health = json.loads((root/'source_health.json').read_text()) if (root/'source_health.json').exists() else {'ok': False}
     rows = status_rows(admissions, policy, db_path=db_path)
     if not health.get('ok'):
-        rows.insert(0, ['', 'source blocked', health.get('reason', 'Source health unavailable'), *(['']*13), datetime.now(UTC).isoformat()])
+        rows.insert(0, ['', 'source blocked', health.get('reason', 'Source health unavailable'), *(['']*13), datetime.now(UTC).isoformat(), '', ''])
     api = client.service.spreadsheets()
     meta = api.get(spreadsheetId=client.spreadsheet_id, fields='sheets.properties').execute()
     props = next((s['properties'] for s in meta['sheets'] if s['properties']['title']==TAB), None)
@@ -82,6 +82,8 @@ def publish_status(*, root=ROOT, db_path='bhiksha.db'):
     # Own this generated tab only. Clear old generated cells in the same atomic update.
     grid = {'sheetId':sheet_id, 'startRowIndex':0, 'endRowIndex':max(len(values),props['gridProperties']['rowCount']), 'startColumnIndex':0,'endColumnIndex':len(HEADERS)}
     requests = []
+    if len(HEADERS)>props['gridProperties']['columnCount']:
+        requests.append({'appendDimension':{'sheetId':sheet_id,'dimension':'COLUMNS','length':len(HEADERS)-props['gridProperties']['columnCount']}})
     if len(values)>props['gridProperties']['rowCount']:
         requests.append({'appendDimension':{'sheetId':sheet_id,'dimension':'ROWS','length':len(values)-props['gridProperties']['rowCount']}})
     requests += [{'updateCells':{'range':grid, 'rows':[{'values':[{'userEnteredValue':{'stringValue':str(v)}} for v in row]} for row in values], 'fields':'userEnteredValue'}},
@@ -108,7 +110,9 @@ def main():
     load_dotenv()
     pointer=Path(os.environ.get('CARTOGRAPHER_WEEKLY_POINTER','/Users/sunny/Documents/market-cartographer/artifacts/weekly/latest.json'))
     try:
-        admitted = import_publication(pointer)
+        client = GoogleSheetTableClient(os.environ['GOOGLE_SHEET_ID'], 'Operator_Defaults_v1', Path(os.environ['GOOGLE_API_CREDENTIALS_PATH']))
+        policy = controls(load_operator_defaults_sheet_rows(client.read_rows()))
+        admitted = import_publication(pointer, policy=policy)
     except Exception as exc:
         atomic_json(ROOT/'source_health.json', {'ok':False,'checked_at':datetime.now(UTC).isoformat(),'reason':f'weekly_import_failed:{type(exc).__name__}'})
         print(json.dumps({'status':'failed','reason':type(exc).__name__,'sheet':publish_status_best_effort()}))

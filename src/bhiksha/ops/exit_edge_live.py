@@ -922,6 +922,8 @@ class ExitEdgeLiveRecorder:
             "entry_premium": float(entry_premium),
             "quantity": int(quantity),
             "cohort_dimensions": {
+                **({key: deployment.strategy.params.get(key) for key in ("entry_arm", "scenario_key", "branch_id", "publication_hash", "author_trigger")}
+                   if getattr(getattr(deployment, "strategy", None), "key", None) == "weekly_chart" else {}),
                 "entry_fill_kind": (entry_context or {}).get("entry_fill_kind", "broker_confirmed"),
                 "strategy_class": (getattr(getattr(deployment, "source", None), "metadata", {}) or {}).get("strategy_class")
                     or getattr(getattr(deployment, "strategy", None), "key", None) or "unclassified",

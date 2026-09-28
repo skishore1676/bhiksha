@@ -15,7 +15,7 @@ PROFILE_MAP = {'TREND_CONTINUATION': 'trend_continuation_balanced',
                'FLASH_REVERSAL': 'flash_reversal_fast_snap',
                'EXHAUSTION_REVERSAL': 'exhaustion_reversal_climax',
                'RANGE_EXPANSION': 'trend_continuation_balanced'}
-DEFAULTS = {'mode': 'SHADOW', 'max_contracts': 1, 'max_trade_premium_usd': 400,
+DEFAULTS = {'mode': 'SHADOW', 'entry_timing_comparison': 'OFF', 'max_contracts': 1, 'max_trade_premium_usd': 400,
             'max_open_positions': 2, 'entry_execution_profile': 'balanced',
             'max_entry_distance_pct': 0.01, 'retry_seconds': 600,
             'dte_min': 7, 'dte_max': 21, 'dte_fallback_max': 28,
@@ -49,6 +49,9 @@ def controls(defaults: dict) -> dict:
     c['mode'] = str(c['mode']).upper()
     if c['mode'] not in {'OFF', 'SHADOW'}:
         raise ValueError('cartographer_weekly supports OFF/SHADOW only; LIVE is not armed')
+    c['entry_timing_comparison'] = str(c['entry_timing_comparison']).upper()
+    if c['entry_timing_comparison'] not in {'OFF', 'PAIRED'}:
+        raise ValueError('weekly entry_timing_comparison must be OFF/PAIRED')
     for key in ['max_contracts', 'max_open_positions', 'retry_seconds', 'dte_min', 'dte_max', 'dte_fallback_max']:
         val = float(c[key])
         if not math.isfinite(val) or val <= 0 or not val.is_integer():
@@ -151,7 +154,7 @@ def resolve_plans(book: dict, packet: dict, provenance: dict, admitted_at: str) 
     return plans, unsupported
 
 
-def import_publication(pointer: Path, root: Path = ROOT, now: datetime | None = None) -> dict:
+def import_publication(pointer: Path, root: Path = ROOT, now: datetime | None = None, *, policy: dict | None = None) -> dict:
     now = now or datetime.now(UTC)
     path = root / 'admissions.json'
     prior = json.loads(path.read_text()) if path.exists() else {'plans': [], 'unsupported': []}
@@ -170,11 +173,37 @@ def import_publication(pointer: Path, root: Path = ROOT, now: datetime | None = 
     for plan in old.values():
         if plan['pack_id'] == book['pack_id'] and plan['publication_hash'] != provenance['publication_hash']:
             plan['admission_block'] = 'weekly_source_revision_requires_readmission'
+    if policy and policy['mode'] == 'SHADOW' and policy['entry_timing_comparison'] == 'PAIRED':
+        for plan in old.values():
+            if not plan.get('admission_block') and stamp(plan['valid_through']) > now:
+                plan.setdefault('early_admitted_at', now.isoformat())
     result = {'schema': 'bhiksha.weekly_admissions.v1', 'checked_at': now.isoformat(),
               'source': provenance, 'plans': list(old.values()), 'unsupported': unsupported}
     atomic_json(path, result)
     atomic_json(root / 'source_health.json', {'ok': True, 'checked_at': now.isoformat(), **provenance,
         'blocked_deployments': [p['deployment_id'] for p in old.values() if p.get('admission_block')]})
+    return result
+
+
+
+EARLY_SUFFIX = '-early1m'
+
+
+def arm_for_id(deployment_id: str) -> str:
+    return 'early_1m' if deployment_id.endswith(EARLY_SUFFIX) else 'baseline'
+
+
+def execution_plans(admissions: dict) -> list[dict]:
+    """Keep baseline identities; admission of the extra arm is durable and prospective."""
+    result = []
+    for p in admissions.get('plans', []):
+        base = {**p, 'base_deployment_id': p['deployment_id'], 'entry_arm': 'baseline',
+                'author_trigger': p['trigger']}
+        result.append(base)
+        if p.get('early_admitted_at'):
+            result.append({**base, 'deployment_id': p['deployment_id'] + EARLY_SUFFIX,
+                'entry_arm': 'early_1m', 'admitted_at': p['early_admitted_at'],
+                'trigger': {**p['trigger'], 'timeframe': '1m', 'count': 1}})
     return result
 
 
@@ -188,7 +217,7 @@ def build_rows(defaults: dict, root: Path = ROOT, db_path: str = 'bhiksha.db') -
         return []  # The weekly owner publishes failure; unrelated scanner compilation continues.
     registry = json.loads(path.read_text())
     rows = []
-    for p in registry['plans']:
+    for p in execution_plans(registry):
         policy = c[f"exit_{p['author_profile'].lower()}"]
         params = {**p, 'controls': c, 'state_db': str(Path(db_path).resolve()),
                   'source_health_path': str((root / 'source_health.json').resolve())}
@@ -197,7 +226,7 @@ def build_rows(defaults: dict, root: Path = ROOT, db_path: str = 'bhiksha.db') -
             authorization_mode='shadow', manual_setup_type='manual_trigger', direction=p['direction'],
             trigger_price=p['trigger']['price'], trigger_direction='ABOVE' if p['direction']=='long' else 'BELOW',
             management_exit=policy, compare_exits=[v.strip() for v in str(c['compare_exits']).split(',') if v.strip()],
-            strategy_class='weekly_chart_' + p['setup_type'],
+            strategy_class='weekly_chart_' + p['setup_type'] + '__' + p['entry_arm'],
             execution_overrides={'dte_min': c['dte_min'], 'dte_max': c['dte_max'],
                 'dte_fallback_policy': 'allow_nearest_after', 'dte_fallback_max': c['dte_fallback_max'],
                 'target_abs_delta_min': float(defaults.get('delta_min', 0.15)), 'target_abs_delta_max': float(defaults.get('delta_max', 0.35)),

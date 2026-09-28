@@ -38,8 +38,10 @@ def state(params):
             status TEXT NOT NULL DEFAULT 'waiting', payload TEXT NOT NULL DEFAULT '{}',
             trade_id TEXT, frozen_deployment TEXT)''')
         db.execute('BEGIN IMMEDIATE')
-        db.execute('INSERT OR IGNORE INTO weekly_chart_state(deployment_id,scenario_key) VALUES (?,?)',
-                   (params['deployment_id'], params['scenario_key']))
+        if 'entry_arm' not in {r[1] for r in db.execute('PRAGMA table_info(weekly_chart_state)')}:
+            db.execute("ALTER TABLE weekly_chart_state ADD COLUMN entry_arm TEXT NOT NULL DEFAULT 'baseline'")
+        db.execute('INSERT OR IGNORE INTO weekly_chart_state(deployment_id,scenario_key,entry_arm) VALUES (?,?,?)',
+                   (params['deployment_id'], params['scenario_key'], params.get('entry_arm', 'baseline')))
         identity = (str(Path(params['state_db']).resolve()), params['deployment_id'])
         if identity not in _RECOVERED:
             row = db.execute('SELECT status,payload FROM weekly_chart_state WHERE deployment_id=?', (params['deployment_id'],)).fetchone()
@@ -61,6 +63,8 @@ def state(params):
 def source_block(params, now):
     if params['controls']['mode'] != 'SHADOW':
         return 'weekly_operator_off'
+    if params.get('entry_arm') == 'early_1m' and params['controls'].get('entry_timing_comparison', 'OFF') != 'PAIRED':
+        return 'weekly_early_arm_off'
     if params.get('admission_block'):
         return params['admission_block']
     if now >= stamp(params['valid_through']):
@@ -70,7 +74,7 @@ def source_block(params, now):
         age = (now - stamp(health['checked_at'])).total_seconds()
         if not health['ok'] or not 0 <= age <= 24 * 3600:
             return 'weekly_source_unhealthy_or_stale'
-        if params['deployment_id'] in health.get('blocked_deployments', []):
+        if params.get('base_deployment_id', params['deployment_id']) in health.get('blocked_deployments', []):
             return 'weekly_source_revision_requires_readmission'
     except (OSError, ValueError, KeyError, TypeError):
         return 'weekly_source_health_unavailable'
@@ -191,8 +195,8 @@ def reserve(deployment, now, open_count):
             return 'weekly_not_eligible'
         if (now-stamp(data['last_evaluation'])).total_seconds() > 120:
             return 'weekly_evaluation_stale'
-        occupied = db.execute("SELECT count(*) FROM weekly_chart_state WHERE scenario_key=? AND status IN ('pending','filled','uncertain')", (params['scenario_key'],)).fetchone()[0]
-        pending = db.execute("SELECT count(*) FROM weekly_chart_state WHERE status IN ('pending','uncertain')").fetchone()[0]
+        occupied = db.execute("SELECT count(*) FROM weekly_chart_state WHERE scenario_key=? AND entry_arm=? AND status IN ('pending','filled','uncertain')", (params['scenario_key'], params.get('entry_arm', 'baseline'))).fetchone()[0]
+        pending = db.execute("SELECT count(*) FROM weekly_chart_state WHERE entry_arm=? AND status IN ('pending','uncertain')", (params.get('entry_arm', 'baseline'),)).fetchone()[0]
         if occupied:
             return 'weekly_scenario_already_reserved_or_consumed'
         if pending + open_count >= params['controls']['max_open_positions']:
@@ -225,8 +229,10 @@ def pending_block(deployment, now):
         data = json.loads(row['payload'])
         if row['status'] != 'pending':
             return 'weekly_' + row['status']
-        if data.get('reason') != 'weekly_confirmed' or (now-stamp(data['last_evaluation'])).total_seconds() > 120:
+        if data.get('reason') != 'weekly_confirmed':
             return data.get('reason') or 'weekly_underlying_stale'
+        if (now-stamp(data['last_evaluation'])).total_seconds() > 120:
+            return 'weekly_underlying_stale'
     return None
 
 
@@ -243,7 +249,7 @@ class WeeklyChartStrategy:
             signal=data['reason'] == 'weekly_confirmed' and status == 'waiting',
             direction=SignalDirection.LONG if params['direction']=='long' else SignalDirection.SHORT,
             reason=[data['reason']], features={'close': data['close'], 'confirmation_at': data.get('confirmation_at'),
-                'scenario_key': params['scenario_key'], 'publication_hash': params['publication_hash']})
+                'entry_arm': params.get('entry_arm', 'baseline'), 'scenario_key': params['scenario_key'], 'publication_hash': params['publication_hash']})
 
     def evaluate_exit(self, frame, deployment_id, params, position):
         now = datetime.now(UTC)
@@ -266,6 +272,7 @@ def frozen_deployment(params):
         if row and row[0]:
             result = json.loads(row[0])
             result['strategy']['params']['controls']['mode'] = params['controls']['mode']
+            result['strategy']['params']['controls']['entry_timing_comparison'] = params['controls'].get('entry_timing_comparison', 'OFF')
             result['strategy']['params']['admission_block'] = params.get('admission_block')
             return result
     return None

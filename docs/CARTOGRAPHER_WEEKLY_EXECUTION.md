@@ -21,7 +21,7 @@ and the existing Google Sheet owns operator controls. No writes to producer Sign
 4. On a valid trigger, use existing option selection, bounded pricing, risk gates,
    shadow ask-touch fills, protection and named exits. OI/spread are price-seeking
    preferences using Sheet defaults, within hard quote, premium and risk safeguards. Preserve one filled trade
-   per scenario across sessions/restarts; sibling branches are mutually exclusive.
+   per scenario per entry arm across sessions/restarts; sibling branches within an arm are mutually exclusive.
    Temporary price/quote failures may retry while the setup remains valid.
 5. Primary management is the Sheet mapping from the author's management profile;
    completed-bar tactical invalidation also exits. Structural invalidation is
@@ -37,7 +37,7 @@ Operator_Defaults_v1 section cartographer_weekly: mode OFF/SHADOW (LIVE unsuppor
 until separately armed), max_contracts, max_trade_premium_usd, max_open_positions,
 entry_execution_profile, max_entry_distance_pct, dte_min/dte_max,
 dte_fallback_max, compare_exits, and four explicit management-profile mappings.
-Reuse Exit_Profiles_v1. Default one contract, $400 premium, two concurrent positions,
+Reuse Exit_Profiles_v1. Default one contract, $400 premium, two concurrent positions per arm,
 balanced entry, 1% maximum distance beyond trigger, 7–21 DTE with bounded 28 fallback.
 Range-expansion stays a three-session comparison initially; multi-day primary
 execution requires verified overnight position ownership/protection and is not
@@ -58,7 +58,7 @@ immutable history in the existing ledger, not unlimited Sheet rows.
 - Same publication: idempotent import. Use stable source identities, no user IDs.
 - Revised admitted scenario: block new entries and surface the revision for explicit
   readmission; no revision grants a second fill. Filled scenarios retain frozen policy.
-- Multiple branches: first fill consumes the scenario; no opposite-side sibling
+- Multiple branches: first fill consumes the scenario within that arm; no opposite-side sibling
   may be pending concurrently. No automatic re-entry after a completed fill.
 - Gap beyond entry-distance limit: wait/expire, never chase. Before-entry tactical
   invalidation retires that branch; a pending sibling reservation releases only after cancellation. Expiry stops entries, not position management.
@@ -100,7 +100,39 @@ Cartographer should specify analysis timeframe separately from entry confirmatio
 and tactical invalidation timeframe. A 39-minute thesis may deliberately use a
 one-minute entry, but that must be authored explicitly and supported before use.
 
-A useful next experiment is paired entry timing: author's confirmed entry versus
-an earlier one-minute close, on the same eligible setups. Measure missed moves,
-false starts and executable entry prices with the same downstream risk/exit rules.
-This is a follow-up, not an implicit modification of this cutover's baseline.
+## Paired entry timing — implemented
+
+`Operator_Defaults_v1 → cartographer_weekly → entry_timing_comparison` controls
+OFF/PAIRED. PAIRED admits a second, shadow-only arm alongside the baseline:
+
+| Arm | Entry confirmation |
+| --- | --- |
+| baseline | Exact author rule, timeframe and completed-bar count |
+| early_1m | First completed regular-session one-minute close beyond the same price |
+
+This is a close beyond the level, not an intraminute touch or a requirement to
+observe a crossing from the other side. Each arm must still be beyond the level
+at entry, within the distance limit, and satisfy the normal entry window, quote,
+option selection, premium and bounded retry rules. A daily baseline enters on
+its next eligible session; its early arm can enter sooner.
+
+Admission of the early arm is timestamped once by the existing morning importer.
+No bars starting before that admission count. Restart/import does not move the
+boundary or grant another trade. OFF stops early entries on the next compile;
+admitted rows and frozen open-position management remain. Baseline IDs stay intact.
+Each arm has its own two-position capacity and scenario reservation, preventing
+an early fill from suppressing baseline evidence. No live capacity is increased.
+
+Keep the same author invalidation and primary/alternative exit policies in both
+arms. Select an executable option independently at each entry time and retain its
+contract, quote, fill, underlying price and timestamps in the existing ledger.
+Arm and source identities travel into exit cohorts and Chart Workbench; exit
+scorecards separate strategy classes by arm rather than pooling different entries.
+
+Cartographer_Status shows both arms, including untriggered and blocked rows. Join
+by publication/scenario/branch, not by ticker or matching option contract. Analyze
+both-filled, early-only, baseline-only and neither-filled cases; missing execution
+is not zero P&L. Compare timing/underlying movement separately from option results,
+and explain no-fill reasons before interpreting profitability. Existing quote-gap
+quality rules still govern clean exit comparisons. No automatic winner selection
+or live promotion; natural market evidence begins after this deployment.

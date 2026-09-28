@@ -341,7 +341,7 @@ def _deployments_from_startup(events: list[dict[str, Any]]) -> tuple[list[dict[s
         weekly = {key: params[key] for key in (
             "pack_id", "scenario_id", "scenario_key", "branch_id", "publication_hash",
             "published_at", "admitted_at", "trigger", "tactical_invalidation", "structural_invalidation",
-            "valid_through", "author_profile", "setup_type",
+            "valid_through", "author_profile", "setup_type", "entry_arm", "author_trigger", "base_deployment_id", "early_admitted_at",
         ) if key in params} if strategy == "weekly_chart" else {}
         result.append({
             "weekly_plan": weekly,
