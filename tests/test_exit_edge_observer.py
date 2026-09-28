@@ -55,3 +55,12 @@ async def test_quote_deadline_records_failure_and_allows_next_poll(tmp_path,monk
     await asyncio.wait_for(observer.run_observer(db_path=tmp_path/'db',status_path=tmp_path/'status',
         enable_marker=marker,reader=reader,stop=stop,poll_seconds=1),timeout=4)
     assert errors==['TimeoutError'] and reader.calls==2 and len(polls)==1
+
+
+def test_observer_owner_has_timely_io_and_existing_restart_policy(tmp_path):
+    from bhiksha.ops.launchd_registry import ACTIVE_LAUNCHD_JOBS
+    job=next(j for j in ACTIVE_LAUNCHD_JOBS if j.runner_job=='exit-edge-observer')
+    plist=job.plist_payload(repo_root=tmp_path)
+    assert plist['ProcessType']=='Standard'
+    assert not plist.get('LowPriorityIO',False)
+    assert plist['KeepAlive'] and plist['RunAtLoad']

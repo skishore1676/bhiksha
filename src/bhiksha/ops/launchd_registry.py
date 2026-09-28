@@ -149,8 +149,8 @@ ACTIVE_LAUNCHD_JOBS: tuple[LaunchdJobSpec, ...] = (
         risk_class="market_data_observer",
         run_at_load=True,
         keep_alive=True,
-        process_type="Background",
-        low_priority_io=True,
+        process_type="Standard",
+        low_priority_io=False,
     ),
     LaunchdJobSpec(
         label="com.bhiksha.cartographer-shadow",

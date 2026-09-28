@@ -151,3 +151,7 @@ marked in the evidence and excluded from clean comparisons; no missing prices ar
 invented. Process existence alone is not acceptance: verify advancing status,
 quote timestamps/counts, registration coverage and recorded gaps in the SQLite
 store. A disabled marker still produces heartbeats.
+
+The quote observer uses Standard process priority and normal I/O in the shared
+launchd registry. It must not be background-throttled while collecting a
+65-second-gap-bounded tape. Other jobs retain their own priority settings.
