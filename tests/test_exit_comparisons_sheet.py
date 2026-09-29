@@ -230,3 +230,12 @@ def test_failed_publication_preserves_last_success(tmp_path, monkeypatch):
     result = sheet.publish_exit_comparisons_best_effort(db_path=tmp_path / "edge.db", receipt_dir=receipts)
     assert result["status"] == "failed" and result["last_success_at"] == prior["published_at"]
     assert json.loads((receipts / "last_success.json").read_text()) == prior
+
+
+def test_weekly_owner_is_reported_as_cartographer_not_active_strategy():
+    from bhiksha.ops.exit_comparisons_sheet import _entry_policy, _strategy_entry_policy
+    plan={'weekly':{'source_owner':'cartographer_weekly','entry_profile':'balanced',
+                    'dte_min':7,'dte_max':21,'dte_fallback_max':28}}
+    assert '1 rows' in _entry_policy(plan)
+    assert '7–21 DTE' in _entry_policy(plan)
+    assert _strategy_entry_policy(plan)=='No strategy rows in current plan'

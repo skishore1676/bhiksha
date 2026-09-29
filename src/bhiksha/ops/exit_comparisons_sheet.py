@@ -202,7 +202,7 @@ def _signals(
 
 
 def _entry_policy(plan: dict[str, dict[str, Any]]) -> str:
-    cartographer = [row for row in plan.values() if row.get("source_owner") == "market_cartographer"]
+    cartographer = [row for row in plan.values() if row.get("source_owner") in {"market_cartographer", "cartographer_weekly"}]
     if not cartographer:
         return "No Cartographer rows in current plan"
     settings = {(row.get("entry_profile"), row.get("dte_min"), row.get("dte_max"),
@@ -212,13 +212,13 @@ def _entry_policy(plan: dict[str, dict[str, Any]]) -> str:
     profile, low, high, fallback = settings.pop()
     return (f"Cartographer · {len(cartographer)} rows · {profile} patience · preferred {low}–{high} DTE · "
             f"fallback ceiling {fallback if fallback is not None else 'none'} DTE · "
-            "control: Operator_Defaults_v1/profile__trend_continuation")
+            "control: Operator_Defaults_v1 (Cartographer settings)")
 
 
 def _strategy_entry_policy(plan: dict[str, dict[str, Any]]) -> str:
     profiles = Counter(
         row.get("entry_profile") or "legacy (implicit)"
-        for row in plan.values() if row.get("source_owner") != "market_cartographer"
+        for row in plan.values() if row.get("source_owner") not in {"market_cartographer", "cartographer_weekly"}
     )
     if not profiles:
         return "No strategy rows in current plan"
