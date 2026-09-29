@@ -40,7 +40,8 @@ class ObserverProgressWatchdog:
     """Exit only this quote-only process on stalled progress; launchd owns restart."""
 
     def __init__(self, status_path, *, deadline=PROGRESS_DEADLINE_SECONDS,
-                 monotonic=clock.monotonic, terminate=os._exit):
+                 monotonic=clock.monotonic, terminate=os._exit, writer_health=None):
+        self.writer_health = writer_health
         self.status_path = Path(status_path)
         self.deadline = deadline
         self.monotonic = monotonic
@@ -54,8 +55,12 @@ class ObserverProgressWatchdog:
 
     def check(self):
         at, stage = self.progress
-        if self.monotonic() - at <= self.deadline:
+        writer = self.writer_health() if self.writer_health else {}
+        writer_stalled = writer.get('oldest_pending_write_seconds', 0) > self.deadline
+        if self.monotonic() - at <= self.deadline and not writer_stalled:
             return False
+        if writer_stalled:
+            stage = 'persist_queued_facts'
         failure = {'status': 'stalled', 'stage': stage,
                    'detected_at': datetime.now(UTC).isoformat(),
                    'reason': 'observer_progress_deadline_exceeded'}
@@ -157,11 +162,13 @@ def recover_registration_intents(
         return after_id
     repository = ProspectiveQuoteTapeRepository(edge_db_path, write_timeout_seconds=0.25)
     with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=0.25) as conn:
+        # Freeze a ceiling before scanning, so concurrent inserts remain for the next poll.
+        ceiling = int(conn.execute("SELECT COALESCE(MAX(id),?) FROM events", (after_id,)).fetchone()[0])
         for _ in range(5):  # bounded catch-up; quote polling resumes after this pass
             rows = conn.execute(
-                "SELECT id,event_type,payload FROM events WHERE id>? AND event_type IN "
+                "SELECT id,event_type,payload FROM events WHERE id>? AND id<=? AND event_type IN "
                 "('exit_edge_registration_intent','signal_outcome','shadow_entry_modeled') "
-                "ORDER BY id LIMIT 1000", (after_id,),
+                "ORDER BY id LIMIT 1000", (after_id, ceiling),
             ).fetchall()
             for event_id, event_type, raw in rows:
                 item: dict[str, Any] = {}
@@ -190,7 +197,7 @@ def recover_registration_intents(
                 after_id = int(event_id)
             if len(rows) < 1000:
                 # Do not rescan the same irrelevant event tail every 15 seconds.
-                return int(conn.execute("SELECT COALESCE(MAX(id),?) FROM events", (after_id,)).fetchone()[0])
+                return ceiling
     return after_id
 
 
@@ -209,7 +216,7 @@ async def run_observer(
     reader = reader or PublicOptionQuoteReader()
     stop = stop or asyncio.Event()
     recorder = ExitEdgeLiveRecorder(db_path=db_path, status_path=status_path, role="observer")
-    watchdog = ObserverProgressWatchdog(status_path)
+    watchdog = ObserverProgressWatchdog(status_path, writer_health=recorder.snapshot)
     watchdog.thread.start()
     recorder.start()
     last_intent_id = 0
@@ -246,12 +253,12 @@ async def run_observer(
                             quote_request_ms=(clock.monotonic() - started) * 1000,
                         )
                     else:
-                        recorder.heartbeat()
+                        recorder.heartbeat(mode="idle_market_closed" if not _regular_session(now) else "idle_no_cohorts")
                 except Exception as exc:
                     recorder.record_observation_error(type(exc).__name__)
                 watchdog.advance('poll_complete')
             elif recorder.snapshot().get('ready'):
-                recorder.heartbeat()  # Disabled is observable, not a silent stale owner.
+                recorder.heartbeat(mode="disabled")  # Disabled is observable, not a silent stale owner.
                 watchdog.advance('disabled')
             try:
                 await asyncio.wait_for(stop.wait(), timeout=max(float(poll_seconds), 1.0))

@@ -155,3 +155,18 @@ store. A disabled marker still produces heartbeats.
 The quote observer uses Standard process priority and normal I/O in the shared
 launchd registry. It must not be background-throttled while collecting a
 65-second-gap-bounded tape. Other jobs retain their own priority settings.
+
+### Reliability repair (2026-09-29)
+
+Bhiksha checkpoints each condition's contiguous verified bar coverage and
+consecutive-close count in the existing scenario state. Evicting old rolling
+bars or restarting does not erase that proof. Missing sessions and missing
+minutes remain explicit. A gap requests at most one day of history from the
+same provider as live bars, once per symbol per five minutes, with a five-second
+request deadline. Recovery never fabricates candles, resets admission, changes
+confirmation time, or renews an expired retry window. If invalidation history
+cannot be recovered, entry remains blocked. A repaired invalidation wins over
+a later trigger. Existing terminal scenarios are not readmitted.
+
+Positive signals coalesced behind a pending execution now record a terminal
+`existing_position_block`, linked to the original signal and execution key.

@@ -236,14 +236,23 @@ def _exit_edge_observer_status(
         status = "observer_not_ready"
     elif not fresh:
         status = "observer_heartbeat_stale"
+    elif health.get("oldest_pending_write_seconds", 0) > 180:
+        status = "observer_writer_stalled"
+    elif (health.get("collection_state") == "observing" and health.get("observation_polls", 0) >= 6
+          and (not _parse_timestamp(health.get("last_quote_persisted_at"))
+               or (now - _parse_timestamp(health.get("last_quote_persisted_at"))).total_seconds() > 90)):
+        status = "observer_quote_evidence_stale"
     else:
-        status = "healthy"
-    return {"status": status, "ok": status in {"healthy", "idle_disabled"},
+        status = health.get("collection_state") if health.get("collection_state") in {"idle_market_closed", "idle_no_cohorts"} else "healthy"
+    return {"status": status, "ok": status in {"healthy", "idle_disabled", "idle_market_closed", "idle_no_cohorts"},
             "updated_at": updated_at.isoformat() if updated_at else None,
             "enabled": enabled, "loaded": loaded,
             "active_cohorts": health.get("active_cohorts"),
             "observation_polls": health.get("observation_polls"),
-            "observation_errors": health.get("observation_errors")}
+            "observation_errors": health.get("observation_errors"),
+            **{key: health.get(key) for key in ("collection_state", "last_successful_poll_at",
+                "last_quote_persisted_at", "last_provider_quote_at", "last_quote_received_at",
+                "quotes_persisted", "pending_writes", "oldest_pending_write_seconds", "storage_failures")}}
 
 
 def _cartographer_installed_pending_first_run(

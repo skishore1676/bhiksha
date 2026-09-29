@@ -23,6 +23,7 @@ class SymbolExecutionDispatcher:
         self._queues: dict[str, asyncio.Queue[ExecutionTask | None]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._pending_keys: dict[str, set[str]] = {}
+        self._pending_identities: dict[tuple[str, str], str] = {}
 
     def start(self, symbols: list[str]) -> None:
         for symbol in symbols:
@@ -48,14 +49,20 @@ class SymbolExecutionDispatcher:
         *,
         key: str,
         runner: Callable[[], Awaitable[None]],
+        identity: str | None = None,
     ) -> bool:
         queue = self._queues[symbol]
         pending_keys = self._pending_keys[symbol]
         if key in pending_keys:
             return False
         pending_keys.add(key)
+        if identity is not None:
+            self._pending_identities[(symbol, key)] = identity
         queue.put_nowait(ExecutionTask(symbol=symbol, key=key, runner=runner))
         return True
+
+    def pending_identity(self, symbol: str, key: str) -> str | None:
+        return self._pending_identities.get((symbol, key))
 
     def queue_depth(self, symbol: str) -> int:
         queue = self._queues.get(symbol)
@@ -75,3 +82,4 @@ class SymbolExecutionDispatcher:
                 logger.exception("Execution task failed for {} key={}: {}", symbol, task.key, exc)
             finally:
                 self._pending_keys[symbol].discard(task.key)
+                self._pending_identities.pop((symbol, task.key), None)

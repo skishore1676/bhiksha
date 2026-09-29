@@ -250,3 +250,72 @@ def test_status_keeps_untriggered_arm_visible(tmp_path,params):
     assert len(rows)==2 and all(len(r)==len(HEADERS) for r in rows)
     assert [r[17] for r in rows]==['baseline','early_1m']
     assert all(r[12]=='' for r in rows) # no invented trades or P&L
+
+
+def test_verified_prefix_survives_eviction_and_restart(params):
+    now=datetime(2026,9,28,14,9,tzinfo=UTC)
+    observe(frame(),params,now)
+    _RECOVERED.clear()
+    # Earlier verified history has left the rolling buffer.
+    later=frame(minutes=78).slice(39)
+    data,_=observe(later,params,now+timedelta(minutes=39))
+    assert data['missing_history_from'] is None
+    assert data['verified_coverage']['invalidation']['through']=='2026-09-28T14:48:00+00:00'
+
+
+def test_hole_repair_preserves_original_confirmation_time(params):
+    now=datetime(2026,9,28,14,48,tzinfo=UTC)
+    missing=frame(minutes=78).slice(1)
+    data,_=observe(missing,params,now)
+    assert data['reason']=='weekly_confirmation_data_gap'
+    assert data['missing_history_from']=='2026-09-28T13:30:00+00:00'
+    data,_=observe(frame(minutes=78),params,now)
+    assert data['missing_history_from'] is None
+    # Repair is not a new opportunity with a fresh retry window.
+    assert data['confirmation_at']=='2026-09-28T14:09:00+00:00'
+    assert data['reason']=='weekly_retry_window_expired'
+
+
+def test_missing_entire_session_is_not_silently_valid(params):
+    now=datetime(2026,9,29,14,9,tzinfo=UTC)
+    data,_=observe(frame('2026-09-29'),params,now)
+    assert data['missing_history_from']=='2026-09-28T13:30:00+00:00'
+    assert 'confirmation_at' not in data
+
+
+def test_repair_reveals_invalidation_before_later_trigger(params):
+    now=datetime(2026,9,28,14,48,tzinfo=UTC)
+    observe(frame(minutes=78).slice(39),params,now)
+    repaired=pl.concat([frame(price=580.0),frame(minutes=78).slice(39)])
+    data,status=observe(repaired,params,now)
+    assert status=='invalidated' and data['reason']=='weekly_invalidated'
+
+
+@pytest.mark.asyncio
+async def test_runtime_repairs_same_source_and_throttles_unresolved_hole(params,monkeypatch):
+    from bhiksha.app import runtime as module
+    from unittest.mock import AsyncMock
+    from bhiksha.domain.models import Bar
+    fixed=datetime(2026,9,28,14,9,1,tzinfo=UTC)
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None): return fixed
+    monkeypatch.setattr(module,'datetime',Clock)
+    original=frame()
+    bars=[Bar(symbol='SPY',timestamp=r['timestamp'],open=r['close'],high=r['close'],
+              low=r['close'],close=r['close'],volume=100) for r in original.iter_rows(named=True)]
+    source=SimpleNamespace(warm_start=AsyncMock(return_value=bars),close=AsyncMock())
+    runtime=SimpleNamespace(_weekly_repair_at={},_live_bar_source=lambda:source,
+        provider_config=SimpleNamespace(underlying_live_primary='schwab'))
+    events=SimpleNamespace(append=AsyncMock())
+    repaired=await module.BhikshaRuntime._repair_weekly_frame(runtime,'SPY',original.slice(1),[deployment(params)],events)
+    data,_=observe(repaired,params,fixed)
+    assert data['reason']=='weekly_confirmed'
+    assert source.warm_start.await_args.args[1]==datetime(2026,9,28,13,30,tzinfo=UTC)
+    assert source.close.await_count==1
+    assert events.append.await_args.args[1]['provider']=='schwab'
+    # A later hole remains explicitly blocked; do not hammer the provider every bar.
+    params['deployment_id']='new-lane'
+    await module.BhikshaRuntime._repair_weekly_frame(runtime,'SPY',original.slice(1),[deployment(params)],events)
+    assert source.warm_start.await_count==1
+    assert observe(original.slice(1),params,fixed)[0]['reason']=='weekly_confirmation_data_gap'

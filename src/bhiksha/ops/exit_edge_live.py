@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread, get_ident
 import time
@@ -101,6 +102,8 @@ class ExitEdgeLiveRecorder:
         )
         self._stop_after_drain = Event()
         self._lock = Lock()
+        self._status_lock = Lock()
+        self._pending_writes: dict[int, float] = {}
         self._active_by_option: dict[str, set[str]] = {}
         self._pending_censors: dict[str, str] = {}
         self._pending_registration_attempts: dict[str, dict[str, Any]] = {}
@@ -214,7 +217,8 @@ class ExitEdgeLiveRecorder:
             )
             if payload is None:
                 self._increment_health("ineligible_fill_attempts")
-            self._queue.put_nowait(_Register(attempt, payload))
+            queued_item = _Register(attempt, payload)
+            self._enqueue(queued_item)
             if payload is not None and self.role != "registration":
                 # Make queue-overflow censoring race-free: the identity is known
                 # before the persistence worker activates the cohort.
@@ -258,7 +262,7 @@ class ExitEdgeLiveRecorder:
                 ask=_maybe_float(getattr(quote, "ask", None)),
                 last=_maybe_float(getattr(quote, "last", None)),
             )
-            self._queue.put_nowait(observed)
+            self._enqueue(observed)
             self._set_health(queued=self._queue.qsize())
         except Full:
             self._record_drop(option_symbol, "quote_queue_full")
@@ -305,9 +309,21 @@ class ExitEdgeLiveRecorder:
         self._set_health(worker_alive=self._thread.is_alive())
         self._write_status_best_effort()
 
+    def _enqueue(self, item) -> None:
+        # Track in-flight work as well as queued work; get() alone is not progress.
+        with self._lock:
+            self._pending_writes[id(item)] = time.monotonic()
+            try:
+                self._queue.put_nowait(item)
+            except Full:
+                self._pending_writes.pop(id(item), None)
+                raise
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             snapshot = dict(self._health)
+            snapshot["pending_writes"] = len(self._pending_writes)
+            snapshot["oldest_pending_write_seconds"] = max(0.0, time.monotonic() - min(self._pending_writes.values())) if self._pending_writes else 0.0
             snapshot["observed_quote_timestamp_fields"] = dict(
                 self._health["observed_quote_timestamp_fields"]
             )
@@ -335,14 +351,17 @@ class ExitEdgeLiveRecorder:
                 for cohort_id in cohort_ids:
                     self._censor(repository, cohort_id, "option_expired_before_candidate_completed")
 
-    def heartbeat(self) -> None:
-        self._set_health()
+    def heartbeat(self, *, mode="observing") -> None:
+        self._set_health(collection_state=mode, heartbeat_at=datetime.now(UTC).isoformat())
         self._write_status_best_effort()
 
     def record_observation_poll(
         self, requested: int, received: int, *, quote_request_ms: float | None = None,
     ) -> None:
         with self._lock:
+            self._health["collection_state"] = "observing"
+            self._health["last_successful_poll_at"] = datetime.now(UTC).isoformat()
+            self._health["heartbeat_at"] = datetime.now(UTC).isoformat()
             self._health["observation_polls"] += 1
             self._health["observation_quote_requests"] += int(requested)
             self._health["observation_quote_results"] += int(received)
@@ -414,6 +433,9 @@ class ExitEdgeLiveRecorder:
                     else:
                         self._persist_quote(repository, item)
                 finally:
+                    with self._lock:
+                        self._pending_writes.pop(id(item), None)
+                        self._health["last_writer_completed_at"] = datetime.now(UTC).isoformat()
                     self._queue.task_done()
                     self._set_health(queued=self._queue.qsize())
                 self._flush_pending_registration_attempts(repository)
@@ -560,6 +582,10 @@ class ExitEdgeLiveRecorder:
                 if not repository.try_append_quote(cohort_id, mark):
                     self._increment_health("storage_failures", error=f"append_failed:{cohort_id}")
                     continue
+                self._increment_health("quotes_persisted")
+                self._set_health(last_quote_persisted_at=datetime.now(UTC).isoformat(),
+                                 last_provider_quote_at=observed.quote_at.isoformat(),
+                                 last_quote_received_at=observed.received_at.isoformat())
                 case = repository.load_case(cohort_id)
                 row = analyze_cases([case])["cases"][0]
                 states = tuple(
@@ -772,6 +798,10 @@ class ExitEdgeLiveRecorder:
             self._health["updated_at"] = datetime.now(UTC).isoformat()
 
     def _write_status_best_effort(self) -> None:
+        with self._status_lock:
+            self._write_status_locked()
+
+    def _write_status_locked(self) -> None:
         try:
             self.status_path.parent.mkdir(parents=True, exist_ok=True)
             payload = self.snapshot()
@@ -784,6 +814,7 @@ class ExitEdgeLiveRecorder:
             temporary.replace(self.status_path)
         except OSError as exc:
             self._increment_health("storage_failures", error=f"status_write:{exc}")
+            print(f"exit_observer_status_write_failed:{type(exc).__name__}", file=sys.stderr, flush=True)
 
     def _registration_payloads(
         self,

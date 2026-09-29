@@ -393,6 +393,7 @@ def build_exit_comparisons_scorecard(
     exits = _exit_review(cases, day)
     return {"schema": "bhiksha.exit_comparisons_sheet.v2", "trading_date": day.isoformat(),
             "generated_at": datetime.now(UTC).isoformat(), "signals": signals, "exits": exits,
+            "observer": _read_json(Path(db_path).with_name("exit_edge_live_status.json")),
             "entry_policy": _entry_policy(plan),
             "strategy_entry_policy": _strategy_entry_policy(plan),
             "registration": _registration_review(db_path, fills["ids"], cases),
@@ -425,6 +426,7 @@ def publish_exit_comparisons_scorecard(
     registration = scorecard.get("registration") or {}
     fills = scorecard.get("fills") or {}
     cumulative = scorecard.get("cumulative") or {}
+    observer = scorecard.get("observer") or {}
     values: list[list[Any]] = [
         [f"Bhiksha session review · {scorecard['trading_date']}"],
         ["Recorded signals", signals["recorded"], "Captured", signals["captured"], "Missed", signals["missed"], "Pending / unknown", signals["pending"]],
@@ -443,6 +445,9 @@ def publish_exit_comparisons_scorecard(
         ["One-session leaders are provisional. Recorded signals only; downtime opportunities unknown. Shadow captures are modeled."],
         [scorecard.get("entry_policy") or "Entry patience and DTE: active-plan readback unavailable"],
         [scorecard.get("strategy_entry_policy") or "Strategy entry patience: active-plan readback unavailable"],
+        [f"Collector snapshot: {observer.get('collection_state', 'unknown')} | heartbeat CT {_ct(observer.get('updated_at'))} | "
+         f"last poll CT {_ct(observer.get('last_successful_poll_at'))} | last saved quote CT {_ct(observer.get('last_quote_persisted_at'))} | "
+         f"pending writes {observer.get('pending_writes', 'unknown')} | storage failures {observer.get('storage_failures', 'unknown')}"],
         [], ["SIGNAL CAPTURE"], SIGNAL_HEADERS, *signals["rows"], [],
         ["EXIT CHOICES · same-trade clean pairs"], EXIT_HEADERS, *exits["rows"], [],
         [f"EXPERIMENT TO DATE · {cumulative.get('start', '')} to {cumulative.get('end', '')} · same-trade matched pairs by frozen policy"],

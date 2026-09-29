@@ -86,3 +86,36 @@ def test_symbol_execution_dispatcher_recovers_after_task_failure() -> None:
         await dispatcher.stop()
 
     asyncio.run(run())
+
+
+def test_duplicate_entry_retains_original_signal_identity():
+    async def run():
+        dispatcher=SymbolExecutionDispatcher();dispatcher.start(['SPY'])
+        release=asyncio.Event()
+        assert dispatcher.submit('SPY',key='entry:lane',runner=release.wait,identity='first')
+        assert not dispatcher.submit('SPY',key='entry:lane',runner=release.wait,identity='second')
+        assert dispatcher.pending_identity('SPY','entry:lane')=='first'
+        release.set();await dispatcher.stop()
+        assert dispatcher.pending_identity('SPY','entry:lane') is None
+    asyncio.run(run())
+
+
+def test_coalesced_signal_has_terminal_outcome_and_original_link():
+    from types import SimpleNamespace
+    from datetime import UTC,datetime
+    from unittest.mock import AsyncMock
+    from bhiksha.app.runtime import record_coalesced_signal
+    from bhiksha.domain.enums import SignalDirection
+    async def run():
+        dispatcher=SymbolExecutionDispatcher();dispatcher.start(['SPY'])
+        release=asyncio.Event()
+        dispatcher.submit('SPY',key='entry:lane',runner=release.wait,identity='first')
+        events=SimpleNamespace(append=AsyncMock())
+        deployment=SimpleNamespace(deployment_id='lane',symbol='SPY',execution=SimpleNamespace(shadow_only=True))
+        decision=SimpleNamespace(timestamp=datetime.now(UTC),direction=SignalDirection.LONG)
+        await record_coalesced_signal(events,dispatcher,deployment,decision)
+        event,payload=events.append.await_args.args
+        assert event=='signal_outcome' and payload['outcome']=='existing_position_block'
+        assert payload['pending_signal_id']=='first' and payload['signal_id']!='first'
+        release.set();await dispatcher.stop()
+    asyncio.run(run())

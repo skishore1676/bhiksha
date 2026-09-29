@@ -833,3 +833,23 @@ def test_bounded_tee_stays_fast_with_many_same_contract_cohorts(tmp_path: Path) 
     _wait_until(lambda: recorder.snapshot()["paired_cohorts"] == 16, timeout=5.0)
     assert recorder.snapshot()["dropped_observations"] == 0
     recorder.close()
+
+
+def test_pending_writer_age_includes_inflight_item(tmp_path):
+    recorder=ExitEdgeLiveRecorder(db_path=tmp_path/'db',status_path=tmp_path/'status',role='observer')
+    item=SimpleNamespace()
+    recorder._enqueue(item)
+    taken=recorder._queue.get_nowait()
+    assert taken is item and recorder._queue.empty()
+    assert recorder.snapshot()['pending_writes']==1
+    assert recorder.snapshot()['oldest_pending_write_seconds']>=0
+    recorder.heartbeat(mode='idle_market_closed')
+    assert json.loads((tmp_path/'status').read_text())['collection_state']=='idle_market_closed'
+
+
+def test_status_write_failure_has_stderr_evidence(tmp_path,capsys):
+    blocked=tmp_path/'not-directory';blocked.write_text('x')
+    recorder=ExitEdgeLiveRecorder(db_path=tmp_path/'db',status_path=blocked/'status',role='observer')
+    recorder.heartbeat(mode='idle_market_closed')
+    assert recorder.snapshot()['storage_failures']==1
+    assert 'exit_observer_status_write_failed' in capsys.readouterr().err

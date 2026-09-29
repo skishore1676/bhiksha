@@ -27,7 +27,7 @@ from bhiksha.domain.runtime import ProviderHealth, StartupReport
 from bhiksha.execution.order_manager import OrderManager
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.position_monitor import PositionMonitor
-from bhiksha.execution.supervisor import ExecutionSupervisor
+from bhiksha.execution.supervisor import ExecutionSupervisor, _signal_outcome_payload
 from bhiksha.integrations.manual_sheet_status import ManualSheetStatusWriter
 from bhiksha.integrations.schwab.settings import SchwabSettings
 from bhiksha.market_data.bar_store import RollingBarStore
@@ -101,6 +101,14 @@ async def record_signal_evaluation(event_repository, decision: SignalDecision) -
     await event_repository.append("signal_evaluation", _signal_decision_payload(decision))
 
 
+async def record_coalesced_signal(event_repository, dispatcher, deployment, decision):
+    payload = _signal_outcome_payload(deployment, decision,
+        outcome="existing_position_block", rejection_reasons=["entry_dispatch_already_pending"])
+    payload['pending_execution_key'] = f"entry:{deployment.deployment_id}"
+    payload['pending_signal_id'] = dispatcher.pending_identity(deployment.symbol, payload['pending_execution_key'])
+    await event_repository.append("signal_outcome", payload)
+
+
 def _signal_decision_payload(decision: SignalDecision) -> dict:
     return {
         "deployment_id": decision.deployment_id,
@@ -149,6 +157,7 @@ class BhikshaRuntime:
     _live_entry_failure_counts: dict[str, int] = field(default_factory=dict, init=False)
     _live_entry_success_ids: set[str] = field(default_factory=set, init=False)
     _dead_lane_alerted_ids: set[str] = field(default_factory=set, init=False)
+    _weekly_repair_at: dict[str, float] = field(default_factory=dict, init=False)
     # RISK MANAGER: constructed once per run_session (needs the same sqlite
     # backend as the rest of the runtime), None until then. See
     # bhiksha.risk.risk_manager.RiskManager.
@@ -240,6 +249,44 @@ class BhikshaRuntime:
             source = PolygonBarSource()
             return await source.warm_start(symbol, start, end)
         raise ValueError(f"Unsupported warm-start provider: {provider}")
+
+    async def _repair_weekly_frame(self, symbol, frame, deployments, event_repository):
+        from bhiksha.strategy.weekly_chart import observe, recovery_start
+        weekly = [d for d in deployments if d.strategy.key == 'weekly_chart']
+        if not weekly:
+            return frame
+        now = datetime.now(UTC)
+        for deployment in weekly:
+            observe(frame, deployment.strategy.params, now)
+        starts = [start for d in weekly if (start := recovery_start(d.strategy.params))]
+        if not starts or time.monotonic() - self._weekly_repair_at.get(symbol, -300) < 300:
+            return frame
+        self._weekly_repair_at[symbol] = time.monotonic()
+        start = min(starts)
+        # Same provider as live bars; bounded historical read, no synthetic minutes.
+        end = min(now, start + timedelta(days=1))
+        source = self._live_bar_source()
+        try:
+            async with asyncio.timeout(5):
+                bars = await source.warm_start(symbol, start, end)
+            repaired = _frame_from_bars(symbol, bars) if bars else frame.head(0)
+            repaired = repaired.filter((pl.col('timestamp') >= start) &
+                                       (pl.col('timestamp') < now - timedelta(minutes=1)))
+            merged = pl.concat([repaired, frame], how='diagonal_relaxed').unique(
+                subset=['timestamp'], keep='last').sort('timestamp')
+            await event_repository.append('weekly_history_repair', {
+                'symbol': symbol, 'from': start.isoformat(), 'through': end.isoformat(),
+                'provider': self.provider_config.underlying_live_primary,
+                'returned_bars': len(repaired), 'status': 'read_completed'})
+            return merged
+        except Exception as exc:
+            await event_repository.append('weekly_history_repair', {
+                'symbol': symbol, 'from': start.isoformat(), 'status': 'unresolved',
+                'reason': type(exc).__name__})
+            return frame
+        finally:
+            if hasattr(source, 'close'):
+                await source.close()
 
     async def run_session(
         self,
@@ -1185,11 +1232,13 @@ class BhikshaRuntime:
                     output(f"{evaluation.deployment.deployment_id}: exit_enqueued option={evaluation.position.option_symbol}")
                 exited_deployments.add(evaluation.deployment.deployment_id)
 
+        weekly_frame = await self._repair_weekly_frame(
+            bar.symbol, frame, deployments_by_symbol[bar.symbol], supervisor.event_repository)
         for deployment in deployments_by_symbol[bar.symbol]:
             if deployment.strategy.key == "weekly_chart":
                 # Pending entries still need completed-bar invalidation and fresh-price checks.
                 from bhiksha.strategy.weekly_chart import observe
-                observe(frame, deployment.strategy.params, datetime.now(UTC))
+                observe(weekly_frame, deployment.strategy.params, datetime.now(UTC))
             if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
                 # Completed bars can invalidate a waiting intent; only fresh
                 # intrabar observations may authorize its next attempt.
@@ -1203,7 +1252,9 @@ class BhikshaRuntime:
                 output(f"{deployment.deployment_id}: entry_skipped_after_exit")
                 continue
             enriched = enriched_frames.get(deployment.deployment_id)
-            if enriched is not None:
+            if deployment.strategy.key == "weekly_chart":
+                decision = evaluator.evaluate_entry(deployment, weekly_frame)
+            elif enriched is not None:
                 decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
             else:
                 decision = evaluator.evaluate_entry(deployment, frame)
@@ -1225,6 +1276,7 @@ class BhikshaRuntime:
                 enqueued = execution_dispatcher.submit(
                     bar.symbol,
                     key=f"entry:{deployment.deployment_id}",
+                    identity=_signal_outcome_payload(deployment, decision, outcome="pending_execution")["signal_id"],
                     runner=self._instrument_execution_runner(
                         supervisor,
                         bar.symbol,
@@ -1244,6 +1296,9 @@ class BhikshaRuntime:
                 )
                 if enqueued:
                     output(f"{deployment.deployment_id}: entry_enqueued")
+                else:
+                    await record_coalesced_signal(supervisor.event_repository, execution_dispatcher,
+                                                  deployment, decision)
         await supervisor.event_repository.append(
             "runtime_metric",
             {
@@ -1545,6 +1600,7 @@ class BhikshaRuntime:
             enqueued = execution_dispatcher.submit(
                 symbol,
                 key=f"entry:{deployment.deployment_id}",
+                identity=_signal_outcome_payload(deployment, decision, outcome="pending_execution")["signal_id"],
                 runner=self._instrument_execution_runner(
                     supervisor,
                     symbol,
@@ -1564,6 +1620,9 @@ class BhikshaRuntime:
             )
             if enqueued:
                 output(f"{deployment.deployment_id}: intrabar_entry_enqueued")
+            else:
+                await record_coalesced_signal(supervisor.event_repository, execution_dispatcher,
+                                              deployment, decision)
 
     async def _refresh_reconciliation(
         self,

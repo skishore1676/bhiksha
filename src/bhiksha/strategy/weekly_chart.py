@@ -81,7 +81,7 @@ def source_block(params, now):
     return None
 
 
-def completed(frame, condition, now):
+def completed(frame, condition, now, boundary=None):
     """Input timestamps are minute opens. Require every minute, including early closes."""
     minutes = {}
     for row in frame.select('timestamp', 'close').iter_rows(named=True):
@@ -90,7 +90,13 @@ def completed(frame, condition, now):
         if t.second == 0 and t.microsecond == 0 and math.isfinite(price) and price > 0:
             minutes[t] = price
     bars = []
-    for day in sorted({t.astimezone(ET).date().isoformat() for t in minutes}):
+    first = boundary or min(minutes, default=now)
+    day = first.astimezone(ET).date()
+    days = []
+    while day <= now.astimezone(ET).date():
+        days.append(day.isoformat())
+        day += timedelta(days=1)
+    for day in days:
         bounds = session(day)
         if not bounds:
             continue
@@ -116,25 +122,61 @@ def matches(price, condition):
 
 
 def confirmations(frame, condition, now, boundary):
-    bars = completed(frame, condition, now)
+    bars = completed(frame, condition, now, boundary)
     count = condition['count']
     return [bars[i][1] for i in range(count-1, len(bars))
             if all(b[0] >= boundary and matches(b[2], condition) for b in bars[i-count+1:i+1])]
 
 
+def advance_coverage(frame, condition, now, boundary, checkpoint):
+    """Checkpoint only a contiguous, proved prefix; keep consecutive-close state."""
+    if checkpoint.get('condition') != condition:
+        checkpoint.clear()
+        checkpoint['condition'] = dict(condition)
+    start_at = stamp(checkpoint['through']) if checkpoint.get('through') else boundary
+    run = int(checkpoint.get('matching_count', 0))
+    confirmed = []
+    gap = None
+    for start, end, price in completed(frame, condition, now, start_at):
+        if start < start_at:
+            continue
+        if price is None:
+            gap = start.isoformat()
+            break
+        run = run + 1 if matches(price, condition) else 0
+        checkpoint.update(through=end.isoformat(), matching_count=min(run, condition['count']))
+        if run >= condition['count']:
+            confirmed.append(end)
+    return confirmed, gap
+
+
+def recovery_start(params):
+    """Earliest unresolved bar, retained in existing scenario state."""
+    with state(params) as db:
+        row = db.execute('SELECT status,payload FROM weekly_chart_state WHERE deployment_id=?',
+                         (params['deployment_id'],)).fetchone()
+        if row['status'] not in {'waiting', 'pending'}:
+            return None
+        data = json.loads(row['payload'])
+        return stamp(data['missing_history_from']) if data.get('missing_history_from') else None
+
+
 def observe(frame, params, now):
     """Observe even while pending; invalidation takes precedence over a same-bar trigger."""
     boundary = max(stamp(params['published_at']), stamp(params['admitted_at']))
-    invalid = confirmations(frame, params['tactical_invalidation'], now, boundary)
-    triggers = confirmations(frame, params['trigger'], now, boundary)
-    missing_confirmation_bars = any(start >= boundary and price is None for condition in [params['trigger'], params['tactical_invalidation']] for start, end, price in completed(frame, condition, now))
-    latest = frame.tail(1).to_dicts()[0]
+    latest = frame.sort('timestamp').tail(1).to_dicts()[0]
     close = float(latest['close'])
     observed = latest['timestamp'].astimezone(UTC) + timedelta(minutes=1)
     with state(params) as db:
         row = db.execute('SELECT * FROM weekly_chart_state WHERE deployment_id=?', (params['deployment_id'],)).fetchone()
         data = json.loads(row['payload'])
         status = row['status']
+        coverage = data.setdefault('verified_coverage', {})
+        invalid, invalid_gap = advance_coverage(frame, params['tactical_invalidation'], now, boundary, coverage.setdefault('invalidation', {}))
+        triggers, trigger_gap = advance_coverage(frame, params['trigger'], now, boundary, coverage.setdefault('trigger', {}))
+        gaps = [g for g in (invalid_gap, trigger_gap) if g]
+        missing_confirmation_bars = bool(gaps)
+        data['missing_history_from'] = min(gaps) if gaps else None
         if invalid and status != 'filled':
             if status != 'pending':
                 status = 'invalidated'
