@@ -170,3 +170,18 @@ a later trigger. Existing terminal scenarios are not readmitted.
 
 Positive signals coalesced behind a pending execution now record a terminal
 `existing_position_block`, linked to the original signal and execution key.
+
+### Owner-status acceptance (2026-09-30)
+
+The registered morning runner invokes weekly intake; its Control Tower status
+reads the same weekly root, not retained daily-alpha projection files. Acceptance
+checks source-health/admission identity, the generated Sheet's latest success or
+later failure, and exact compiled weekly deployment IDs, publication hashes and
+admission times after the existing compile deadline. Prior-session evidence stays
+quiet only before the existing scheduled retry plus grace; failed, overdue, future,
+or mismatched evidence still pages. Historical daily receipts remain available to
+their diagnostic tooling. No producer replay or new schedule is part of this fix.
+
+The quote observer's lifecycle is derived from its semantic `ok`, including healthy
+market-closed/no-cohort idle states; fresh process existence does not excuse stale
+quote evidence while observing, a dead writer, or a stale heartbeat.

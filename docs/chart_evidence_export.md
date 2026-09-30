@@ -17,6 +17,14 @@ only after its broker-confirmed entry flow. An explicit positive
 shadow trade rows remain modeled. Option premiums are never mapped onto the
 underlying chart.
 
+Occurrence clocks are preserved. When a retained occurrence is later than a
+ledger creation/update clock, `knownAt` is conservatively advanced to the latest
+retained occurrence instead of backdating the event. The immutable writer rejects
+any remaining occurrence-after-knowledge record before creating an outbox file.
+A rejected immutable packet is preserved outside the active outbox, with its
+hash recorded, and corrected by a higher revision—not overwritten or accepted by
+weakening the consumer's invariant.
+
 The packet has the ordinary v2 `schemaVersion`, source, run, provenance,
 instruments, cases, and records fields. Its top-level `publication` envelope
 uses a stable `streamId` of `bhiksha-<date>`, a caller-selected positive

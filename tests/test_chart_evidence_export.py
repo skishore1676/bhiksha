@@ -224,3 +224,24 @@ def test_matching_trade_receipts_are_corroboration_not_duplicate_markers(tmp_pat
     assert {record["label"] for record in corroborations} >= {
         "entry fill corroboration recorded", "exit fill corroboration recorded"
     }
+    exit_record = next(r for r in exits if r['label'] == 'confirmed exit fill recorded')
+    assert exit_record['knownAt'] == exit_record['occurredAt']
+    assert all(r.get('occurredAt', r['knownAt']) <= r['knownAt'] for r in packet['records'])
+
+
+def test_source_clock_skew_preserves_event_occurrence(tmp_path):
+    db = _db(tmp_path / 'bhiksha.db')
+    with sqlite3.connect(db) as conn:
+        conn.execute('UPDATE events SET created_at=? WHERE id=2', ('2026-09-01T14:29:59+00:00',))
+    packet = export_chart_evidence(db, output_dir=tmp_path / 'out', trading_date=DAY).packet
+    event = next(r for r in packet['records'] if r['id'] == 'bhiksha-event-2')
+    assert event['knownAt'] == event['occurredAt'] == 1788273000
+    assert event['visuals'][0]['time'] == event['occurredAt']
+
+
+def test_invalid_time_order_rejected_before_immutable_write(tmp_path):
+    from bhiksha.ops.chart_evidence_export import write_immutable_packet
+    packet = {'id': 'invalid', 'records': [{'id': 'record', 'knownAt': 10, 'occurredAt': 11}]}
+    with pytest.raises(ValueError, match='Occurrence follows knowledge'):
+        write_immutable_packet(packet, tmp_path / 'out')
+    assert not (tmp_path / 'out').exists()

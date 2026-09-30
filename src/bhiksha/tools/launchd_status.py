@@ -17,7 +17,7 @@ from typing import Any
 from bhiksha.config.environment import load_dotenv
 from bhiksha.ops.launchd_registry import latest_status_path, registered_launchd_jobs
 from bhiksha.ops.provider_reconciliation_health import inspect_provider_reconciliation
-from bhiksha.tools.cartographer_evidence_status import build_status as cartographer_evidence_status
+from bhiksha.tools.cartographer_weekly_status import build_status as cartographer_weekly_status
 
 # External callers (lathi Control Tower) kill this command at 20s
 # (LATHI_BHIKSHA_TIMEOUT_SECONDS). Keep the whole snapshot under that:
@@ -176,7 +176,7 @@ def build_status_snapshot(
             job["last"] = {"domain": semantic, "recorded_at": semantic.get("updated_at")}
             job["last_run_status"] = semantic["status"]
             job["last_run_at"] = semantic.get("updated_at")
-            job["lifecycle"] = "armed" if semantic["status"] in {"healthy", "idle_disabled"} else "stuck"
+            job["lifecycle"] = "armed" if semantic["ok"] else "stuck"
             job["findings"] = [] if job["lifecycle"] == "armed" else [str(semantic["status"])]
         details = _job_details(last)
         if details:
@@ -208,13 +208,9 @@ def build_status_snapshot(
 def _cartographer_semantic_status(
     repo_root: Path, *, now: datetime | None = None
 ) -> dict[str, Any]:
-    output_root = Path(os.getenv("BHIKSHA_CARTOGRAPHER_OUTPUT_ROOT", repo_root / "artifacts/cartographer-shadow"))
-    projection_root = output_root / "projection"
-    return cartographer_evidence_status(
-        producer_status_path=projection_root / "producer-status.json",
-        projection_receipt_path=projection_root / "latest.json",
+    return cartographer_weekly_status(
+        repo_root=repo_root,
         active_plan_path=repo_root / "artifacts/playbook/active_plan.json",
-        events_db_path=repo_root / "bhiksha.db",
         now=now,
     )
 

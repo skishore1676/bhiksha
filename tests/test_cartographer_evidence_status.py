@@ -310,13 +310,16 @@ def test_both_runtime_entry_runners_terminalize_cartographer_exceptions() -> Non
 def test_advertised_launchd_job_invokes_real_shadow_runner(tmp_path, monkeypatch) -> None:
     captured = {}
     monkeypatch.setattr(launchd_job, "_print_result", lambda payload: captured.update(payload))
+    commands = []
+    def run_module(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
     monkeypatch.setattr(
-        launchd_job.subprocess, "run",
-        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "ok", ""),
+        launchd_job, "_run_python_module", run_module,
     )
     assert launchd_job._cartographer_shadow_job(Namespace(job="cartographer-shadow"), repo_root=tmp_path) == 0
     assert captured["job"] == "cartographer-shadow"
-    assert "run_cartographer_shadow.sh" in " ".join(captured.get("stdout_tail", "") or "") or captured["status"] == "ok"
+    assert commands == [["bhiksha.tools.cartographer_weekly"]]
     installer = Path("scripts/launchd/install_cartographer_shadow_launchd.sh").read_text()
     assert "job.plist_payload" in installer
     assert "com.bhiksha.cartographer-shadow.plist.template" not in installer

@@ -191,6 +191,9 @@ def build_chart_evidence_packet(snapshot: dict[str, Any], *, revision: int) -> d
 def write_immutable_packet(packet: dict[str, Any], output_dir: str | Path) -> tuple[Path, bool]:
     """Write `<packet.id>.json`, reusing byte-identical canonical content only."""
 
+    for record in packet.get("records", []):
+        if record.get("occurredAt", record["knownAt"]) > record["knownAt"]:
+            raise ValueError(f"Occurrence follows knowledge: {record['id']}")
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     target = root / f"{packet['id']}.json"
@@ -384,7 +387,7 @@ def _records(
         domain, basis, label = _event_shape(event["event_type"], payload)
         occurred = _epoch(payload.get("timestamp") or payload.get("entry_timestamp") or payload.get("exit_filled_at"))
         if occurred is not None and occurred > known:
-            occurred = known
+            known = occurred  # Never backdate an actual occurrence to an earlier ledger clock.
         record: dict[str, Any] = {
             "id": _safe_slug(f"bhiksha-event-{event['id']}"), "revision": 1,
             "caseId": case_id, "domain": domain, "basis": basis, "knownAt": known,
@@ -443,6 +446,11 @@ def _records(
         known = trade.get("updated_at") or trade.get("entry_timestamp")
         if not isinstance(known, int):
             continue
+        # The snapshot can contain fill clocks rounded after its row-update clock.
+        # Preserve the actual occurrence and use the latest retained fact as the
+        # conservative knowledge boundary; never invent earlier knowledge.
+        known = max([known] + [trade[key] for key in ("entry_timestamp", "exit_filled_at")
+                               if isinstance(trade.get(key), int)])
         record = {
             "id": _safe_slug(f"bhiksha-trade-{_short_hash(trade['trade_id'])}"), "revision": 1,
             "caseId": case_id, "domain": "management", "basis": "recorded", "knownAt": known,

@@ -1487,3 +1487,22 @@ def test_exit_edge_observer_status_uses_live_heartbeat_and_enable_marker(tmp_pat
     marker.unlink()
     idle = launchd_status._exit_edge_observer_status(tmp_path, loaded, now + timedelta(minutes=5))
     assert idle["status"] == "idle_disabled"
+
+
+@pytest.mark.parametrize("collection", ["idle_market_closed", "idle_no_cohorts", "observing"])
+def test_observer_snapshot_lifecycle_follows_owner_health(tmp_path, monkeypatch, collection):
+    now = datetime(2026, 9, 30, 22, 0, tzinfo=UTC)
+    marker = tmp_path / "artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    path = tmp_path / "artifacts/observations/exit_edge_live_status.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"role": "observer", "ready": True, "worker_alive": True,
+                                "updated_at": now.isoformat(), "collection_state": collection,
+                                "observation_polls": 10}))
+    monkeypatch.setattr(launchd_status, "registered_launchd_jobs", lambda: [job_by_runner("exit-edge-observer")])
+    monkeypatch.setattr(launchd_status, "_launchd_state", lambda **kw: {"com.bhiksha.exit-edge-observer": {"loaded": True}})
+    monkeypatch.setattr(launchd_status, "_runtime_status", lambda **kw: {})
+    job = launchd_status.build_status_snapshot(repo_root=tmp_path, active_plan_path=tmp_path / 'plan.json', now=now)['jobs'][0]
+    assert job['lifecycle'] == ('stuck' if collection == 'observing' else 'armed')
+    assert bool(job['findings']) == (collection == 'observing')
