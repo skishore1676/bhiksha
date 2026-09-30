@@ -23,3 +23,14 @@ heartbeat on oldmac; published Sheet readback. A complete regular session of
 natural collection remains necessary to demonstrate sustained reliability.
 The prior stale heartbeat's exact cause remains unproven; these changes fix
 verified blind spots rather than claiming a proven host failure.
+
+
+## September 30 follow-up
+
+A transient failure to persist a rejected quote permanently censored AMD's
+comparison. The independent observer now keeps that cohort active, records the
+storage failure in collector health, and continues to exclude the invalid mark.
+The next admissible quote still records a continuity gap when the frozen interval
+limit is exceeded. Legacy embedded collection is unchanged. Existing censors and
+historical tapes are not rewritten. This scoped repair does not resolve oldmac's
+host pressure or prove a complete reliable session.

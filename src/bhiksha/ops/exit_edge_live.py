@@ -670,7 +670,13 @@ class ExitEdgeLiveRecorder:
             "storage_failures",
             error=f"quote_rejection_persist_failed:{cohort_id}:{reason}",
         )
-        self._censor(repository, cohort_id, "quote_rejection_persistence_failure")
+        # The independent owner can resume after storage contention. The rejected
+        # mark never enters the tape; append_quote labels any missed interval on
+        # the next usable quote. Do not turn a transient diagnostic-write failure
+        # into a permanent end to observation. Legacy embedded collection retains
+        # its fail-closed censor semantics.
+        if self.role != "observer":
+            self._censor(repository, cohort_id, "quote_rejection_persistence_failure")
 
     def _flush_pending_censors(self, repository: ProspectiveQuoteTapeRepository) -> None:
         with self._lock:

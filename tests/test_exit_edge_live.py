@@ -853,3 +853,46 @@ def test_status_write_failure_has_stderr_evidence(tmp_path,capsys):
     recorder.heartbeat(mode='idle_market_closed')
     assert recorder.snapshot()['storage_failures']==1
     assert 'exit_observer_status_write_failed' in capsys.readouterr().err
+
+
+def test_observer_resumes_after_rejection_write_failure_with_honest_gap(tmp_path):
+    class ContendedRepository(ProspectiveQuoteTapeRepository):
+        def try_record_quote_rejection(self, *args, **kwargs):
+            return False
+
+    registration = _recorder(tmp_path, role="registration")
+    _, payload = registration._registration_payloads(
+        deployment=_deployment(), trade_id="rejection-write-failure",
+        option_symbol=OPTION, entry_timestamp=ENTRY, entry_premium=2.0, quantity=10,
+    )
+    repository = ContendedRepository(tmp_path / "edge.db")
+    repository.initialize()
+    repository.register_cohort(payload)
+    observer = _recorder(tmp_path, role="observer", repository_factory=ContendedRepository)
+    observer.start()
+    try:
+        _wait_until(lambda: observer.snapshot()["ready"])
+        first_at = ENTRY + timedelta(seconds=15)
+        observer.observe_quote(OPTION, _quote(first_at, 2.1), first_at)
+        _wait_until(lambda: repository.latest_sequence(payload["cohort_id"]) == 1)
+        rejected_at = first_at + timedelta(minutes=1)
+        observer.observe_quote(OPTION, _paired_quote(
+            rejected_at - timedelta(seconds=10), rejected_at - timedelta(seconds=10), 2.1,
+        ), rejected_at)
+        _wait_until(lambda: observer.snapshot()["storage_failures"] == 1)
+        assert observer.snapshot()["active_cohorts"] == 1
+        assert observer.snapshot()["censored_cohorts"] == 0
+        resumed_at = first_at + timedelta(minutes=5)
+        observer.observe_quote(OPTION, _quote(resumed_at, 2.1), resumed_at)
+        _wait_until(lambda: repository.latest_sequence(payload["cohort_id"]) == 2)
+    finally:
+        observer.close()
+    case = repository.load_case(payload["cohort_id"])
+    assert len(case.quotes) == 2  # rejected observation was never admitted
+    assert case.persisted_censor_reason is None
+    assert len(case.observation_gaps) == 1
+    assert case.observation_gaps[0].last_received_at == first_at
+    assert case.observation_gaps[0].first_received_at == resumed_at
+    row = analyze_prospective_repository(repository)["cases"][0]
+    assert row["status"] == "gap_affected"
+    assert row["candidate_delta_pnl_usd"] == {}
