@@ -239,3 +239,18 @@ def test_weekly_owner_is_reported_as_cartographer_not_active_strategy():
     assert '1 rows' in _entry_policy(plan)
     assert '7–21 DTE' in _entry_policy(plan)
     assert _strategy_entry_policy(plan)=='No strategy rows in current plan'
+
+
+def test_unfinished_candidates_remain_visible_with_clean_pairs_and_gaps():
+    partial = _case("partial", delta=45)
+    partial["insufficient_reason"] = "right_censored:range_expansion_swing"
+    affected = _case("affected", delta=10, gap=True)
+    affected["insufficient_reason"] = "right_censored:range_expansion_swing"
+    completed = _case("complete", delta=20)
+    completed["status"] = "paired"
+    result = sheet._exit_review([partial, affected, completed], date(2026, 9, 22))
+    assert result["collecting"] == 2
+    assert result["clean"] == 3
+    assert result["fully_clean"] == 1
+    assert result["censored"] == 1
+    assert result["unusable"] == 0

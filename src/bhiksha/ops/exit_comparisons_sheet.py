@@ -330,12 +330,12 @@ def _exit_review(cases: list[dict[str, Any]], day: date) -> dict[str, Any]:
         affected = [case for case in members if case.get("observation_gaps") or str(case.get("insufficient_reason") or "").startswith("persisted_censor:")]
         censored_total += len(affected)
         for case in members:
-            if case in affected or case.get("clean_candidate_delta_pnl_usd"):
-                continue
             reason = str(case.get("insufficient_reason") or "")
+            # A completed clean pair does not end collection for other candidates.
+            # Gap-affected candidates can also continue diagnostic observation.
             if reason.startswith("right_censored:") or reason == "quote_tape_too_short_for_next_tick_fill":
                 collecting_total += 1
-            else:
+            elif case not in affected and not case.get("clean_candidate_delta_pnl_usd"):
                 unusable_total += 1
         for case in affected:
             for gap in case.get("observation_gaps") or [None]:
@@ -433,8 +433,8 @@ def publish_exit_comparisons_scorecard(
         ["Published CT", _ct(scorecard["generated_at"]), "Age (hours)", '=ROUND((NOW()-DATEVALUE(LEFT(B3,10))-TIMEVALUE(MID(B3,12,8)))*24,1)',
          "Last signal CT", _ct(signals["latest"]), "Last exit quote CT", _ct(exits["latest"])],
         [f"Exit evidence: {exits['registered']} registered · {exits.get('fully_clean', 0)} fully complete · "
-         f"{exits['clean']} with a clean pair · {exits['collecting']} collecting · "
-         f"{exits['censored']} gap/censored · {exits['unusable']} other unusable; pair and gap counts may overlap"],
+         f"{exits['clean']} with a clean pair · {exits['collecting']} still collecting · "
+         f"{exits['censored']} gap/censored · {exits['unusable']} other unusable; counts may overlap"],
         [f"Fill → comparison: {registration.get('filled', signals['captured'])} filled · {registration.get('registered', exits['registered'])} registered · "
          f"{registration.get('missing', 0)} missing | {'; '.join(registration.get('detail') or []) or 'No missing cohorts'}"],
         [f"Independent fills: {fills.get('broker_confirmed', 0)} broker confirmed · {fills.get('modeled', 0)} modeled · "
