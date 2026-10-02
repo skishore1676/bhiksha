@@ -10,6 +10,7 @@ Nothing here imports a broker/order manager or mutates runtime/profile state.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 import hashlib
@@ -18,7 +19,7 @@ import math
 from pathlib import Path
 import sqlite3
 from statistics import fmean
-from typing import Any
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from bhiksha.market_data.trading_calendar import is_trading_day
@@ -173,22 +174,27 @@ class ProspectiveQuoteTapeRepository:
         self.read_only = bool(read_only)
         self.write_timeout_seconds = max(float(write_timeout_seconds), 0.0)
 
+    @contextmanager
     def _connect(
         self,
         *,
         timeout_seconds: float | None = None,
-    ) -> sqlite3.Connection:
+    ) -> Iterator[sqlite3.Connection]:
         timeout_seconds = self.write_timeout_seconds if timeout_seconds is None else timeout_seconds
         if self.read_only:
             uri = f"file:{self.path.resolve()}?mode=ro"
-            conn = sqlite3.connect(
-                uri, uri=True, timeout=timeout_seconds
-            )
+            conn = sqlite3.connect(uri, uri=True, timeout=timeout_seconds)
+        else:
+            conn = sqlite3.connect(self.path, timeout=timeout_seconds)
+        try:
             conn.execute("PRAGMA foreign_keys=ON")
-            return conn
-        conn = sqlite3.connect(self.path, timeout=timeout_seconds)
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+            # SQLite's transaction context commits/rolls back, but does not close.
+            # This resident owner must release every connection without waiting
+            # for garbage collection to recover scarce file descriptors.
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def initialize(self) -> None:
         if self.read_only:

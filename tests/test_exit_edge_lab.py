@@ -645,3 +645,49 @@ def test_historical_mode_reports_coverage_only(tmp_path: Path) -> None:
     assert report["verdict"] == "historical_data_ineligible_for_paired_outcome_estimation"
     assert report["counts"]["trades_with_any_post_exit_mark"] == 1
     assert report["counts"]["eligible_paired_trades"] == 0
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_repository_reads_close_connections_without_garbage_collection(tmp_path, monkeypatch, read_only):
+    path = tmp_path / "lab.db"
+    setup = ProspectiveQuoteTapeRepository(path)
+    setup.initialize()
+    setup.register_cohort(_raw_case())
+    opened = []
+    original_connect = sqlite3.connect
+
+    def retain_connection(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        opened.append(conn)  # Keep references so garbage collection cannot hide leaks.
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", retain_connection)
+    repo = ProspectiveQuoteTapeRepository(path, read_only=read_only)
+    for _ in range(25):
+        assert repo.list_cohort_ids() == ["C1"]
+        assert repo.load_case("C1").trade_id == _raw_case()["trade_id"]
+        assert repo.latest_sequence("C1") == 0
+    assert len(opened) == 75
+    try:
+        for conn in opened:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                conn.execute("SELECT 1")
+    finally:
+        for conn in opened:
+            conn.close()
+
+
+def test_repository_connection_commits_or_rolls_back_then_closes(tmp_path):
+    repo = ProspectiveQuoteTapeRepository(tmp_path / "transactions.db")
+    with repo._connect() as committed:
+        committed.execute("CREATE TABLE facts(value TEXT)")
+        committed.execute("INSERT INTO facts VALUES('kept')")
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with repo._connect() as rolled_back:
+            rolled_back.execute("INSERT INTO facts VALUES('discarded')")
+            raise RuntimeError("interrupted")
+    with repo._connect() as readback:
+        assert readback.execute("SELECT value FROM facts").fetchall() == [("kept",)]
+    for conn in (committed, rolled_back, readback):
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")

@@ -34,3 +34,15 @@ The next admissible quote still records a continuity gap when the frozen interva
 limit is exceeded. Legacy embedded collection is unchanged. Existing censors and
 historical tapes are not rewritten. This scoped repair does not resolve oldmac's
 host pressure or prove a complete reliable session.
+
+
+## October 2 connection ownership
+
+The resident observer exhausted its file descriptors overnight: the sampled
+process held 10,348 file entries, including 3,418 exit-store entries, and status
+writes repeatedly failed. SQLite transaction contexts did not close connections.
+The repository now closes every read/write connection in a finally block and
+registration scans explicitly close their read-only event connection, while
+preserving commit/rollback and read-only semantics. Regression tests retain
+connection references so garbage collection cannot conceal a leak. Restart restores
+collection, but this morning's missing quotes remain gap-affected evidence.

@@ -8,6 +8,7 @@ and appends observed Public option quotes to the same isolated SQLite store.
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 from datetime import UTC, datetime, time
 import json
 import os
@@ -161,7 +162,7 @@ def recover_registration_intents(
     if not source.is_file():
         return after_id
     repository = ProspectiveQuoteTapeRepository(edge_db_path, write_timeout_seconds=0.25)
-    with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=0.25) as conn:
+    with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=0.25)) as conn:
         # Freeze a ceiling before scanning, so concurrent inserts remain for the next poll.
         ceiling = int(conn.execute("SELECT COALESCE(MAX(id),?) FROM events", (after_id,)).fetchone()[0])
         for _ in range(5):  # bounded catch-up; quote polling resumes after this pass

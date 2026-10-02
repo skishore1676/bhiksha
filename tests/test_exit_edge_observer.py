@@ -109,8 +109,8 @@ def test_registration_cursor_does_not_skip_concurrent_insert(tmp_path,monkeypatc
         db.execute("INSERT INTO events VALUES(1,'signal_outcome','{}')")
     original=observer.sqlite3.connect
     class Connection:
-        def __enter__(self): self.conn=original(path);return self
-        def __exit__(self,*args): self.conn.close()
+        def __init__(self): self.conn=original(path)
+        def close(self): self.conn.close()
         def execute(self,sql,args=()):
             result=self.conn.execute(sql,args)
             if 'MAX(id)' in sql:
@@ -140,3 +140,39 @@ def test_status_separates_idle_from_failed_evidence(tmp_path):
     health['collection_state']='observing';status.write_text(json.dumps(health))
     result=_exit_edge_observer_status(tmp_path,{'loaded':True},now)
     assert not result['ok'] and result['status']=='observer_quote_evidence_stale'
+
+
+@pytest.mark.parametrize("retry_pending", [False, True])
+def test_registration_scan_closes_source_connection_on_completion_and_retry(tmp_path, monkeypatch, retry_pending):
+    import sqlite3
+    path = tmp_path / "events.db"
+    setup = sqlite3.connect(path)
+    try:
+        setup.execute("CREATE TABLE events(id INTEGER PRIMARY KEY,event_type TEXT,payload TEXT)")
+        payload = {"attempt": {"trade_id": "pending"}, "cohort": None} if retry_pending else {}
+        kind = "exit_edge_registration_intent" if retry_pending else "signal_outcome"
+        setup.execute("INSERT INTO events VALUES(1,?,?)", (kind, json.dumps(payload)))
+        setup.commit()
+    finally:
+        setup.close()
+    opened = []
+    original = sqlite3.connect
+
+    def retain(*args, **kwargs):
+        conn = original(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(observer.sqlite3, "connect", retain)
+    monkeypatch.setattr(observer.ProspectiveQuoteTapeRepository, "try_record_registration_attempt",
+                        lambda *args, **kwargs: False)
+    for _ in range(25):
+        assert observer.recover_registration_intents(path, tmp_path / "edge", 0) == (0 if retry_pending else 1)
+    assert len(opened) == 25
+    try:
+        for conn in opened:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                conn.execute("SELECT 1")
+    finally:
+        for conn in opened:
+            conn.close()
