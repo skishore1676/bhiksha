@@ -4,7 +4,8 @@ Keep the existing executor, independent quote observer, SQLite evidence store,
 and Sheet report owner. This repair adds no scheduler or trading authority.
 
 - The observer stays resident outside market hours, publishing
-  `idle_market_closed` without requesting option quotes.
+  `idle_market_closed` without requesting option quotes or repeatedly scanning
+  the databases. See the October 2 session-window correction below.
 - Status distinguishes heartbeat, successful poll, provider quote time,
   received quote time, durable append time, and pending writer age. The existing
   watchdog detects stalled in-flight writes as well as a stalled main loop.
@@ -46,3 +47,26 @@ registration scans explicitly close their read-only event connection, while
 preserving commit/rollback and read-only semantics. Regression tests retain
 connection references so garbage collection cannot conceal a leak. Restart restores
 collection, but this morning's missing quotes remain gap-affected evidence.
+
+## October 2 session window
+
+One existing launchd owner remains resident; no new scheduler is needed.
+Ten minutes before the regular exchange open (normally 08:20 CT), it starts
+saved-comparison recovery and registration catch-up. During the session it polls
+every 15 seconds. At the exchange close it stops new requests, drains queued
+facts, retains unfinished swing comparisons, then idles. A cold overnight start
+does not initialize or replay SQLite; an already-warm owner keeps its state for
+the next session. Off-hours work is limited to a status heartbeat each minute and
+the existing watchdog. An empty observer writer waits instead of spinning.
+
+The existing XNYS exchange-calendar dependency supplies holidays, daylight-saving
+changes and early closes. This preserves the regular-equity observation window;
+it does not extend the experiment into additional options trading hours.
+Continuity accounting uses the same session boundaries, so closed market time
+cannot create a quote gap. Existing stored quotes, gaps, censors and frozen
+policies are not rewritten. Sheet reporting remains with the existing publisher.
+
+Tests cover cold off-hours startup without a database, pre-open recovery,
+collection, queued-write drainage, next-session resumption, holidays, weekends,
+early closes and continuity across closed intervals. Natural overnight-to-open
+proof remains a subsequent session check, distinct from these tests.

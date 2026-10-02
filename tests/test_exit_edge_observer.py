@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -53,7 +54,8 @@ async def test_quote_deadline_records_failure_and_allows_next_poll(tmp_path,monk
     monkeypatch.setattr(observer,'QUOTE_DEADLINE_SECONDS',0.01)
     reader=Reader()
     await asyncio.wait_for(observer.run_observer(db_path=tmp_path/'db',status_path=tmp_path/'status',
-        enable_marker=marker,reader=reader,stop=stop,poll_seconds=1),timeout=4)
+        enable_marker=marker,reader=reader,stop=stop,poll_seconds=1,
+        now_fn=lambda:datetime(2026,10,2,15,0,tzinfo=UTC)),timeout=4)
     assert errors==['TimeoutError'] and reader.calls==2 and len(polls)==1
 
 
@@ -84,11 +86,11 @@ async def test_offhours_heartbeat_without_quotes(tmp_path,monkeypatch):
     stop=asyncio.Event(); modes=[]
     class Recorder:
         def __init__(self,**kwargs): pass
-        def start(self): pass
-        def snapshot(self): return {'ready':True,'worker_alive':True}
-        def refresh_active_from_store(self): pass
-        def censor_expired_options(self,now): pass
-        def active_option_symbols(self): return ('OPTION',)
+        def start(self): raise AssertionError('offhours database recovery')
+        def snapshot(self): return {'ready':False,'worker_alive':False}
+        def refresh_active_from_store(self): raise AssertionError('offhours scan')
+        def censor_expired_options(self,now): raise AssertionError('offhours censor')
+        def active_option_symbols(self): raise AssertionError('offhours evaluation')
         def heartbeat(self,*,mode): modes.append(mode);stop.set()
         def close(self,**kwargs): pass
     class Reader:
@@ -97,7 +99,8 @@ async def test_offhours_heartbeat_without_quotes(tmp_path,monkeypatch):
     monkeypatch.setattr(observer,'ExitEdgeLiveRecorder',Recorder)
     monkeypatch.setattr(observer,'_regular_session',lambda now:False)
     await observer.run_observer(db_path=tmp_path/'db',status_path=tmp_path/'status',
-        enable_marker=marker,reader=Reader(),stop=stop)
+        enable_marker=marker,reader=Reader(),stop=stop,
+        now_fn=lambda:datetime(2026,10,3,15,0,tzinfo=UTC))
     assert modes==['idle_market_closed']
 
 
@@ -176,3 +179,113 @@ def test_registration_scan_closes_source_connection_on_completion_and_retry(tmp_
     finally:
         for conn in opened:
             conn.close()
+
+
+@pytest.mark.parametrize('stamp,phase', [
+    ('2026-10-02T13:19:59+00:00', 'closed'),
+    ('2026-10-02T13:20:00+00:00', 'warmup'),
+    ('2026-10-02T13:30:00+00:00', 'open'),
+    ('2026-10-02T20:00:00+00:00', 'closed'),
+    ('2026-10-03T15:00:00+00:00', 'closed'),  # Saturday
+    ('2026-11-26T15:00:00+00:00', 'closed'),  # Thanksgiving
+    ('2026-11-27T17:59:59+00:00', 'open'),
+    ('2026-11-27T18:00:00+00:00', 'closed'),  # Early close
+])
+def test_observer_exchange_session_boundaries(stamp, phase):
+    now = datetime.fromisoformat(stamp)
+    assert observer._session_phase(now) == phase
+    assert observer._regular_session(now) == (phase == 'open')
+
+
+def test_idle_wait_is_lightweight_and_wakes_at_session_boundaries():
+    assert observer._wait_seconds(datetime(2026,10,3,15,tzinfo=UTC), 'closed', 15) == 60
+    assert observer._wait_seconds(datetime(2026,10,2,13,19,40,tzinfo=UTC), 'closed', 15) == 20
+    assert observer._wait_seconds(datetime(2026,10,2,13,29,59,tzinfo=UTC), 'warmup', 15) == 1
+    assert observer._wait_seconds(datetime(2026,11,27,17,59,59,tzinfo=UTC), 'open', 15) == 1
+
+
+@pytest.mark.asyncio
+async def test_warmup_collect_drain_and_idle_preserve_one_worker(tmp_path, monkeypatch):
+    marker = tmp_path/'enabled'; marker.touch()
+    stamps = [datetime.fromisoformat(s) for s in (
+        '2026-11-27T14:19:50+00:00',  # Cold, premarket
+        '2026-11-27T14:20:00+00:00',  # Recover 10 minutes before open
+        '2026-11-27T14:30:00+00:00',  # Collect
+        '2026-11-27T18:00:00+00:00',  # Drain at early close
+        '2026-11-27T18:00:01+00:00',  # Idle with saved unfinished cohort
+        '2026-11-28T15:00:00+00:00',  # Weekend, no additional scans
+        '2026-11-30T14:20:00+00:00',  # Resume recovery using the same worker
+    )]
+    index = [0]; calls = []; modes = []
+    class Stop:
+        done = False
+        def is_set(self): return self.done
+        async def wait(self):
+            if index[0] == 3: rec.pending = 0
+            index[0] += 1
+            if index[0] == len(stamps): self.done = True; index[0] -= 1
+            await asyncio.sleep(0)
+    stop = Stop()
+    class Recorder:
+        ready = False; pending = 0
+        def __init__(self, **kwargs): pass
+        def start(self): calls.append(('start',index[0])); self.ready=True
+        def snapshot(self): return {'ready':self.ready,'worker_alive':self.ready,'pending_writes':self.pending}
+        def refresh_active_from_store(self): calls.append(('refresh',index[0]))
+        def censor_expired_options(self, now): pass
+        def active_option_symbols(self): return ('OPTION',)
+        def heartbeat(self, *, mode): modes.append((mode,index[0]))
+        def observe_quote(self, *args): self.pending=1
+        def record_observation_poll(self,*args,**kwargs): pass
+        def record_observation_error(self,reason): raise AssertionError(reason)
+        def close(self,**kwargs): calls.append(('close',index[0]))
+    rec=Recorder()
+    class Reader:
+        async def quotes(self,symbols): calls.append(('quotes',index[0]));return {'OPTION':SimpleNamespace()}
+        async def close(self): pass
+    monkeypatch.setattr(observer,'ExitEdgeLiveRecorder',lambda **kw:rec)
+    monkeypatch.setattr(observer,'recover_registration_intents',lambda *a:calls.append(('intents',index[0])) or 1)
+    await observer.run_observer(db_path=tmp_path/'db',event_db_path=tmp_path/'events',
+        status_path=tmp_path/'status',enable_marker=marker,reader=Reader(),stop=stop,
+        now_fn=lambda:stamps[index[0]])
+    assert [i for kind,i in calls if kind=='start'] == [1]
+    assert [i for kind,i in calls if kind=='refresh'] == [1,2,6]
+    assert [i for kind,i in calls if kind=='intents'] == [1,2,6]
+    assert [i for kind,i in calls if kind=='quotes'] == [2]
+    assert modes == [('idle_market_closed',0),('warming_market_open',1),
+                     ('draining_market_close',3),('idle_market_closed',4),
+                     ('idle_market_closed',5),('warming_market_open',6)]
+
+
+@pytest.mark.asyncio
+async def test_cold_offhours_start_creates_no_database(tmp_path, monkeypatch):
+    marker=tmp_path/'enabled'; marker.touch()
+    stop=asyncio.Event()
+    original=observer.ExitEdgeLiveRecorder.heartbeat
+    def heartbeat(self, **kwargs):
+        original(self, **kwargs)
+        stop.set()
+    monkeypatch.setattr(observer.ExitEdgeLiveRecorder, 'heartbeat', heartbeat)
+    await observer.run_observer(db_path=tmp_path/'db',event_db_path=tmp_path/'events',
+        status_path=tmp_path/'status',enable_marker=marker,stop=stop,
+        now_fn=lambda:datetime(2026,11,26,15,tzinfo=UTC))
+    assert not (tmp_path/'db').exists()
+    health=json.loads((tmp_path/'status').read_text())
+    assert health['collection_state']=='idle_market_closed'
+    assert not health['ready'] and not health['worker_alive']
+
+
+def test_cold_idle_status_is_healthy_only_outside_session(tmp_path):
+    from bhiksha.tools.launchd_status import _exit_edge_observer_status
+    marker=tmp_path/'artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled'
+    marker.parent.mkdir(parents=True); marker.touch()
+    status=tmp_path/'artifacts/observations/exit_edge_live_status.json'
+    status.parent.mkdir(parents=True)
+    for now,expected in ((datetime(2026,11,27,18,tzinfo=UTC),'idle_market_closed'),
+                         (datetime(2026,11,27,17,tzinfo=UTC),'observer_not_ready')):
+        status.write_text(json.dumps({'updated_at':now.isoformat(),'role':'observer',
+            'ready':False,'worker_alive':False,'collection_state':'idle_market_closed'}))
+        assert _exit_edge_observer_status(tmp_path,{'loaded':True},now)['status']==expected
+    status.write_text(json.dumps({'updated_at':now.isoformat(),'role':'observer',
+        'ready':True,'worker_alive':False,'collection_state':'idle_market_closed'}))
+    assert _exit_edge_observer_status(tmp_path,{'loaded':True},now)['status']=='observer_not_ready'

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import math
@@ -22,7 +22,7 @@ from statistics import fmean
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
-from bhiksha.market_data.trading_calendar import is_trading_day
+from bhiksha.market_data.trading_calendar import regular_session_bounds
 
 from bhiksha.execution.profile_exit import (
     ProfileExitFields,
@@ -2160,9 +2160,9 @@ def _observable_seconds(start: datetime, end: datetime) -> float:
     final = end.astimezone(ET).date()
     total = 0.0
     while current <= final:
-        if is_trading_day(current):
-            opened = datetime.combine(current, time(9, 30), tzinfo=ET).astimezone(UTC)
-            closed = datetime.combine(current, time(16, 0), tzinfo=ET).astimezone(UTC)
+        bounds = regular_session_bounds(current)
+        if bounds is not None:
+            opened, closed = bounds
             total += max(0.0, (min(end, closed) - max(start, opened)).total_seconds())
         current += timedelta(days=1)
     return total

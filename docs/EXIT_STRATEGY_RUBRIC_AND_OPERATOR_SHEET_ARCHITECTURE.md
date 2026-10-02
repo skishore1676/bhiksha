@@ -94,6 +94,10 @@ holidays do not consume the timer; early-close days contribute only their actual
 session time. Stops, targets and other configured exits can finish the arm sooner.
 
 Observation continues after the primary exit and across observer restarts.
+The existing quote observer recovers ten minutes before the exchange open,
+collects only within the regular exchange session, drains queued facts at close,
+and idles off-hours without repeated database scans. The exchange calendar owns
+holidays and early closes; unfinished swing comparisons resume next session.
 Missing observable quotes remain explicit gaps; recovery does not fabricate
 fills. If the option expires before the comparison finishes, mark it
 `option_expired_before_candidate_completed`, rather than inventing an expiry

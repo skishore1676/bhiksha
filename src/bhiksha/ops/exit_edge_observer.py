@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import closing
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, timedelta
 import json
 import os
 import sys
@@ -26,7 +26,7 @@ import httpx
 from bhiksha.execution.brokers.public.auth import get_access_token
 from bhiksha.execution.brokers.public.settings import PublicBrokerSettings
 from bhiksha.execution.quote_lineage import extract_public_quote_timestamp
-from bhiksha.market_data.trading_calendar import is_trading_day
+from bhiksha.market_data.trading_calendar import regular_session_bounds
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
 from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository
 
@@ -35,6 +35,8 @@ POLL_SECONDS = 15.0
 MAX_BATCH = 20
 QUOTE_DEADLINE_SECONDS = 45.0
 PROGRESS_DEADLINE_SECONDS = 180.0
+IDLE_SECONDS = 60.0  # Lightweight status only; below the watchdog/freshness deadlines.
+WARMUP = timedelta(minutes=10)
 
 
 class ObserverProgressWatchdog:
@@ -150,8 +152,27 @@ class PublicOptionQuoteReader:
 
 
 def _regular_session(now: datetime) -> bool:
-    local = now.astimezone(CENTRAL)
-    return is_trading_day(local.date()) and time(8, 30) <= local.time() <= time(15, 0)
+    bounds = regular_session_bounds(now.astimezone(CENTRAL).date())
+    return bounds is not None and bounds[0] <= now < bounds[1]
+
+
+def _session_phase(now: datetime) -> str:
+    bounds = regular_session_bounds(now.astimezone(CENTRAL).date())
+    if bounds is None or now < bounds[0] - WARMUP or now >= bounds[1]:
+        return "closed"
+    return "open" if now >= bounds[0] else "warmup"
+
+
+def _wait_seconds(now: datetime, phase: str, poll_seconds: float) -> float:
+    delay = IDLE_SECONDS if phase == "closed" else max(float(poll_seconds), 1.0)
+    bounds = regular_session_bounds(now.astimezone(CENTRAL).date())
+    if bounds:
+        # Wake at warmup, open and close instead of overshooting a boundary.
+        for boundary in (bounds[0] - WARMUP, bounds[0], bounds[1]):
+            if boundary > now:
+                delay = min(delay, (boundary - now).total_seconds())
+                break
+    return delay
 
 
 def recover_registration_intents(
@@ -211,22 +232,42 @@ async def run_observer(
     reader: Any | None = None,
     stop: asyncio.Event | None = None,
     poll_seconds: float = POLL_SECONDS,
+    now_fn: Any = None,
 ) -> None:
     """Keep one observation owner alive across executor lifecycle changes."""
     marker = Path(enable_marker)
-    reader = reader or PublicOptionQuoteReader()
+    now_fn = now_fn or (lambda: datetime.now(UTC))
     stop = stop or asyncio.Event()
     recorder = ExitEdgeLiveRecorder(db_path=db_path, status_path=status_path, role="observer")
     watchdog = ObserverProgressWatchdog(status_path, writer_health=recorder.snapshot)
     watchdog.thread.start()
-    recorder.start()
+    started_worker = False
     last_intent_id = 0
     try:
         while not stop.is_set():
+            now = now_fn()
+            phase = _session_phase(now)
+            enabled = marker.is_file()
             health = recorder.snapshot()
-            if health.get("ready") and not health.get("worker_alive"):
+            if started_worker and health.get("ready") and not health.get("worker_alive"):
                 raise RuntimeError("exit_observer_writer_stopped")
-            if recorder.snapshot().get("ready") and marker.is_file():
+            if phase == "closed" or not enabled:
+                # A cold off-hours start does not even initialize/replay SQLite.
+                # A warm owner retains unfinished comparisons in memory; its writer
+                # finishes already-queued facts without a new scan or quote call.
+                draining = any(health.get(key, 0) for key in
+                               ("pending_writes", "pending_censors", "pending_registration_attempts"))
+                mode = "draining_market_close" if draining else "idle_market_closed" if enabled else "disabled"
+                recorder.heartbeat(mode=mode)
+                watchdog.advance(mode)
+            else:
+                if not started_worker:
+                    recorder.start()
+                    started_worker = True
+                    watchdog.advance('recover_saved_comparisons')
+                # Do not reset progress while recovery is still running:
+                # the existing watchdog bounds failed or stalled startup too.
+            if phase != "closed" and enabled and recorder.snapshot().get("ready"):
                 try:
                     watchdog.advance('recover_registration_intents')
                     if event_db_path is not None:
@@ -235,16 +276,17 @@ async def run_observer(
                         )
                     watchdog.advance('refresh_cohorts')
                     recorder.refresh_active_from_store()
-                    now = datetime.now(UTC)
+                    now = now_fn()
                     recorder.censor_expired_options(now)
                     symbols = recorder.active_option_symbols()
                     if symbols and _regular_session(now):
+                        reader = reader or PublicOptionQuoteReader()
                         started = clock.monotonic()
                         watchdog.advance('request_quotes')
                         async with asyncio.timeout(QUOTE_DEADLINE_SECONDS):
                             quotes = await reader.quotes(symbols)
                         watchdog.advance('persist_quotes')
-                        received = datetime.now(UTC)
+                        received = now_fn()
                         for symbol in symbols:
                             quote = quotes.get(symbol)
                             if quote is not None:
@@ -254,19 +296,24 @@ async def run_observer(
                             quote_request_ms=(clock.monotonic() - started) * 1000,
                         )
                     else:
-                        recorder.heartbeat(mode="idle_market_closed" if not _regular_session(now) else "idle_no_cohorts")
+                        recorder.heartbeat(mode="warming_market_open" if phase == "warmup" else "idle_no_cohorts")
                 except Exception as exc:
                     recorder.record_observation_error(type(exc).__name__)
                 watchdog.advance('poll_complete')
-            elif recorder.snapshot().get('ready'):
-                recorder.heartbeat(mode="disabled")  # Disabled is observable, not a silent stale owner.
-                watchdog.advance('disabled')
             try:
-                await asyncio.wait_for(stop.wait(), timeout=max(float(poll_seconds), 1.0))
+                wait_now = now_fn()
+                wait_phase = _session_phase(wait_now)
+                delay = _wait_seconds(wait_now, wait_phase, poll_seconds)
+                if wait_phase != phase:
+                    delay = 0.0  # Publish/drain immediately if a request crossed the close.
+                if phase == "closed" and draining:
+                    delay = min(delay, 1.0)
+                await asyncio.wait_for(stop.wait(), timeout=delay)
             except TimeoutError:
                 pass
     finally:
         watchdog.advance('shutdown')
         recorder.close(join_timeout_seconds=5.0)
-        await reader.close()
+        if reader is not None:
+            await reader.close()
         watchdog.close()

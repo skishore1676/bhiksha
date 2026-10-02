@@ -46,3 +46,22 @@ def test_session_boundary_moves_to_next_day_immediately_after_required_through()
     required = next_trading_session_required_through(datetime(2026, 7, 16, 20, 16, tzinfo=UTC))
 
     assert required.isoformat() == "2026-07-17T15:15:00-05:00"
+
+
+def test_regular_session_bounds_include_dst_holidays_and_early_close():
+    from bhiksha.market_data.trading_calendar import regular_session_bounds
+    assert regular_session_bounds(date(2026,11,26)) is None
+    assert regular_session_bounds(date(2026,10,3)) is None
+    assert regular_session_bounds(date(2025,1,9)) is None
+    assert regular_session_bounds(date(2026,10,2)) == (
+        datetime(2026,10,2,13,30,tzinfo=UTC),datetime(2026,10,2,20,tzinfo=UTC))
+    assert regular_session_bounds(date(2026,11,27)) == (
+        datetime(2026,11,27,14,30,tzinfo=UTC),datetime(2026,11,27,18,tzinfo=UTC))
+
+
+def test_observation_continuity_excludes_early_close_weekend_and_holiday():
+    from bhiksha.ops.exit_edge_lab import _observable_seconds
+    assert _observable_seconds(datetime(2026,11,27,17,59,45,tzinfo=UTC),
+        datetime(2026,11,30,14,30,15,tzinfo=UTC)) == 30
+    assert _observable_seconds(datetime(2026,11,25,20,59,45,tzinfo=UTC),
+        datetime(2026,11,27,14,30,15,tzinfo=UTC)) == 30

@@ -323,6 +323,8 @@ class ExitEdgeLiveRecorder:
         with self._lock:
             snapshot = dict(self._health)
             snapshot["pending_writes"] = len(self._pending_writes)
+            snapshot["pending_censors"] = len(self._pending_censors)
+            snapshot["pending_registration_attempts"] = len(self._pending_registration_attempts)
             snapshot["oldest_pending_write_seconds"] = max(0.0, time.monotonic() - min(self._pending_writes.values())) if self._pending_writes else 0.0
             snapshot["observed_quote_timestamp_fields"] = dict(
                 self._health["observed_quote_timestamp_fields"]
@@ -420,7 +422,7 @@ class ExitEdgeLiveRecorder:
             self._write_status_best_effort()
             while True:
                 try:
-                    item = self._queue.get(timeout=0.05)
+                    item = self._queue.get(timeout=1.0 if self.role == "observer" else 0.05)
                 except Empty:
                     self._flush_pending_registration_attempts(repository)
                     self._flush_pending_censors(repository)

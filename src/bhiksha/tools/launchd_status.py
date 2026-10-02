@@ -13,6 +13,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from bhiksha.config.environment import load_dotenv
 from bhiksha.ops.launchd_registry import latest_status_path, registered_launchd_jobs
@@ -224,10 +225,17 @@ def _exit_edge_observer_status(
     enabled = marker.is_file()
     loaded = launchd.get("loaded") is True
     fresh = updated_at is not None and 0 <= (now - updated_at).total_seconds() <= 90
+    from bhiksha.market_data.trading_calendar import regular_session_bounds
+    bounds = regular_session_bounds(now.astimezone(ZoneInfo("America/Chicago")).date())
+    market_closed = bounds is None or not bounds[0] <= now < bounds[1]
     if not enabled and loaded:
         status = "idle_disabled"
     elif not loaded:
         status = "observer_not_loaded"
+    elif (market_closed and fresh and health.get("role") == "observer"
+          and health.get("collection_state") == "idle_market_closed"
+          and not health.get("ready") and not health.get("worker_alive")):
+        status = "idle_market_closed"  # Cold start deliberately defers database recovery.
     elif health.get("role") != "observer" or not health.get("ready") or not health.get("worker_alive"):
         status = "observer_not_ready"
     elif not fresh:
@@ -239,8 +247,8 @@ def _exit_edge_observer_status(
                or (now - _parse_timestamp(health.get("last_quote_persisted_at"))).total_seconds() > 90)):
         status = "observer_quote_evidence_stale"
     else:
-        status = health.get("collection_state") if health.get("collection_state") in {"idle_market_closed", "idle_no_cohorts"} else "healthy"
-    return {"status": status, "ok": status in {"healthy", "idle_disabled", "idle_market_closed", "idle_no_cohorts"},
+        status = health.get("collection_state") if health.get("collection_state") in {"idle_market_closed", "idle_no_cohorts", "warming_market_open", "draining_market_close"} else "healthy"
+    return {"status": status, "ok": status in {"healthy", "idle_disabled", "idle_market_closed", "idle_no_cohorts", "warming_market_open", "draining_market_close"},
             "updated_at": updated_at.isoformat() if updated_at else None,
             "enabled": enabled, "loaded": loaded,
             "active_cohorts": health.get("active_cohorts"),

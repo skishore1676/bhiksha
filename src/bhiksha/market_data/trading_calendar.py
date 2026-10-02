@@ -10,6 +10,23 @@ from zoneinfo import ZoneInfo
 CENTRAL = ZoneInfo("America/Chicago")
 
 
+@lru_cache(maxsize=512)
+def regular_session_bounds(value: date) -> tuple[datetime, datetime] | None:
+    """XNYS regular session in UTC, including holidays and early closes.
+
+    Reuse the exchange calendar already used by weekly chart confirmations.
+    This is the regular-equity observation window, not extended options hours.
+    """
+    import exchange_calendars
+
+    calendar = exchange_calendars.get_calendar("XNYS")
+    day = value.isoformat()
+    if not calendar.is_session(day):
+        return None
+    return (calendar.session_open(day).to_pydatetime(),
+            calendar.session_close(day).to_pydatetime())
+
+
 SPECIAL_FULL_DAY_CLOSURES: frozenset[date] = frozenset(
     {
         date(2025, 1, 9),  # National Day of Mourning for President Jimmy Carter.
