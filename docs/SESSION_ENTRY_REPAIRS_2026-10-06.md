@@ -18,8 +18,8 @@ service, order or position is changed by this candidate.
 
 - Entry pricing and paper observation share proved provider timestamp lineage.
   Numeric provider timestamps are accepted; local receipt time is never provider
-  proof. Supplied invalid or future side timestamps fail closed. The existing
-  five-second freshness threshold remains in force.
+  proof. Supplied invalid or future side timestamps fail closed. Entry pricing
+  and modeled entry fills use a shared eight-second freshness threshold.
 - A timestamp-only entry rejection may make one additional quote read. Both
   observations and fetch timing are retained. Window, signal and retry guards
   are rechecked; hard price/liquidity, premium, cash and risk limits remain in
@@ -45,6 +45,14 @@ reserve settled cash for the full order. Shadow capture continues to require a
 later fresh ask touching the resting limit. Neither policy is tuned to force
 fills. Modeled shadow exit-cohort registration already exists and is unchanged.
 
+After the retrospective, Suman requested an entry quote-age ceiling between five
+and ten seconds. This candidate uses eight seconds, inclusive, as that operator
+policy choice. It is not presented as an empirically calibrated optimum. Quotes
+older than eight seconds remain stale; missing, unproved and future timestamps
+still fail closed. The retrospective's historical five-second counts remain
+historical evidence. Exit Edge's separate five-second experiment tape admission
+policy is unchanged.
+
 ## Historical reporting disposition
 
 The exact excluded case is trade `edb45772-3304-4623-ad91-b6ed1c8f4a59`, deployment
@@ -64,11 +72,15 @@ safety problem must still be visible.
 
 ## Validation and review
 
-Final validation on October 6 passed:
+Final validation on October 6, including the eight-second entry policy, passed:
 
-- Full repository suite: **1,482 passed in 24.86 seconds**.
-- Final focused session-repair and daily-report regressions: **79 passed**,
-  including 50 session-repair cases.
+- Full repository suite: **1,491 passed in 24.40 seconds**.
+- Focused session-repair, pricing, entry/exit and planner regressions:
+  **123 passed**, including 59 session-repair cases. Boundary coverage accepts
+  eight seconds exactly, rejects eight seconds plus one microsecond, accepts a
+  seven-second planner quote without a refresh, and applies the same ceiling
+  to modeled paper fills. Stale-refresh and delayed-risk fixtures use nine
+  seconds to continue exercising rejection and reservation release.
 - `python -m compileall -q src/bhiksha tests` and `git diff --check` passed.
 
 The full-suite command, run from this isolated checkout, was:
@@ -83,8 +95,9 @@ first on `PYTHONPATH` and the kernel's `src` second. Import resolution was
 verified into the isolated checkout. Kernel revision was
 `f4f1223b24e02bd3fc04f393088a508f9731d56c`. The final full-suite run permitted
 the existing test's localhost HTTP listener; no broker service was involved.
-Supporting logs are saved in the task's `verification/full-suite-final.txt`
-and `verification/focused-final.txt`.
+Supporting logs are saved in the task's `verification/eight-second-full-suite.txt`
+and `verification/eight-second-focused.txt`. The original five-second candidate's
+logs remain available separately.
 
 Direct final review covered the two-read quote bound, freshness and permission
 checks after asynchronous work, reservation release on rejection, immutable

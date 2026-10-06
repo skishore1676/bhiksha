@@ -53,12 +53,16 @@ def quote(at=NOW, **kwargs):
     ({'quoteTimestamp': NOW.timestamp() * 1000}, 'current'),
     ({'quoteTimestamp': NOW.isoformat()}, 'current'),
     ({'quoteTimestamp': (NOW - timedelta(seconds=5)).isoformat()}, 'current'),
-    ({'quoteTimestamp': (NOW - timedelta(seconds=5, microseconds=1)).isoformat()}, 'stale'),
+    ({'quoteTimestamp': (NOW - timedelta(seconds=5, microseconds=1)).isoformat()}, 'current'),
+    ({'quoteTimestamp': (NOW - timedelta(seconds=8)).isoformat()}, 'current'),
+    ({'quoteTimestamp': (NOW - timedelta(seconds=8, microseconds=1)).isoformat()}, 'stale'),
+    ({'quoteTimestamp': (NOW - timedelta(seconds=10)).isoformat()}, 'stale'),
     ({'quoteTimestamp': (NOW + timedelta(microseconds=1)).isoformat()}, 'unproven'),
     ({'bidTimestamp': NOW.isoformat()}, 'missing'),
     ({'quoteTimestamp': NOW.isoformat(), 'bidTimestamp': 'bad'}, 'unproven'),
     ({'quoteTimestamp': NOW.isoformat(), 'askTimestamp': (NOW + timedelta(seconds=1)).isoformat()}, 'unproven'),
-    ({'quoteTimestamp': NOW.isoformat(), 'bidTimestamp': (NOW - timedelta(seconds=6)).isoformat()}, 'stale'),
+    ({'quoteTimestamp': NOW.isoformat(), 'bidTimestamp': (NOW - timedelta(seconds=6)).isoformat()}, 'current'),
+    ({'quoteTimestamp': NOW.isoformat(), 'bidTimestamp': (NOW - timedelta(seconds=8, microseconds=1)).isoformat()}, 'stale'),
     ({'bidTimestamp': NOW.isoformat(), 'askTimestamp': (NOW + timedelta(seconds=1)).isoformat()}, 'unproven'),
     ({'timestamp': NOW.isoformat()}, 'missing'),
 ])
@@ -71,7 +75,7 @@ def test_quote_gate_proves_provider_timestamp_and_sides(payload, status):
     evidence = result.evidence()
     assert evidence['quote_timestamp_status'] == status
     assert evidence['quote_observed_at'] == NOW.isoformat()
-    assert evidence['quote_max_age_seconds'] == 5
+    assert evidence['quote_max_age_seconds'] == 8
 
 
 def test_inconsistent_effective_side_timestamp_cannot_pass_gate():
@@ -80,6 +84,41 @@ def test_inconsistent_effective_side_timestamp_cannot_pass_gate():
     q.bid_timestamp = (NOW - timedelta(seconds=1)).isoformat()
     q.ask_timestamp = NOW.isoformat()
     assert quote_timestamp_evidence(q, NOW)['quote_timestamp_status'] == 'unproven'
+
+
+def test_planner_accepts_seven_second_quote_without_refresh(monkeypatch):
+    freeze(monkeypatch)
+    dep = _enabled_deployment('market_impulse_qqq_short_v1')
+    dep.execution.entry_pricing_mode = 'price_seeking'
+    manager = StubOrderManager()
+    manager.get_option_quote = AsyncMock(return_value=quote(NOW - timedelta(seconds=7)))
+    planner = ExecutionPlanner(chain_service=StubChainService(), order_manager=manager,
+                               position_tracker=PositionTracker())
+    decision = SignalDecision(dep.deployment_id, 'QQQ', NOW, True, SignalDirection.SHORT, [], {})
+    plan = asyncio.run(planner.plan_entry(dep, decision, dry_run=True, simulate_only=True))
+    assert plan.risk_reasons == ['approved']
+    assert manager.get_option_quote.await_count == 1
+    assert plan.risk_details['entry_pricing']['quote_max_age_seconds'] == 8
+
+
+@pytest.mark.parametrize('age,filled', [(6, True), (8, True), (8.000001, False), (10, False)])
+def test_paper_fill_uses_eight_second_quote_boundary(age, filled):
+    async def run():
+        dep = paper_deployment()
+        decision = SignalDecision(dep.deployment_id, dep.symbol, NOW, True, SignalDirection.SHORT, [], {})
+        plan = TradePlan('paper-age', dep.deployment_id, dep.symbol, SignalDirection.SHORT,
+                         'QQQ260330P00558000', 1, 2.90, ['approved'], entry_timestamp=NOW)
+        q = quote(NOW + timedelta(seconds=1))
+        manager = SimpleNamespace(get_option_quote=AsyncMock(return_value=q), close=AsyncMock())
+        planner = SimpleNamespace(position_tracker=PositionTracker(), order_manager=manager, close=AsyncMock())
+        supervisor = ExecutionSupervisor(planner=planner, exit_edge_recorder=MagicMock())
+        supervisor._paper_entries[plan.trade_id] = (dep, decision, plan, NOW, NOW + timedelta(seconds=30))
+        supervisor.lifecycle_store.begin_entry(dep.symbol, dep.deployment_id, order_id='PAPER_PENDING')
+        await supervisor.poll_paper_entries(now=NOW + timedelta(seconds=1 + age))
+        assert planner.position_tracker.total_open_positions == int(filled)
+        assert (plan.trade_id not in supervisor._paper_entries) == filled
+        assert plan.risk_details['paper_quote_timing']['quote_max_age_seconds'] == 8
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize('case,reads,reason', [
@@ -96,7 +135,7 @@ def test_planner_refresh_is_bounded_and_preserves_safety(monkeypatch, case, read
     dep.execution.entry_window_start_et = '09:35'
     dep.execution.entry_window_end_et = '15:45'
     dep.risk.max_trade_premium_usd = 300
-    first = quote(NOW - timedelta(seconds=6))
+    first = quote(NOW - timedelta(seconds=9))
     if case == 'missing': first.quote_timestamp = None
     if case == 'crossed': first.bid, first.ask = 3, 2.9
     if case == 'oi': first.open_interest = 0
@@ -135,7 +174,7 @@ def test_refresh_then_reservation_window_expiry_releases_cash_and_risk(monkeypat
     dep.execution.entry_pricing_mode = 'price_seeking'
     dep.execution.entry_window_end_et = '15:45'
     manager = StubOrderManager()
-    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=6)), quote()])
+    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=9)), quote()])
     original_preflight = manager.preflight_entry
     async def aligned_preflight(symbol, limit, quantity):
         result = await original_preflight(symbol, limit, quantity)
@@ -290,7 +329,7 @@ def test_refresh_exception_is_terminal_and_cannot_submit(monkeypatch):
     dep = _enabled_deployment('market_impulse_qqq_short_v1')
     dep.execution.entry_pricing_mode = 'price_seeking'
     manager = StubOrderManager()
-    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=6)), RuntimeError('provider unavailable')])
+    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=9)), RuntimeError('provider unavailable')])
     planner = ExecutionPlanner(chain_service=StubChainService(), order_manager=manager, position_tracker=PositionTracker())
     decision = SignalDecision(dep.deployment_id, 'QQQ', NOW, True, SignalDirection.SHORT, [], {})
     plan = asyncio.run(planner.plan_entry(dep, decision, dry_run=False))
@@ -308,7 +347,7 @@ def test_refresh_preserves_downstream_caps_and_delayed_final_quote_gate(monkeypa
     dep = _enabled_deployment('market_impulse_qqq_short_v1')
     dep.execution.entry_pricing_mode = 'price_seeking'
     manager = StubOrderManager()
-    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=6)), quote()])
+    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=9)), quote()])
     original_preflight = manager.preflight_entry
     async def preflight(symbol, limit, quantity):
         result = await original_preflight(symbol, limit, quantity)
@@ -319,7 +358,7 @@ def test_refresh_preserves_downstream_caps_and_delayed_final_quote_gate(monkeypa
     reserve_risk = risk.reserve_sized_entry
     async def delayed_reserve(**kwargs):
         result = await reserve_risk(**kwargs)
-        if stage == 'risk_delay': Clock.current += timedelta(seconds=6)
+        if stage == 'risk_delay': Clock.current += timedelta(seconds=9)
         return result
     risk.reserve_sized_entry = delayed_reserve
     cash = RecordingAllowedCashGuard()
@@ -480,7 +519,7 @@ def test_weekly_pending_ttl_crossing_during_refresh_refuses_submission(monkeypat
     async def fetch(symbol):
         nonlocal reads
         reads += 1
-        if reads == 1: return quote(Clock.current - timedelta(seconds=6))
+        if reads == 1: return quote(Clock.current - timedelta(seconds=9))
         Clock.current += timedelta(seconds=2)
         return quote(Clock.current)
     manager.get_option_quote = fetch

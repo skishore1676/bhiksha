@@ -9,6 +9,8 @@ from typing import Any
 
 PUBLIC_QUOTE_TIMESTAMP_FIELD = "quoteTimestamp"
 PUBLIC_BID_ASK_TIMESTAMP_FIELD = "bidTimestamp+askTimestamp"
+# Operator-selected entry policy; keep pricing and modeled entry fills consistent.
+MAX_ENTRY_QUOTE_AGE_SECONDS = 8
 PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS = frozenset(
     {
         PUBLIC_QUOTE_TIMESTAMP_FIELD,
@@ -128,14 +130,17 @@ def proved_quote_timestamp_lineage(
 
 
 def quote_timestamp_evidence(quote: Any, observed_at: datetime) -> dict[str, Any]:
-    """The unchanged five-second entry gate, with inspectable provenance."""
+    """Classify entry quote freshness with inspectable provider provenance."""
     observed = aware_utc(observed_at)
     lineage = proved_quote_timestamp_lineage(quote, observed_at=observed)
     effective_age = (observed - lineage.quote_at).total_seconds() if lineage else None
     side_ages = lineage.ages_ms(observed) if lineage else (None, None)
     status = "missing" if getattr(quote, "quote_timestamp", None) is None else "unproven"
     if lineage:
-        status = "current" if (0 <= effective_age <= 5 and all(0 <= age <= 5000 for age in side_ages)) else "stale"
+        status = "current" if (
+            0 <= effective_age <= MAX_ENTRY_QUOTE_AGE_SECONDS
+            and all(0 <= age <= MAX_ENTRY_QUOTE_AGE_SECONDS * 1000 for age in side_ages)
+        ) else "stale"
     return {
         "quote_timestamp": getattr(quote, "quote_timestamp", None),
         "quote_timestamp_field": getattr(quote, "quote_timestamp_field", None),
@@ -145,7 +150,7 @@ def quote_timestamp_evidence(quote: Any, observed_at: datetime) -> dict[str, Any
         "effective_quote_at": lineage.quote_at.isoformat() if lineage else None,
         "quote_age_seconds": effective_age,
         "bid_age_ms": side_ages[0], "ask_age_ms": side_ages[1],
-        "quote_timestamp_status": status, "quote_max_age_seconds": 5,
+        "quote_timestamp_status": status, "quote_max_age_seconds": MAX_ENTRY_QUOTE_AGE_SECONDS,
     }
 
 
@@ -186,6 +191,7 @@ def _string_or_none(value: Any) -> str | None:
 
 
 __all__ = [
+    "MAX_ENTRY_QUOTE_AGE_SECONDS",
     "PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS",
     "PUBLIC_BID_ASK_TIMESTAMP_FIELD",
     "PUBLIC_QUOTE_TIMESTAMP_FIELD",
