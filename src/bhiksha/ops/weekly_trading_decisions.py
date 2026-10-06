@@ -32,6 +32,8 @@ from bhiksha.ops.trade_observation import (
     NON_TRADE_OUTCOMES,
     NO_SIGNAL,
     classify_trade_observation,
+    evaluation_coverage,
+    summarize_evaluation_coverage,
     group_events_by_deployment_day,
     index_terminal_entry_observations,
     terminal_entry_observation,
@@ -475,6 +477,7 @@ def build_trading_decision_export(
         "facts": facts,
         "observations": observations,
         "daily_status": daily_status,
+        "evaluation_coverage": summarize_evaluation_coverage(weekly_observation_events, deployments),
     }
     # The receipt identifies evidence, not run time. A retry with unchanged
     # facts must reuse the same digest so the workbook and Obsidian card can be
@@ -487,6 +490,7 @@ def build_trading_decision_export(
             for row in observations
         ],
         "daily_status": daily_status,
+        "evaluation_coverage": body["evaluation_coverage"],
     }
     digest = hashlib.sha256(json.dumps(digest_payload, sort_keys=True, default=str).encode()).hexdigest()
     body["receipt"] = {
@@ -526,6 +530,9 @@ def _load_observation_events(
                 "signal_decision",
                 "signal_evaluation",
                 "trade_plan",
+                "startup_config",
+                "provider_backoff",
+                "runtime_issue",
             ]
         )
     placeholders = ", ".join("?" for _ in event_types)
@@ -683,8 +690,12 @@ def _event_only_observations(
             outcome = BLOCKED
             source_event = trade_plans[-1]
         elif signal_events and not true_signal:
-            outcome = NO_SIGNAL
-            source_event = signal_events[-1]
+            incomplete = [e for e in signal_events if evaluation_coverage(e.get("payload") or {}) == "incomplete"]
+            confirmed_gated = [e for e in signal_events if ((e.get("payload") or {}).get("features") or {}).get("confirmation_at")]
+            outcome = MISSING if incomplete else BLOCKED if confirmed_gated else NO_SIGNAL
+            source_event = incomplete[-1] if incomplete else confirmed_gated[-1] if confirmed_gated else signal_events[-1]
+            if incomplete:
+                missing_reason = "incomplete_evaluation_coverage"
         elif trade_plans:
             outcome = MISSING
             source_event = trade_plans[-1]
@@ -702,9 +713,13 @@ def _event_only_observations(
             "source_event_type": source_event.get("event_type"),
             "source_event_id": source_event.get("event_id"),
             "observed_at": source_event.get("created_at"),
+            "evaluation_coverage": "incomplete" if missing_reason == "incomplete_evaluation_coverage" else "partial",
         }
         if missing_reason is not None:
             observation["missing_reason"] = missing_reason
+        if outcome == BLOCKED and (payload.get("features") or {}).get("confirmation_at"):
+            observation["block_reason"] = payload.get("reason")
+            observation["confirmation_at"] = payload["features"]["confirmation_at"]
         results.append(
             _normalized_observation(
                 observation,
@@ -825,13 +840,14 @@ def _daily_status_rows(
                 )
             )
             if (
-                needs_shadow_reclassification
+                (needs_shadow_reclassification or "evaluation_coverage" not in report
+                 or "total_excluded_count" not in (report.get("trade_summary") or {}))
                 and db_path is not None
                 and db_path.exists()
             ):
                 # Recompute the read-only classification from immutable event
                 # and trade facts. This lets a Friday export apply newer
-                # report semantics to an already-written Monday report without
+                # coverage/economics semantics to an already-written report without
                 # rewriting that historical artifact.
                 report = build_daily_report(
                     db_path,
@@ -859,6 +875,9 @@ def _daily_status_rows(
                 ),
                 "reconciliation_status": "DEGRADED" if provider.get("degraded_count") else ("WARNING" if provider.get("warning_count") else "OK"),
                 "report_status": ((report.get("status") or {}).get("level") or "UNKNOWN"),
+                "evaluation_coverage": (report.get("evaluation_coverage") or {}).get("status", "unknown"),
+                "excluded_count": (report.get("trade_summary") or {}).get("total_excluded_count", 0),
+                "realized_pnl_usd": (report.get("trade_summary") or {}).get("total_realized_pnl_usd"),
             })
         except (OSError, json.JSONDecodeError, TypeError):
             continue

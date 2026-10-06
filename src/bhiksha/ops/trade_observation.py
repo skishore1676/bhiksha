@@ -20,6 +20,109 @@ NO_SIGNAL = "NO_SIGNAL"
 BLOCKED = "BLOCKED"
 NO_FILL = "NO_FILL"
 MISSING = "MISSING"
+EXCLUDED = "EXCLUDED"
+INCOMPLETE_COVERAGE_REASONS = frozenset({"weekly_confirmation_data_gap", "weekly_underlying_stale"})
+
+# Closed by the operator on 2026-10-05. Raw ledger economics remain untouched;
+# this exact historical row is not evidence of a breakeven strategy result.
+_CLOSED_OPERATOR_CASE = {
+    "trade_id": "edb45772-3304-4623-ad91-b6ed1c8f4a59",
+    "deployment_id": "strategy_market_impulse_all_basket_discovery_iwm_long_live_row_3",
+    "symbol": "IWM", "option_symbol": "IWM260929C00285000",
+    "entry_order_id": "98f8868b-438f-4c46-a509-75605218b52c",
+    "entry_timestamp": "2026-09-25T13:54:52.525000+00:00",
+}
+
+
+def reporting_exclusion(trade: dict[str, Any]) -> dict[str, Any] | None:
+    if not _is_closed(trade) or any(str(trade.get(key) or "") != value for key, value in _CLOSED_OPERATOR_CASE.items()):
+        return None
+    return {
+        "observation_outcome": EXCLUDED, "pnl_eligible": False,
+        "realized_pnl_usd": None, "economics_status": "excluded",
+        "operator_case_status": "closed",
+        "exclusion_reason": "operator_closed_historical_iwm_2026_09_25_unattributable_economics",
+        "trade_id": trade.get("trade_id"), "deployment_id": trade.get("deployment_id"),
+        "symbol": trade.get("symbol"), "observed_at": trade.get("entry_timestamp"),
+    }
+
+
+def evaluation_coverage(payload: dict[str, Any]) -> str:
+    reasons = payload.get("reason") or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    if INCOMPLETE_COVERAGE_REASONS.intersection(reasons) or (payload.get("features") or {}).get("evaluation_coverage") == "incomplete":
+        return "incomplete"
+    return "observed"
+
+
+def summarize_evaluation_coverage(events: Iterable[dict[str, Any]], deployments=None) -> dict[str, Any]:
+    """Receipt coverage is partial unless an explicit expected cadence is proved."""
+    events = list(events)
+    enabled: set[str] = set()
+    symbols: dict[str, str] = {}
+    historical_inventory = False
+    for event in events:
+        payload = event.get("payload") or {}
+        if event.get("event_type") == "startup_config" and isinstance(payload.get("deployments"), list):
+            historical_inventory = True
+            for row in payload["deployments"]:
+                if isinstance(row, dict) and row.get("enabled", True) and row.get("deployment_id"):
+                    ident = row["deployment_id"]
+                    enabled.add(ident)
+                    symbols[ident] = str(row.get("symbol") or "")
+    if not historical_inventory:
+        for deployment in deployments or []:
+            if getattr(deployment, "enabled", True):
+                enabled.add(deployment.deployment_id)
+                symbols[deployment.deployment_id] = str(getattr(deployment, "symbol", ""))
+
+    grouped = defaultdict(list)
+    source_issues = []
+    for event in events:
+        payload = event.get("payload") or {}
+        kind = event.get("event_type")
+        if kind in {"signal_evaluation", "signal_decision"} and payload.get("deployment_id"):
+            grouped[payload["deployment_id"]].append(payload)
+            symbols.setdefault(payload["deployment_id"], str(payload.get("symbol") or ""))
+        # These stages exclusively describe underlying feed IO. Broker quote,
+        # order, reconciliation and generic exception receipts retain their
+        # existing safety classification without implying a bar-data gap.
+        if kind == "provider_backoff" or (kind == "runtime_issue" and payload.get("stage") in {"market_data_provider", "warm_start", "manual_intrabar"}):
+            source_issues.append({"event_id": event.get("event_id"), "event_type": kind,
+                "symbol": payload.get("symbol"), "stage": payload.get("stage"),
+                "error": payload.get("error"), "observed_at": event.get("created_at")})
+    rows = []
+    for ident in sorted(enabled | grouped.keys()):
+        evidence = grouped.get(ident, [])
+        gaps = sum(evaluation_coverage(payload) == "incomplete" for payload in evidence)
+        feed_issues = sum(issue["symbol"] in {None, "ALL", symbols.get(ident)} for issue in source_issues)
+        status = "incomplete" if gaps or feed_issues else "partial" if evidence else "unknown"
+        rows.append({"deployment_id": ident, "evaluation_count": len(evidence),
+            "incomplete_evaluation_count": gaps, "source_issue_count": feed_issues, "status": status})
+    status = (
+        "incomplete" if source_issues or any(row["status"] == "incomplete" for row in rows)
+        else "partial" if rows and all(row["evaluation_count"] for row in rows)
+        else "unknown"
+    )
+    inventory_source = (
+        "startup_config" if historical_inventory else
+        "provided_deployments" if deployments is not None else "evaluation_receipts_only"
+    )
+    return {"status": status, "lanes": rows, "source_issues": source_issues,
+            "expected_cadence_proved": False, "inventory_source": inventory_source}
+
+
+def economics_summary(trades: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    trades = list(trades)
+    excluded = [t for t in trades if t.get("economics_status") == "excluded"]
+    missing = [t for t in trades if t.get("realized_pnl_usd") is None and t not in excluded]
+    priced = [t for t in trades if t.get("realized_pnl_usd") is not None and t not in excluded]
+    subtotal = round(sum(t["realized_pnl_usd"] for t in priced), 2)
+    return {"excluded_count": len(excluded), "missing_pnl_count": len(missing),
+            "eligible_closed": len(priced), "known_subtotal_pnl_usd": subtotal if priced else None,
+            "total_pnl_usd": None if excluded or missing else subtotal,
+            "economics_status": "excluded" if excluded and not priced and not missing else "incomplete" if excluded or missing else "complete"}
 
 NON_TRADE_OUTCOMES = frozenset({ENTRY_CANCELLED_UNFILLED, NO_FILL})
 
@@ -106,6 +209,9 @@ def classify_trade_observation(
 ) -> dict[str, Any] | None:
     """Classify a persisted trade row using only positive evidence."""
 
+    exclusion = reporting_exclusion(trade)
+    if exclusion is not None:
+        return exclusion
     trade_id = str(trade.get("trade_id") or "")
     terminal = terminal_by_trade.get(trade_id)
     if terminal is not None:

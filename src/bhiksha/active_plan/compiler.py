@@ -1204,7 +1204,8 @@ def _compile_manual_trigger_row(
     if row.source_metadata.get("source_owner") == "cartographer_weekly":
         if row.authorization_mode != "shadow" or not payload["exit"].get("eod_flat", True):
             raise ValueError("weekly route requires SHADOW with intraday primary management")
-        payload["strategy"] = {"key": "weekly_chart", "version": 1, "params": row.source_metadata["weekly_plan"]}
+        payload["strategy"] = {"key": "weekly_chart", "version": 1, "params": dict(row.source_metadata["weekly_plan"])}
+        payload["strategy"]["params"]["entry_window_start_et"] = payload["execution"].get("entry_window_start_et")
         payload["source"]["origin"] = "cartographer_weekly"
         payload["exit"]["use_algorithmic_exit"] = True
         from bhiksha.strategy.weekly_chart import frozen_deployment

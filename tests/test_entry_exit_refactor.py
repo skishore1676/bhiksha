@@ -435,6 +435,8 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
         plan = TradePlan("repriced-paper", dep.deployment_id, dep.symbol, SignalDirection.SHORT,
                          "QQQ260925P00500000", 2, 2.0, ["approved"], entry_timestamp=now,
                          risk_details={"effective_max_trade_premium_usd": 400 if case == "premium_cap" else 1000})
+        if case == "fixed_concession":
+            plan.risk_details["entry_pricing"] = {"initial_mid": 2.0, "price_improvement_applied": True}
         quote = PublicQuote(plan.option_symbol, bid=2.0, ask=2.2, open_interest=1000,
                             quote_timestamp=(now + timedelta(seconds=2)).isoformat(), quote_timestamp_field="quoteTimestamp")
         manager = SimpleNamespace(get_option_quote=AsyncMock(return_value=quote), close=AsyncMock())

@@ -202,16 +202,16 @@ def test_parallel_arms_are_independent_and_keep_same_author_rule(params):
     assert baseline['deployment_id']==params['deployment_id']
     assert early['author_trigger']==baseline['trigger']
     assert early['tactical_invalidation']==baseline['tactical_invalidation']
-    first=datetime(2026,9,28,13,31,tzinfo=UTC)
-    assert observe(frame(minutes=1),early,first)[0]['reason']=='weekly_confirmed'
-    assert observe(frame(minutes=1),baseline,first)[0]['reason']=='weekly_waiting_confirmation'
+    first=datetime(2026,9,28,13,35,tzinfo=UTC)
+    assert observe(frame(minutes=5),early,first)[0]['reason']=='weekly_confirmed'
+    assert observe(frame(minutes=5),baseline,first)[0]['reason']=='weekly_waiting_confirmation'
     assert reserve(deployment(early),first,0) is None
     transition(deployment(early),'filled','early-trade')
     later=datetime(2026,9,28,14,9,tzinfo=UTC)
     assert observe(frame(),baseline,later)[0]['reason']=='weekly_confirmed'
     assert reserve(deployment(baseline),later,0) is None
     sibling=deepcopy(early);sibling['deployment_id']='cw-sibling-early1m'
-    observe(frame(minutes=1),sibling,first)
+    observe(frame(minutes=5),sibling,first)
     assert reserve(deployment(sibling),first,0)=='weekly_scenario_already_reserved_or_consumed'
 
 

@@ -51,6 +51,8 @@ from bhiksha.ops.daily_report import (
 from bhiksha.ops.trade_observation import (
     NON_TRADE_OUTCOMES,
     classify_trade_observation,
+    reporting_exclusion,
+    economics_summary,
     index_terminal_entry_observations,
 )
 
@@ -353,7 +355,7 @@ def _load_live_cumulative_rows(
         return []
     rows = conn.execute(
         """
-        SELECT trade_id, deployment_id, entry_order_id, exit_order_type, entry_price, exit_price,
+        SELECT trade_id, deployment_id, symbol, option_symbol, entry_order_id, exit_order_type, entry_price, exit_price,
                exit_filled_quantity, quantity, entry_timestamp, exit_filled_at, status
         FROM trade_sessions
         WHERE substr(replace(COALESCE(entry_timestamp, ''), ' ', 'T'), 1, 10) BETWEEN ? AND ?
@@ -406,6 +408,8 @@ def _trade_pnl_and_basis(row: dict[str, Any], partials: list[dict[str, Any]]) ->
     premium over the ORIGINAL entry quantity (residual final qty + banked qty)
     so the blended return % is honest for a laddered trade.
     """
+    if reporting_exclusion(row):
+        return None, None, _maybe_int(row.get("quantity")) or 0
     entry = _maybe_float(row.get("entry_price"))
     exit_price = _maybe_float(row.get("exit_price"))
     final_qty = _maybe_int(row.get("exit_filled_quantity"))
@@ -457,6 +461,7 @@ def _augment_trade(
         "is_profile_exit": bool(exit_attribution and exit_attribution.startswith("profile:")),
         "is_win": realized is not None and realized > 0,
         "option_strike": _parse_option_strike(_maybe_str(row.get("option_symbol"))),
+        **(reporting_exclusion(row) or {}),
     }
 
 
@@ -471,7 +476,8 @@ def _headline(trades: list[dict[str, Any]]) -> dict[str, Any]:
         missing_pnl = [t for t in closed if t["realized_pnl_usd"] is None]
         return {
             "trades": len(subset),
-            "closed": len(closed),
+            "closed": sum(t.get("economics_status") != "excluded" for t in closed),
+            "closed_observation_count": len(closed),
             "open": len(subset) - len(closed),
             "wins": sum(1 for t in closed if t["is_win"]),
             "total_pnl_usd": (
@@ -482,6 +488,7 @@ def _headline(trades: list[dict[str, Any]]) -> dict[str, Any]:
                 )
             ),
             "missing_pnl_count": len(missing_pnl),
+            **economics_summary(closed),
         }
 
     live = [t for t in trades if t["lane"] == "live"]
@@ -512,7 +519,8 @@ def _lane_rollups(
                 "display_id": _compact_deployment_id(deployment_id),
                 "mode": "live" if any(t["lane"] == "live" for t in lane_trades) else "shadow",
                 "trades": len(lane_trades),
-                "closed": len(closed),
+                "closed": sum(t.get("economics_status") != "excluded" for t in closed),
+                "closed_observation_count": len(closed),
                 "open": len(lane_trades) - len(closed),
                 "wins": sum(1 for t in closed if t["is_win"]),
                 "total_pnl_usd": (
@@ -523,6 +531,7 @@ def _lane_rollups(
                     )
                 ),
                 "missing_pnl_count": len(missing_pnl),
+                **economics_summary(closed),
                 "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
                 "exit_rule_counts": dict(sorted(exit_counts.items())),
                 "evidence_gates_relaxed": relaxed,
@@ -539,7 +548,8 @@ def _bucket(trades: list[dict[str, Any]]) -> dict[str, Any]:
     returns = [t["return_pct"] for t in trades if t["return_pct"] is not None]
     missing_pnl = [t for t in trades if t["realized_pnl_usd"] is None]
     return {
-        "n": len(trades),
+        "n": sum(t.get("realized_pnl_usd") is not None for t in trades),
+        **economics_summary(trades),
         "wins": sum(1 for t in trades if t["is_win"]),
         "total_pnl_usd": (
             None
@@ -596,13 +606,13 @@ def _promotion_candidates(
             "note": _promotion_note(relaxed),
         }
         qualifies = (
-            lane["closed"] >= PROMOTION_MIN_CLOSED_TRADES
+            lane.get("eligible_closed", lane["closed"]) >= PROMOTION_MIN_CLOSED_TRADES
             and (lane["total_pnl_usd"] or 0.0) > 0
             and not disqualified
         )
         if qualifies:
             candidates.append(entry)
-        elif lane["closed"] >= PROMOTION_MIN_CLOSED_TRADES:
+        elif lane.get("eligible_closed", lane["closed"]) >= PROMOTION_MIN_CLOSED_TRADES:
             # Cleared the sample bar but failed P&L / flags -- worth showing so
             # the operator sees the reasoning, not a silent omission.
             entry = {**entry, "disqualified_by": _disqualifier(lane, disqualified)}
@@ -645,10 +655,16 @@ def _live_cumulative(live_rows: list[dict[str, Any]], exp_start: date) -> dict[s
     by_day: dict[str, dict[str, Any]] = {}
     total = 0.0
     total_trades = 0
+    excluded_count = 0
+    missing_count = 0
     for row in live_rows:
+        if reporting_exclusion(row):
+            excluded_count += 1
+            continue
         partials = row.get("_partials", [])
         realized, _basis, _qty = _trade_pnl_and_basis(row, partials)
         if realized is None:
+            missing_count += 1
             continue
         day = _row_day(row)
         bucket = by_day.setdefault(day, {"day": day, "trades": 0, "pnl_usd": 0.0})
@@ -659,7 +675,9 @@ def _live_cumulative(live_rows: list[dict[str, Any]], exp_start: date) -> dict[s
     return {
         "since": exp_start.isoformat(),
         "by_day": [by_day[day] for day in sorted(by_day)],
-        "total_pnl_usd": _round_money(total),
+        "total_pnl_usd": None if excluded_count or missing_count else _round_money(total),
+        "known_subtotal_pnl_usd": _round_money(total) if total_trades else None,
+        "excluded_count": excluded_count, "missing_pnl_count": missing_count,
         "total_trades": total_trades,
     }
 
@@ -715,6 +733,7 @@ def render_weekly_scorecard_markdown(report: dict[str, Any]) -> str:
         f"({live.get('closed', 0)} closed, {live.get('wins', 0)} wins)",
         f"- shadow: `{_fmt_money_or_na(shadow.get('total_pnl_usd'))}` "
         f"({shadow.get('closed', 0)} closed, {shadow.get('wins', 0)} wins)",
+        f"- exclusions: `{total.get('excluded_count', 0)}`; known subtotal: `{_fmt_money_or_na(total.get('known_subtotal_pnl_usd'))}`",
         f"- combined realized: `{_fmt_money_or_na(total.get('total_pnl_usd'))}` "
         f"({total.get('closed', 0)} closed trades)",
     ]
@@ -886,7 +905,7 @@ def render_weekly_scorecard_telegram_summary(
         f"- Promotion candidates: {len(candidates)}",
         (
             f"- Live cumulative since {cumulative.get('since')}: "
-            f"${cumulative.get('total_pnl_usd', 0.0):.2f} "
+            f"{_fmt_money_or_na(cumulative.get('total_pnl_usd'))} "
             f"({cumulative.get('total_trades', 0)} trades)"
         ),
     ]

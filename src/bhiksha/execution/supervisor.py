@@ -2306,7 +2306,7 @@ class ExecutionSupervisor:
         anchored to the original midpoint and bounded concession.
         """
         from math import isfinite
-        from bhiksha.execution.quote_lineage import PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
+        from bhiksha.execution.quote_lineage import quote_timestamp_evidence
         from bhiksha.execution.planner import _entry_window_allows
         for trade_id, item in list(self._paper_entries.items()):
             deployment, decision, plan, started, expires = item
@@ -2326,13 +2326,15 @@ class ExecutionSupervisor:
                 try:
                     quote = await self.planner.order_manager.get_option_quote(plan.option_symbol)
                     received = now or datetime.now(UTC)
-                    if received >= expires:
+                    if received >= expires or not _entry_window_allows(deployment, received):
                         await self._finish_paper_no_fill(trade_id, "paper_limit_expired")
                         continue
-                    quote_at = datetime.fromisoformat(str(quote.quote_timestamp).replace("Z", "+00:00"))
-                    if quote_at.tzinfo is None or quote.quote_timestamp_field not in PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS:
+                    timing = quote_timestamp_evidence(quote, received)
+                    plan.risk_details["paper_quote_timing"] = timing
+                    if timing["quote_timestamp_status"] != "current":
                         continue
-                    if not (started < quote_at <= received) or (received - quote_at).total_seconds() > 5:
+                    quote_at = datetime.fromisoformat(timing["effective_quote_at"])
+                    if not (started < quote_at <= received):
                         continue
                     if quote.bid is None or quote.ask is None or not all(isfinite(v) for v in (quote.bid, quote.ask)):
                         continue
@@ -2340,7 +2342,7 @@ class ExecutionSupervisor:
                         continue
                     # Check hard quote gates again at fill; preferred liquidity is not a veto.
                     from bhiksha.execution.pricing import select_entry_limit
-                    if not select_entry_limit(quote, deployment.execution.model_dump()).approved:
+                    if not select_entry_limit(quote, deployment.execution.model_dump(), observed_at=received).approved:
                         continue
                     effective_at = datetime.fromisoformat(plan.risk_details.get("paper_limit_effective_at", started.isoformat()))
                     if quote_at <= effective_at:
@@ -2378,7 +2380,7 @@ class ExecutionSupervisor:
             return
         attempt = completed + 1
         plan.risk_details["paper_reprice_attempt"] = attempt
-        pricing = select_entry_limit(quote, _entry_reprice_pricing_params(self.app_config, deployment, plan, attempt))
+        pricing = select_entry_limit(quote, _entry_reprice_pricing_params(self.app_config, deployment, plan, attempt), observed_at=received)
         if not pricing.approved or pricing.limit_price is None:
             await self._finish_paper_no_fill(plan.trade_id, "paper_reprice_quote_blocked")
             return

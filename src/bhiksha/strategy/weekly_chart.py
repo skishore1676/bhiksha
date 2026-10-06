@@ -161,6 +161,35 @@ def recovery_start(params):
         return stamp(data['missing_history_from']) if data.get('missing_history_from') else None
 
 
+def retry_anchor(params, confirmed):
+    """Freeze retry time to the confirmation's authorized session, never observation time."""
+    day = confirmed.astimezone(ET).date().isoformat()
+    if params['trigger']['timeframe'] == 'daily':
+        calendar = exchange_calendars.get_calendar('XNYS')
+        day = calendar.next_session(day).date().isoformat()
+    opening, _ = session(day)
+    # Old unfrozen admissions predate the compiler's explicit window provenance;
+    # 09:35 is their original compiled entry start, not a new policy default.
+    window = params.get('entry_window_start_et') or '09:35'
+    hour, minute = map(int, window.split(':')[:2])
+    authorized_start = opening.astimezone(ET).replace(hour=hour, minute=minute, second=0, microsecond=0).astimezone(UTC)
+    return max(confirmed, authorized_start)
+
+
+def retry_time_block(params, data, now, frozen=None):
+    if not data.get('confirmation_at'):
+        return None
+    if frozen:
+        saved = json.loads(frozen)
+        params = {**params, 'entry_window_start_et': saved.get('execution', {}).get('entry_window_start_et') or params.get('entry_window_start_et')}
+    anchor = retry_anchor(params, stamp(data['confirmation_at']))
+    if now < anchor:
+        return 'weekly_waiting_entry_window'
+    if (now - anchor).total_seconds() > params['controls']['retry_seconds']:
+        return 'weekly_retry_window_expired'
+    return None
+
+
 def observe(frame, params, now):
     """Observe even while pending; invalidation takes precedence over a same-bar trigger."""
     boundary = max(stamp(params['published_at']), stamp(params['admitted_at']))
@@ -186,7 +215,10 @@ def observe(frame, params, now):
         # A daily confirmation has exactly one following session in which to enter.
         if params['trigger']['timeframe'] == 'daily' and triggers:
             data['confirmation_at'] = max(triggers).isoformat()
-        data.update(last_evaluation=now.isoformat(), underlying_observed_at=observed.isoformat(), close=close)
+        underlying_age = (now-observed).total_seconds()
+        data.update(last_evaluation=now.isoformat(), underlying_observed_at=observed.isoformat(), close=close,
+                    underlying_age_seconds=underlying_age,
+                    evaluation_coverage='incomplete' if gaps or not 0 <= underlying_age <= 120 else 'observed')
         reason = source_block(params, now)
         if data.get('invalidated_at') and status != 'filled':
             reason = 'weekly_invalidated'
@@ -207,10 +239,16 @@ def observe(frame, params, now):
                 next_day = calendar.next_session(confirmed.astimezone(ET).date().isoformat()).date()
                 if now.astimezone(ET).date() != next_day:
                     reason = reason or 'weekly_waiting_next_session_confirmation'
-                elif 'retry_started_at' not in data or data.get('retry_confirmation') != data['confirmation_at']:
-                    data.update(retry_started_at=now.isoformat(), retry_confirmation=data['confirmation_at'])
-            else:
-                data.setdefault('retry_started_at', confirmed.isoformat())
+            # Recompute deterministically from the original confirmation, including
+            # old state whose clock began before the authorized entry window.
+            anchor_params = params
+            if row['frozen_deployment']:
+                frozen = json.loads(row['frozen_deployment'])
+                anchor_params = {**params, 'entry_window_start_et': frozen.get('execution', {}).get('entry_window_start_et') or params.get('entry_window_start_et')}
+            anchor = retry_anchor(anchor_params, confirmed)
+            data.update(retry_started_at=anchor.isoformat(), retry_confirmation=data['confirmation_at'])
+            if now < anchor:
+                reason = reason or 'weekly_waiting_entry_window'
             if data.get('retry_started_at') and (now-stamp(data['retry_started_at'])).total_seconds() > params['controls']['retry_seconds']:
                 reason = reason or 'weekly_retry_window_expired'
             if not matches(close, params['trigger']):
@@ -235,6 +273,9 @@ def reserve(deployment, now, open_count):
         data = json.loads(row['payload'])
         if row['status'] != 'waiting' or data.get('reason') != 'weekly_confirmed':
             return 'weekly_not_eligible'
+        reason = retry_time_block(params, data, now, row['frozen_deployment'])
+        if reason:
+            return reason
         if (now-stamp(data['last_evaluation'])).total_seconds() > 120:
             return 'weekly_evaluation_stale'
         occupied = db.execute("SELECT count(*) FROM weekly_chart_state WHERE scenario_key=? AND entry_arm=? AND status IN ('pending','filled','uncertain')", (params['scenario_key'], params.get('entry_arm', 'baseline'))).fetchone()[0]
@@ -273,6 +314,9 @@ def pending_block(deployment, now):
             return 'weekly_' + row['status']
         if data.get('reason') != 'weekly_confirmed':
             return data.get('reason') or 'weekly_underlying_stale'
+        reason = retry_time_block(params, data, now, row['frozen_deployment'])
+        if reason:
+            return reason
         if (now-stamp(data['last_evaluation'])).total_seconds() > 120:
             return 'weekly_underlying_stale'
     return None
@@ -291,7 +335,9 @@ class WeeklyChartStrategy:
             signal=data['reason'] == 'weekly_confirmed' and status == 'waiting',
             direction=SignalDirection.LONG if params['direction']=='long' else SignalDirection.SHORT,
             reason=[data['reason']], features={'close': data['close'], 'confirmation_at': data.get('confirmation_at'),
-                'entry_arm': params.get('entry_arm', 'baseline'), 'scenario_key': params['scenario_key'], 'publication_hash': params['publication_hash']})
+                'entry_arm': params.get('entry_arm', 'baseline'), 'scenario_key': params['scenario_key'], 'publication_hash': params['publication_hash'],
+                'evaluation_coverage': data['evaluation_coverage'],
+                'missing_history_from': data.get('missing_history_from'), 'underlying_observed_at': data.get('underlying_observed_at')})
 
     def evaluate_exit(self, frame, deployment_id, params, position):
         now = datetime.now(UTC)

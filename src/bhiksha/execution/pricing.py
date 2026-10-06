@@ -8,6 +8,7 @@ import math
 from typing import Any, Literal
 
 from bhiksha.execution.order_manager import PublicQuote, round_price
+from bhiksha.execution.quote_lineage import quote_timestamp_evidence
 
 EntryPricingMode = Literal["passive", "balanced", "urgent", "cross", "price_seeking"]
 EntryExecutionProfileName = Literal["patient", "balanced", "urgent"]
@@ -110,6 +111,7 @@ class EntryPricingResult:
     limit_price: float | None
     block_reasons: list[str]
     price_improvement_applied: bool = False
+    observed_at: datetime | None = None
 
     @property
     def approved(self) -> bool:
@@ -138,6 +140,7 @@ class EntryPricingResult:
             "liquidity_warnings": liquidity_warnings(self.quote, self.policy),
             "liquidity_policy": "default_price_through_v1",
             "policy": asdict(self.policy),
+            **quote_timestamp_evidence(self.quote, self.observed_at or datetime.now(UTC)),
         }
         return payload
 
@@ -147,14 +150,16 @@ def select_entry_limit(
     execution_params: dict[str, Any] | None = None,
     *,
     policy: EntryPricingPolicy | None = None,
+    observed_at: datetime | None = None,
 ) -> EntryPricingResult:
     params = execution_params or {}
     active_policy = policy or EntryPricingPolicy.from_execution_params(params)
     target = _optional_float(params.get("entry_price_through_target"))
     pressure = bool(liquidity_warnings(quote, active_policy))
-    block_reasons = _quote_blocks(quote, params, active_policy, price_through=pressure or target is not None)
+    observed_at = observed_at or datetime.now(UTC)
+    block_reasons = _quote_blocks(quote, params, active_policy, price_through=pressure or target is not None, observed_at=observed_at)
     if block_reasons:
-        return EntryPricingResult(policy=active_policy, quote=quote, limit_price=None, block_reasons=block_reasons)
+        return EntryPricingResult(policy=active_policy, quote=quote, limit_price=None, block_reasons=block_reasons, observed_at=observed_at)
 
     bid = float(quote.bid)  # guarded by _quote_blocks
     ask = float(quote.ask)  # guarded by _quote_blocks
@@ -205,6 +210,7 @@ def select_entry_limit(
                      if price_improvement_applied else round_price(max(0.01, min(limit_price, ask)))) ,
         block_reasons=[],
         price_improvement_applied=price_improvement_applied,
+        observed_at=observed_at,
     )
 
 
@@ -298,7 +304,7 @@ def liquidity_warnings(quote: PublicQuote, policy: EntryPricingPolicy) -> list[s
 
 def _quote_blocks(
     quote: PublicQuote, execution_params: dict[str, Any], policy: EntryPricingPolicy,
-    *, price_through: bool = False,
+    *, price_through: bool = False, observed_at: datetime | None = None,
 ) -> list[str]:
     blocks: list[str] = []
     if any(value is not None and not math.isfinite(value) for value in (quote.bid, quote.ask, quote.open_interest)):
@@ -306,14 +312,9 @@ def _quote_blocks(
     if (policy.mode == "price_seeking" or price_through) and not (0 <= policy.price_improvement_discount_pct <= policy.price_improvement_max_pct <= .5 and math.isfinite(policy.price_improvement_curve) and policy.price_improvement_curve > 0):
         return ["invalid_price_improvement_policy"]
     if policy.mode == "price_seeking" or price_through:
-        from bhiksha.execution.quote_lineage import PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS
-        try:
-            stamp = datetime.fromisoformat(str(quote.quote_timestamp).replace("Z", "+00:00"))
-            age = (datetime.now(UTC) - stamp).total_seconds()
-            if quote.quote_timestamp_field not in PROVED_TWO_SIDED_QUOTE_TIMESTAMP_FIELDS or not 0 <= age <= 5:
-                blocks.append("public_quote_stale_or_unproven")
-        except (TypeError, ValueError):
-            blocks.append("public_quote_timestamp_missing")
+        status = quote_timestamp_evidence(quote, observed_at or datetime.now(UTC))["quote_timestamp_status"]
+        if status != "current":
+            blocks.append("public_quote_timestamp_missing" if status == "missing" else "public_quote_stale_or_unproven")
     if policy.require_two_sided_quote or policy.mode == "price_seeking" or policy.preferred_min_open_interest is not None or policy.preferred_max_bid_ask_spread_pct is not None:
         if quote.bid is None or quote.ask is None or quote.bid <= 0 or quote.ask <= 0:
             blocks.append("public_quote_missing_bid_ask")

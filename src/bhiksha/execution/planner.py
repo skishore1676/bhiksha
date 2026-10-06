@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import time, timedelta
+from datetime import UTC, datetime, time, timedelta
 import uuid
+import time as clock
 
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
 from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
@@ -12,6 +13,7 @@ from bhiksha.execution.native_orders import (
     decide_execution_route,
 )
 from bhiksha.execution.order_manager import OrderManager, OrderResult
+from bhiksha.execution.quote_lineage import parse_provider_timestamp
 from bhiksha.execution.pricing import (
     build_entry_profile_comparison,
     resolve_entry_reprice_max_chase_pct,
@@ -167,7 +169,11 @@ class ExecutionPlanner:
                 entry_timestamp=decision.timestamp,
             )
         try:
+            quote_fetch_started_at = datetime.now(UTC)
+            quote_fetch_started = clock.monotonic()
             quote = await self.order_manager.get_option_quote(selection.option_symbol)
+            quote_received_at = datetime.now(UTC)
+            quote_fetch_seconds = clock.monotonic() - quote_fetch_started
         except Exception:
             return TradePlan(
                 trade_id=trade_id,
@@ -192,7 +198,61 @@ class ExecutionPlanner:
                 open_interest_percentile=selection.open_interest_percentile,
             )
         pricing = select_entry_limit(quote, execution_params)
+        def attempt_evidence(result, started_at, received_at, fetch_seconds):
+            return {**result.evidence(), "quote_fetch_started_at": started_at.isoformat(),
+                "quote_received_at": received_at.isoformat(), "quote_fetch_seconds": fetch_seconds,
+                "fetch_to_pricing_seconds": (result.observed_at - received_at).total_seconds()}
+
+        quote_attempts = [attempt_evidence(pricing, quote_fetch_started_at, quote_received_at, quote_fetch_seconds)]
+        refreshed_quote = False
+
+        def guarded_plan(*, check_freshness: bool = False) -> TradePlan | None:
+            reason = entry_guard() if entry_guard is not None else None
+            current = datetime.now(UTC)
+            final_quote_validation = None
+            if reason is None and (refreshed_quote or deployment.strategy.key == "weekly_chart") and not _entry_window_allows(deployment, current):
+                reason = "execution_window_blocked"
+            if reason is None and deployment.strategy.key == "weekly_chart":
+                from bhiksha.strategy.weekly_chart import pending_block
+                reason = pending_block(deployment, current)
+            if reason is None and refreshed_quote and check_freshness:
+                fresh_pricing = select_entry_limit(quote, execution_params, observed_at=current)
+                final_quote_validation = fresh_pricing.evidence()
+                reason = next(iter(fresh_pricing.block_reasons), None)
+            if reason is None:
+                return None
+            return TradePlan(trade_id=trade_id, deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol, direction=decision.direction,
+                option_symbol=selection.option_symbol, quantity=0,
+                estimated_entry_price=pricing.limit_price or selection.estimated_entry_price or 0.0,
+                risk_reasons=[reason], dry_run=dry_run,
+                underlying_entry_price=underlying_entry_price, entry_timestamp=decision.timestamp,
+                risk_details={"entry_pricing": {**pricing.evidence(), "quote_attempts": quote_attempts,
+                    "final_quote_validation": final_quote_validation},
+                    "entry_permission_checked_at": current.isoformat(), **selection_details})
+
+        timestamp_blocks = {"public_quote_stale_or_unproven", "public_quote_timestamp_missing"}
+        if pricing.block_reasons and set(pricing.block_reasons) <= timestamp_blocks:
+            refreshed_quote = True
+            guarded = guarded_plan()
+            if guarded is not None:
+                return guarded
+            try:
+                quote_fetch_started_at = datetime.now(UTC)
+                quote_fetch_started = clock.monotonic()
+                quote = await self.order_manager.get_option_quote(selection.option_symbol)
+                quote_received_at = datetime.now(UTC)
+                quote_fetch_seconds = clock.monotonic() - quote_fetch_started
+                pricing = select_entry_limit(quote, execution_params)
+                quote_attempts.append(attempt_evidence(pricing, quote_fetch_started_at, quote_received_at, quote_fetch_seconds))
+            except Exception as exc:
+                quote_attempts.append({"quote_timestamp_status": "unavailable", "error": type(exc).__name__})
+            guarded = guarded_plan()
+            if guarded is not None:
+                return guarded
         pricing_evidence = pricing.evidence()
+        first_provider_at = parse_provider_timestamp(quote_attempts[0].get("effective_quote_at"))
+        final_provider_at = parse_provider_timestamp(quote_attempts[-1].get("effective_quote_at"))
         pricing_evidence = {
             **pricing_evidence,
             "initial_mid": pricing_evidence.get("mid"),
@@ -201,6 +261,15 @@ class ExecutionPlanner:
                 deployment.execution.model_dump()
             ),
             "initial_limit_price": pricing.limit_price,
+            "quote_attempts": quote_attempts,
+            "quote_refresh_status": (
+                "recovered" if refreshed_quote and pricing.approved else
+                "unavailable" if refreshed_quote else "not_needed"
+            ),
+            "provider_timestamp_advanced": (
+                final_provider_at > first_provider_at
+                if len(quote_attempts) == 2 and first_provider_at is not None and final_provider_at is not None else None
+            ),
             "initial_profile_comparison": build_entry_profile_comparison(
                 quote,
                 deployment.execution.model_dump(),
@@ -357,18 +426,7 @@ class ExecutionPlanner:
                 },
             )
 
-        def guarded_plan() -> TradePlan | None:
-            reason = entry_guard() if entry_guard is not None else None
-            if reason is None:
-                return None
-            return TradePlan(trade_id=trade_id, deployment_id=deployment.deployment_id,
-                symbol=deployment.symbol, direction=decision.direction,
-                option_symbol=selection.option_symbol, quantity=0,
-                estimated_entry_price=entry_price, risk_reasons=[reason], dry_run=dry_run,
-                underlying_entry_price=underlying_entry_price, entry_timestamp=decision.timestamp,
-                risk_details=selection_details)
-
-        guarded = guarded_plan()
+        guarded = guarded_plan(check_freshness=True)
         if guarded is not None:
             return guarded
         if dry_run:
@@ -583,7 +641,7 @@ class ExecutionPlanner:
                 )
         # Recheck a queued entry intent after all awaited selection/preflight/
         # reservation work and immediately before broker submission.
-        guarded = guarded_plan()
+        guarded = guarded_plan(check_freshness=True)
         if guarded is not None:
             if self.cash_guard is not None:
                 await self.cash_guard.release_entry(trade_id)

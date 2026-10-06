@@ -26,6 +26,8 @@ from bhiksha.ops.trade_observation import (
     NON_TRADE_OUTCOMES,
     NO_FILL,
     classify_trade_observation,
+    reporting_exclusion,
+    summarize_evaluation_coverage,
     index_terminal_entry_observations,
 )
 
@@ -99,7 +101,10 @@ def build_daily_report(
     day = _coerce_day(trading_date)
     path = Path(db_path)
     if not path.exists():
-        return _empty_report(day)
+        report = _empty_report(day)
+        report["evaluation_coverage"] = summarize_evaluation_coverage([], deployments)
+        report["coverage_status"] = {"level": "NO_DATA", "reason": "unknown"}
+        return report
 
     with closing(sqlite3.connect(path)) as conn:
         conn.row_factory = sqlite3.Row
@@ -171,8 +176,14 @@ def build_daily_report(
         events, deployments, trades
     )
     entry_profile_comparison = _entry_profile_comparison_summary(events)
+    evaluation_coverage = summarize_evaluation_coverage(events, deployments)
 
     return {
+        "evaluation_coverage": evaluation_coverage,
+        "coverage_status": {
+            "level": "YELLOW" if evaluation_coverage["status"] == "incomplete" else "NO_DATA",
+            "reason": evaluation_coverage["status"],
+        },
         "trading_date": day.isoformat(),
         "db_path": str(path),
         "code_version": code_version,
@@ -192,6 +203,11 @@ def build_daily_report(
             "live_open_count": len(live_open_positions),
             "shadow_open_count": len(shadow_open_positions),
             "total_open_count": len(open_positions),
+            **{f"{lane}_excluded_count": sum(t.get("economics_status") == "excluded" for t in subset)
+               for lane, subset in (("live", live_trades), ("shadow", shadow_trades), ("total", trades))},
+            **{f"{lane}_known_subtotal_pnl_usd": _round_money(sum(t["realized_pnl_usd"] for t in subset if t.get("realized_pnl_usd") is not None))
+               if any(t.get("realized_pnl_usd") is not None for t in subset) else None
+               for lane, subset in (("live", live_trades), ("shadow", shadow_trades), ("total", trades))},
             "live_realized_pnl_usd": _complete_realized_pnl(live_trades),
             "shadow_realized_pnl_usd": _complete_realized_pnl(shadow_trades),
             "total_realized_pnl_usd": _complete_realized_pnl(trades),
@@ -231,6 +247,7 @@ def build_daily_report(
             runtime_issue_counts=runtime_issue_counts,
             open_positions=open_positions,
             entry_reconciliation=entry_reconciliation,
+            evaluation_coverage=evaluation_coverage,
         ),
     }
 
@@ -244,6 +261,7 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         f"# Bhiksha Trade Session - {report.get('trading_date')}",
         "",
         f"- status: `{status.get('level', 'UNKNOWN')}`",
+        f"- evaluation coverage: `{(report.get('evaluation_coverage') or {}).get('status', 'unknown')}`",
         f"- live trades: `{summary.get('live_count', 0)}`",
         f"- shadow trades: `{summary.get('shadow_count', 0)}`",
         f"- open live positions: `{summary.get('live_open_count', 0)}`",
@@ -1085,9 +1103,10 @@ def _augment_trade(trade: dict[str, Any], partials: list[dict[str, Any]] | None 
     entry = _maybe_float(trade.get("entry_price"))
     exit_price = _maybe_float(trade.get("exit_price"))
     quantity = _maybe_int(trade.get("exit_filled_quantity")) or _maybe_int(trade.get("quantity")) or 0
+    exclusion = reporting_exclusion(trade)
     partial_pnl = 0.0
     banked_quantity = 0
-    for partial in partials or []:
+    for partial in ([] if exclusion else partials or []):
         if partial.get("abandoned_reason"):
             continue
         fill_price = _maybe_float(partial.get("fill_price"))
@@ -1097,7 +1116,7 @@ def _augment_trade(trade: dict[str, Any], partials: list[dict[str, Any]] | None 
         partial_pnl += (fill_price - entry) * fill_quantity * 100
         banked_quantity += fill_quantity
     realized = None
-    if entry is not None and ((exit_price is not None and quantity) or banked_quantity):
+    if exclusion is None and entry is not None and ((exit_price is not None and quantity) or banked_quantity):
         final_pnl = (exit_price - entry) * quantity * 100 if exit_price is not None and quantity else 0.0
         realized = _round_money(final_pnl + partial_pnl)
     lane = "shadow" if _is_shadow_trade(trade) else "live"
@@ -1111,6 +1130,7 @@ def _augment_trade(trade: dict[str, Any], partials: list[dict[str, Any]] | None 
         "protection_state": _protection_state(trade),
         "exit_attribution": _exit_attribution(trade),
         "qty_label": _format_qty_label(_maybe_int(trade.get("quantity")), trade.get("can_ladder")),
+        **(exclusion or {}),
     }
 
 
@@ -1119,6 +1139,7 @@ def _missing_exit_truth_count(trades: list[dict[str, Any]]) -> int:
         1
         for trade in trades
         if trade.get("observation_outcome") not in NON_TRADE_OUTCOMES
+        and trade.get("economics_status") != "excluded"
         and not _is_open_trade(trade)
         and _maybe_float(trade.get("entry_price")) is not None
         and (_maybe_int(trade.get("quantity")) or 0) > 0
@@ -1127,7 +1148,7 @@ def _missing_exit_truth_count(trades: list[dict[str, Any]]) -> int:
 
 
 def _complete_realized_pnl(trades: list[dict[str, Any]]) -> float | None:
-    if _missing_exit_truth_count(trades):
+    if _missing_exit_truth_count(trades) or any(t.get("economics_status") == "excluded" for t in trades):
         return None
     return _round_money(sum(_maybe_float(trade.get("realized_pnl_usd")) or 0.0 for trade in trades))
 
@@ -1135,6 +1156,11 @@ def _complete_realized_pnl(trades: list[dict[str, Any]]) -> float | None:
 def _summary_pnl_text(summary: dict[str, Any], lane: str) -> str:
     missing = _maybe_int(summary.get(f"{lane}_missing_exit_truth_count")) or 0
     value = _maybe_float(summary.get(f"{lane}_realized_pnl_usd"))
+    excluded = _maybe_int(summary.get(f"{lane}_excluded_count")) or 0
+    if excluded:
+        subtotal = summary.get(f"{lane}_known_subtotal_pnl_usd")
+        suffix = f"; known subtotal ${subtotal:.2f}" if subtotal is not None else ""
+        return f"unknown ({excluded} excluded{suffix})"
     if missing:
         noun = "fill" if missing == 1 else "fills"
         return f"unknown ({missing} missing exit {noun})"
@@ -1343,7 +1369,7 @@ def _entry_selector_empty_by_deployment(
 def _data_quality_warnings(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
     for trade in trades:
-        if trade.get("observation_outcome") in NON_TRADE_OUTCOMES:
+        if trade.get("observation_outcome") in NON_TRADE_OUTCOMES or trade.get("economics_status") == "excluded":
             continue
         if (
             trade.get("lane") == "live"
@@ -1425,6 +1451,7 @@ def _report_status(
     runtime_issue_counts: dict[str, int] | None = None,
     open_positions: list[dict[str, Any]] | None = None,
     entry_reconciliation: dict[str, Any] | None = None,
+    evaluation_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if any(
         str(position.get("lane") or "").lower() == "live"
@@ -1440,6 +1467,8 @@ def _report_status(
         return {"level": "RED", "reason": "reconciliation_recovery_exhausted", "attention_required": True}
     if provider_events.get("active_blocking_count", 0) > 0:
         return {"level": "RED", "reason": "blocking_reconciliation_failure", "attention_required": True}
+    if (evaluation_coverage or {}).get("status") == "incomplete":
+        return {"level": "YELLOW", "reason": "incomplete_evaluation_coverage", "attention_required": False}
     if provider_events.get("active_degraded_count", 0) > 0:
         return {"level": "YELLOW", "reason": "degraded_reconciliation", "attention_required": False}
     if data_quality_warnings:
@@ -1693,10 +1722,13 @@ def _pnl_row(report: dict[str, Any], lane: str) -> tuple[str, str, str, str]:
     summary = report.get("trade_summary") or {}
     key = f"{lane}_realized_pnl_usd"
     val = summary.get(key)
-    text = _fmt_money_or_na(val) if val is not None else "$0.00"
+    text = _summary_pnl_text(summary, lane)
     count = int(summary.get(f"{lane}_count") or 0)
     # P&L is info-only; keep GREEN unless we have no truth
     missing = int(summary.get(f"{lane}_missing_exit_truth_count") or 0)
+    excluded = int(summary.get(f"{lane}_excluded_count") or 0)
+    if excluded:
+        return (f"P&L ({lane})", f"{text} ({count} trades)", _ryg("YELLOW"), f"{excluded} excluded; operator case closed")
     if missing > 0:
         return (f"P&L ({lane})", f"{text} ({count} trades)", _ryg("YELLOW"), f"{missing} missing exit truth")
     return (f"P&L ({lane})", f"{text} ({count} trades)", _ryg("GREEN"), "realized")
@@ -1720,7 +1752,6 @@ def _signal_rows(report: dict[str, Any], lane: str, funnel: dict[str, dict[str, 
     selector_empty = int(f.get("selector_empty") or 0)
     attempted = int(f.get("attempted") or 0)
     filled = int(f.get("filled") or 0)
-    triggered = max(0, attempted)  # proxy for triggered that reached selector
     # Only surface RYG on the "unfillable" case
     if selector_empty > 0 and attempted == selector_empty:
         ryg = _ryg("YELLOW")
@@ -1730,19 +1761,20 @@ def _signal_rows(report: dict[str, Any], lane: str, funnel: dict[str, dict[str, 
         why = f"{selector_empty} selector_empty"
     else:
         ryg = _ryg("GREEN")
-        why = "flow ok" if attempted > 0 or evaluated == 0 else "quiet"
+        why = "records observed" if attempted > 0 else "no records"
     return [
-        ("Signals eval", str(evaluated) if lane == "live" else "—", ryg if lane == "live" else _ryg("GREEN"), why if lane == "live" else "shadow"),
-        ("Signals triggered", str(triggered), ryg, why),
-        ("Entry attempts", str(attempted), ryg, why),
-        ("Fills", str(filled), _ryg("GREEN"), "filled"),
+        ("Contract selection failures", str(selector_empty), ryg, why),
+        ("Recorded trades", str(filled), _ryg("GREEN"), "trade records"),
     ]
 
 
 def _build_ryg_tables(report: dict[str, Any], *, app_status: dict[str, Any] | None = None, schwab_status: dict[str, Any] | None = None) -> dict[str, list[tuple[str, str, str, str]]]:
     positions = report.get("open_positions") or []
     funnel = _signal_funnel_by_lane(report)
+    coverage = (report.get("evaluation_coverage") or {}).get("status", "unknown")
     app_rows: list[tuple[str, str, str, str]] = [
+        ("Evaluation coverage", coverage, _ryg("YELLOW" if coverage == "incomplete" else "NO_DATA"), "session cadence unproved"),
+        ("Signals evaluated (all lanes)", str((report.get("event_type_counts") or {}).get("signal_evaluation", 0)), _ryg("NO_DATA"), "coverage reported separately"),
         _app_running_row(report, app_status=app_status),
         _schwab_row(report, schwab_status=schwab_status),
         _provider_row(report),

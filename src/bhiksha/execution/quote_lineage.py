@@ -90,11 +90,17 @@ def proved_quote_timestamp_lineage(
         )
         if quote_at is None:
             return None
+        bid_raw = getattr(quote, "bid_timestamp", None)
+        ask_raw = getattr(quote, "ask_timestamp", None)
+        bid_at = parse_provider_timestamp(bid_raw) if bid_raw is not None else quote_at
+        ask_at = parse_provider_timestamp(ask_raw) if ask_raw is not None else quote_at
+        if bid_at is None or ask_at is None or bid_at > quote_at or ask_at > quote_at:
+            return None
         lineage = ProvedQuoteTimestampLineage(
-            quote_at=quote_at,
+            quote_at=min(quote_at, bid_at, ask_at),
             field=field,
-            bid_at=quote_at,
-            ask_at=quote_at,
+            bid_at=bid_at,
+            ask_at=ask_at,
         )
     else:
         bid_at = parse_provider_timestamp(getattr(quote, "bid_timestamp", None))
@@ -116,9 +122,31 @@ def proved_quote_timestamp_lineage(
 
     if observed_at is not None:
         bid_age_ms, ask_age_ms = lineage.ages_ms(observed_at)
-        if bid_age_ms < 0 or ask_age_ms < 0:
+        if bid_age_ms < 0 or ask_age_ms < 0 or quote_at > aware_utc(observed_at):
             return None
     return lineage
+
+
+def quote_timestamp_evidence(quote: Any, observed_at: datetime) -> dict[str, Any]:
+    """The unchanged five-second entry gate, with inspectable provenance."""
+    observed = aware_utc(observed_at)
+    lineage = proved_quote_timestamp_lineage(quote, observed_at=observed)
+    effective_age = (observed - lineage.quote_at).total_seconds() if lineage else None
+    side_ages = lineage.ages_ms(observed) if lineage else (None, None)
+    status = "missing" if getattr(quote, "quote_timestamp", None) is None else "unproven"
+    if lineage:
+        status = "current" if (0 <= effective_age <= 5 and all(0 <= age <= 5000 for age in side_ages)) else "stale"
+    return {
+        "quote_timestamp": getattr(quote, "quote_timestamp", None),
+        "quote_timestamp_field": getattr(quote, "quote_timestamp_field", None),
+        "bid_timestamp": getattr(quote, "bid_timestamp", None),
+        "ask_timestamp": getattr(quote, "ask_timestamp", None),
+        "quote_observed_at": observed.isoformat(),
+        "effective_quote_at": lineage.quote_at.isoformat() if lineage else None,
+        "quote_age_seconds": effective_age,
+        "bid_age_ms": side_ages[0], "ask_age_ms": side_ages[1],
+        "quote_timestamp_status": status, "quote_max_age_seconds": 5,
+    }
 
 
 def parse_provider_timestamp(value: Any) -> datetime | None:
@@ -165,4 +193,5 @@ __all__ = [
     "extract_public_quote_timestamp",
     "parse_provider_timestamp",
     "proved_quote_timestamp_lineage",
+    "quote_timestamp_evidence",
 ]

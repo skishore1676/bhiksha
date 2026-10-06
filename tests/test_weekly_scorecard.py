@@ -322,8 +322,8 @@ def test_weekly_scorecard_profile_vs_legacy_buckets(tmp_path) -> None:
 
     report = build_weekly_scorecard(db_path, week_start="2026-07-07", week_end="2026-07-09")
     pvl = report["profile_vs_legacy"]
-    assert pvl["live"]["profile"] == {"n": 1, "wins": 1, "total_pnl_usd": 100.0, "avg_return_pct": 50.0}
-    assert pvl["live"]["legacy"] == {"n": 1, "wins": 0, "total_pnl_usd": -70.0, "avg_return_pct": -35.0}
+    assert {k: pvl["live"]["profile"][k] for k in ("n", "wins", "total_pnl_usd", "avg_return_pct")} == {"n": 1, "wins": 1, "total_pnl_usd": 100.0, "avg_return_pct": 50.0}
+    assert {k: pvl["live"]["legacy"][k] for k in ("n", "wins", "total_pnl_usd", "avg_return_pct")} == {"n": 1, "wins": 0, "total_pnl_usd": -70.0, "avg_return_pct": -35.0}
     assert pvl["overall"]["profile"]["total_pnl_usd"] == 100.0
     assert pvl["overall"]["legacy"]["total_pnl_usd"] == -70.0
     assert "OVERSTATE stop slippage" in pvl["caveat"]
