@@ -5,6 +5,12 @@ import httpx
 from bhiksha.execution.order_manager import OrderManager, normalize_option_symbol, round_price, snap_price
 
 
+def increment_error(message):
+    request = httpx.Request("POST", "https://broker.invalid/order")
+    response = httpx.Response(422, request=request, json={"message": message})
+    return httpx.HTTPStatusError(message, request=request, response=response)
+
+
 def test_option_symbol_normalization_strips_suffix() -> None:
     assert normalize_option_symbol("qqq250330p00100000-option") == "QQQ250330P00100000"
 
@@ -13,8 +19,8 @@ def test_round_price_uses_two_decimals() -> None:
     assert round_price(1.234) == 1.23
 
 
-def test_snap_price_uses_buy_ceiling() -> None:
-    assert snap_price(3.21, 0.10, side="BUY") == 3.30
+def test_snap_price_preserves_buy_ceiling() -> None:
+    assert snap_price(3.21, 0.10, side="BUY") == 3.20
 
 
 def test_snap_price_uses_sell_floor() -> None:
@@ -57,7 +63,7 @@ def test_order_manager_retries_entry_after_increment_rejection() -> None:
         async def place_order(self, payload: dict) -> dict:
             self.placed_orders.append(dict(payload))
             if len(self.placed_orders) == 1:
-                raise ValueError("limitPrice must be in increments of $0.05")
+                raise increment_error("limitPrice must be in increments of $0.05")
             return {"orderId": "OID123"}
 
         async def close(self) -> None:
@@ -70,7 +76,7 @@ def test_order_manager_retries_entry_after_increment_rejection() -> None:
 
     assert result.order_id == "OID123"
     assert broker.placed_orders[0]["limitPrice"] == "3.21"
-    assert broker.placed_orders[1]["limitPrice"] == "3.25"
+    assert broker.placed_orders[1]["limitPrice"] == "3.20"
 
 
 def test_order_manager_retries_stop_after_increment_rejection() -> None:
@@ -84,7 +90,7 @@ def test_order_manager_retries_stop_after_increment_rejection() -> None:
         async def place_order(self, payload: dict) -> dict:
             self.placed_orders.append(dict(payload))
             if len(self.placed_orders) == 1:
-                raise ValueError("stopPrice must be in increments of $0.05")
+                raise increment_error("stopPrice must be in increments of $0.05")
             return {"orderId": "STOP123"}
 
         async def close(self) -> None:
@@ -113,7 +119,7 @@ def test_order_manager_reuses_learned_underlying_increment() -> None:
         async def place_order(self, payload: dict) -> dict:
             self.placed_orders.append(dict(payload))
             if len(self.placed_orders) == 1:
-                raise ValueError("limitPrice must be in increments of $0.05")
+                raise increment_error("limitPrice must be in increments of $0.05")
             return {"orderId": f"OID{len(self.placed_orders)}"}
 
         async def close(self) -> None:
@@ -127,7 +133,7 @@ def test_order_manager_reuses_learned_underlying_increment() -> None:
 
     assert first.order_id == "OID2"
     assert second.order_id == "OID3"
-    assert broker.placed_orders[2]["limitPrice"] == "4.25"
+    assert broker.placed_orders[2]["limitPrice"] == "4.20"
 
 
 def test_cancel_ack_requires_terminal_zero_fill_readback() -> None:

@@ -174,7 +174,7 @@ def test_refresh_then_reservation_window_expiry_releases_cash_and_risk(monkeypat
     dep.execution.entry_pricing_mode = 'price_seeking'
     dep.execution.entry_window_end_et = '15:45'
     manager = StubOrderManager()
-    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=9)), quote()])
+    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=9)), quote(), quote(NOW - timedelta(seconds=9)), quote(NOW - timedelta(seconds=9))])
     original_preflight = manager.preflight_entry
     async def aligned_preflight(symbol, limit, quantity):
         result = await original_preflight(symbol, limit, quantity)
@@ -347,7 +347,7 @@ def test_refresh_preserves_downstream_caps_and_delayed_final_quote_gate(monkeypa
     dep = _enabled_deployment('market_impulse_qqq_short_v1')
     dep.execution.entry_pricing_mode = 'price_seeking'
     manager = StubOrderManager()
-    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=9)), quote()])
+    manager.get_option_quote = AsyncMock(side_effect=[quote(NOW - timedelta(seconds=9)), quote(), quote(NOW - timedelta(seconds=9)), quote(NOW - timedelta(seconds=9))])
     original_preflight = manager.preflight_entry
     async def preflight(symbol, limit, quantity):
         result = await original_preflight(symbol, limit, quantity)
@@ -371,11 +371,11 @@ def test_refresh_preserves_downstream_caps_and_delayed_final_quote_gate(monkeypa
     plan = asyncio.run(planner.plan_entry(dep, decision, dry_run=False))
     assert plan.risk_reasons == [{'cash_reject': 'cash_guard_blocked', 'risk_reject': 'risk_cap_blocked',
                                  'risk_delay': 'public_quote_stale_or_unproven'}[stage]]
-    assert manager.get_option_quote.await_count == 2
+    assert manager.get_option_quote.await_count == (4 if stage == 'risk_delay' else 2)
     assert manager.place_entry_order_calls == 0
     if stage == 'risk_delay':
-        assert risk.release_calls == [plan.trade_id]
-        assert ('release', plan.trade_id) in cash.calls
+        assert risk.release_calls
+        assert all(('release', trade_id) in cash.calls for trade_id in risk.release_calls)
 
 
 def test_historical_startup_inventory_wins_over_current_manifest():
@@ -602,8 +602,8 @@ def test_live_sizing_repreflights_actual_quantity_and_final_quote(monkeypatch, t
     if change=='stale':
         assert plan.risk_reasons==['public_quote_stale_or_unproven']
         assert manager.place_entry_order_calls==0
-        assert risk.release_calls==[plan.trade_id]
-        assert asyncio.run(cash.repository.get_reservation(plan.trade_id)).status=='released'
+        assert risk.release_calls
+        assert all(asyncio.run(cash.repository.get_reservation(t)).status=='released' for t in risk.release_calls)
     else:
         assert plan.quantity==1 and plan.order_id=='OID123'
         assert risk.reserve_calls[-1]['quantity']==1
@@ -630,7 +630,8 @@ def test_final_live_quote_age_gate_also_covers_initially_fresh_quotes(monkeypatc
     decision = SignalDecision(dep.deployment_id,'QQQ',NOW,True,SignalDirection.SHORT,[],{})
     plan = asyncio.run(planner.plan_entry(dep,decision,dry_run=False))
     assert plan.risk_reasons == ['public_quote_stale_or_unproven']
-    assert manager.get_option_quote.await_count == 1
+    assert manager.get_option_quote.await_count == (3 if mode == 'price_seeking' else 2)
     assert manager.place_entry_order_calls == 0
-    assert risk.release_calls == [plan.trade_id]
-    assert ('release',plan.trade_id) in cash.calls
+    assert risk.release_calls
+    assert all(('release', trade_id) in cash.calls for trade_id in risk.release_calls)
+    assert all(('release',trade_id) in cash.calls for trade_id in risk.release_calls)

@@ -1239,7 +1239,7 @@ class BhikshaRuntime:
                 # Pending entries still need completed-bar invalidation and fresh-price checks.
                 from bhiksha.strategy.weekly_chart import observe
                 observe(weekly_frame, deployment.strategy.params, datetime.now(UTC))
-            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+            if deployment.strategy.key == "manual_trigger" and supervisor.has_entry_liquidity_retry(deployment.deployment_id):
                 # Completed bars can invalidate a waiting intent; only fresh
                 # intrabar observations may authorize its next attempt.
                 price = bar.low if deployment.strategy.params.get("direction") == "long" else bar.high
@@ -1581,7 +1581,7 @@ class BhikshaRuntime:
             enriched = enriched_frames.get(deployment.deployment_id)
             if enriched is None:
                 continue
-            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+            if deployment.strategy.key == "manual_trigger" and supervisor.has_entry_liquidity_retry(deployment.deployment_id):
                 # This bounded intent has already fired its one-shot trigger.
                 # Recheck only the fresh price, preserving trigger/invalidation gates.
                 enriched = enriched.tail(1)

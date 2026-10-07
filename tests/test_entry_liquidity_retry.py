@@ -105,13 +105,12 @@ def test_retry_cancels_without_rearming(setup, stop):
     assert any(k=='entry_liquidity_retry_finished' for k,_ in events)
 
 
-@pytest.mark.parametrize('kind',['oi','budget_exception','off','other_owner'])
+@pytest.mark.parametrize('kind',['oi','budget_exception','off'])
 def test_no_retry_for_non_liquidity_failures_or_unarmed_lanes(setup,kind):
     s,p,d,decision,_ = setup
     if kind=='oi': p.error=SelectorEmptyError(d.deployment_id, {'open_interest_below_min':1}, {'liquidity_retry_candidates':0})
     if kind=='budget_exception': p.error=ValueError('insufficient_budget')
     if kind=='off': d.execution.entry_liquidity_retry_seconds=0
-    if kind=='other_owner': d.source.metadata['source_owner']='operator'
     async def run():
         with pytest.raises((SelectorEmptyError,ValueError)):
             await s.handle_signal(d,decision(),dry_run=True,simulate_only=True)

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -193,16 +194,17 @@ def load_attempt_events(path: str | Path, *, limit: int = 2_000) -> list[dict[st
     if not database.is_file():
         return []
     try:
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
             rows = connection.execute(
                 "SELECT id, created_at, event_type, payload FROM events "
-                "WHERE event_type IN (?, ?, ?, ?, ?) ORDER BY id DESC LIMIT ?",
+                "WHERE event_type IN (?, ?, ?, ?, ?, ?) ORDER BY id DESC LIMIT ?",
                 (
                     ATTEMPT_EVENT,
                     OUTCOME_EVENT,
                     RECOVERY_EVENT,
                     "signal_decision",
                     "trade_plan",
+                    "entry_liquidity_retry_scheduled",
                     int(limit),
                 ),
             ).fetchall()

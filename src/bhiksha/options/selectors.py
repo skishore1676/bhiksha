@@ -146,7 +146,11 @@ class SingleLegOptionSelector:
                 contract.option_symbol.replace(" ", "").upper(),
             ),
         )
-        chosen = ranked[0]
+        candidate_rank = int(request.execution_params.get("_entry_candidate_rank", 0))
+        if candidate_rank >= len(ranked):
+            raise SelectorEmptyError(request.deployment_id, eliminated,
+                diagnostics={"ranked_candidates_exhausted": True, "eligible_candidates": len(ranked)})
+        chosen = ranked[candidate_rank]
         percentile_cohort = [
             contract
             for contract in desired_contracts

@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
+from decimal import Decimal, ROUND_FLOOR
 import re
 import uuid
 from typing import Any
@@ -26,6 +27,13 @@ DEFAULT_OPTION_TICK_INCREMENT = 0.05
 CANCEL_STATUS_READBACK_TIMEOUT_SECONDS = 1.0
 
 
+def preflight_failure_is_transient(error: Exception) -> bool:
+    """Only transport failures and temporary broker responses merit recovery."""
+    return isinstance(error, (httpx.RequestError, TimeoutError)) or (
+        isinstance(error, httpx.HTTPStatusError)
+        and (error.response.status_code in {408, 429} or error.response.status_code >= 500))
+
+
 def round_price(value: float) -> float:
     """Round to standard 2-decimal option pricing."""
     return round(float(value) + 1e-9, 2)
@@ -43,6 +51,11 @@ def normalize_option_symbol(symbol: str) -> str:
 class OrderResult:
     order_id: str | None
     error: str | None = None
+    actual_limit_price: float | None = None
+    increment_rejected: bool = False
+    submission_uncertain: bool = False
+    submission_attempted: bool = True
+    pre_submission_retryable: bool = False
 
 
 @dataclass(slots=True)
@@ -97,10 +110,15 @@ class PreflightCheck:
 
 
 def snap_price(value: float, increment: float, *, side: str) -> float:
-    """Snap a price to the broker-supported increment."""
-    scaled = value / increment
-    snapped = math.ceil(scaled - 1e-9) if side.upper() == "BUY" else math.floor(scaled + 1e-9)
-    return round_price(snapped * increment)
+    """BUY limits are ceilings; preserve existing SELL floor semantics."""
+    if not math.isfinite(value) or not math.isfinite(increment) or increment <= 0:
+        raise ValueError("invalid_price_increment")
+    units = (Decimal(str(value)) / Decimal(str(increment))).to_integral_value(rounding=ROUND_FLOOR)
+    price = float(units * Decimal(str(increment)))
+    if price <= 0:
+        raise ValueError("price_below_broker_increment")
+    return round_price(price)
+
 
 
 class OrderManager:
@@ -168,17 +186,34 @@ class OrderManager:
         quantity: int,
     ) -> PreflightCheck:
         payload = self._entry_payload(option_symbol, limit_price, quantity)
-        response = await self.broker.preflight_single_leg(payload)
-        increment = _maybe_float((response.get("priceIncrement") or {}).get("currentIncrement"))
-        if increment:
-            self._cache_price_increment(option_symbol, increment)
-            payload["limitPrice"] = f"{snap_price(limit_price, increment, side='BUY'):.2f}"
-        return PreflightCheck(
-            payload=payload,
-            current_increment=increment,
-            buying_power_requirement=_maybe_float(response.get("buyingPowerRequirement")),
-            estimated_cost=_maybe_float(response.get("estimatedCost")),
-        )
+        increment = self._lookup_price_increment(option_symbol)
+        for _ in range(3):
+            if increment:
+                payload["limitPrice"] = f"{snap_price(limit_price, increment, side='BUY'):.2f}"
+            try:
+                response = await self.broker.preflight_single_leg(payload)
+            except httpx.HTTPStatusError as exc:
+                discovered = (_extract_price_increment(_exception_message(exc))
+                              if exc.response.status_code in {400, 422} else None)
+                if not discovered:
+                    raise
+                increment = discovered
+                self._cache_price_increment(option_symbol, increment)
+                continue
+            discovered = _maybe_float((response.get("priceIncrement") or {}).get("currentIncrement"))
+            if discovered:
+                if not math.isfinite(discovered) or discovered <= 0:
+                    raise ValueError("invalid_price_increment")
+                increment = discovered
+                self._cache_price_increment(option_symbol, increment)
+                corrected = f"{snap_price(limit_price, increment, side='BUY'):.2f}"
+                if corrected != payload["limitPrice"]:
+                    payload["limitPrice"] = corrected
+                    continue  # Costs must belong to the exact final price/quantity.
+            return PreflightCheck(payload=payload, current_increment=increment,
+                buying_power_requirement=_maybe_float(response.get("buyingPowerRequirement")),
+                estimated_cost=_maybe_float(response.get("estimatedCost")))
+        raise ValueError("entry_preflight_increment_unstable")
 
     async def get_portfolio(self) -> dict[str, Any]:
         return await self.broker.get_portfolio()
@@ -193,10 +228,11 @@ class OrderManager:
         quantity: int,
         *,
         order_id: str | None = None,
+        submission_guard: Callable[[], str | None] | None = None,
     ) -> OrderResult:
         payload = self._entry_payload(option_symbol, limit_price, quantity, order_id=order_id)
         payload = await self._apply_increment_correction(payload, side="BUY", price_key="limitPrice")
-        return await self._submit_with_increment_retry(payload, side="BUY", price_key="limitPrice")
+        return await self._submit_with_increment_retry(payload, side="BUY", price_key="limitPrice", submission_guard=submission_guard)
 
     async def place_stop_loss_order(
         self,
@@ -394,12 +430,28 @@ class OrderManager:
         return False, last_payload, "fill_timeout"
 
     async def _submit(self, payload: dict[str, Any]) -> OrderResult:
+        price = _maybe_float(payload.get("limitPrice"))
         try:
             response = await self.broker.place_order(payload)
             order_id = response.get("orderId") or response.get("id")
-            return OrderResult(order_id=str(order_id) if order_id else None, error=None if order_id else "missing_order_id")
+            if order_id:
+                return OrderResult(order_id=str(order_id), actual_limit_price=price)
+            error, uncertain, increment_rejected = "missing_order_id", True, False
         except Exception as exc:
-            return OrderResult(order_id=None, error=_exception_message(exc))
+            error = _exception_message(exc)
+            definite = (isinstance(exc, httpx.HTTPStatusError)
+                        and 400 <= exc.response.status_code < 500
+                        and exc.response.status_code not in {408, 409, 429})
+            uncertain = not definite
+            increment_rejected = (isinstance(exc, httpx.HTTPStatusError)
+                                  and exc.response.status_code in {400, 422}
+                                  and _extract_price_increment(error) is not None)
+        # The client order ID is durable reconciliation identity, not a fill.
+        # A timeout or malformed success cannot authorize another BUY.
+        hold_id = str(payload["orderId"]) if uncertain and payload.get("orderSide") == "BUY" else None
+        return OrderResult(order_id=hold_id, error=error, actual_limit_price=price,
+                           increment_rejected=increment_rejected,
+                           submission_uncertain=bool(hold_id))
 
     async def _submit_with_increment_retry(
         self,
@@ -407,11 +459,15 @@ class OrderManager:
         *,
         side: str,
         price_key: str,
+        submission_guard: Callable[[], str | None] | None = None,
     ) -> OrderResult:
+        reason = submission_guard() if submission_guard else None
+        if reason:
+            return OrderResult(order_id=None, error=reason, submission_attempted=False)
         result = await self._submit(payload)
         if result.order_id or not result.error:
             return result
-        increment = _extract_price_increment(result.error)
+        increment = _extract_price_increment(result.error) if result.increment_rejected else None
         if increment is None:
             return result
         symbol = normalize_option_symbol(str((payload.get("instrument") or {}).get("symbol", "")))
@@ -430,6 +486,18 @@ class OrderManager:
             f"{original_price:.2f}",
             payload[price_key],
         )
+        if side.upper() == "BUY":
+            # A proved validation rejection permits exact-price preflight, not
+            # an unpriced increase or a retry of an uncertain submission.
+            try:
+                checked = await self.preflight_entry(symbol, corrected_price, int(payload["quantity"]))
+                payload[price_key] = checked.payload[price_key]
+            except Exception as exc:
+                return OrderResult(order_id=None, error=f"public_preflight_failed:{type(exc).__name__}",
+                                   submission_attempted=False, pre_submission_retryable=preflight_failure_is_transient(exc))
+        reason = submission_guard() if submission_guard else None
+        if reason:
+            return OrderResult(order_id=None, error=reason, submission_attempted=False)
         return await self._submit(payload)
 
     async def _apply_increment_correction(

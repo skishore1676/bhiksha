@@ -1422,7 +1422,7 @@ class BhikshaRuntime:
                 exited_deployments.add(evaluation.deployment.deployment_id)
 
         for deployment in deployments_by_symbol[bar.symbol]:
-            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+            if deployment.strategy.key == "manual_trigger" and supervisor.has_entry_liquidity_retry(deployment.deployment_id):
                 # Completed-bar extremes can invalidate a setup even if the
                 # latest tick has recovered; they cannot authorize a retry.
                 price = bar.low if deployment.strategy.params.get("direction") == "long" else bar.high
@@ -1757,7 +1757,7 @@ class BhikshaRuntime:
             enriched = enriched_frames.get(deployment.deployment_id)
             if enriched is None:
                 continue
-            if supervisor.has_entry_liquidity_retry(deployment.deployment_id):
+            if deployment.strategy.key == "manual_trigger" and supervisor.has_entry_liquidity_retry(deployment.deployment_id):
                 # Re-evaluate today's trigger at the fresh current price. The
                 # first-trigger latch already fired for this bounded intent.
                 enriched = enriched.tail(1)

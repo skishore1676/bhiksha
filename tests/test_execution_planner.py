@@ -891,7 +891,7 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
     assert plan is not None
     assert plan.quantity == 0
     assert plan.risk_reasons == ["insufficient_budget_for_single_contract"]
-    assert plan.risk_details == {
+    assert {k:v for k,v in plan.risk_details.items() if k not in {"entry_recovery_attempts", "final_quote_rebuild_used", "candidate_search_exhausted"}} == {
         "reason": "insufficient_budget",
         "max_premium": 300.0,
         "entry_price": 9.1,

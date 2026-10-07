@@ -203,6 +203,7 @@ def _signal_outcome_payload(
     mode: str | None = None,
 ) -> dict[str, Any]:
     return {
+        "opportunity_id": (plan.risk_details.get("entry_opportunity_id") if plan else None),
         "signal_id": f"{deployment.deployment_id}:{decision.timestamp.isoformat()}:{decision.direction.value if decision.direction else 'none'}",
         "deployment_id": deployment.deployment_id,
         "symbol": deployment.symbol,
@@ -1754,6 +1755,9 @@ class ExecutionSupervisor:
             if reason:
                 await self._finish_entry_retry(deployment.deployment_id, reason, now=now)
                 return None
+            if retry.pending_decision and decision.direction != retry.pending_decision.direction:
+                await self._finish_entry_retry(deployment.deployment_id, "entry_retry_direction_changed", now=now)
+                return None
             price = _underlying_entry_price(decision)
             if (not decision.signal or price is None or now < retry.next_attempt_at
                 or retry.observation_reason(price=price, timestamp=decision.timestamp, now=now)):
@@ -1945,20 +1949,28 @@ class ExecutionSupervisor:
                             rejection_reasons=[f"entry_planning_error:{type(exc).__name__}"],
                             mode="shadow" if simulate_only else ("dry_run" if dry_run else "live")))
                     raise
+            if (plan is not None and plan.order_id is None
+                and await self._schedule_entry_retry(deployment, decision, plan, attempt=attempt)):
+                plan.risk_details["entry_opportunity_id"] = self._entry_liquidity_retries[deployment.deployment_id].opportunity_id
+                await self.event_repository.append("trade_plan", asdict(plan))
+                return None
+            if plan is not None and retry is not None:
+                plan.risk_details["entry_opportunity_id"] = retry.opportunity_id
             completed_retry = self._entry_liquidity_retries.pop(deployment.deployment_id, None)
             if completed_retry is not None:
                 await self.event_repository.append("entry_liquidity_retry_finished", {
                     "deployment_id": deployment.deployment_id, "symbol": deployment.symbol,
-                    "reason": "selection_completed", "attempts": completed_retry.attempts})
+                    "reason": "execution_owned" if plan and _entry_plan_approved(plan) else "terminal_rejection", "attempts": completed_retry.attempts})
                 if plan is not None and _entry_plan_approved(plan):
                     await self._dispatch_manual_status(deployment, stage="retry_completed",
                         writer_call=self.manual_status_writer._write_status(deployment,
                             status="entry_planned", event_at=datetime.now(UTC),
-                            note="Liquidity retry selected a contract; fill still requires confirmation.",
+                            note="Entry is now owned by the working-order/model lifecycle; fill still requires confirmation.",
                             trade_id=plan.trade_id, disable_row=True)
                         if self.manual_status_writer is not None else None)
             if plan is not None:
                 plan.risk_details["entry_signal_identity"] = {
+                    "opportunity_id": plan.risk_details.get("entry_opportunity_id"),
                     "signal_id": _signal_outcome_payload(deployment, decision, outcome="pending_execution")["signal_id"],
                     "signal_timestamp": decision.timestamp.isoformat(),
                     "direction": decision.direction.value if decision.direction else None,
@@ -2421,16 +2433,24 @@ class ExecutionSupervisor:
 
     async def _schedule_entry_retry(self, deployment, decision, error, *, attempt) -> bool:
         seconds = deployment.execution.entry_liquidity_retry_seconds
-        if (not seconds or not is_cartographer_deployment(deployment)
-            or not _is_self_disarming_manual_deployment(deployment)
-            or deployment.strategy.key != "manual_trigger"
-            or not error.diagnostics.get("liquidity_retry_candidates", 0)):
-            return False
+        if not seconds or deployment.strategy.key == "weekly_chart":
+            return False  # Weekly has its own durable, author-anchored retry owner.
+        if isinstance(error, SelectorEmptyError):
+            if not error.diagnostics.get("liquidity_retry_candidates", 0):
+                return False
+            diagnostics = error.diagnostics
+        else:
+            reasons = set(error.risk_reasons) - {"approved"}
+            transient = {"public_quote_stale_or_unproven", "public_quote_timestamp_missing", "public_quote_unavailable"}
+            if (error.order_id or not reasons or not all(reason in transient or (reason.startswith("public_preflight_failed:") and error.risk_details.get("pre_submission_retryable")) for reason in reasons)):
+                return False
+            diagnostics = {"reasons": sorted(reasons), "trade_id": error.trade_id}
         now = datetime.now(UTC)
         retry = self._entry_liquidity_retries.get(deployment.deployment_id)
         if retry is None:
             retry = EntryLiquidityRetry(deployment.model_copy(deep=True),
-                decision.timestamp + timedelta(seconds=seconds), now)
+                decision.timestamp + timedelta(seconds=seconds), now,
+                opportunity_id=_signal_outcome_payload(deployment, decision, outcome="pending_execution")["signal_id"])
         if retry.stop_reason(now):
             return False
         retry.pending_decision = decision
@@ -2443,18 +2463,25 @@ class ExecutionSupervisor:
             await self._record_cartographer_attempt_outcome(attempt,
                 outcome="blocked", reason="liquidity_retry_scheduled")
         if self.record_signal_outcomes:
-            await self.event_repository.append("signal_outcome", _signal_outcome_payload(
-                deployment, decision, outcome="pending_execution",
-                rejection_reasons=["liquidity_retry_scheduled"],
-                mode="shadow" if deployment.execution.shadow_only else "live"))
+            payload = _signal_outcome_payload(deployment, decision, outcome="pending_execution",
+                rejection_reasons=["entry_recovery_waiting"],
+                mode="shadow" if deployment.execution.shadow_only else "live")
+            payload["opportunity_id"] = retry.opportunity_id
+            await self.event_repository.append("signal_outcome", payload)
         await self.event_repository.append("entry_liquidity_retry_scheduled", {
             "deployment_id": deployment.deployment_id, "symbol": deployment.symbol,
             "deadline": retry.deadline.isoformat(), "next_attempt_at": retry.next_attempt_at.isoformat(),
-            "attempts": retry.attempts, "diagnostics": error.diagnostics})
+            "attempts": retry.attempts, "diagnostics": diagnostics, "opportunity_id": retry.opportunity_id,
+            "manual_intent": ({"strategy": deployment.strategy.model_dump(mode="json"),
+                "execution": deployment.execution.model_dump(mode="json"),
+                "risk": deployment.risk.model_dump(mode="json"),
+                "exit": deployment.exit.model_dump(mode="json"),
+                "source_metadata": deployment.source.metadata}
+                if _is_self_disarming_manual_deployment(deployment) else None)})
         await self._dispatch_manual_status(deployment, stage="liquidity_retry",
             writer_call=self.manual_status_writer._write_status(deployment,
                 status="waiting_liquidity", event_at=now,
-                note=f"Spread rejected; retry until {retry.deadline.isoformat()} while setup remains valid.",
+                note=f"Waiting for an executable entry; retry until {retry.deadline.isoformat()} while setup remains valid.",
                 disable_row=True) if self.manual_status_writer is not None else None)
         return True
 
@@ -2463,8 +2490,9 @@ class ExecutionSupervisor:
         if decision is None:
             return
         if self.record_signal_outcomes:
-            await self.event_repository.append("signal_outcome", _signal_outcome_payload(
-                retry.deployment, decision, outcome=outcome, rejection_reasons=[reason]))
+            payload = _signal_outcome_payload(retry.deployment, decision, outcome=outcome, rejection_reasons=[reason])
+            payload["opportunity_id"] = retry.opportunity_id
+            await self.event_repository.append("signal_outcome", payload)
         retry.pending_decision = None
 
     async def _finish_entry_retry(self, deployment_id, reason, *, now):
@@ -2496,11 +2524,11 @@ class ExecutionSupervisor:
             and deployment.deployment_id in self._canary_rollback_deployments
         ):
             return False
+        retry = self._entry_liquidity_retries.get(deployment.deployment_id)
+        if retry is not None:
+            now = datetime.now(UTC)
+            return retry.next_attempt_at <= now and retry.stop_reason(now) is None
         if _is_self_disarming_manual_deployment(deployment):
-            retry = self._entry_liquidity_retries.get(deployment.deployment_id)
-            if retry is not None:
-                now = datetime.now(UTC)
-                return retry.next_attempt_at <= now and retry.stop_reason(now) is None
             return deployment.deployment_id not in self._disabled_entry_deployments
         return True
 

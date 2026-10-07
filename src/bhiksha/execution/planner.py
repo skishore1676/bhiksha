@@ -12,7 +12,7 @@ from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradeP
 from bhiksha.execution.native_orders import (
     decide_execution_route,
 )
-from bhiksha.execution.order_manager import OrderManager, OrderResult
+from bhiksha.execution.order_manager import OrderManager, OrderResult, preflight_failure_is_transient
 from bhiksha.execution.quote_lineage import parse_provider_timestamp
 from bhiksha.execution.pricing import (
     build_entry_profile_comparison,
@@ -113,7 +113,51 @@ class ExecutionPlanner:
         await self.chain_service.close()
         await self.order_manager.close()
 
-    async def plan_entry(
+    async def plan_entry(self, deployment, decision, *, dry_run, simulate_only=False, entry_guard=None):
+        """Bounded recovery before submission, within one frozen chain cohort."""
+        context = {"candidate_rank": 0}
+        attempts = []
+        fresh_rebuild_used = False
+        previous = None
+        for _ in range(6):  # Five candidates plus at most one final-freshness rebuild.
+            try:
+                plan = await self._plan_entry_once(deployment, decision, dry_run=dry_run,
+                    simulate_only=simulate_only, entry_guard=entry_guard, _context=context)
+            except SelectorEmptyError:
+                if previous is None:
+                    raise
+                previous.risk_details["candidate_search_exhausted"] = True
+                plan = previous
+                break
+            if plan is None:
+                return None
+            attempts.append({"trade_id": plan.trade_id, "option_symbol": plan.option_symbol,
+                "candidate_rank": context["candidate_rank"], "quantity": plan.quantity,
+                "price": plan.estimated_entry_price, "reasons": plan.risk_reasons})
+            previous = plan
+            reasons = set(plan.risk_reasons) - {"approved"}
+            pr = plan.risk_details.get("entry_pricing") or {}
+            final = pr.get("final_quote_validation") or {}
+            if plan.order_id or not reasons:
+                break
+            if (not fresh_rebuild_used and reasons <= {"public_quote_stale_or_unproven", "public_quote_timestamp_missing"}
+                and final.get("quote_timestamp_status") != "current" and final
+                and pr.get("final_quote_validation_stage") == "before_submission"):
+                fresh_rebuild_used = True
+                context["rebuilding_final_quote"] = True
+                continue
+            contract_blocks = {"insufficient_budget_for_single_contract", "option_contract_already_owned_by_other_deployment",
+                "public_quote_stale_or_unproven", "public_quote_timestamp_missing", "public_quote_unavailable",
+                "public_quote_crossed_bid_ask", "public_quote_nonfinite", "public_open_interest_missing",
+                "risk_prospective_loss_headroom_exceeded", "insufficient_internal_settled_cash_budget"}
+            if not reasons or not reasons <= contract_blocks or context["candidate_rank"] >= 4:
+                break
+            context["candidate_rank"] += 1
+        plan.risk_details["entry_recovery_attempts"] = attempts
+        plan.risk_details["final_quote_rebuild_used"] = fresh_rebuild_used
+        return plan
+
+    async def _plan_entry_once(
         self,
         deployment: DeploymentManifest,
         decision: SignalDecision,
@@ -121,9 +165,11 @@ class ExecutionPlanner:
         dry_run: bool,
         simulate_only: bool = False,
         entry_guard: Callable[[], str | None] | None = None,
+        _context: dict | None = None,
     ) -> TradePlan | None:
         if not decision.signal or decision.direction is None:
             return None
+        _context = _context or {}
         underlying_entry_price = _underlying_entry_price(decision)
         if not _entry_window_allows(deployment, decision.timestamp):
             return TradePlan(
@@ -149,6 +195,7 @@ class ExecutionPlanner:
             execution_profile=deployment.execution.profile,
             execution_params={
                 **deployment.execution.model_dump(),
+                "_entry_candidate_rank": _context.get("candidate_rank", 0),
                 "long_signal_contract_type": deployment.execution.option_mapping.get("long_signal", "CALL"),
                 "short_signal_contract_type": deployment.execution.option_mapping.get("short_signal", "PUT"),
             },
@@ -162,12 +209,15 @@ class ExecutionPlanner:
         lookup_dte_max = deployment.execution.dte_max + dte_lookup_padding_days
         if dte_fallback_policy == "allow_nearest_after" and deployment.execution.dte_fallback_max is not None:
             lookup_dte_max = deployment.execution.dte_fallback_max + 1
-        contracts = await self.chain_service.get_chain(
-            deployment.symbol,
-            contract_type="ALL",
-            from_date=decision.timestamp.date(),
-            to_date=(decision.timestamp + timedelta(days=lookup_dte_max)).date(),
-        )
+        contracts = _context.get("contracts")
+        if contracts is None:
+            contracts = await self.chain_service.get_chain(
+                deployment.symbol,
+                contract_type="ALL",
+                from_date=decision.timestamp.date(),
+                to_date=(decision.timestamp + timedelta(days=lookup_dte_max)).date(),
+            )
+            _context["contracts"] = contracts
         lane = "shadow" if simulate_only else ("dry_run" if dry_run else "live")
         snapshot_id = str(uuid.uuid4())
         try:
@@ -254,11 +304,11 @@ class ExecutionPlanner:
         quote_attempts = [attempt_evidence(pricing, quote_fetch_started_at, quote_received_at, quote_fetch_seconds)]
         refreshed_quote = False
 
-        def guarded_plan(*, check_freshness: bool = False) -> TradePlan | None:
+        def guarded_plan(*, check_freshness: bool = False, before_submission: bool = False) -> TradePlan | None:
             reason = entry_guard() if entry_guard is not None else None
             current = datetime.now(UTC)
             final_quote_validation = None
-            if reason is None and (refreshed_quote or deployment.strategy.key == "weekly_chart") and not _entry_window_allows(deployment, current):
+            if reason is None and (refreshed_quote or deployment.strategy.key == "weekly_chart" or _context.get("candidate_rank") or _context.get("rebuilding_final_quote")) and not _entry_window_allows(deployment, current):
                 reason = "execution_window_blocked"
             if reason is None and deployment.strategy.key == "weekly_chart":
                 from bhiksha.strategy.weekly_chart import pending_block
@@ -267,6 +317,7 @@ class ExecutionPlanner:
                 fresh_pricing = select_entry_limit(quote, execution_params, observed_at=current)
                 final_quote_validation = fresh_pricing.evidence()
                 pricing_evidence["final_quote_validation"] = final_quote_validation
+                pricing_evidence["final_quote_validation_stage"] = "before_submission" if before_submission else "before_preflight"
                 reason = next(iter(fresh_pricing.block_reasons), None)
                 if reason is None and not dry_run:
                     status = final_quote_validation['quote_timestamp_status']
@@ -282,7 +333,8 @@ class ExecutionPlanner:
                 risk_reasons=[reason], dry_run=dry_run,
                 underlying_entry_price=underlying_entry_price, entry_timestamp=decision.timestamp,
                 risk_details={"entry_pricing": {**pricing.evidence(), "quote_attempts": quote_attempts,
-                    "final_quote_validation": final_quote_validation},
+                    "final_quote_validation": final_quote_validation,
+                    "final_quote_validation_stage": "before_submission" if before_submission else "before_preflight"},
                     "entry_permission_checked_at": current.isoformat(), **selection_details})
 
         timestamp_blocks = {"public_quote_stale_or_unproven", "public_quote_timestamp_missing"}
@@ -550,7 +602,10 @@ class ExecutionPlanner:
             # the actual smaller quantity; never approve by scaling old broker costs.
             for attempt in range(3):
                 stage = "public_preflight"
+                started = clock.monotonic()
                 preflight = await self.order_manager.preflight_entry(selection.option_symbol, entry_price, quantity)
+                pricing_evidence.setdefault("preflight_attempts", []).append({"quantity": quantity,
+                    "price": float(preflight.payload["limitPrice"]), "latency_seconds": clock.monotonic()-started})
                 stage = "entry_sizing"
                 normalized_price = float(preflight.payload["limitPrice"])
                 required = max(preflight.buying_power_requirement or 0.0,
@@ -586,6 +641,7 @@ class ExecutionPlanner:
                 risk_details={
                     "entry_pricing": pricing_evidence,
                     "entry_sizing": sizing_receipts,
+                    "pre_submission_retryable": stage == "public_preflight" and preflight_failure_is_transient(exc),
                     **premium_cap_receipt,
                     **selection_details,
                 },
@@ -726,16 +782,20 @@ class ExecutionPlanner:
                 )
         # Recheck a queued entry intent after all awaited selection/preflight/
         # reservation work and immediately before broker submission.
-        guarded = guarded_plan(check_freshness=True)
+        guarded = guarded_plan(check_freshness=True, before_submission=True)
         if guarded is not None:
             if self.cash_guard is not None:
                 await self.cash_guard.release_entry(trade_id)
             if self.risk_manager is not None:
                 await self.risk_manager.release_sized_entry(trade_id)
             return guarded
+        def submission_guard():
+            blocked = guarded_plan(check_freshness=True, before_submission=True)
+            return blocked.risk_reasons[0] if blocked else None
         try:
             result: OrderResult = await self.order_manager.place_entry_order(
                 selection.option_symbol, final_limit_price, quantity, order_id=trade_id,
+                **({"submission_guard": submission_guard} if isinstance(self.order_manager, OrderManager) else {}),
             )
         except Exception:
             if self.cash_guard is not None:
@@ -743,10 +803,15 @@ class ExecutionPlanner:
             if self.risk_manager is not None:
                 await self.risk_manager.release_sized_entry(trade_id)
             raise
-        if self.cash_guard is not None and (result.order_id is None or result.error):
+        if self.cash_guard is not None and (result.order_id is None or (result.error and not getattr(result, "submission_uncertain", False))):
             await self.cash_guard.release_entry(trade_id)
-        if self.risk_manager is not None and (result.order_id is None or result.error):
+        if self.risk_manager is not None and (result.order_id is None or (result.error and not getattr(result, "submission_uncertain", False))):
             await self.risk_manager.release_sized_entry(trade_id)
+        pricing_evidence["submitted_limit_price"] = getattr(result, "actual_limit_price", None)
+        if getattr(result, "actual_limit_price", None) is not None:
+            final_limit_price = result.actual_limit_price
+        pricing_evidence["submission_uncertain"] = getattr(result, "submission_uncertain", False)
+        pricing_evidence["submission_error"] = result.error
         if result.order_id:
             self.position_tracker.open_position(
                 deployment.symbol,
@@ -773,6 +838,7 @@ class ExecutionPlanner:
             underlying_entry_price=underlying_entry_price,
             entry_timestamp=decision.timestamp,
             risk_details={
+                "pre_submission_retryable": getattr(result, "pre_submission_retryable", False),
                 "required_cash": required_cash,
                 "buying_power_requirement": preflight.buying_power_requirement,
                 "estimated_cost": preflight.estimated_cost,

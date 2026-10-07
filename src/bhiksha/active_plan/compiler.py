@@ -2073,6 +2073,10 @@ def _normalize_sheet_mapping(data: dict[str, Any]) -> dict[str, Any]:
         value = _normalize_value(raw_value)
         if key in normalized and normalized[key] is not None and value is None:
             continue
+        if key == "execution_overrides" and isinstance(normalized.get(key), dict) and isinstance(value, dict):
+            # Both operator columns are aliases. Preserve non-conflicting
+            # window/risk controls instead of dropping the earlier JSON object.
+            value = {**normalized[key], **value}
         normalized[key] = value
     for key in ("after_time_et", "entry_window_start_et", "entry_window_end_et", "hard_flat_time_et"):
         normalized[key] = normalize_time_text(normalized.get(key))

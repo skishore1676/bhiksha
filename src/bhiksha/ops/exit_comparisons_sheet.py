@@ -21,7 +21,8 @@ TAB = "Exit_Comparisons"
 DETAIL_LIMIT = 8
 VISIBLE_COLUMNS = 8
 SHEET_COLUMNS = 12
-SIGNAL_HEADERS = ["Strategy", "Lane", "Signals", "Captured", "Missed", "Pending / unknown", "Main miss reason", "Default exit", "Deployments"]
+SIGNAL_HEADERS = ["Strategy", "Lane", "Positive attempts", "Captured", "Missed", "Pending / unknown", "Main miss reason", "Default exit", "Deployments"]
+OPPORTUNITY_HEADERS = ["Symbol", "Lane", "Strategy", "First signal CT", "Attempts", "Outcome", "Reason category", "Latest reason", "Opportunity"]
 EXIT_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Observed leader", "Clean / registered", "Sessions", "Δ $ / trade", "Why / evidence", "Frozen evaluator", "Frozen hash", "Deployments"]
 CUMULATIVE_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Candidate", "Clean pairs", "Sessions", "Mean net Δ $", "Mean net Δ R", "Mean gross Δ $", "Frozen hash", "Window", "Deployment"]
 GAP_HEADERS = ["Trade", "Strategy", "Lane / entry", "Last good quote CT", "Resumed CT", "Reason", "Evidence state", "", "Full trade ID"]
@@ -80,6 +81,12 @@ def _plan(path: str | Path | None) -> dict[str, dict[str, str]]:
             "dte_min": execution.get("dte_min"), "dte_max": execution.get("dte_max"),
             "dte_fallback_max": execution.get("dte_fallback_max"),
             "source_owner": str(meta.get("source_owner") or ""),
+            "symbol": str(item.get("symbol") or ""),
+            "opportunity_key": (
+                "weekly:" + ":".join(str((strategy.get("params") or {}).get(k) or "")
+                    for k in ["publication_hash", "scenario_key", "entry_arm"])
+                if strategy_key == "weekly_chart" else "chart:" + str(meta["signal_id"])
+                if meta.get("signal_id") else None),
         }
     return result
 
@@ -151,9 +158,11 @@ def _signals(
             continue
         deployment = str(payload.get("deployment_id") or "unknown")
         key = str(payload.get("signal_id") or f"{deployment}:{timestamp}:{payload.get('direction') or 'none'}")
-        row = signals.setdefault(key, {"deployment": deployment, "timestamp": timestamp})
+        row = signals.setdefault(key, {"deployment": deployment, "timestamp": timestamp, "signal_id": key, "symbol": payload.get("symbol")})
         latest = max(latest, timestamp)
         if event_type == "signal_outcome":
+            if payload.get("opportunity_id"):
+                row["opportunity_id"] = payload["opportunity_id"]
             # A pending event can be followed by a fill or terminal rejection.
             outcome = str(payload.get("outcome") or "unknown")
             previous = row.get("outcome")
@@ -189,7 +198,29 @@ def _signals(
         default = ", ".join(_label(name) for name, _ in policies.most_common(2))
         rows.append([_label(strategy), lane, len(members), captured, len(misses), pending, reason, default,
                      ", ".join(sorted({item["deployment"] for item in members}))])
-    return {"rows": rows, "recorded": len(signals), "captured": sum(row.get("outcome") == "filled" for row in signals.values()),
+    opportunities = defaultdict(list)
+    for item in signals.values():
+        config = plan.get(item["deployment"], {})
+        identity = item.get("opportunity_id") or config.get("opportunity_key") or item["signal_id"]
+        opportunities[(item["deployment"], identity)].append(item)
+    opportunity_rows = []
+    for (deployment, identity), members in opportunities.items():
+        config = plan.get(deployment, {})
+        terminal = next((m for m in reversed(members) if m.get("outcome") == "filled"), members[-1])
+        outcome = terminal.get("outcome") or "unknown"
+        reason = ", ".join(terminal.get("reasons") or [])
+        if outcome == "filled": category = "Filled"
+        elif outcome in {"pending_execution", "unknown", "fill_unverified"}: category = "Waiting / working"
+        elif outcome == "no_fill": category = "Valid limit unfilled"
+        elif any(k in reason for k in ["price_seeking_tick", "entry_planning_error"]): category = "Application failure"
+        elif "quote" in reason: category = "Market / quote provider"
+        elif "preflight_failed" in reason: category = "Execution service failure"
+        elif outcome in {"budget_block", "risk_block", "existing_position_block"}: category = "Risk / configuration"
+        else: category = "Expired / invalidated / selection"
+        opportunity_rows.append([terminal.get("symbol") or config.get("symbol"),
+            terminal.get("mode", config.get("lane", "Unknown")), _label(config.get("strategy")),
+            _ct(members[0]["timestamp"]), len(members), _label(outcome), category, reason, identity])
+    return {"rows": rows, "opportunity_rows": opportunity_rows, "opportunities": len(opportunities), "recorded": len(signals), "captured": sum(row.get("outcome") == "filled" for row in signals.values()),
             "missed": sum(row.get("outcome") not in {None, "filled", "pending_execution", "unknown", "fill_unverified"} for row in signals.values()),
             "pending": sum(row.get("outcome") in {None, "pending_execution", "unknown", "fill_unverified"} for row in signals.values()),
             "evaluated": sum(bool(row.get("evaluation")) for row in signals.values()),
@@ -449,6 +480,7 @@ def publish_exit_comparisons_scorecard(
          f"last poll CT {_ct(observer.get('last_successful_poll_at'))} | last saved quote CT {_ct(observer.get('last_quote_persisted_at'))} | "
          f"pending writes {observer.get('pending_writes', 'unknown')} | storage failures {observer.get('storage_failures', 'unknown')}"],
         [], ["SIGNAL CAPTURE"], SIGNAL_HEADERS, *signals["rows"], [],
+        ["ENTRY OPPORTUNITIES · related attempts grouped"], OPPORTUNITY_HEADERS, *(signals.get("opportunity_rows") or []), [],
         ["EXIT CHOICES · same-trade clean pairs"], EXIT_HEADERS, *exits["rows"], [],
         [f"EXPERIMENT TO DATE · {cumulative.get('start', '')} to {cumulative.get('end', '')} · same-trade matched pairs by frozen policy"],
         CUMULATIVE_HEADERS, *(cumulative.get("rows") or []), [],
@@ -457,7 +489,7 @@ def publish_exit_comparisons_scorecard(
          "this is a stress assumption, not broker fees. Shared entry costs cancel. No automatic policy promotion; frozen hashes are in supporting columns."],
     ]
     sections = [i for i, row in enumerate(values) if row and isinstance(row[0], str) and
-                (row[0] == "SIGNAL CAPTURE" or row[0].startswith("EXIT CHOICES")
+                (row[0] == "SIGNAL CAPTURE" or row[0].startswith("ENTRY OPPORTUNITIES") or row[0].startswith("EXIT CHOICES")
                  or row[0].startswith("EXPERIMENT TO DATE") or row[0].startswith("EVIDENCE GAPS"))]
     headers = [i + 1 for i in sections]
     height = len(values)
