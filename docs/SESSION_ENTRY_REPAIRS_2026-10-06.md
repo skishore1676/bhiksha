@@ -40,8 +40,10 @@ service, order or position is changed by this candidate.
   is unknown, excluded observations cannot affect outcome statistics, and a
   known eligible subtotal is separate from an incomplete overall total.
 
-Cash sizing continues to size against the configured premium cap and then
-reserve settled cash for the full order. Shadow capture continues to require a
+As of the October 7 follow-up, live sizing fits the configured premium/contract
+ceiling to existing settled cash and prospective-loss headroom before preflight,
+then repeats broker preflight if the normalized price or costs require fewer
+contracts. Final cash and risk reservations still arbitrate races. Shadow capture continues to require a
 later fresh ask touching the resting limit. Neither policy is tuned to force
 fills. Modeled shadow exit-cohort registration already exists and is unchanged.
 
@@ -133,3 +135,32 @@ Astra diff review.
    fields and retry expiry. Do not place a test order to prove this release.
 6. If rollback is needed, restore the previous source/plan through the normal
    authorized procedure. This candidate requires no ledger-data rollback.
+
+
+## October 7 follow-up — approved scope and acceptance
+
+Astra high review supported three scoped changes. Bhiksha now fits LIVE quantity
+within the existing cash owner and Rail A prospective-risk owner, rather than
+vetoing an unnecessarily large premium-cap quantity. Shared accounting and whole-
+quantity rounded stop risk are reused. Unknown economics, halts, cluster caps and
+one-contract insufficiency still block. Shadow sizing and replacement-order
+quantities are unchanged. At most three broker preflights are attempted; each
+changed quantity receives its own actual preflight. Cash reserve, final locked
+risk reserve and immediate submission permission/8-second provider quote check
+remain mandatory. Entry sizing receipts explain requested and selected quantity.
+
+Close-only Cartographer conditions require the observed calendar bar closing
+minute, not all interior minute observations. Interior holes are retained as
+bounded diagnostic warnings in new state/evaluation evidence. Missing required
+closes block, including each one-minute close in the early arm. No history, old
+signal decisions or exit-observation gap labels are rewritten.
+
+The existing session-review automation retains its owner and Mon/Wed/Fri 15:15 CT
+schedule. Its watermark means contiguous sessions reviewed; economic completeness
+and evaluation cadence are separate fields. Unknown or exactly excluded economics
+do not stop later reviews; failed source reads still do. Catch-up spans Sep24–Oct6
+across W39/W40/W41. The narrow, already deployed Sep25 IWM reporting exclusion is
+unchanged, with null attributed P&L and a separately labeled eligible subtotal.
+
+Natural broker execution and newly recovered Cartographer decisions require a
+future authorized signal. Tests and deployment readback are not natural proof.

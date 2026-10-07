@@ -43,6 +43,7 @@ class CashGuard:
         trade_id: str,
         required_cash: float,
         timestamp: datetime,
+        reserve: bool = True,
     ) -> CashGuardResult:
         mode = cash_guard_mode()
         if mode == "off":
@@ -108,6 +109,11 @@ class CashGuard:
                     },
                 )
 
+            if not reserve:
+                return CashGuardResult(enforced=True, blocked=False, details={
+                    "remaining_budget": remaining_budget, "usable_budget": day.usable_budget,
+                    "cash_guard_mode": mode, "account_type": account_type,
+                })
             await self.repository.upsert_reservation(
                 CashBudgetReservation(
                     trade_id=trade_id,
@@ -129,6 +135,11 @@ class CashGuard:
                     "cash_guard_mode": mode,
                 },
             )
+
+    async def preview_entry(self, *, trade_id: str, timestamp: datetime) -> CashGuardResult:
+        """Read authoritative capacity; final reserve_entry still arbitrates races."""
+        return await self.reserve_entry(trade_id=trade_id, required_cash=0,
+                                        timestamp=timestamp, reserve=False)
 
     async def finalize_entry(self, trade_id: str) -> None:
         reservation = await self.repository.get_reservation(trade_id)

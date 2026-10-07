@@ -30,13 +30,17 @@ from bhiksha.options.vehicle_resolver import VehicleResolver
 from bhiksha.persistence.repository import ChainSnapshotRepository, NullChainSnapshotRepository
 from bhiksha.risk.cash_guard import CashGuard
 from bhiksha.risk.governor import RiskGovernor
-from bhiksha.risk.planned_loss import resolve_planned_stop_loss_pct
+from bhiksha.risk.planned_loss import planned_stop_loss_usd, resolve_planned_stop_loss_pct
 from bhiksha.risk.risk_manager import RiskManager
 from bhiksha.state.position_tracker import PositionTracker
 from bhiksha.time_utils import parse_time_text
 
 
 DTE_FALLBACK_LOOKAHEAD_DAYS = 7
+
+
+class _SizingBlocked(Exception):
+    pass
 
 
 class ExecutionPlanner:
@@ -60,6 +64,50 @@ class ExecutionPlanner:
         self.cash_guard = cash_guard
         self.risk_manager = risk_manager
         self.chain_snapshot_repository = chain_snapshot_repository or NullChainSnapshotRepository()
+
+    async def _fit_live_quantity(self, *, trade_id, deployment, timestamp, price,
+                                 upper_quantity, premium_cap, extra_cash=0.0):
+        """Advisory sizing from existing owners; no relaxation of final reservations."""
+        details = {"requested_quantity": upper_quantity}
+        quantity = min(upper_quantity, int(premium_cap // (price * 100)))
+        if self.cash_guard is not None:
+            cash = await self.cash_guard.preview_entry(trade_id=trade_id, timestamp=timestamp)
+            details["cash_capacity"] = dict(cash.details)
+            if cash.blocked:
+                return 0, cash.reason, details
+            if cash.enforced:
+                capacity = cash.details.get("remaining_budget")
+                if capacity is None:
+                    return 0, "cash_guard_cash_unavailable", details
+                quantity = min(quantity, int(max(0, float(capacity) - extra_cash) // (price * 100)))
+                if quantity < 1:
+                    return 0, "insufficient_internal_settled_cash_budget", details
+        if self.risk_manager is not None:
+            stop, _ = resolve_planned_stop_loss_pct(deployment)
+            risk = await self.risk_manager.preview_sized_entry(
+                trade_id=trade_id, deployment_id=deployment.deployment_id,
+                symbol=deployment.symbol, entry_price=price, quantity=max(1, quantity), stop_loss_pct=stop)
+            details["risk_capacity"] = dict(risk.details)
+            if not risk.allowed and risk.reason != "risk_prospective_loss_headroom_exceeded":
+                return 0, risk.reason, details
+            headroom = risk.details.get("remaining_loss_headroom_usd")
+            if headroom is not None:
+                # Compare rounded loss for the whole quantity, including exact boundaries.
+                low, high = 0, quantity
+                while low < high:
+                    candidate = (low + high + 1) // 2
+                    loss = planned_stop_loss_usd(entry_price=price, quantity=candidate, stop_loss_pct=stop)
+                    if loss is not None and loss <= float(headroom):
+                        low = candidate
+                    else:
+                        high = candidate - 1
+                quantity = low
+                if quantity < 1:
+                    return 0, "risk_prospective_loss_headroom_exceeded", details
+            elif not risk.allowed:
+                return 0, risk.reason, details
+        details["selected_quantity"] = quantity
+        return quantity, None if quantity > 0 else "insufficient_budget_for_single_contract", details
 
     async def close(self) -> None:
         await self.chain_service.close()
@@ -215,10 +263,16 @@ class ExecutionPlanner:
             if reason is None and deployment.strategy.key == "weekly_chart":
                 from bhiksha.strategy.weekly_chart import pending_block
                 reason = pending_block(deployment, current)
-            if reason is None and refreshed_quote and check_freshness:
+            if reason is None and check_freshness and (refreshed_quote or not dry_run):
                 fresh_pricing = select_entry_limit(quote, execution_params, observed_at=current)
                 final_quote_validation = fresh_pricing.evidence()
+                pricing_evidence["final_quote_validation"] = final_quote_validation
                 reason = next(iter(fresh_pricing.block_reasons), None)
+                if reason is None and not dry_run:
+                    status = final_quote_validation['quote_timestamp_status']
+                    if status != 'current':
+                        reason = ('public_quote_timestamp_missing' if status == 'missing'
+                                  else 'public_quote_stale_or_unproven')
             if reason is None:
                 return None
             return TradePlan(trade_id=trade_id, deployment_id=deployment.deployment_id,
@@ -483,8 +537,38 @@ class ExecutionPlanner:
                 execution_route=route,
             )
 
+        sizing_receipts = []
+        stage = "entry_sizing"
         try:
-            preflight = await self.order_manager.preflight_entry(selection.option_symbol, entry_price, quantity)
+            quantity, sizing_reason, receipt = await self._fit_live_quantity(
+                trade_id=trade_id, deployment=deployment, timestamp=decision.timestamp,
+                price=entry_price, upper_quantity=quantity, premium_cap=max_trade_premium)
+            sizing_receipts.append(receipt)
+            if sizing_reason:
+                raise _SizingBlocked(sizing_reason)
+            # A normalized broker price or fixed fees can reduce capacity. Re-preflight
+            # the actual smaller quantity; never approve by scaling old broker costs.
+            for attempt in range(3):
+                stage = "public_preflight"
+                preflight = await self.order_manager.preflight_entry(selection.option_symbol, entry_price, quantity)
+                stage = "entry_sizing"
+                normalized_price = float(preflight.payload["limitPrice"])
+                required = max(preflight.buying_power_requirement or 0.0,
+                               preflight.estimated_cost or 0.0, normalized_price * quantity * 100)
+                fitted, sizing_reason, receipt = await self._fit_live_quantity(
+                    trade_id=trade_id, deployment=deployment, timestamp=decision.timestamp,
+                    price=normalized_price, upper_quantity=quantity, premium_cap=max_trade_premium,
+                    extra_cash=max(0.0, required - normalized_price * quantity * 100))
+                sizing_receipts.append(receipt)
+                if sizing_reason:
+                    quantity = fitted
+                    raise _SizingBlocked(sizing_reason)
+                if fitted == quantity:
+                    break
+                quantity = fitted
+            else:
+                raise _SizingBlocked("entry_sizing_preflight_unstable")
+            pricing_evidence["entry_sizing"] = sizing_receipts
         except Exception as exc:
             return TradePlan(
                 trade_id=trade_id,
@@ -494,13 +578,14 @@ class ExecutionPlanner:
                 option_symbol=selection.option_symbol,
                 quantity=quantity,
                 estimated_entry_price=entry_price,
-                risk_reasons=[f"public_preflight_failed:{exc}"],
+                risk_reasons=[str(exc) if isinstance(exc, _SizingBlocked) else f"{stage}_failed:{exc}"],
                 dry_run=False,
                 order_id=None,
                 underlying_entry_price=underlying_entry_price,
                 entry_timestamp=decision.timestamp,
                 risk_details={
                     "entry_pricing": pricing_evidence,
+                    "entry_sizing": sizing_receipts,
                     **premium_cap_receipt,
                     **selection_details,
                 },

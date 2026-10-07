@@ -81,8 +81,8 @@ def source_block(params, now):
     return None
 
 
-def completed(frame, condition, now, boundary=None):
-    """Input timestamps are minute opens. Require every minute, including early closes."""
+def completed(frame, condition, now, boundary=None, warnings=None):
+    """Close rules require the actual closing minute at calendar-aligned bar end."""
     minutes = {}
     for row in frame.select('timestamp', 'close').iter_rows(named=True):
         t = row['timestamp'].astimezone(UTC)
@@ -107,10 +107,16 @@ def completed(frame, condition, now, boundary=None):
             end = min(start + timedelta(minutes=width), closing)
             if end > now:
                 break
-            n = int((end-start).total_seconds()/60)
-            values = [minutes.get(start+timedelta(minutes=i)) for i in range(n)]
-            # Keep holes explicit so consecutive confirmations cannot bridge a missing bar.
-            bars.append((start, end, values[-1] if all(v is not None for v in values) else None))
+            # An interior hole cannot change a close-only rule. A missing closing
+            # minute remains explicit; consecutive closes cannot bridge that hole.
+            price = minutes.get(end - timedelta(minutes=1))
+            bars.append((start, end, price))
+            if warnings is not None and price is not None and start >= first:
+                missing = sum(start + timedelta(minutes=i) not in minutes
+                              for i in range(int((end-start).total_seconds()/60)-1))
+                if missing:
+                    warnings.append({'bar_start': start.isoformat(), 'bar_end': end.isoformat(),
+                                     'missing_interior_minutes': missing})
             start = end
     return bars
 
@@ -128,7 +134,7 @@ def confirmations(frame, condition, now, boundary):
             if all(b[0] >= boundary and matches(b[2], condition) for b in bars[i-count+1:i+1])]
 
 
-def advance_coverage(frame, condition, now, boundary, checkpoint):
+def advance_coverage(frame, condition, now, boundary, checkpoint, warnings=None):
     """Checkpoint only a contiguous, proved prefix; keep consecutive-close state."""
     if checkpoint.get('condition') != condition:
         checkpoint.clear()
@@ -137,7 +143,7 @@ def advance_coverage(frame, condition, now, boundary, checkpoint):
     run = int(checkpoint.get('matching_count', 0))
     confirmed = []
     gap = None
-    for start, end, price in completed(frame, condition, now, start_at):
+    for start, end, price in completed(frame, condition, now, start_at, warnings=warnings):
         if start < start_at:
             continue
         if price is None:
@@ -201,8 +207,15 @@ def observe(frame, params, now):
         data = json.loads(row['payload'])
         status = row['status']
         coverage = data.setdefault('verified_coverage', {})
-        invalid, invalid_gap = advance_coverage(frame, params['tactical_invalidation'], now, boundary, coverage.setdefault('invalidation', {}))
-        triggers, trigger_gap = advance_coverage(frame, params['trigger'], now, boundary, coverage.setdefault('trigger', {}))
+        quality = data.setdefault('interior_gap_warnings', {})
+        invalid_warnings, trigger_warnings = [], []
+        invalid, invalid_gap = advance_coverage(frame, params['tactical_invalidation'], now, boundary,
+            coverage.setdefault('invalidation', {}), warnings=invalid_warnings)
+        triggers, trigger_gap = advance_coverage(frame, params['trigger'], now, boundary,
+            coverage.setdefault('trigger', {}), warnings=trigger_warnings)
+        for role, warnings in (('invalidation', invalid_warnings), ('trigger', trigger_warnings)):
+            if warnings:
+                quality[role] = warnings[-10:]
         gaps = [g for g in (invalid_gap, trigger_gap) if g]
         missing_confirmation_bars = bool(gaps)
         data['missing_history_from'] = min(gaps) if gaps else None
@@ -216,6 +229,7 @@ def observe(frame, params, now):
         if params['trigger']['timeframe'] == 'daily' and triggers:
             data['confirmation_at'] = max(triggers).isoformat()
         underlying_age = (now-observed).total_seconds()
+        data['close_evidence_policy'] = 'observed_calendar_bar_closing_minute_v1'
         data.update(last_evaluation=now.isoformat(), underlying_observed_at=observed.isoformat(), close=close,
                     underlying_age_seconds=underlying_age,
                     evaluation_coverage='incomplete' if gaps or not 0 <= underlying_age <= 120 else 'observed')
@@ -337,6 +351,8 @@ class WeeklyChartStrategy:
             reason=[data['reason']], features={'close': data['close'], 'confirmation_at': data.get('confirmation_at'),
                 'entry_arm': params.get('entry_arm', 'baseline'), 'scenario_key': params['scenario_key'], 'publication_hash': params['publication_hash'],
                 'evaluation_coverage': data['evaluation_coverage'],
+                'close_evidence_policy': data['close_evidence_policy'],
+                'interior_gap_warnings': data.get('interior_gap_warnings', {}),
                 'missing_history_from': data.get('missing_history_from'), 'underlying_observed_at': data.get('underlying_observed_at')})
 
     def evaluate_exit(self, frame, deployment_id, params, position):

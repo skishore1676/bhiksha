@@ -1,11 +1,12 @@
 import asyncio
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
 from bhiksha.domain.enums import SignalDirection
 from bhiksha.domain.models import OptionContractSnapshot, SignalDecision
 from bhiksha.execution.order_manager import PublicQuote, PreflightCheck
+from bhiksha.execution import planner as planner_module
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.options.selectors import SelectorEmptyError
 from bhiksha.persistence.repository import ChainSnapshotRepository
@@ -79,6 +80,8 @@ class StubOrderManager:
             last=2.80,
             open_interest=550,
             outcome="SUCCESS",
+            quote_timestamp=planner_module.datetime.now(UTC).isoformat(),
+            quote_timestamp_field="quoteTimestamp",
         )
 
     async def preflight_entry(self, option_symbol: str, limit_price: float, quantity: int):
@@ -185,6 +188,9 @@ class StubRiskManager:
         self.reserve_calls: list[dict] = []
         self.release_calls: list[str] = []
 
+    async def preview_sized_entry(self, **kwargs):
+        return EntryDecision(allowed=True, reason="approved", details={})
+
     async def reserve_sized_entry(self, **kwargs):
         self.reserve_calls.append(kwargs)
         return EntryDecision(
@@ -198,6 +204,9 @@ class StubRiskManager:
 
 
 class BlockingCashGuard:
+    async def preview_entry(self, **kwargs):
+        return CashGuardResult(enforced=False, blocked=False)
+
     def __init__(self) -> None:
         self.started = asyncio.Event()
         self.proceed = asyncio.Event()
@@ -214,6 +223,9 @@ class BlockingCashGuard:
 
 
 class RecordingAllowedCashGuard:
+    async def preview_entry(self, **kwargs):
+        return CashGuardResult(enforced=False, blocked=False)
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
@@ -929,32 +941,8 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
     assert plan is not None
     assert plan.order_id is None
     assert plan.risk_reasons == ["insufficient_internal_settled_cash_budget"]
-    assert plan.risk_details == {
-        "required_cash": 290.04,
-        "buying_power_requirement": 290.04,
-            "estimated_cost": 289.98,
-            "base_max_trade_premium_usd": 300.0,
-            "risk_envelope_cap_fraction": None,
-            "effective_max_trade_premium_usd": 300.0,
-        "entry_pricing": plan.risk_details["entry_pricing"],
-        "remaining_budget": 142.5,
-        "usable_budget": 142.5,
-        "broker_cash_only_buying_power": 150.0,
-        "buffer_pct": 0.05,
-        "account_type": "CASH",
-        "cash_guard_mode": "on",
-        "selected_open_interest": 500,
-        "open_interest_percentile": 1.0,
-        "selected_dte": 0,
-        "selected_abs_delta": 0.31,
-        "selected_bid": 3.0,
-        "selected_ask": 2.9,
-        "selected_spread_pct": pytest.approx(0.03389830508474579),
-        "option_selection_snapshot_id": plan.risk_details["option_selection_snapshot_id"],
-        "option_selection_snapshot_persisted": True,
-        "option_candidate_set_sha256": plan.risk_details["option_candidate_set_sha256"],
-        "actual_option_selection_sha256": plan.risk_details["actual_option_selection_sha256"],
-    }
+    assert plan.quantity == 0
+    assert plan.risk_details["entry_sizing"][0]["cash_capacity"]["remaining_budget"] == 142.5
     assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.85
     assert order_manager.place_entry_order_calls == 0
 

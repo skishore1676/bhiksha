@@ -528,3 +528,109 @@ def test_weekly_pending_ttl_crossing_during_refresh_refuses_submission(monkeypat
     plan = asyncio.run(planner.plan_entry(dep, decision, dry_run=True, simulate_only=True))
     assert plan.risk_reasons == ['weekly_retry_window_expired']
     assert reads == 2 and manager.place_entry_order_calls == 0
+
+@pytest.mark.parametrize('price,headroom,expected', [(0.85,165.98,5),(0.89,165.98,5),(0.77,165.98,6),(0.82,165.98,5),(0.85,29.75,1),(0.85,29.74,0),(0.85,59.50,2)])
+def test_adaptive_sizing_uses_real_headroom_and_whole_quantity_rounding(tmp_path, price, headroom, expected):
+    from test_risk_manager import _manager, _settings, _put_budget, NOW as RISK_NOW
+    manager, _ = _manager(tmp_path, now=RISK_NOW, settings=_settings(max_daily_drawdown_pct=7.5,
+                                flatten_daily_drawdown_pct=10, max_open_positions_per_cluster=0))
+    _put_budget(manager, headroom / 0.075)
+    dep = _enabled_deployment('market_impulse_qqq_short_v1')
+    dep.exit.stop_loss_pct = 0.35
+    planner = ExecutionPlanner(risk_manager=manager, order_manager=StubOrderManager())
+    async def run():
+        qty, reason, _ = await planner._fit_live_quantity(trade_id='fit', deployment=dep,
+            timestamp=RISK_NOW, price=price, upper_quantity=20, premium_cap=4000)
+        assert qty == expected
+        assert reason == (None if expected else 'risk_prospective_loss_headroom_exceeded')
+        assert await manager.trade_state_repository.get_active_entry_risk_reservations() == []
+    asyncio.run(run())
+
+
+def test_smh_settled_cash_fit_and_advisory_does_not_reserve(tmp_path, monkeypatch):
+    from test_execution_planner import _cash_guard
+    monkeypatch.setenv('BHIKSHA_CASH_GUARD_MODE','on')
+    monkeypatch.setenv('BHIKSHA_CASH_GUARD_BUFFER_PCT','0')
+    manager=StubOrderManager()
+    manager.get_portfolio=AsyncMock(return_value={'buyingPower':{'cashOnlyBuyingPower':'693.03'}})
+    cash=_cash_guard(manager,tmp_path)
+    planner=ExecutionPlanner(cash_guard=cash,order_manager=manager)
+    dep=_enabled_deployment('market_impulse_qqq_short_v1')
+    async def run():
+        qty, reason, _=await planner._fit_live_quantity(trade_id='fit',deployment=dep,timestamp=NOW,
+            price=2.55,upper_quantity=5,premium_cap=1300)
+        assert (qty,reason)==(2,None)
+        assert await cash.repository.get_reservation('fit') is None
+        await cash.reserve_entry(trade_id='other',required_cash=500,timestamp=NOW)
+        qty, reason, _=await planner._fit_live_quantity(trade_id='fit',deployment=dep,timestamp=NOW,
+            price=2.55,upper_quantity=5,premium_cap=1300)
+        assert qty==0 and reason=='insufficient_internal_settled_cash_budget'
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('change', ['fees','price','stale'])
+def test_live_sizing_repreflights_actual_quantity_and_final_quote(monkeypatch, tmp_path, change):
+    from test_execution_planner import _cash_guard
+    from bhiksha.execution.order_manager import PreflightCheck
+    freeze(monkeypatch)
+    monkeypatch.setenv('BHIKSHA_CASH_GUARD_MODE','on')
+    monkeypatch.setenv('BHIKSHA_CASH_GUARD_BUFFER_PCT','0')
+    dep=_enabled_deployment('market_impulse_qqq_short_v1')
+    if change == 'stale':
+        dep.execution.entry_pricing_mode = 'price_seeking'
+        dep.execution.entry_pricing_spread_fraction = 0.75
+    dep.risk.max_trade_premium_usd=2000
+    dep.risk.max_contracts=10
+    manager=StubOrderManager()
+    manager.get_option_quote=AsyncMock(return_value=quote())
+    manager.get_portfolio=AsyncMock(return_value={'buyingPower':{'cashOnlyBuyingPower':'570'}})
+    calls=[]
+    async def preflight(symbol,price,quantity):
+        calls.append(quantity)
+        if change=='stale': Clock.current=NOW+timedelta(seconds=9)
+        normalized=price if change=='stale' else 3.0 if change=='price' else 2.85
+        return PreflightCheck(payload={'limitPrice':str(normalized)},current_increment=.01,
+                             buying_power_requirement=normalized*quantity*100+0.10,estimated_cost=None)
+    manager.preflight_entry=preflight
+    cash=_cash_guard(manager,tmp_path)
+    risk=StubRiskManager()
+    planner=ExecutionPlanner(chain_service=StubChainService(),order_manager=manager,
+        cash_guard=cash,risk_manager=risk,position_tracker=PositionTracker())
+    decision=SignalDecision(dep.deployment_id,'QQQ',NOW,True,SignalDirection.SHORT,[],{})
+    plan=asyncio.run(planner.plan_entry(dep,decision,dry_run=False))
+    assert calls==([2] if change=='stale' else [2,1])
+    if change=='stale':
+        assert plan.risk_reasons==['public_quote_stale_or_unproven']
+        assert manager.place_entry_order_calls==0
+        assert risk.release_calls==[plan.trade_id]
+        assert asyncio.run(cash.repository.get_reservation(plan.trade_id)).status=='released'
+    else:
+        assert plan.quantity==1 and plan.order_id=='OID123'
+        assert risk.reserve_calls[-1]['quantity']==1
+        assert risk.reserve_calls[-1]['entry_price']==(3.0 if change=='price' else 2.85)
+
+
+@pytest.mark.parametrize('mode', ['urgent', 'balanced', 'price_seeking'])
+def test_final_live_quote_age_gate_also_covers_initially_fresh_quotes(monkeypatch, mode):
+    freeze(monkeypatch)
+    dep = _enabled_deployment('market_impulse_qqq_short_v1')
+    dep.execution.entry_pricing_mode = mode
+    manager = StubOrderManager()
+    manager.get_option_quote = AsyncMock(return_value=quote())
+    async def preflight(symbol, price, quantity):
+        from bhiksha.execution.order_manager import PreflightCheck
+        Clock.current = NOW + timedelta(seconds=9)
+        return PreflightCheck(payload={'limitPrice':str(price)},current_increment=.01,
+                              buying_power_requirement=price*quantity*100,estimated_cost=None)
+    manager.preflight_entry = preflight
+    risk = StubRiskManager()
+    cash = RecordingAllowedCashGuard()
+    planner = ExecutionPlanner(chain_service=StubChainService(),order_manager=manager,
+        cash_guard=cash,risk_manager=risk,position_tracker=PositionTracker())
+    decision = SignalDecision(dep.deployment_id,'QQQ',NOW,True,SignalDirection.SHORT,[],{})
+    plan = asyncio.run(planner.plan_entry(dep,decision,dry_run=False))
+    assert plan.risk_reasons == ['public_quote_stale_or_unproven']
+    assert manager.get_option_quote.await_count == 1
+    assert manager.place_entry_order_calls == 0
+    assert risk.release_calls == [plan.trade_id]
+    assert ('release',plan.trade_id) in cash.calls

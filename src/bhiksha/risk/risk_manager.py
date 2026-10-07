@@ -977,6 +977,7 @@ class RiskManager:
         entry_price: float,
         quantity: int,
         stop_loss_pct: float | None,
+        reserve: bool = True,
     ) -> EntryDecision:
         """Atomically approve and reserve final, priced live-entry risk.
 
@@ -984,6 +985,10 @@ class RiskManager:
         the book from accepting open planned-stop risk which, together with
         losses already realized today, would exceed that same halt budget.
         """
+        async def emit(decision):
+            if reserve:
+                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+
         async with self._sized_entry_lock:
             proposed_loss = planned_stop_loss_usd(
                 entry_price=entry_price,
@@ -1001,7 +1006,7 @@ class RiskManager:
                         "stop_loss_pct": stop_loss_pct,
                     },
                 )
-                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                await emit(decision)
                 return decision
             proposed_loss = proposed_loss or 0.0
 
@@ -1018,7 +1023,7 @@ class RiskManager:
                     rail="entry-risk",
                     details={"error": str(exc)},
                 )
-                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                await emit(decision)
                 return decision
 
             now = self._now_fn()
@@ -1064,7 +1069,7 @@ class RiskManager:
                     rail="correlation-cluster",
                     details=cluster_details,
                 )
-                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                await emit(decision)
                 return decision
 
             loss_details: dict[str, object] = {
@@ -1085,7 +1090,7 @@ class RiskManager:
                             "trade_date": rail_a.trade_date,
                         },
                     )
-                    await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                    await emit(decision)
                     return decision
                 if rail_a.active and (rail_a.halted or rail_a.flatten):
                     self._session_halted = True
@@ -1096,7 +1101,7 @@ class RiskManager:
                         rail="A",
                         details=loss_details,
                     )
-                    await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                    await emit(decision)
                     return decision
                 if rail_a.active:
                     open_planned_loss = 0.0
@@ -1154,7 +1159,7 @@ class RiskManager:
                             rail="A-prospective",
                             details=loss_details,
                         )
-                        await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                        await emit(decision)
                         return decision
                     if prospective_total > loss_budget:
                         decision = EntryDecision(
@@ -1163,8 +1168,11 @@ class RiskManager:
                             rail="A-prospective",
                             details=loss_details,
                         )
-                        await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                        await emit(decision)
                         return decision
+
+            if not reserve:
+                return EntryDecision(allowed=True, reason="approved", rail="sized-entry", details=loss_details)
 
             try:
                 await self.trade_state_repository.upsert_entry_risk_reservation(
@@ -1184,7 +1192,7 @@ class RiskManager:
                     rail="entry-risk",
                     details={**loss_details, "error": str(exc)},
                 )
-                await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+                await emit(decision)
                 return decision
             decision = EntryDecision(
                 allowed=True,
@@ -1192,8 +1200,12 @@ class RiskManager:
                 rail="sized-entry",
                 details=loss_details,
             )
-            await self._emit_sized_entry_decision(deployment_id, trade_id, decision)
+            await emit(decision)
             return decision
+
+    async def preview_sized_entry(self, **kwargs) -> EntryDecision:
+        """Reuse final-consult economics without approving/reserving a submission."""
+        return await self.reserve_sized_entry(**kwargs, reserve=False)
 
     async def release_sized_entry(self, trade_id: str) -> None:
         async with self._sized_entry_lock:

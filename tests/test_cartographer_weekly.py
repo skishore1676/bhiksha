@@ -40,9 +40,9 @@ def test_no_entry_until_39_minute_bar_closes(params):
     assert observe(frame(),params,now)[0]['reason']=='weekly_confirmed'
 
 
-def test_missing_minute_and_prepublication_cannot_confirm(params):
+def test_missing_closing_minute_and_prepublication_cannot_confirm(params):
     now=datetime(2026,9,28,14,9,tzinfo=UTC)
-    assert not confirmations(frame().slice(1),params['trigger'],now,datetime(2026,9,27,tzinfo=UTC))
+    assert not confirmations(frame().head(38),params['trigger'],now,datetime(2026,9,27,tzinfo=UTC))
     params['admitted_at']='2026-09-28T13:31:00+00:00'
     assert observe(frame(),params,now)[0]['reason']=='weekly_waiting_confirmation'
 
@@ -108,7 +108,7 @@ def test_early_close_daily_and_consecutive_hole(params):
     assert len(completed(bars,condition,opening+timedelta(minutes=210)))==1
     assert not completed(bars,condition,opening+timedelta(minutes=209))
     condition={**params['trigger'],'count':2}
-    bars=frame(minutes=78).filter(pl.col('timestamp')!=datetime(2026,9,28,13,35,tzinfo=UTC))
+    bars=frame(minutes=78).filter(pl.col('timestamp')!=datetime(2026,9,28,14,8,tzinfo=UTC))
     assert not confirmations(bars,condition,datetime(2026,9,28,14,48,tzinfo=UTC),datetime(2026,9,27,tzinfo=UTC))
 
 
@@ -265,7 +265,7 @@ def test_verified_prefix_survives_eviction_and_restart(params):
 
 def test_hole_repair_preserves_original_confirmation_time(params):
     now=datetime(2026,9,28,14,48,tzinfo=UTC)
-    missing=frame(minutes=78).slice(1)
+    missing=frame(minutes=78).filter(pl.col("timestamp")!=datetime(2026,9,28,14,8,tzinfo=UTC))
     data,_=observe(missing,params,now)
     assert data['reason']=='weekly_confirmation_data_gap'
     assert data['missing_history_from']=='2026-09-28T13:30:00+00:00'
@@ -308,7 +308,7 @@ async def test_runtime_repairs_same_source_and_throttles_unresolved_hole(params,
     runtime=SimpleNamespace(_weekly_repair_at={},_live_bar_source=lambda:source,
         provider_config=SimpleNamespace(underlying_live_primary='schwab'))
     events=SimpleNamespace(append=AsyncMock())
-    repaired=await module.BhikshaRuntime._repair_weekly_frame(runtime,'SPY',original.slice(1),[deployment(params)],events)
+    repaired=await module.BhikshaRuntime._repair_weekly_frame(runtime,'SPY',original.filter(pl.col("timestamp")!=datetime(2026,9,28,14,8,tzinfo=UTC)),[deployment(params)],events)
     data,_=observe(repaired,params,fixed)
     assert data['reason']=='weekly_confirmed'
     assert source.warm_start.await_args.args[1]==datetime(2026,9,28,13,30,tzinfo=UTC)
@@ -316,6 +316,39 @@ async def test_runtime_repairs_same_source_and_throttles_unresolved_hole(params,
     assert events.append.await_args.args[1]['provider']=='schwab'
     # A later hole remains explicitly blocked; do not hammer the provider every bar.
     params['deployment_id']='new-lane'
-    await module.BhikshaRuntime._repair_weekly_frame(runtime,'SPY',original.slice(1),[deployment(params)],events)
+    await module.BhikshaRuntime._repair_weekly_frame(runtime,'SPY',original.filter(pl.col("timestamp")!=datetime(2026,9,28,14,8,tzinfo=UTC)),[deployment(params)],events)
     assert source.warm_start.await_count==1
-    assert observe(original.slice(1),params,fixed)[0]['reason']=='weekly_confirmation_data_gap'
+    assert observe(original.filter(pl.col("timestamp")!=datetime(2026,9,28,14,8,tzinfo=UTC)),params,fixed)[0]['reason']=='weekly_confirmation_data_gap'
+
+@pytest.mark.parametrize('timeframe,minutes', [('39m',39),('daily',390)])
+def test_close_rule_ignores_interior_hole_but_requires_actual_final_minute(params,timeframe,minutes):
+    condition={**params['trigger'],'timeframe':timeframe}
+    now=datetime(2026,9,28,13,30,tzinfo=UTC)+timedelta(minutes=minutes)
+    bars=frame(minutes=minutes).slice(1)
+    assert confirmations(bars,condition,now,datetime(2026,9,27,tzinfo=UTC))==[now]
+    assert not confirmations(bars.head(minutes-2),condition,now,datetime(2026,9,27,tzinfo=UTC))
+    assert not confirmations(frame(minutes=minutes,price=600),condition,now,datetime(2026,9,27,tzinfo=UTC))
+
+
+def test_interior_gap_is_diagnostic_and_early_arm_keeps_required_minute_gap(params):
+    now=datetime(2026,9,28,14,9,tzinfo=UTC)
+    bars=frame().filter(pl.col('timestamp')!=datetime(2026,9,28,13,35,tzinfo=UTC))
+    data,_=observe(bars,params,now)
+    assert data['reason']=='weekly_confirmed'
+    assert data['close_evidence_policy']=='observed_calendar_bar_closing_minute_v1'
+    assert data['interior_gap_warnings']['trigger'][0]['missing_interior_minutes']==1
+    early=deepcopy(params);early['deployment_id']+='-early';early['trigger']['timeframe']='1m'
+    data,_=observe(bars,early,now)
+    assert data['reason']=='weekly_confirmation_data_gap'
+    assert data['missing_history_from']=='2026-09-28T13:35:00+00:00'
+    assert data['verified_coverage']['invalidation']['through']=='2026-09-28T14:09:00+00:00'
+
+
+def test_daily_interior_recovery_preserves_prior_invalidation(params):
+    params['trigger']['timeframe']='daily'
+    params['tactical_invalidation']['timeframe']='daily'
+    params['tactical_invalidation']['price']=601
+    atomic_json(__import__('pathlib').Path(params['source_health_path']),{'ok':True,'checked_at':'2026-09-29T12:30:00+00:00'})
+    bars=pl.concat([frame(minutes=390).slice(1),frame('2026-09-29',minutes=5)])
+    data,status=observe(bars,params,datetime(2026,9,29,13,35,tzinfo=UTC))
+    assert status=='invalidated' and data['invalidated_at']=='2026-09-28T20:00:00+00:00'

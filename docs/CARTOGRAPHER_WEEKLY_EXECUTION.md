@@ -161,7 +161,12 @@ launchd registry. It must not be background-throttled while collecting a
 Bhiksha checkpoints each condition's contiguous verified bar coverage and
 consecutive-close count in the existing scenario state. Evicting old rolling
 bars or restarting does not erase that proof. Missing sessions and missing
-minutes remain explicit. A gap requests at most one day of history from the
+required closing minutes remain explicit. For close-only rules the actual minute
+opening at bar-end minus one minute proves the close; absent interior minutes
+are diagnostic warnings, not a confirmation veto. No forward fill or synthetic
+bar is permitted. Every minute is a required close for the early_1m arm, so that
+arm cannot bridge a hole. Calendar alignment, completion time, admission boundary,
+original retry clock and invalidation precedence are preserved. A gap requests at most one day of history from the
 same provider as live bars, once per symbol per five minutes, with a five-second
 request deadline. Recovery never fabricates candles, resets admission, changes
 confirmation time, or renews an expired retry window. If invalidation history
