@@ -30,7 +30,7 @@ from bhiksha.domain.exit_state import (
 from bhiksha.domain.models import ExitDecision, ExitPlan, PartialFillRecord, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.entry_retry import EntryLiquidityRetry
 from bhiksha.execution.cartographer_excursions import option_mfe_mae, underlying_mfe_mae
-from bhiksha.execution.order_manager import OrderResult, normalize_option_symbol, round_price
+from bhiksha.execution.order_manager import OrderManager, OrderResult, normalize_option_symbol, round_price, preflight_failure_is_transient
 from bhiksha.execution.planner import ExecutionPlanner
 from bhiksha.execution.quote_lineage import proved_quote_timestamp_lineage
 from bhiksha.execution.brokers.public.order_status import (
@@ -42,7 +42,6 @@ from bhiksha.execution.pricing import (
     build_entry_profile_comparison,
     get_entry_execution_profile,
     resolve_entry_reprice_max_chase_pct,
-    scale_spread_fraction,
     select_entry_limit,
 )
 from bhiksha.options.selectors import SelectorEmptyError
@@ -117,6 +116,7 @@ class _EntryRepriceResult:
     filled: bool = False
     payload: dict | None = None
     cancelled_without_fill: bool = False
+    retryable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +193,21 @@ class _ExitCancelRaceOutcome:
     cancel_error: str | None = None
 
 
+def _entry_execution_summary(plan: TradePlan | None, *, fill_basis: str | None = None) -> dict:
+    if plan is None:
+        return {}
+    pricing = plan.risk_details.get("entry_pricing") or {}
+    return {
+        "starting_bid": pricing.get("starting_bid"), "starting_ask": pricing.get("starting_ask"),
+        "price_ceiling": pricing.get("max_entry_price"),
+        "initial_limit": pricing.get("initial_limit_price"), "final_limit": plan.risk_details.get("submitted_entry_limit_price", plan.estimated_entry_price),
+        "quantity": plan.quantity, "retries": plan.risk_details.get("entry_retry_attempts", 0),
+        "replacements": plan.risk_details.get("entry_reprice_attempt", plan.risk_details.get("paper_reprice_attempt", 0)),
+        "fill_basis": fill_basis or plan.risk_details.get("entry_fill_kind") or "unconfirmed",
+        "tick_increment": pricing.get("preflight_increment"),
+    }
+
+
 def _signal_outcome_payload(
     deployment: DeploymentManifest,
     decision: SignalDecision,
@@ -203,6 +218,7 @@ def _signal_outcome_payload(
     mode: str | None = None,
 ) -> dict[str, Any]:
     return {
+        "entry_execution": _entry_execution_summary(plan),
         "opportunity_id": (plan.risk_details.get("entry_opportunity_id") if plan else None),
         "signal_id": f"{deployment.deployment_id}:{decision.timestamp.isoformat()}:{decision.direction.value if decision.direction else 'none'}",
         "deployment_id": deployment.deployment_id,
@@ -1923,7 +1939,7 @@ class ExecutionSupervisor:
                         decision,
                         dry_run=dry_run,
                         simulate_only=simulate_only,
-                        **({"entry_guard": retry_guard} if retry is not None else {}),
+                        **({"entry_guard": retry_guard, "pricing_references": retry.pricing_references} if retry is not None else {}),
                     )
                 except SelectorEmptyError as exc:
                     if (retry is None or self._entry_liquidity_retries.get(deployment.deployment_id) is retry) and await self._schedule_entry_retry(deployment, decision, exc, attempt=attempt):
@@ -1955,7 +1971,9 @@ class ExecutionSupervisor:
                 await self.event_repository.append("trade_plan", asdict(plan))
                 return None
             if plan is not None and retry is not None:
+                plan.risk_details["entry_retry_attempts"] = max(0, retry.attempts-1)
                 plan.risk_details["entry_opportunity_id"] = retry.opportunity_id
+                plan.risk_details["entry_opportunity_deadline"] = retry.deadline.isoformat()
             completed_retry = self._entry_liquidity_retries.pop(deployment.deployment_id, None)
             if completed_retry is not None:
                 await self.event_repository.append("entry_liquidity_retry_finished", {
@@ -2050,25 +2068,22 @@ class ExecutionSupervisor:
                     and plan.option_symbol
                     and plan.order_id is None
                 ):
-                    if deployment.exit.management_exit or (deployment.execution.entry_pricing_mode == "price_seeking" or deployment.execution.preferred_min_open_interest is not None or deployment.execution.preferred_max_bid_ask_spread_pct is not None):
-                        started = datetime.now(UTC)
-                        lifetime = _entry_reprice_cancel_after_seconds(self.app_config, deployment)
-                        self._paper_entries[plan.trade_id] = (
-                            deployment.model_copy(deep=True), decision, plan, started,
-                            started + timedelta(seconds=max(1, lifetime)),
-                        )
-                        transition = self.lifecycle_store.begin_entry(
-                            deployment.symbol, deployment.deployment_id,
-                            option_symbol=plan.option_symbol, order_id="PAPER_PENDING",
-                        )
-                        await self._emit_lifecycle_transition(transition, reason="paper_limit_pending")
-                        plan.risk_details["paper_entry_status"] = "pending"
-                        await self.event_repository.append("paper_entry_pending", {
-                            **asdict(plan), "started_at": started.isoformat(),
-                            "expires_at": self._paper_entries[plan.trade_id][4].isoformat(),
-                        })
-                    else:
-                        await self._open_shadow_entry(deployment, plan)
+                    started = datetime.now(UTC)
+                    lifetime = _entry_reprice_cancel_after_seconds(self.app_config, deployment)
+                    self._paper_entries[plan.trade_id] = (
+                        deployment.model_copy(deep=True), decision, plan, started,
+                        _entry_working_deadline(deployment, started, max(1, lifetime), plan),
+                    )
+                    transition = self.lifecycle_store.begin_entry(
+                        deployment.symbol, deployment.deployment_id,
+                        option_symbol=plan.option_symbol, order_id="PAPER_PENDING",
+                    )
+                    await self._emit_lifecycle_transition(transition, reason="paper_limit_pending")
+                    plan.risk_details["paper_entry_status"] = "pending"
+                    await self.event_repository.append("paper_entry_pending", {
+                        **asdict(plan), "started_at": started.isoformat(),
+                        "expires_at": self._paper_entries[plan.trade_id][4].isoformat(),
+                    })
                 elif not dry_run and plan.order_id:
                     plan = await self._protect_live_entry(plan, deployment)
                 elif dry_run and plan.order_id:
@@ -2360,7 +2375,8 @@ class ExecutionSupervisor:
                     if quote_at <= effective_at:
                         continue
                     if quote.ask > plan.estimated_entry_price:
-                        await self._reprice_paper_entry(deployment, decision, plan, started, expires, quote, received)
+                        await self._reprice_paper_entry(deployment, decision, plan, started, expires, quote, received,
+                            now_fn=(lambda: now) if now is not None else (lambda: datetime.now(UTC)))
                         continue
                 except Exception as exc:
                     await self.event_repository.append("paper_entry_quote_unavailable", {
@@ -2382,30 +2398,52 @@ class ExecutionSupervisor:
                 await self.event_repository.append("signal_outcome", _signal_outcome_payload(
                     deployment, decision, outcome="filled", plan=plan, mode="shadow"))
 
-    async def _reprice_paper_entry(self, deployment, decision, plan, started, expires, quote, received):
+    async def _reprice_paper_entry(self, deployment, decision, plan, started, expires, quote, received, *, now_fn=None):
         """Model the configured ladder without submitting orders or inventing fills."""
         if not _entry_reprice_enabled(self.app_config, deployment, plan):
+            return
+        if plan.risk_details.get("paper_reprice_recovery_disabled"):
+            return
+        retry_at = plan.risk_details.get("paper_reprice_retry_at")
+        if retry_at and received < datetime.fromisoformat(retry_at):
             return
         checkpoints = _entry_reprice_checkpoints(self.app_config, deployment)
         completed = int(plan.risk_details.get("paper_reprice_attempt", 0))
         if completed >= len(checkpoints) or (received - started).total_seconds() < checkpoints[completed]:
             return
         attempt = completed + 1
-        plan.risk_details["paper_reprice_attempt"] = attempt
         pricing = select_entry_limit(quote, _entry_reprice_pricing_params(self.app_config, deployment, plan, attempt), observed_at=received)
         if not pricing.approved or pricing.limit_price is None:
-            await self._finish_paper_no_fill(plan.trade_id, "paper_reprice_quote_blocked")
+            await self._rest_paper_entry_for_reprice_recovery(deployment, plan, received, pricing.block_reasons)
             return
-        proposed = round_price(pricing.limit_price)
-        evidence = _entry_pricing_evidence(pricing, deployment, plan)
-        reference = _entry_reprice_reference_limit_price(plan)
-        chase = resolve_entry_reprice_max_chase_pct(deployment.execution.model_dump())
-        if (reference is not None and chase is not None and proposed > plan.estimated_entry_price
-                and proposed > round_price(reference * (1 + chase)) + 1e-9):
-            await self.event_repository.append("paper_entry_reprice_chase_guard_resting", {
-                "trade_id": plan.trade_id, "deployment_id": deployment.deployment_id, "attempt": attempt,
-                "current_limit_price": plan.estimated_entry_price, "proposed_limit_price": proposed,
-                "reference_limit_price": reference, "max_chase_pct": chase, "mode": "shadow"})
+        try:
+            checked = await self.planner.order_manager.preflight_entry(plan.option_symbol, pricing.limit_price, plan.quantity)
+        except Exception as exc:
+            if not preflight_failure_is_transient(exc):
+                await self._finish_paper_no_fill(plan.trade_id, "paper_reprice_preflight_failed")
+            else:
+                await self._rest_paper_entry_for_reprice_recovery(deployment, plan, received, [type(exc).__name__])
+            return
+        if not checked.current_increment:
+            await self._finish_paper_no_fill(plan.trade_id, "public_preflight_tick_metadata_unavailable")
+            return
+        proposed = float(checked.payload["limitPrice"])
+        if proposed > pricing.limit_price + 1e-9:
+            await self._finish_paper_no_fill(plan.trade_id, "broker_entry_price_exceeds_limit")
+            return
+        # Recheck both quote age and the original deadline after awaited preflight.
+        validation_at = (now_fn or (lambda: datetime.now(UTC)))()
+        if _entry_working_guard(deployment, plan, validation_at) or validation_at >= expires:
+            await self._finish_paper_no_fill(plan.trade_id, "paper_limit_expired")
+            return
+        if not select_entry_limit(quote, _entry_reprice_pricing_params(self.app_config, deployment, plan, attempt), observed_at=validation_at).approved:
+            await self._rest_paper_entry_for_reprice_recovery(deployment, plan, validation_at, ["public_quote_stale_or_unproven"])
+            return
+        evidence = {**_entry_pricing_evidence(pricing, deployment, plan),
+                    "preflight_increment": checked.current_increment,
+                    "tick_validation_basis": "broker_preflight"}
+        if received >= expires:
+            await self._finish_paper_no_fill(plan.trade_id, "paper_limit_expired")
             return
         cap = deployment.risk.max_trade_premium_usd or 300.0
         effective_cap = plan.risk_details.get("effective_max_trade_premium_usd")
@@ -2414,16 +2452,27 @@ class ExecutionSupervisor:
         if proposed * plan.quantity * 100 > cap:
             await self._finish_paper_no_fill(plan.trade_id, "paper_reprice_above_max_trade_premium")
             return
-        if proposed == plan.estimated_entry_price:
+        if proposed <= plan.estimated_entry_price:
             return
         updated = replace(plan, estimated_entry_price=proposed, risk_details={
-            **plan.risk_details, "entry_pricing": evidence, "paper_limit_effective_at": received.isoformat()})
+            **plan.risk_details, "paper_reprice_attempt": attempt, "entry_pricing": evidence, "paper_limit_effective_at": received.isoformat()})
         self._paper_entries[plan.trade_id] = (deployment, decision, updated, started, expires)
         await self.event_repository.append("paper_entry_repriced", {
             "trade_id": plan.trade_id, "deployment_id": deployment.deployment_id, "attempt": attempt,
             "previous_limit_price": plan.estimated_entry_price, "limit_price": proposed,
             "quantity": plan.quantity, "effective_at": received.isoformat(), "mode": "shadow",
             "pricing_evidence": evidence})
+
+    async def _rest_paper_entry_for_reprice_recovery(self, deployment, plan, received, reasons):
+        if not _entry_reprice_recovery_enabled(deployment):
+            plan.risk_details["paper_reprice_recovery_disabled"] = True
+        else:
+            plan.risk_details["paper_reprice_retry_at"] = (
+                received + timedelta(seconds=deployment.execution.entry_liquidity_retry_interval_seconds)).isoformat()
+        await self.event_repository.append("paper_entry_reprice_recovery_waiting", {
+            "trade_id": plan.trade_id, "reasons": reasons,
+            "next_attempt_at": plan.risk_details.get("paper_reprice_retry_at"),
+            "recovery_enabled": _entry_reprice_recovery_enabled(deployment)})
 
     def consume_entry_intent(self, deployment_id: str) -> None:
         self._disabled_entry_deployments.add(deployment_id)
@@ -2442,7 +2491,7 @@ class ExecutionSupervisor:
         else:
             reasons = set(error.risk_reasons) - {"approved"}
             transient = {"public_quote_stale_or_unproven", "public_quote_timestamp_missing", "public_quote_unavailable"}
-            if (error.order_id or not reasons or not all(reason in transient or (reason.startswith("public_preflight_failed:") and error.risk_details.get("pre_submission_retryable")) for reason in reasons)):
+            if (error.order_id or not reasons or not all(reason in transient or (reason.startswith("public_preflight_failed") and error.risk_details.get("pre_submission_retryable")) for reason in reasons)):
                 return False
             diagnostics = {"reasons": sorted(reasons), "trade_id": error.trade_id}
         now = datetime.now(UTC)
@@ -2453,6 +2502,8 @@ class ExecutionSupervisor:
                 opportunity_id=_signal_outcome_payload(deployment, decision, outcome="pending_execution")["signal_id"])
         if retry.stop_reason(now):
             return False
+        if isinstance(error, TradePlan):
+            retry.pricing_references.update(error.risk_details.get("entry_pricing_references") or {})
         retry.pending_decision = decision
         retry.next_attempt_at = now + timedelta(seconds=deployment.execution.entry_liquidity_retry_interval_seconds)
         self._entry_liquidity_retries[deployment.deployment_id] = retry
@@ -2465,6 +2516,7 @@ class ExecutionSupervisor:
         if self.record_signal_outcomes:
             payload = _signal_outcome_payload(deployment, decision, outcome="pending_execution",
                 rejection_reasons=["entry_recovery_waiting"],
+                plan=error if isinstance(error, TradePlan) else None,
                 mode="shadow" if deployment.execution.shadow_only else "live")
             payload["opportunity_id"] = retry.opportunity_id
             await self.event_repository.append("signal_outcome", payload)
@@ -2472,6 +2524,7 @@ class ExecutionSupervisor:
             "deployment_id": deployment.deployment_id, "symbol": deployment.symbol,
             "deadline": retry.deadline.isoformat(), "next_attempt_at": retry.next_attempt_at.isoformat(),
             "attempts": retry.attempts, "diagnostics": diagnostics, "opportunity_id": retry.opportunity_id,
+            "pricing_references": retry.pricing_references,
             "manual_intent": ({"strategy": deployment.strategy.model_dump(mode="json"),
                 "execution": deployment.execution.model_dump(mode="json"),
                 "risk": deployment.risk.model_dump(mode="json"),
@@ -2562,6 +2615,7 @@ class ExecutionSupervisor:
                         "signal_outcome",
                         {
                             **plan.risk_details.get("entry_signal_identity", {}),
+                            "entry_execution": _entry_execution_summary(plan, fill_basis="unfilled"),
                             "deployment_id": deployment.deployment_id,
                             "symbol": deployment.symbol,
                             "timestamp": datetime.now(UTC).isoformat(),
@@ -2599,6 +2653,7 @@ class ExecutionSupervisor:
                         "signal_outcome",
                         {
                             **plan.risk_details.get("entry_signal_identity", {}),
+                            "entry_execution": _entry_execution_summary(plan, fill_basis="unfilled"),
                             "deployment_id": deployment.deployment_id,
                             "symbol": deployment.symbol,
                             "timestamp": datetime.now(UTC).isoformat(),
@@ -2672,6 +2727,7 @@ class ExecutionSupervisor:
                 event_type="signal_outcome",
                 event_payload={
                     **plan.risk_details.get("entry_signal_identity", {}),
+                    "entry_execution": _entry_execution_summary(plan, fill_basis="broker_confirmed"),
                     "deployment_id": deployment.deployment_id,
                     "symbol": deployment.symbol,
                     "timestamp": confirmed_at.isoformat() if confirmed_at else datetime.now(UTC).isoformat(),
@@ -2798,6 +2854,7 @@ class ExecutionSupervisor:
             risk_details["protection_error"] = protection_error
         return replace(plan, stop_order_id=stop_result.order_id, target_order_id=target_order_id, risk_details=risk_details)
 
+
     async def _wait_for_entry_fill_or_cancel(
         self,
         plan: TradePlan,
@@ -2814,36 +2871,35 @@ class ExecutionSupervisor:
         active_plan = plan
         cancel_after_seconds = _entry_reprice_cancel_after_seconds(self.app_config, deployment)
         checkpoints = _entry_reprice_checkpoints(self.app_config, deployment)
+        deadline = _entry_working_deadline(deployment, started_at, cancel_after_seconds, plan)
+        plan.risk_details.setdefault("entry_working_deadline", deadline.isoformat())
         for attempt, checkpoint_seconds in enumerate(checkpoints, start=1):
-            wait_seconds = _remaining_seconds(started_at, checkpoint_seconds)
-            result = await self._wait_for_entry_fill_once(
-                active_plan,
-                timeout_seconds=wait_seconds,
-                reprice_attempt=attempt - 1,
-            )
-            if result.filled or _terminal_entry_error(result.error):
-                return result
-            reprice = await self._reprice_live_entry(active_plan, deployment, attempt=attempt)
-            if reprice.filled:
-                return _EntryWaitResult(
-                    plan=reprice.plan,
-                    filled=True,
-                    payload=reprice.payload,
-                    error=None,
-                )
-            if reprice.error is not None:
-                return _EntryWaitResult(
-                    plan=reprice.plan,
-                    filled=False,
-                    payload=reprice.payload or result.payload,
-                    error=reprice.error,
-                    cancelled_without_fill=reprice.cancelled_without_fill,
-                )
-            active_plan = reprice.plan
+            next_step = started_at + timedelta(seconds=checkpoint_seconds)
+            while datetime.now(UTC) < deadline:
+                wait_seconds = max(0, min(int((next_step-datetime.now(UTC)).total_seconds()),
+                                         int((deadline-datetime.now(UTC)).total_seconds())))
+                result = await self._wait_for_entry_fill_once(active_plan, timeout_seconds=wait_seconds,
+                    reprice_attempt=attempt-1)
+                if result.filled or _terminal_entry_error(result.error):
+                    return result
+                if datetime.now(UTC) >= deadline:
+                    break
+                guard = _entry_working_guard(deployment, active_plan, datetime.now(UTC))
+                reprice = (await self._cancel_entry_for_reprice_block(active_plan, attempt=attempt, reason=guard)
+                    if guard else await self._reprice_live_entry(active_plan, deployment, attempt=attempt))
+                if reprice.filled:
+                    return _EntryWaitResult(reprice.plan, True, reprice.payload, None)
+                if reprice.error is not None:
+                    return _EntryWaitResult(reprice.plan, False, reprice.payload or result.payload,
+                        reprice.error, reprice.cancelled_without_fill)
+                active_plan = reprice.plan
+                if not reprice.retryable or not _entry_reprice_recovery_enabled(deployment):
+                    break
+                next_step = datetime.now(UTC) + timedelta(seconds=deployment.execution.entry_liquidity_retry_interval_seconds)
 
         result = await self._wait_for_entry_fill_once(
             active_plan,
-            timeout_seconds=_remaining_seconds(started_at, cancel_after_seconds),
+            timeout_seconds=max(0, int((deadline-datetime.now(UTC)).total_seconds())),
             reprice_attempt=len(checkpoints),
         )
         if result.filled or _terminal_entry_error(result.error):
@@ -2962,32 +3018,31 @@ class ExecutionSupervisor:
         *,
         attempt: int,
     ) -> "_EntryRepriceResult":
+        if plan.risk_details.get("entry_reprice_attempt", 0) >= 1:
+            return _EntryRepriceResult(plan=plan)
+        guard = _entry_working_guard(deployment, plan, datetime.now(UTC))
+        if guard:
+            return await self._cancel_entry_for_reprice_block(plan, attempt=attempt, reason=guard)
         pricing_params = _entry_reprice_pricing_params(self.app_config, deployment, plan, attempt)
         try:
             quote = await self.planner.order_manager.get_option_quote(plan.option_symbol)
             pricing = select_entry_limit(quote, pricing_params)
         except Exception as exc:
-            return await self._cancel_entry_for_reprice_block(
-                plan,
-                attempt=attempt,
-                reason=f"entry_reprice_quote_unavailable:{exc}",
-            )
+            return await self._rest_entry_for_reprice_recovery(plan, attempt, "public_quote_unavailable")
         pricing_evidence = _entry_pricing_evidence(pricing, deployment, plan)
         if pricing.block_reasons or pricing.limit_price is None:
-            return await self._cancel_entry_for_reprice_block(
-                plan,
-                attempt=attempt,
-                reason="entry_reprice_quote_blocked:" + ",".join(pricing.block_reasons or ["missing_limit"]),
-                pricing_evidence=pricing_evidence,
-            )
+            return await self._rest_entry_for_reprice_recovery(plan, attempt,
+                "entry_reprice_quote_blocked:" + ",".join(pricing.block_reasons or ["missing_limit"]))
 
         try:
             preflight = await self.planner.order_manager.preflight_entry(plan.option_symbol, pricing.limit_price, plan.quantity)
         except Exception as exc:
+            if preflight_failure_is_transient(exc):
+                return await self._rest_entry_for_reprice_recovery(plan, attempt, "public_preflight_temporary_failure")
             return await self._cancel_entry_for_reprice_block(
                 plan,
                 attempt=attempt,
-                reason=f"entry_reprice_preflight_failed:{exc}",
+                reason=f"entry_reprice_preflight_failed:{type(exc).__name__}",
                 pricing_evidence=pricing_evidence,
             )
         final_limit_price = float(preflight.payload["limitPrice"])
@@ -2998,44 +3053,19 @@ class ExecutionSupervisor:
             "preflight_buying_power_requirement": preflight.buying_power_requirement,
             "preflight_estimated_cost": preflight.estimated_cost,
         }
-        price_through_target = pricing_params.get("entry_price_through_target")
-        if price_through_target is not None and final_limit_price > float(price_through_target) + 1e-9:
-            await self.event_repository.append("entry_reprice_chase_guard_resting", {
-                "deployment_id": plan.deployment_id,
-                "trade_id": plan.trade_id,
-                "order_id": plan.order_id,
-                "attempt": attempt,
-                "decision": "rest_existing_order",
-                "current_limit_price": plan.estimated_entry_price,
-                "proposed_limit_price": final_limit_price,
-                "max_chase_price": price_through_target,
-                "pricing_evidence": pricing_evidence,
-            })
-            return _EntryRepriceResult(plan=plan)
-        reference_limit_price = _entry_reprice_reference_limit_price(plan)
-        max_chase_pct = resolve_entry_reprice_max_chase_pct(deployment.execution.model_dump())
-        if reference_limit_price is not None and max_chase_pct is not None:
-            max_chase_price = round_price(reference_limit_price * (1.0 + max_chase_pct))
-            is_upward_reprice = final_limit_price > plan.estimated_entry_price + 1e-9
-            if is_upward_reprice and final_limit_price > max_chase_price + 1e-9:
-                await self.event_repository.append(
-                    "entry_reprice_chase_guard_resting",
-                    {
-                        "deployment_id": plan.deployment_id,
-                        "trade_id": plan.trade_id,
-                        "order_id": plan.order_id,
-                        "attempt": attempt,
-                        "decision": "rest_existing_order",
-                        "current_limit_price": plan.estimated_entry_price,
-                        "reference_limit_price": reference_limit_price,
-                        "proposed_limit_price": final_limit_price,
-                        "max_chase_pct": max_chase_pct,
-                        "max_chase_price": max_chase_price,
-                        "pricing_evidence": pricing_evidence,
-                    },
-                )
-                return _EntryRepriceResult(plan=plan)
-        max_trade_premium = deployment.risk.max_trade_premium_usd or 300.0
+        if final_limit_price > pricing.limit_price + 1e-9:
+            return await self._cancel_entry_for_reprice_block(plan, attempt=attempt,
+                reason="broker_entry_price_exceeds_limit", pricing_evidence=pricing_evidence)
+        if final_limit_price <= plan.estimated_entry_price:
+            return await self._rest_entry_for_reprice_recovery(plan, attempt, "no_upward_price_step")
+        from bhiksha.execution.quote_lineage import quote_timestamp_evidence
+        if quote_timestamp_evidence(quote, datetime.now(UTC))["quote_timestamp_status"] != "current":
+            return await self._rest_entry_for_reprice_recovery(plan, attempt, "public_quote_stale_or_unproven")
+        guard = _entry_working_guard(deployment, plan, datetime.now(UTC))
+        if guard:
+            return await self._cancel_entry_for_reprice_block(plan, attempt=attempt, reason=guard)
+        max_trade_premium = min(deployment.risk.max_trade_premium_usd or 300.0,
+            plan.risk_details.get("effective_max_trade_premium_usd") or float("inf"))
         repriced_premium = final_limit_price * plan.quantity * 100
         if repriced_premium > max_trade_premium:
             return await self._cancel_entry_for_reprice_block(
@@ -3054,6 +3084,32 @@ class ExecutionSupervisor:
             preflight.estimated_cost or 0.0,
             final_limit_price * plan.quantity * 100,
         )
+        replacement_quantity = plan.quantity
+        fit = getattr(self.planner, "_fit_live_quantity", None)
+        if fit is not None:
+            replacement_quantity, reason, capacity = await fit(trade_id=plan.trade_id,
+                deployment=deployment, timestamp=plan.entry_timestamp or datetime.now(UTC),
+                price=final_limit_price, upper_quantity=plan.quantity, premium_cap=max_trade_premium,
+                extra_cash=max(0.0, required_cash-final_limit_price*plan.quantity*100))
+            pricing_evidence["replacement_capacity"] = capacity
+            if reason:
+                return await self._cancel_entry_for_reprice_block(plan, attempt=attempt,
+                    reason=reason, pricing_evidence=pricing_evidence)
+            if replacement_quantity < plan.quantity:
+                try:
+                    preflight = await self.planner.order_manager.preflight_entry(
+                        plan.option_symbol, final_limit_price, replacement_quantity)
+                except Exception as exc:
+                    if preflight_failure_is_transient(exc):
+                        return await self._rest_entry_for_reprice_recovery(plan, attempt, "public_preflight_temporary_failure")
+                    return await self._cancel_entry_for_reprice_block(plan, attempt=attempt,
+                        reason="entry_reprice_preflight_failed", pricing_evidence=pricing_evidence)
+                if float(preflight.payload["limitPrice"]) > final_limit_price + 1e-9:
+                    return await self._cancel_entry_for_reprice_block(plan, attempt=attempt,
+                        reason="broker_entry_price_exceeds_limit", pricing_evidence=pricing_evidence)
+                final_limit_price = float(preflight.payload["limitPrice"])
+                required_cash = max(preflight.buying_power_requirement or 0.0,
+                    preflight.estimated_cost or 0.0, final_limit_price*replacement_quantity*100)
         cancel_result = await self._cancel_entry_order_and_check_fill(plan)
         if cancel_result.filled:
             filled_plan = _entry_plan_from_cancel_fill(plan, cancel_result)
@@ -3092,6 +3148,7 @@ class ExecutionSupervisor:
             cancel_state = cancel_result.status_error or cancel_result.status or cancel_result.cancel_error or "unknown"
             return _EntryRepriceResult(plan=plan, error=f"entry_reprice_cancel_unconfirmed:{cancel_state}")
 
+        plan = replace(plan, quantity=replacement_quantity)
         cash_guard_details: dict[str, object] = {}
         sized_risk_details: dict[str, object] = {}
         risk_manager = getattr(self.planner, "risk_manager", None)
@@ -3126,6 +3183,29 @@ class ExecutionSupervisor:
                     cancelled_without_fill=True,
                 )
 
+        replacement_order_id = str(uuid.uuid4())
+        # Persist replacement identity BEFORE broker I/O. If interrupted, the existing
+        # pending-entry reconciler queries this exact identity and cannot replay a BUY.
+        intended_plan = replace(plan, order_id=replacement_order_id, estimated_entry_price=final_limit_price,
+            risk_details={**plan.risk_details, "entry_pricing": pricing_evidence, "entry_reprice_attempt": attempt})
+        replacement_intent = TradeRecord(trade_id=plan.trade_id,
+                deployment_id=plan.deployment_id, symbol=plan.symbol, option_symbol=plan.option_symbol,
+                quantity=plan.quantity, entry_price=final_limit_price,
+                underlying_entry_price=plan.underlying_entry_price, entry_timestamp=plan.entry_timestamp,
+                status="pending_entry_reconcile", entry_order_id=replacement_order_id,
+                **_selection_trade_record_kwargs(plan))
+        async def clear_unsubmitted_intent():
+            await self._upsert_trade_record(replace(replacement_intent,
+                quantity=0, entry_price=None, entry_order_id=None, status="closed"))
+        try:
+            await self._upsert_trade_record(replacement_intent)
+            await self.event_repository.append("entry_replacement_intent", {
+                **asdict(intended_plan), "previous_order_id": plan.order_id})
+        except Exception:
+            await clear_unsubmitted_intent()
+            await self._release_entry_reservations(plan.trade_id)
+            return _EntryRepriceResult(plan=plan, error="entry_replacement_intent_persistence_failed",
+                cancelled_without_fill=True)
         # The cash guard above can await account state.  Re-evaluate and
         # reserve sized risk only after it returns so canary expiry/latch state
         # is fresh at the replacement-order boundary.  There is deliberately
@@ -3154,6 +3234,7 @@ class ExecutionSupervisor:
                         "error": str(exc),
                     },
                 )
+                await clear_unsubmitted_intent()
                 return _EntryRepriceResult(
                     plan=plan,
                     error=f"entry_reprice_sized_risk_check_failed:{exc}",
@@ -3178,31 +3259,36 @@ class ExecutionSupervisor:
                         **sized_risk_details,
                     },
                 )
+                await clear_unsubmitted_intent()
                 return _EntryRepriceResult(
                     plan=plan,
                     error=sized_risk.reason or "entry_reprice_sized_risk_blocked",
                     cancelled_without_fill=True,
                 )
 
-        replacement_order_id = str(uuid.uuid4())
+        def submission_guard():
+            from bhiksha.execution.quote_lineage import quote_timestamp_evidence
+            reason = _entry_working_guard(deployment, plan, datetime.now(UTC))
+            if reason:
+                return reason
+            if quote_timestamp_evidence(quote, datetime.now(UTC))["quote_timestamp_status"] != "current":
+                return "public_quote_stale_or_unproven"
+            return None
+        guard = submission_guard()
+        if guard:
+            await clear_unsubmitted_intent()
+            await self._release_entry_reservations(plan.trade_id)
+            return _EntryRepriceResult(plan=plan, error=guard, cancelled_without_fill=True)
         try:
             result = await self.planner.order_manager.place_entry_order(
-                plan.option_symbol,
-                final_limit_price,
-                plan.quantity,
-                order_id=replacement_order_id,
-            )
+                plan.option_symbol, final_limit_price, plan.quantity, order_id=replacement_order_id,
+                **({"submission_guard": submission_guard} if isinstance(self.planner.order_manager, OrderManager) else {}))
         except Exception as exc:
-            if getattr(self.planner, "cash_guard", None) is not None:
-                await self.planner.cash_guard.release_entry(plan.trade_id)
-            if risk_manager is not None:
-                await risk_manager.release_sized_entry(plan.trade_id)
-            return _EntryRepriceResult(
-                plan=plan,
-                error=f"entry_reprice_order_submit_failed:{exc}",
-                cancelled_without_fill=True,
-            )
+            # Exceptions from broker I/O are unknown effects, not proved zero fills.
+            return _EntryRepriceResult(plan=intended_plan,
+                error=f"entry_reprice_submission_uncertain:{type(exc).__name__}")
         if result.order_id is None:
+            await clear_unsubmitted_intent()
             if getattr(self.planner, "cash_guard", None) is not None:
                 await self.planner.cash_guard.release_entry(plan.trade_id)
             if risk_manager is not None:
@@ -3213,6 +3299,12 @@ class ExecutionSupervisor:
                 cancelled_without_fill=True,
             )
 
+        actual = getattr(result, "actual_limit_price", None)
+        if actual is not None:
+            final_limit_price = float(actual)
+        if getattr(result, "submission_uncertain", False):
+            return _EntryRepriceResult(plan=replace(intended_plan, estimated_entry_price=final_limit_price),
+                error="entry_reprice_submission_uncertain")
         risk_details = {
             **dict(plan.risk_details),
             "entry_pricing": pricing_evidence,
@@ -3277,6 +3369,14 @@ class ExecutionSupervisor:
             },
         )
         return _EntryRepriceResult(plan=repriced_plan)
+
+    async def _rest_entry_for_reprice_recovery(self, plan, attempt, reason):
+        await self.event_repository.append("entry_reprice_recovery_waiting", {
+            "trade_id": plan.trade_id, "deployment_id": plan.deployment_id,
+            "order_id": plan.order_id, "attempt": attempt, "reason": reason,
+            "deadline": plan.risk_details.get("entry_working_deadline"),
+            "decision": "rest_existing_order"})
+        return _EntryRepriceResult(plan=plan, retryable=True)
 
     async def _cancel_entry_for_reprice_block(
         self,
@@ -9311,31 +9411,19 @@ def _max_valid_sell_stop_price(bid: float) -> float | None:
 
 def _entry_reprice_pricing_params(app_config, deployment, plan, attempt):
     pricing_params = deployment.execution.model_dump()
-    initial_pricing = plan.risk_details.get("entry_pricing")
-    if isinstance(initial_pricing, dict) and initial_pricing.get("price_improvement_applied"):
-        try:
-            frozen_mid = float(initial_pricing.get("initial_mid") or initial_pricing["mid"])
-        except (KeyError, TypeError, ValueError):
-            frozen_mid = 0.0
-        if frozen_mid > 0:
-            from bhiksha.execution.pricing import PRICE_THROUGH_CONCESSION_USD
-            pricing_params["entry_price_through_target"] = round_price(
-                frozen_mid + (PRICE_THROUGH_CONCESSION_USD if attempt > 1 else 0.0)
-            )
-            return pricing_params
-    spread_fraction = _entry_reprice_spread_fraction(deployment, attempt)
-    if spread_fraction is None:
-        pricing_params["entry_pricing_urgent_spread_pct"] = _entry_reprice_spread_pct(app_config, attempt)
-    else:
-        pricing_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
-            spread_fraction,
-            enabled=(
-                deployment.execution.entry_pricing_oi_percentile_scale
-                or get_entry_execution_profile(deployment.execution.entry_execution_profile) is not None
-            ),
-            open_interest_percentile=_risk_open_interest_percentile(plan),
-        )
+    prior = plan.risk_details.get("entry_pricing") or {}
+    pricing_params.update(entry_reprice_step=True,
+        entry_original_mid=prior.get("original_mid", prior.get("initial_mid", prior.get("mid"))),
+        entry_price_ceiling=prior.get("max_entry_price"),
+        entry_wide_market=prior.get("wide_market", bool(prior.get("price_improvement_applied"))))
     return pricing_params
+
+
+def _entry_reprice_recovery_enabled(deployment) -> bool:
+    # Weekly confirmation owns its retry clock; ordinary/manual lanes use execution settings.
+    seconds = (deployment.strategy.params.get("controls", {}).get("retry_seconds", 0)
+               if deployment.strategy.key == "weekly_chart" else deployment.execution.entry_liquidity_retry_seconds)
+    return float(seconds or 0) > 0
 
 
 def _entry_reprice_enabled(
@@ -9375,26 +9463,7 @@ def _entry_reprice_checkpoints(app_config: AppConfig, deployment: DeploymentMani
     else:
         source = app_config.entry_reprice_checkpoints_seconds
     checkpoints = sorted({max(int(value), 0) for value in source})
-    return [value for value in checkpoints if value < cancel_after]
-
-
-def _entry_reprice_spread_pct(app_config: AppConfig, attempt: int) -> float:
-    values = [float(value) for value in app_config.entry_reprice_spread_pcts if float(value) >= 0]
-    if not values:
-        return 1.0
-    index = max(attempt - 1, 0)
-    return values[index] if index < len(values) else values[-1]
-
-
-def _entry_reprice_spread_fraction(deployment: DeploymentManifest, attempt: int) -> float | None:
-    values = deployment.execution.entry_reprice_spread_fractions
-    if values is None:
-        profile = get_entry_execution_profile(deployment.execution.entry_execution_profile)
-        values = list(profile.reprice_spread_fractions) if profile is not None else None
-    if not values:
-        return None
-    index = max(attempt - 1, 0)
-    return float(values[index] if index < len(values) else values[-1])
+    return [value for value in checkpoints if value < cancel_after][:1]
 
 
 def _entry_pricing_evidence(
@@ -9417,6 +9486,12 @@ def _entry_pricing_evidence(
     return {
         **pricing.evidence(),
         "initial_mid": initial_mid,
+        "starting_bid": prior_pricing.get("starting_bid") if isinstance(prior_pricing, dict) else None,
+        "starting_ask": prior_pricing.get("starting_ask") if isinstance(prior_pricing, dict) else None,
+        "starting_quote_at": prior_pricing.get("starting_quote_at") if isinstance(prior_pricing, dict) else None,
+        "original_mid": prior_pricing.get("original_mid", initial_mid) if isinstance(prior_pricing, dict) else pricing.original_mid,
+        "max_entry_price": prior_pricing.get("max_entry_price", pricing.max_entry_price) if isinstance(prior_pricing, dict) else pricing.max_entry_price,
+        "wide_market": prior_pricing.get("wide_market", pricing.wide_market) if isinstance(prior_pricing, dict) else pricing.wide_market,
         "entry_execution_profile": profile.name if profile is not None else "legacy",
         "entry_reprice_max_chase_pct": resolve_entry_reprice_max_chase_pct(
             deployment.execution.model_dump()
@@ -9434,18 +9509,6 @@ def _entry_pricing_evidence(
             )
         ),
     }
-
-
-def _entry_reprice_reference_limit_price(plan: TradePlan) -> float | None:
-    prior_pricing = plan.risk_details.get("entry_pricing")
-    value = prior_pricing.get("initial_limit_price") if isinstance(prior_pricing, dict) else None
-    if value is None:
-        value = plan.estimated_entry_price
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
 
 
 def _entry_plan_from_cancel_fill(plan: TradePlan, cancel_result: _EntryCancelResult) -> TradePlan:
@@ -9935,3 +9998,39 @@ def _resolve_exit_quantity(decision: ExitDecision, position: TrackedPosition) ->
         return qty
     # Full exit: never close more than the position holds.
     return min(qty, position.quantity)
+
+
+def _entry_working_deadline(deployment, started, lifetime, plan):
+    """Original execution patience bounded by existing author and exit clocks."""
+    from zoneinfo import ZoneInfo
+    from bhiksha.time_utils import parse_time_text
+    deadlines = [started + timedelta(seconds=lifetime)]
+    for key in ("entry_working_deadline", "entry_opportunity_deadline"):
+        if plan.risk_details.get(key):
+            deadlines.append(datetime.fromisoformat(plan.risk_details[key]))
+    if deployment.source.metadata.get("valid_through"):
+        deadlines.append(datetime.fromisoformat(str(deployment.source.metadata["valid_through"]).replace("Z", "+00:00")))
+    local = started.astimezone(ZoneInfo("America/New_York"))
+    boundaries = [deployment.execution.entry_window_end_et]
+    if deployment.exit.eod_flat:
+        boundaries.append(deployment.exit.hard_flat_time_et)
+    for value in boundaries:
+        if value:
+            deadlines.append(datetime.combine(local.date(), parse_time_text(value), local.tzinfo).astimezone(UTC))
+    return min(deadlines)
+
+
+def _entry_working_guard(deployment, plan, now):
+    from bhiksha.execution.planner import _entry_window_allows
+    if not _entry_window_allows(deployment, now):
+        return "entry_window_closed"
+    deadline = plan.risk_details.get("entry_working_deadline")
+    if deadline and now >= datetime.fromisoformat(deadline):
+        return "entry_working_deadline_reached"
+    valid = deployment.source.metadata.get("valid_through")
+    if valid and now >= datetime.fromisoformat(str(valid).replace("Z", "+00:00")):
+        return "chart_signal_expired"
+    if deployment.strategy.key == "weekly_chart":
+        from bhiksha.strategy.weekly_chart import pending_block
+        return pending_block(deployment, now)
+    return None

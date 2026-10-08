@@ -227,7 +227,10 @@ def test_paper_limit_needs_later_fresh_ask_and_expires_without_fill():
                          2, 2.0, ["approved"], entry_timestamp=now)
         quote = PublicQuote(plan.option_symbol, bid=1.9, ask=2.1, open_interest=1000,
                             quote_timestamp=(now + timedelta(seconds=1)).isoformat(), quote_timestamp_field="quoteTimestamp")
-        manager = SimpleNamespace(get_option_quote=AsyncMock(return_value=quote), close=AsyncMock())
+        from bhiksha.execution.order_manager import PreflightCheck
+        async def preflight(symbol, price, quantity):
+            return PreflightCheck(payload={"limitPrice": str(price)}, current_increment=.01, estimated_cost=price*quantity*100)
+        manager = SimpleNamespace(get_option_quote=AsyncMock(return_value=quote), preflight_entry=preflight, close=AsyncMock())
         planner = SimpleNamespace(position_tracker=PositionTracker(), order_manager=manager, close=AsyncMock())
         recorder = MagicMock()
         supervisor = ExecutionSupervisor(planner=planner, exit_edge_recorder=recorder)
@@ -422,8 +425,8 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
     async def run():
         dep = deployment()
         dep.execution = dep.execution.model_copy(update={
-            "entry_reprice_enabled": case != "disabled", "entry_reprice_checkpoints_seconds": [2, 4],
-            "entry_reprice_cancel_after_seconds": 10, "entry_reprice_spread_fractions": [1.0, 1.0],
+            "entry_reprice_enabled": case != "disabled", "entry_reprice_checkpoints_seconds": [2],
+            "entry_reprice_cancel_after_seconds": 10, "entry_reprice_spread_fractions": [1.0],
             "entry_reprice_max_chase_pct": .15, "entry_pricing_oi_percentile_scale": False,
             "entry_execution_profile": None,
             "entry_pricing_mode": "price_seeking" if case == "fixed_concession" else "patient",
@@ -439,7 +442,10 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
             plan.risk_details["entry_pricing"] = {"initial_mid": 2.0, "price_improvement_applied": True}
         quote = PublicQuote(plan.option_symbol, bid=2.0, ask=2.2, open_interest=1000,
                             quote_timestamp=(now + timedelta(seconds=2)).isoformat(), quote_timestamp_field="quoteTimestamp")
-        manager = SimpleNamespace(get_option_quote=AsyncMock(return_value=quote), close=AsyncMock())
+        from bhiksha.execution.order_manager import PreflightCheck
+        async def preflight(symbol, price, quantity):
+            return PreflightCheck(payload={"limitPrice": str(price)}, current_increment=.01, estimated_cost=price*quantity*100)
+        manager = SimpleNamespace(get_option_quote=AsyncMock(return_value=quote), preflight_entry=preflight, close=AsyncMock())
         planner = SimpleNamespace(position_tracker=PositionTracker(), order_manager=manager, close=AsyncMock())
         recorder = MagicMock()
         events = SimpleNamespace(append=AsyncMock())
@@ -456,8 +462,12 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
             return
         active = supervisor._paper_entries[plan.trade_id][2]
         assert active.quantity == 2
-        if case in {"fixed_concession", "disabled", "stale"}:
+        if case in {"disabled", "stale"}:
             assert active.estimated_entry_price == 2.0
+            return
+        if case == "fixed_concession":
+            assert active.estimated_entry_price == 2.1
+            assert active.risk_details["entry_pricing"]["max_entry_price"] == 2.1
             return
         assert active.estimated_entry_price == 2.2
         assert active.risk_details["entry_pricing"]["initial_limit_price"] == 2.0
@@ -469,7 +479,7 @@ def test_shadow_repricing_is_bounded_and_requires_a_subsequent_quote(case):
             quote.quote_timestamp = (now + timedelta(seconds=5)).isoformat()
             await supervisor.poll_paper_entries(now=now + timedelta(seconds=5))
             assert supervisor._paper_entries[plan.trade_id][2].estimated_entry_price == 2.2
-            assert "paper_entry_reprice_chase_guard_resting" in str(events.append.call_args_list)
+            assert active.risk_details["paper_reprice_attempt"] == 1
             await supervisor.poll_paper_entries(now=now + timedelta(seconds=11))
             assert not supervisor._paper_entries
             assert not recorder.prepare_registration.called

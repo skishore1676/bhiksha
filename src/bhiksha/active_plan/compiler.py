@@ -1375,14 +1375,16 @@ def _google_catalog_entry_payload(
             0.20,
         ),
     }
+    retired_controls = ("price_improvement_discount_pct", "price_improvement_max_pct", "price_improvement_curve",
+        "entry_pricing_spread_fraction", "entry_pricing_oi_percentile_scale", "entry_reprice_spread_fractions")
+    for key in retired_controls:
+        if vehicle_mapping.get(key) is not None or (use_defaults and defaults.get(key) is not None):
+            raise ValueError(f"midpoint_entry_v2 retired control requires migration: {key}")
     execution_default_fields = {
         "entry_execution_profile": _coerce_text,
-        "entry_pricing_spread_fraction": _coerce_float,
-        "entry_pricing_oi_percentile_scale": _coerce_bool,
         "entry_reprice_enabled": _coerce_bool,
         "entry_reprice_checkpoints_seconds": _coerce_int_list,
         "entry_reprice_cancel_after_seconds": _coerce_int,
-        "entry_reprice_spread_fractions": _coerce_float_list,
         "entry_reprice_max_chase_pct": _coerce_float,
     }
     for key, coercer in execution_default_fields.items():
@@ -1685,6 +1687,12 @@ def _split_signal_window(value: Any) -> tuple[str | None, str | None]:
 
 
 def _apply_execution_overrides(section: dict[str, Any], row: ActivePlanSheetRow) -> dict[str, Any]:
+    retired = {"price_improvement_discount_pct", "price_improvement_max_pct", "price_improvement_curve",
+        "entry_pricing_spread_fraction", "entry_pricing_oi_percentile_scale", "entry_reprice_spread_fractions",
+        "entry_pricing_urgent_spread_pct", "entry_pricing_passive_spread_pct", "entry_pricing_cross_tight_spread_pct"}
+    populated = [key for key in retired if row.execution_overrides.get(key) is not None]
+    if populated:
+        raise ValueError("midpoint_entry_v2 retired controls require migration: " + ",".join(sorted(populated)))
     updated = _deep_merge(section, row.execution_overrides)
     updated["shadow_only"] = row.authorization_mode != "live"
     if row.management_exit:

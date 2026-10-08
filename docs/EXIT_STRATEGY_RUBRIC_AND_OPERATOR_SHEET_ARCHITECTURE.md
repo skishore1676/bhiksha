@@ -107,6 +107,19 @@ This confirmed intention applies to the swing comparison. The five current
 live primary profiles retain their intraday settings. Freeze the resolved
 comparison definition at entry so subsequent Sheet edits do not rewrite history.
 
+## October 8 entry contract amendment
+
+The approved [single-leg entry contract](ENTRY_LIQUIDITY_DEFAULT_2026-09-22.md)
+is authoritative for the pending entry refactor. It replaces bargain-first
+normal-market pricing and the chase ceiling tied to the opening bid with
+midpoint-first pricing, one bounded replacement, a frozen market-reference
+ceiling, and sizing for that ceiling. It also aligns pre-submission/repricing
+recovery and LIVE/SHADOW pricing through the existing owners. Existing exit
+policies, source confirmations, risk limits and live authorizations remain.
+This amendment is approved intent, not a claim of deployment. Baseline 0bab73a3
+is already deployed; the implementation partner must record the new cutover.
+Where older entry descriptions below conflict, the linked contract governs.
+
 ## 3. Entry sources converge on the same compiler
 
 | Operator surface | Entry source | Exit authority |
@@ -248,41 +261,28 @@ additional controls. New projected manual rows freeze them in their existing
 | `entry_liquidity_retry_seconds` | 600 | Maximum lifetime from the original trigger; 0 disables retry. |
 | `entry_liquidity_retry_interval_seconds` | 60 | Minimum interval between selection attempts. |
 
-The entry path corrects execution problems before declaring a miss:
+No match starts a retry only when at least one contract in the permitted expiry
+set passes delta and open-interest filters but fails the spread filter. Budget,
+missing expiry, risk, lifecycle and infrastructure failures remain terminal.
+Each attempt uses the existing intrabar loop and per-symbol execution queue. It
+re-evaluates the trigger at a fresh underlying price (at most five seconds old),
+checks invalidation, signal validity and entry/hard-flat windows, then runs the
+normal selection, sizing and risk checks. Historical first-trigger suppression
+is bypassed only for that already-latched retry intent. Completed bars cannot
+authorize retries; observed adverse extremes can invalidate them.
 
-- BUY prices round down to the broker tick, never above the authorized ceiling.
-  Preflight costs belong to the corrected price and quantity. An explicit broker
-  increment rejection permits one corrected submission; an uncertain response
-  retains the client order identity and reservations for reconciliation.
-- Selection may try up to five ranked contracts from the original eligible
-  expiry/delta cohort, with a fresh executable quote and full sizing checks for
-  each. An expensive primary contract does not silently authorize farther DTE.
-- A quote that ages during our preflight/reservation processing gets one fresh
-  rebuild, after releasing the old reservations. All price, sizing, signal,
-  invalidation, cash and risk checks run again. The eight-second final entry gate
-  stays unchanged; recovery never stretches the original entry window.
-- Known pre-submission quote/preflight failures can wait through the existing
-  retry owner. `entry_liquidity_retry_seconds=0` disables this. The Sheet's
-  `active_strategy.execution` JSON controls ordinary lanes; new manual rows
-  carry the same controls in their execution JSON. Existing projected profile
-  defaults remain in `Operator_Defaults_v1`.
+The supervisor holds one small session-local retry per deployment. No sleeping
+worker holds the symbol queue; exits retain their normal scheduling. The original
+deadline never slides. Selection/preflight cannot submit after a retry has been
+cancelled or expired: the planner rechecks the intent immediately before its
+broker call and releases reservations on refusal. Selection success (including
+a subsequent budget refusal) consumes the retry. A selected paper limit still
+requires the existing modeled ask-touch fill before experiment registration.
 
-Manual retries re-evaluate the trigger on a fresh underlying observation and
-retain original invalidation and author confirmation. Ordinary strategies must
-qualify again on completed bars; they are not retriggered by the manual tick
-loop. Weekly Cartographer arms keep their existing durable owner and original
-confirmation/retry clock. No sleeping worker holds the symbol queue.
-
-The deadline is anchored to the original signal and never slides. Selection
-success alone is not a fill: working orders and paper limits continue through
-existing fill, cancellation and protection owners. Unknown broker submissions
-are never retried as new BUYs. A restart restores the consumed manual-intent
-latch; an unfinished session-local pre-submission retry is not replayed from a
-stale plan. Weekly arms retain their existing durable recovery. Old disabled
-manual rows remain untouched.
-
-`Exit_Comparisons` reports positive attempts separately from grouped entry
-opportunities and shows filled, waiting/working, valid limit unfilled,
-market/provider, risk/configuration and application/service outcomes. No new
-Sheet, scheduler or experiment registry is introduced. Historical facts,
-exit comparisons, risk limits and live/shadow authority remain unchanged.
+The manual row remains consumed (`enabled=FALSE`) and displays
+`waiting_liquidity`, then the entry or terminal reason. Existing event/attempt
+receipts account for each selection attempt. A restart abandons the session-local
+retry rather than rearming a consumed row; no live order is replayed. Old disabled
+rows remain untouched. Defaults govern future projections; changing them does
+not rewrite already-frozen profile snapshots. Existing scanner lanes, their
+budgets, Rail B recovery, and native order switches are unaffected.

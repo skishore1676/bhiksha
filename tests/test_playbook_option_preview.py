@@ -1,11 +1,12 @@
 from __future__ import annotations
+from datetime import UTC, datetime
 
 import asyncio
 import json
 from pathlib import Path
 
 from bhiksha.domain.models import OptionContractSnapshot
-from bhiksha.execution.order_manager import PublicQuote
+from bhiksha.execution.order_manager import PublicQuote, PreflightCheck
 from bhiksha.packets.option_preview import build_playbook_option_preview
 from bhiksha.shared_kernel import ensure_kernel_on_path
 from bhiksha.tools.preview_playbook_option import main as preview_main
@@ -79,7 +80,11 @@ class StubOrderManager:
             last=(self.bid + self.ask) / 2,
             open_interest=self.open_interest,
             outcome="SUCCESS",
+            quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp",
         )
+
+    async def preflight_entry(self, symbol, price, quantity):
+        return PreflightCheck(payload={"limitPrice": str(price)}, current_increment=.01, estimated_cost=price*quantity*100)
 
     async def close(self):
         return None
@@ -121,7 +126,7 @@ def test_option_preview_writes_ready_preview_without_order_submission(tmp_path: 
             chain_service=chain,
             order_manager=order_manager,
             out_root=tmp_path / "previews",
-            underlying_price=210.25,
+            underlying_price=210.25, max_trade_premium_usd=400,
         )
     )
 
@@ -129,10 +134,10 @@ def test_option_preview_writes_ready_preview_without_order_submission(tmp_path: 
     assert result.preview_ready is True
     assert result.option_symbol == "IWM260330P00558000"
     assert result.quantity == 1
-    assert result.estimated_entry_price == 2.85
+    assert result.estimated_entry_price == 2.80
     assert result.pricing_evidence["bid"] == 2.70
     assert result.pricing_evidence["ask"] == 2.90
-    assert result.pricing_evidence["selected_limit_price"] == 2.85
+    assert result.pricing_evidence["selected_limit_price"] == 2.80
     assert result.underlying_entry_price == 210.25
     assert result.risk_reasons == ["approved"]
     assert result.order_submission_allowed is False
@@ -148,13 +153,20 @@ def test_option_preview_writes_ready_preview_without_order_submission(tmp_path: 
 def test_option_preview_blocks_wide_quote_without_proved_timestamp(tmp_path: Path) -> None:
     intent_path = _write_intent(tmp_path)
     packet_path = write_packet(tmp_path, _execution_packet())
+    manager = StubOrderManager(bid=2.00, ask=2.90)
+    original = manager.get_option_quote
+    async def missing_timestamp(symbol):
+        q = await original(symbol)
+        q.quote_timestamp = None
+        return q
+    manager.get_option_quote = missing_timestamp
 
     result = asyncio.run(
         build_playbook_option_preview(
             intent_artifact=intent_path,
             packet_path=packet_path,
             chain_service=StubChainService(bid=2.80, ask=2.90),
-            order_manager=StubOrderManager(bid=2.00, ask=2.90),
+            order_manager=manager,
             out_root=tmp_path / "previews",
         )
     )
@@ -205,7 +217,7 @@ def test_option_preview_supports_live_gated_packet_with_underlying_stop(tmp_path
             order_manager=StubOrderManager(),
             out_root=tmp_path / "previews",
             underlying_price=286.38,
-            underlying_stop_price=287.10,
+            max_trade_premium_usd=400, underlying_stop_price=287.10,
         )
     )
 

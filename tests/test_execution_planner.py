@@ -19,7 +19,7 @@ from historical_config import historical_deployment
 
 def _enabled_deployment(deployment_id: str):
     deployment = historical_deployment(deployment_id)
-    return deployment.model_copy(update={"enabled": True})
+    return deployment.model_copy(update={"enabled": True, "risk": deployment.risk.model_copy(update={"max_trade_premium_usd": 400.0})})
 
 
 class StubChainService:
@@ -86,10 +86,10 @@ class StubOrderManager:
 
     async def preflight_entry(self, option_symbol: str, limit_price: float, quantity: int):
         return PreflightCheck(
-            payload={"limitPrice": "2.90"},
-            current_increment=0.10,
-            buying_power_requirement=290.04,
-            estimated_cost=289.98,
+            payload={"limitPrice": f"{limit_price:.2f}"},
+            current_increment=0.01,
+            buying_power_requirement=limit_price*quantity*100+.04,
+            estimated_cost=limit_price*quantity*100+.04,
         )
 
     async def get_portfolio(self):
@@ -134,6 +134,8 @@ class MissingPriceOrderManager(StubOrderManager):
             last=None,
             open_interest=550,
             outcome="SUCCESS",
+            quote_timestamp=planner_module.datetime.now(UTC).isoformat(),
+            quote_timestamp_field="quoteTimestamp",
         )
 
 
@@ -146,6 +148,8 @@ class ExpensiveQuoteOrderManager(StubOrderManager):
             last=9.00,
             open_interest=550,
             outcome="SUCCESS",
+            quote_timestamp=planner_module.datetime.now(UTC).isoformat(),
+            quote_timestamp_field="quoteTimestamp",
         )
 
 
@@ -275,7 +279,7 @@ def test_execution_planner_creates_dry_run_trade_plan():
     assert plan is not None
     assert plan.option_symbol == "QQQ260330P00558000"
     assert plan.order_id == "DRY_RUN"
-    assert plan.estimated_entry_price == 2.85
+    assert plan.estimated_entry_price == 2.80
     assert plan.risk_details["entry_pricing"]["bid"] == 2.70
     assert plan.risk_details["entry_pricing"]["ask"] == 2.90
     assert plan.risk_details["entry_pricing"]["mid"] == 2.80
@@ -306,7 +310,7 @@ def test_live_planner_blocks_before_order_when_sized_risk_rejects() -> None:
     assert plan.order_id is None
     assert plan.risk_reasons == ["risk_prospective_loss_headroom_exceeded"]
     assert order_manager.place_entry_order_calls == 0
-    assert risk_manager.reserve_calls[0]["entry_price"] == 2.9
+    assert risk_manager.reserve_calls[0]["entry_price"] == pytest.approx(3.22)
     assert risk_manager.reserve_calls[0]["quantity"] == 1
 
 
@@ -429,7 +433,7 @@ def test_live_planner_releases_sized_risk_when_broker_rejects() -> None:
     assert risk_manager.release_calls == [plan.trade_id]
 
 
-def test_execution_planner_scales_initial_spread_fraction_by_chain_oi_percentile():
+def test_execution_planner_legacy_wire_fields_do_not_change_midpoint_policy():
     deployment = _enabled_deployment("market_impulse_qqq_short_v1")
     deployment = deployment.model_copy(
         update={
@@ -450,9 +454,9 @@ def test_execution_planner_scales_initial_spread_fraction_by_chain_oi_percentile
     plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
 
     assert plan is not None
-    assert plan.estimated_entry_price == 2.75
+    assert plan.estimated_entry_price == 2.80
     assert plan.risk_details["open_interest_percentile"] == 1.0
-    assert plan.risk_details["entry_pricing"]["policy"]["spread_fraction"] == 0.25
+    assert plan.risk_details["entry_pricing"]["entry_policy_version"] == "midpoint_entry_v2"
 
 
 def test_execution_planner_named_patient_profile_sets_authoritative_price_and_comparisons():
@@ -473,11 +477,11 @@ def test_execution_planner_named_patient_profile_sets_authoritative_price_and_co
     plan = asyncio.run(planner.plan_entry(deployment, _short_decision(deployment), dry_run=True))
 
     pricing = plan.risk_details["entry_pricing"]
-    assert plan.estimated_entry_price == 2.75
+    assert plan.estimated_entry_price == 2.80
     assert pricing["entry_execution_profile"] == "patient"
     assert pricing["entry_reprice_max_chase_pct"] == 0.10
-    assert pricing["initial_limit_price"] == 2.75
-    assert pricing["initial_profile_comparison"]["balanced"]["quote_limit_price"] == 2.77
+    assert pricing["initial_limit_price"] == 2.80
+    assert pricing["initial_profile_comparison"]["balanced"]["quote_limit_price"] == 2.80
     assert pricing["initial_profile_comparison"]["urgent"]["quote_limit_price"] == 2.80
 
 
@@ -525,7 +529,7 @@ def test_execution_planner_allow_nearest_after_extends_chain_lookup_and_records_
 
 
 def test_execution_planner_blocks_trade_outside_execution_window() -> None:
-    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
+    deployment = _enabled_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService()
     planner = ExecutionPlanner(
         chain_service=chain_service,
@@ -552,7 +556,7 @@ def test_execution_planner_blocks_trade_outside_execution_window() -> None:
 
 
 def test_execution_planner_can_simulate_without_tracking_position() -> None:
-    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
+    deployment = _enabled_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     planner = ExecutionPlanner(
@@ -581,7 +585,7 @@ def test_execution_planner_can_simulate_without_tracking_position() -> None:
 
 
 def test_execution_planner_shadow_ignores_book_position_caps() -> None:
-    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
+    deployment = _enabled_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="SHADOW-IWM", option_symbol="IWM260417C00210000")
@@ -611,7 +615,7 @@ def test_execution_planner_shadow_ignores_book_position_caps() -> None:
 
 
 def test_execution_planner_dry_run_still_honors_book_position_caps() -> None:
-    deployment = historical_deployment("jerk_pivot_momentum_tsla_short_v1")
+    deployment = _enabled_deployment("jerk_pivot_momentum_tsla_short_v1")
     chain_service = StubChainService(symbol="TSLA", option_symbol="TSLA260417P00250000", dte=17, delta=-0.45)
     tracker = PositionTracker()
     tracker.open_position("IWM", "market_impulse_iwm_long_v1", trade_id="DRY-IWM", option_symbol="IWM260417C00210000")
@@ -891,28 +895,10 @@ def test_execution_planner_blocks_trade_when_one_contract_exceeds_budget() -> No
     assert plan is not None
     assert plan.quantity == 0
     assert plan.risk_reasons == ["insufficient_budget_for_single_contract"]
-    assert {k:v for k,v in plan.risk_details.items() if k not in {"entry_recovery_attempts", "final_quote_rebuild_used", "candidate_search_exhausted"}} == {
-        "reason": "insufficient_budget",
-        "max_premium": 300.0,
-        "entry_price": 9.1,
-            "min_contract_cost": 910.0,
-            "base_max_trade_premium_usd": 300.0,
-            "risk_envelope_cap_fraction": None,
-            "effective_max_trade_premium_usd": 300.0,
-        "entry_pricing": plan.risk_details["entry_pricing"],
-        "selected_open_interest": 500,
-        "open_interest_percentile": 1.0,
-        "selected_dte": 0,
-        "selected_abs_delta": 0.31,
-        "selected_bid": 3.0,
-        "selected_ask": 2.9,
-        "selected_spread_pct": pytest.approx(0.03389830508474579),
-        "option_selection_snapshot_id": plan.risk_details["option_selection_snapshot_id"],
-        "option_selection_snapshot_persisted": True,
-        "option_candidate_set_sha256": plan.risk_details["option_candidate_set_sha256"],
-        "actual_option_selection_sha256": plan.risk_details["actual_option_selection_sha256"],
-    }
-    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 9.1
+    assert plan.risk_details["max_premium"] == 400.0
+    assert plan.risk_details["min_contract_cost"] == pytest.approx(1035.0)
+    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 9.0
+    assert plan.risk_details["entry_pricing"]["max_entry_price"] == pytest.approx(10.35)
 
 
 def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insufficient(monkeypatch, tmp_path) -> None:
@@ -943,7 +929,7 @@ def test_execution_planner_blocks_live_trade_when_internal_cash_budget_is_insuff
     assert plan.risk_reasons == ["insufficient_internal_settled_cash_budget"]
     assert plan.quantity == 0
     assert plan.risk_details["entry_sizing"][0]["cash_capacity"]["remaining_budget"] == 142.5
-    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.85
+    assert plan.risk_details["entry_pricing"]["selected_limit_price"] == 2.80
     assert order_manager.place_entry_order_calls == 0
 
 

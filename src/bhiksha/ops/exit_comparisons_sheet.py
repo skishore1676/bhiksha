@@ -22,7 +22,7 @@ DETAIL_LIMIT = 8
 VISIBLE_COLUMNS = 8
 SHEET_COLUMNS = 12
 SIGNAL_HEADERS = ["Strategy", "Lane", "Positive attempts", "Captured", "Missed", "Pending / unknown", "Main miss reason", "Default exit", "Deployments"]
-OPPORTUNITY_HEADERS = ["Symbol", "Lane", "Strategy", "First signal CT", "Attempts", "Outcome", "Reason category", "Latest reason", "Opportunity"]
+OPPORTUNITY_HEADERS = ["Symbol", "Lane", "Strategy", "First signal CT", "Attempts", "Outcome", "Reason category", "Entry / latest reason", "Opportunity"]
 EXIT_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Observed leader", "Clean / registered", "Sessions", "Δ $ / trade", "Why / evidence", "Frozen evaluator", "Frozen hash", "Deployments"]
 CUMULATIVE_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Candidate", "Clean pairs", "Sessions", "Mean net Δ $", "Mean net Δ R", "Mean gross Δ $", "Frozen hash", "Window", "Deployment"]
 GAP_HEADERS = ["Trade", "Strategy", "Lane / entry", "Last good quote CT", "Resumed CT", "Reason", "Evidence state", "", "Full trade ID"]
@@ -170,6 +170,8 @@ def _signals(
                 row.update(outcome=outcome, reasons=payload.get("rejection_reasons") or [], mode=payload.get("mode"),
                            policy=(payload.get("evidence_identity") or {}).get("exit_policy_id"),
                            trade_id=payload.get("trade_id"))
+            if payload.get("entry_execution"):
+                row["entry_execution"] = payload["entry_execution"]
         else:
             row["evaluation" if event_type == "signal_evaluation" else "decision"] = True
             row["policy"] = (payload.get("evidence_identity") or {}).get("exit_policy_id")
@@ -212,11 +214,22 @@ def _signals(
         if outcome == "filled": category = "Filled"
         elif outcome in {"pending_execution", "unknown", "fill_unverified"}: category = "Waiting / working"
         elif outcome == "no_fill": category = "Valid limit unfilled"
-        elif any(k in reason for k in ["price_seeking_tick", "entry_planning_error"]): category = "Application failure"
+        elif any(k in reason for k in ["price_seeking_tick", "broker_entry_price", "entry_planning_error"]): category = "Application failure"
         elif "quote" in reason: category = "Market / quote provider"
         elif "preflight_failed" in reason: category = "Execution service failure"
         elif outcome in {"budget_block", "risk_block", "existing_position_block"}: category = "Risk / configuration"
         else: category = "Expired / invalidated / selection"
+        execution = terminal.get("entry_execution") or next((m["entry_execution"] for m in reversed(members) if m.get("entry_execution")), {})
+        if execution:
+            def price(value):
+                return "unknown" if value is None else f"${float(value):.2f}"
+            quote = (f"Start {price(execution.get('starting_bid'))}/{price(execution.get('starting_ask'))}; "
+                     f"ceiling {price(execution.get('price_ceiling'))}")
+            limits = (f"Qty {execution.get('quantity', 'unknown')}; "
+                      f"limit {price(execution.get('initial_limit'))} -> {price(execution.get('final_limit'))}; "
+                      f"retries {execution.get('retries', 0)}; replacements {execution.get('replacements', 0)}")
+            basis = f"Fill: {execution.get('fill_basis') or 'unconfirmed'}"
+            reason = "\n".join(v for v in (quote, limits, basis, reason) if v)
         opportunity_rows.append([terminal.get("symbol") or config.get("symbol"),
             terminal.get("mode", config.get("lane", "Unknown")), _label(config.get("strategy")),
             _ct(members[0]["timestamp"]), len(members), _label(outcome), category, reason, identity])

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import UTC, datetime
 
 import asyncio
 import json
@@ -57,7 +58,7 @@ class StubOrderManager:
             bid=self.quote_bid,
             ask=self.quote_ask,
             last=(self.quote_bid + self.quote_ask) / 2,
-            open_interest=500,
+            open_interest=500, quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp",
             outcome="SUCCESS",
         )
 
@@ -192,8 +193,8 @@ def test_playbook_lifecycle_submits_entry_and_arms_virtual_target(tmp_path: Path
     assert result.management_spec["target_r"] == 1.0
     assert result.management_spec["stop_anchor"] == "underlying_reversal_extreme"
     assert result.management_spec["source"] == "packet_runtime_controls"
-    assert result.pricing_evidence["selected_limit_price"] == 2.85
-    assert result.pricing_evidence["preflight_limit_price"] == 2.85
+    assert result.pricing_evidence["selected_limit_price"] == 2.80
+    assert result.pricing_evidence["preflight_limit_price"] == 2.80
     assert order_manager.preflight_calls == 1
     assert order_manager.entry_calls == 1
     assert order_manager.stop_calls == 1
@@ -257,6 +258,12 @@ def test_playbook_lifecycle_blocks_wide_quote_without_proved_timestamp(tmp_path:
     ticket_path = _write_live_ticket(tmp_path)
     packet_path = write_packet(tmp_path, _execution_packet())
     order_manager = StubOrderManager(quote_bid=2.00, quote_ask=2.90)
+    original = order_manager.get_option_quote
+    async def missing_timestamp(symbol):
+        quote = await original(symbol)
+        quote.quote_timestamp = None
+        return quote
+    order_manager.get_option_quote = missing_timestamp
 
     result = asyncio.run(
         submit_playbook_live_ticket(

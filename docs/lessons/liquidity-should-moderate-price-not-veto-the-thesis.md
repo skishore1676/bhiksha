@@ -87,3 +87,16 @@ This replaces the earlier opt-in rollout guidance for liquidity pressure.
 Shadow marks a fill only when a later fresh ask reaches the resting buy limit.
 Its report must show an unfilled order as modeled no-fill rather than claiming
 midpoint execution. Live fill evidence continues to come from broker status.
+
+## October 8 correction: opening discount is not the chase reference
+
+The September price-through ladder retained the July original-bid percentage
+cap. Together they could prohibit reaching an unchanged original midpoint:
+RBLX started at $0.43 against a $0.62 midpoint, while a 15% cap limited it to
+about $0.49. This is a policy composition error, not evidence that the market
+moved away. The approved replacement contract is
+[the single-leg entry policy](../ENTRY_LIQUIDITY_DEFAULT_2026-09-22.md).
+Its market-reference ceiling supersedes the original-submitted-limit guidance
+above. Normal markets start at midpoint; price and quantity are planned together.
+Do not add another exception to preserve contradictory rules. Deployment is
+pending and must be established by its own receipt.

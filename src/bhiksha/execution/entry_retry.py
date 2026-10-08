@@ -1,5 +1,5 @@
 """Bounded pre-submission recovery; never retry an uncertain order."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import math
 
@@ -17,6 +17,7 @@ class EntryLiquidityRetry:
     attempts: int = 1
     pending_decision: SignalDecision | None = None
     opportunity_id: str | None = None
+    pricing_references: dict = field(default_factory=dict)
 
     def stop_reason(self, now: datetime) -> str | None:
         if now >= self.deadline:

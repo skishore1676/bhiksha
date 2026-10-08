@@ -148,9 +148,10 @@ def lane_config_snapshot(plan: dict[str, object]) -> dict[str, dict[str, object]
         if isinstance(execution, dict):
             initial_fraction, profile = resolve_initial_spread_fraction(execution)
             lane["effective_entry_pricing_spread_fraction"] = initial_fraction
-            lane["effective_entry_pricing_oi_percentile_scale"] = bool(
-                execution.get("entry_pricing_oi_percentile_scale") or profile is not None
-            )
+            lane["effective_entry_pricing_oi_percentile_scale"] = False
+            lane["entry_policy_version"] = "midpoint_entry_v2"
+            lane["entry_ceiling_reference"] = "original_midpoint"
+            lane["wide_market_initial_fraction"] = .25
             lane["effective_entry_reprice_enabled"] = _first_not_none(
                 execution.get("entry_reprice_enabled"),
                 True if profile is not None else None,
@@ -159,14 +160,17 @@ def lane_config_snapshot(plan: dict[str, object]) -> dict[str, dict[str, object]
                 execution.get("entry_reprice_checkpoints_seconds"),
                 list(profile.reprice_checkpoints_seconds) if profile is not None else None,
             )
+            values = lane["effective_entry_reprice_checkpoints_seconds"]
+            if values is not None:
+                lane["effective_entry_reprice_checkpoints_seconds"] = values[:1]
             lane["effective_entry_reprice_cancel_after_seconds"] = _first_not_none(
                 execution.get("entry_reprice_cancel_after_seconds"),
                 profile.cancel_after_seconds if profile is not None else None,
             )
-            lane["effective_entry_reprice_spread_fractions"] = _first_not_none(
-                execution.get("entry_reprice_spread_fractions"),
-                list(profile.reprice_spread_fractions) if profile is not None else None,
-            )
+            lane["effective_entry_reprice_spread_fractions"] = [1.0]
+            lane["entry_policy_retired_overrides"] = {
+                k: execution[k] for k in ("entry_pricing_spread_fraction", "entry_reprice_spread_fractions")
+                if execution.get(k) is not None}
             lane["effective_entry_reprice_max_chase_pct"] = resolve_entry_reprice_max_chase_pct(execution)
         lanes[deployment_id] = lane
     return lanes

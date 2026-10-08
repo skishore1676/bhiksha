@@ -134,7 +134,7 @@ def test_planner_refresh_is_bounded_and_preserves_safety(monkeypatch, case, read
     dep.execution.entry_pricing_mode = 'price_seeking'
     dep.execution.entry_window_start_et = '09:35'
     dep.execution.entry_window_end_et = '15:45'
-    dep.risk.max_trade_premium_usd = 300
+    dep.risk.max_trade_premium_usd = 400
     first = quote(NOW - timedelta(seconds=9))
     if case == 'missing': first.quote_timestamp = None
     if case == 'crossed': first.bid, first.ask = 3, 2.9
@@ -583,14 +583,14 @@ def test_live_sizing_repreflights_actual_quantity_and_final_quote(monkeypatch, t
     dep.risk.max_contracts=10
     manager=StubOrderManager()
     manager.get_option_quote=AsyncMock(return_value=quote())
-    manager.get_portfolio=AsyncMock(return_value={'buyingPower':{'cashOnlyBuyingPower':'570'}})
+    manager.get_portfolio=AsyncMock(return_value={'buyingPower':{'cashOnlyBuyingPower':'650'}})
     calls=[]
     async def preflight(symbol,price,quantity):
         calls.append(quantity)
         if change=='stale': Clock.current=NOW+timedelta(seconds=9)
-        normalized=price if change=='stale' else 3.0 if change=='price' else 2.85
+        normalized=3.0 if change=='price' else price
         return PreflightCheck(payload={'limitPrice':str(normalized)},current_increment=.01,
-                             buying_power_requirement=normalized*quantity*100+0.10,estimated_cost=None)
+                             buying_power_requirement=normalized*quantity*100+10.0,estimated_cost=None)
     manager.preflight_entry=preflight
     cash=_cash_guard(manager,tmp_path)
     risk=StubRiskManager()
@@ -598,16 +598,20 @@ def test_live_sizing_repreflights_actual_quantity_and_final_quote(monkeypatch, t
         cash_guard=cash,risk_manager=risk,position_tracker=PositionTracker())
     decision=SignalDecision(dep.deployment_id,'QQQ',NOW,True,SignalDirection.SHORT,[],{})
     plan=asyncio.run(planner.plan_entry(dep,decision,dry_run=False))
-    assert calls==([2] if change=='stale' else [2,1])
+    assert calls == [2,1]
     if change=='stale':
         assert plan.risk_reasons==['public_quote_stale_or_unproven']
         assert manager.place_entry_order_calls==0
         assert risk.release_calls
         assert all(asyncio.run(cash.repository.get_reservation(t)).status=='released' for t in risk.release_calls)
+    elif change == "price":
+        assert plan.order_id is None
+        assert plan.risk_reasons == ["broker_entry_price_exceeds_limit"]
+        assert manager.place_entry_order_calls == 0
     else:
-        assert plan.quantity==1 and plan.order_id=='OID123'
-        assert risk.reserve_calls[-1]['quantity']==1
-        assert risk.reserve_calls[-1]['entry_price']==(3.0 if change=='price' else 2.85)
+        assert plan.quantity==1 and plan.order_id=="OID123"
+        assert risk.reserve_calls[-1]["quantity"]==1
+        assert risk.reserve_calls[-1]["entry_price"]==pytest.approx(3.22)
 
 
 @pytest.mark.parametrize('mode', ['urgent', 'balanced', 'price_seeking'])
@@ -630,7 +634,7 @@ def test_final_live_quote_age_gate_also_covers_initially_fresh_quotes(monkeypatc
     decision = SignalDecision(dep.deployment_id,'QQQ',NOW,True,SignalDirection.SHORT,[],{})
     plan = asyncio.run(planner.plan_entry(dep,decision,dry_run=False))
     assert plan.risk_reasons == ['public_quote_stale_or_unproven']
-    assert manager.get_option_quote.await_count == (3 if mode == 'price_seeking' else 2)
+    assert manager.get_option_quote.await_count == 3
     assert manager.place_entry_order_calls == 0
     assert risk.release_calls
     assert all(('release', trade_id) in cash.calls for trade_id in risk.release_calls)

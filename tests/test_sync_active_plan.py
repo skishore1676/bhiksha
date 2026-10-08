@@ -315,8 +315,8 @@ def test_lane_config_diff_surfaces_patient_entry_policy_changes() -> None:
     assert fields["entry_execution_profile"] == {"before": None, "after": "patient"}
     assert fields["entry_reprice_spread_fractions"] == {"before": None, "after": [0.50, 0.70]}
     assert fields["entry_reprice_max_chase_pct"] == {"before": None, "after": 0.08}
-    assert after["smh_lane"]["effective_entry_pricing_spread_fraction"] == 0.25
-    assert after["smh_lane"]["effective_entry_reprice_checkpoints_seconds"] == [60, 180]
+    assert after["smh_lane"]["effective_entry_pricing_spread_fraction"] == 0.5
+    assert after["smh_lane"]["effective_entry_reprice_checkpoints_seconds"] == [60]
     assert after["smh_lane"]["effective_entry_reprice_max_chase_pct"] == 0.08
 
 

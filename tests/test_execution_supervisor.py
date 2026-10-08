@@ -17,7 +17,6 @@ from bhiksha.execution.supervisor import (
     _entry_reprice_checkpoints,
     _entry_reprice_enabled,
     _entry_reprice_pricing_params,
-    _entry_reprice_spread_fraction,
 )
 from bhiksha.persistence.sqlite import SQLiteEventRepository, SQLiteTradeStateRepository
 from bhiksha.risk.cash_guard import CashGuardResult
@@ -74,6 +73,7 @@ class StubOrderManager:
             last=3.02,
             open_interest=500,
             outcome="SUCCESS",
+            quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp",
         )
 
 
@@ -160,6 +160,7 @@ class RecordingOrderManager(StubOrderManager):
             last=self.quote_bid + 0.02,
             open_interest=500,
             outcome="SUCCESS",
+            quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp",
         )
 
     async def get_portfolio(self):
@@ -215,6 +216,7 @@ class RepricingOrderManager(StubOrderManager):
             last=(self.quote_bid + self.quote_ask) / 2,
             open_interest=500,
             outcome="SUCCESS",
+            quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp",
         )
 
     async def preflight_entry(self, option_symbol: str, limit_price: float, quantity: int):
@@ -549,8 +551,8 @@ def test_execution_supervisor_uses_lane_patient_reprice_policy_when_global_polic
     protected = asyncio.run(supervisor._protect_live_entry(plan, deployment))
 
     assert protected.order_id != "ENTRY123"
-    assert order_manager.entry_calls[0][1] == 2.73
-    assert protected.risk_details["entry_pricing"]["policy"]["spread_fraction"] == 0.125
+    assert order_manager.entry_calls[0][1] == 2.90
+    assert protected.risk_details["entry_pricing"]["entry_policy_version"] == "midpoint_entry_v2"
     assert protected.risk_details["entry_pricing"]["initial_profile_comparison"] == {
         "patient": {"quote_limit_price": 2.71},
         "balanced": {"quote_limit_price": 2.73},
@@ -576,10 +578,8 @@ def test_named_patient_profile_resolves_full_lane_policy_when_global_policy_is_o
     )
 
     assert _entry_reprice_enabled(app_config, deployment) is True
-    assert _entry_reprice_checkpoints(app_config, deployment) == [60, 180]
+    assert _entry_reprice_checkpoints(app_config, deployment) == [60]
     assert _entry_reprice_cancel_after_seconds(app_config, deployment) == 300
-    assert _entry_reprice_spread_fraction(deployment, 1) == 0.50
-    assert _entry_reprice_spread_fraction(deployment, 2) == 0.70
 
     disabled = deployment.model_copy(
         update={
@@ -616,15 +616,15 @@ def test_price_through_replacement_uses_frozen_mid_and_respects_lane_disable() -
         order_id="ENTRY123",
     )
     assert _entry_reprice_enabled(app_config, deployment, plan) is True
-    assert _entry_reprice_pricing_params(app_config, deployment, plan, 1)["entry_price_through_target"] == 2.40
-    assert _entry_reprice_pricing_params(app_config, deployment, plan, 2)["entry_price_through_target"] == 2.50
+    assert _entry_reprice_pricing_params(app_config, deployment, plan, 1)["entry_original_mid"] == 2.40
+    assert _entry_reprice_pricing_params(app_config, deployment, plan, 1)["entry_wide_market"] is True
     disabled = deployment.model_copy(update={
         "execution": deployment.execution.model_copy(update={"entry_reprice_enabled": False})
     })
     assert _entry_reprice_enabled(app_config, disabled, plan) is False
 
 
-def test_reprice_above_profile_chase_cap_leaves_existing_order_resting(tmp_path) -> None:
+def test_reprice_clips_to_frozen_midpoint_ceiling(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=3.00, quote_ask=3.20)
     supervisor = ExecutionSupervisor(
@@ -649,7 +649,7 @@ def test_reprice_above_profile_chase_cap_leaves_existing_order_resting(tmp_path)
         quantity=1,
         estimated_entry_price=2.70,
         risk_reasons=["approved"],
-        risk_details={"entry_pricing": {"initial_limit_price": 2.70}},
+        risk_details={"entry_pricing": {"initial_limit_price": 2.70, "original_mid": 2.80, "max_entry_price": 2.97, "wide_market": False}},
         dry_run=False,
         order_id="ENTRY123",
     )
@@ -657,20 +657,10 @@ def test_reprice_above_profile_chase_cap_leaves_existing_order_resting(tmp_path)
     result = asyncio.run(supervisor._reprice_live_entry(plan, deployment, attempt=1))
 
     assert result.error is None
-    assert result.plan.order_id == "ENTRY123"
-    assert order_manager.cancel_calls == []
-    assert order_manager.entry_calls == []
-    with sqlite3.connect(tmp_path / "events.db") as conn:
-        payload = json.loads(
-            conn.execute(
-                "SELECT payload FROM events WHERE event_type = 'entry_reprice_chase_guard_resting'"
-            ).fetchone()[0]
-        )
-    assert payload["decision"] == "rest_existing_order"
-    assert payload["reference_limit_price"] == 2.70
-    assert payload["proposed_limit_price"] == 3.00
-    assert payload["max_chase_pct"] == 0.10
-    assert payload["max_chase_price"] == 2.97
+    assert result.plan.estimated_entry_price == 2.97
+    assert order_manager.cancel_calls == ["ENTRY123"]
+    assert len(order_manager.entry_calls) == 1
+    assert result.plan.risk_details["entry_pricing"]["max_entry_price"] == 2.97
 
 
 def test_reprice_chase_cap_remains_anchored_to_original_limit(tmp_path) -> None:
@@ -708,14 +698,14 @@ def test_reprice_chase_cap_remains_anchored_to_original_limit(tmp_path) -> None:
     order_manager.quote_ask = 3.10
     second = asyncio.run(supervisor._reprice_live_entry(first.plan, deployment, attempt=2))
 
-    assert first.plan.estimated_entry_price == 2.85
+    assert first.plan.estimated_entry_price == 2.95
     assert first.plan.risk_details["entry_pricing"]["initial_limit_price"] == 2.70
     assert second.plan.order_id == first.plan.order_id
     assert order_manager.cancel_calls == ["ENTRY123"]
     assert len(order_manager.entry_calls) == 1
 
 
-def test_reprice_chase_cap_does_not_block_a_lower_replacement(tmp_path) -> None:
+def test_reprice_does_not_replace_without_an_upward_step(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=2.90, quote_ask=3.00)
     supervisor = ExecutionSupervisor(
@@ -747,9 +737,10 @@ def test_reprice_chase_cap_does_not_block_a_lower_replacement(tmp_path) -> None:
 
     result = asyncio.run(supervisor._reprice_live_entry(plan, deployment, attempt=1))
 
-    assert result.plan.estimated_entry_price == 2.90
-    assert order_manager.cancel_calls == ["ENTRY_HIGH"]
-    assert order_manager.entry_calls[0][1] == 2.90
+    assert result.plan.estimated_entry_price == 3.00
+    assert result.retryable
+    assert order_manager.cancel_calls == []
+    assert order_manager.entry_calls == []
 
 
 def test_reprice_rechecks_sized_risk_after_confirmed_cancel(tmp_path) -> None:
@@ -888,7 +879,7 @@ def test_reprice_releases_cash_and_risk_when_final_risk_check_raises(tmp_path) -
     ]
 
 
-def test_reprice_submit_exception_releases_sized_risk(tmp_path) -> None:
+def test_reprice_submit_exception_preserves_identity_and_sized_risk(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RaisingRepricingOrderManager(
         fill_after_orders=99,
@@ -917,9 +908,10 @@ def test_reprice_submit_exception_releases_sized_risk(tmp_path) -> None:
 
     result = asyncio.run(supervisor._reprice_live_entry(plan, deployment, attempt=1))
 
-    assert result.cancelled_without_fill is True
-    assert result.error == "entry_reprice_order_submit_failed:submit transport failed"
-    assert risk_manager.release_calls == ["TRADE_RISK_EXCEPTION"]
+    assert result.cancelled_without_fill is False
+    assert result.error == "entry_reprice_submission_uncertain:RuntimeError"
+    assert result.plan.order_id != "ENTRY_EXCEPTION"
+    assert risk_manager.release_calls == []
 
 
 def test_filled_entry_commits_sized_risk_after_open_trade_is_persisted(tmp_path) -> None:
@@ -955,7 +947,7 @@ def test_filled_entry_commits_sized_risk_after_open_trade_is_persisted(tmp_path)
     assert risk_manager.commit_calls == ["TRADE_RISK_COMMIT"]
 
 
-def test_order_resting_above_chase_cap_is_cancelled_at_profile_deadline(tmp_path) -> None:
+def test_order_without_upward_step_is_cancelled_at_profile_deadline(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=3.00, quote_ask=3.20)
     supervisor = ExecutionSupervisor(
@@ -983,9 +975,9 @@ def test_order_resting_above_chase_cap_is_cancelled_at_profile_deadline(tmp_path
         direction=SignalDirection.SHORT,
         option_symbol="QQQ260330P00558000",
         quantity=1,
-        estimated_entry_price=2.70,
+        estimated_entry_price=2.97,
         risk_reasons=["approved"],
-        risk_details={"entry_pricing": {"initial_limit_price": 2.70}},
+        risk_details={"entry_pricing": {"initial_limit_price": 2.70, "original_mid": 2.80, "max_entry_price": 2.97, "wide_market": False}},
         dry_run=False,
         order_id="ENTRY_RESTING",
     )
@@ -997,7 +989,7 @@ def test_order_resting_above_chase_cap_is_cancelled_at_profile_deadline(tmp_path
     assert order_manager.entry_calls == []
     with sqlite3.connect(tmp_path / "events.db") as conn:
         event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id")]
-    assert "entry_reprice_chase_guard_resting" in event_types
+    assert "entry_reprice_recovery_waiting" in event_types
     assert "entry_reprice_cancel_after_timeout" in event_types
 
 
@@ -1363,7 +1355,7 @@ def test_execution_supervisor_cancels_unfilled_entry_after_reprice_ceiling(tmp_p
     assert "entry_reprice_cancel_after_timeout" in event_types
 
 
-def test_execution_supervisor_cancels_when_wide_reprice_quote_has_no_proved_timestamp(tmp_path) -> None:
+def test_execution_supervisor_unusable_reprice_rests_then_cancels_at_deadline(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=2.00, quote_ask=2.90)
     supervisor = ExecutionSupervisor(
@@ -1407,8 +1399,8 @@ def test_execution_supervisor_cancels_when_wide_reprice_quote_has_no_proved_time
     assert supervisor.planner.position_tracker.active_positions() == []
     with sqlite3.connect(tmp_path / "events.db") as conn:
         rows = conn.execute("SELECT event_type, payload FROM events ORDER BY id").fetchall()
-    blocked_payload = next(json.loads(row[1]) for row in rows if row[0] == "entry_reprice_blocked")
-    assert "public_quote_timestamp_missing" in blocked_payload["reason"]
+    blocked_payload = next(json.loads(row[1]) for row in rows if row[0] == "entry_reprice_recovery_waiting")
+    assert blocked_payload["decision"] == "rest_existing_order"
 
 
 def test_execution_supervisor_records_live_entry_unprotected_when_initial_stop_fails(tmp_path) -> None:
@@ -1902,7 +1894,7 @@ def test_execution_supervisor_does_not_apply_stale_gate_to_dry_run_or_shadow_ent
     assert shadow_plan.risk_reasons == ["approved"]
 
 
-def test_execution_supervisor_tracks_shadow_plan_as_paper_position(tmp_path) -> None:
+def test_execution_supervisor_leaves_shadow_pending_before_quote_touch(tmp_path) -> None:
     from bhiksha.config.loader import load_deployments
 
     deployment = _enabled_deployment("market_impulse_qqq_short_v1")
@@ -1946,21 +1938,13 @@ def test_execution_supervisor_tracks_shadow_plan_as_paper_position(tmp_path) -> 
     plan = asyncio.run(supervisor.handle_signal(deployment, decision, dry_run=True, simulate_only=True))
 
     assert plan is not None
-    positions = supervisor.planner.position_tracker.active_positions()
-    assert len(positions) == 1
-    assert positions[0].source == "shadow"
-    assert positions[0].order_id == "SHADOW_ENTRY"
-    trades = asyncio.run(trade_repo.get_open_trades())
-    assert len(trades) == 1
-    assert trades[0].status == "open_unprotected"
-    assert trades[0].underlying_entry_price == 558.0
+    assert supervisor.planner.position_tracker.active_positions() == []
+    assert "SHADOW1" in supervisor._paper_entries
+    assert asyncio.run(trade_repo.get_open_trades()) == []
     with sqlite3.connect(tmp_path / "events.db") as conn:
-        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
-        shadow_payload = conn.execute(
-            "SELECT payload FROM events WHERE event_type = 'shadow_entry_assumed'"
-        ).fetchone()[0]
-    assert "shadow_entry_assumed" in event_types
-    assert json.loads(shadow_payload)["underlying_entry_price"] == 558.0
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id")]
+    assert "paper_entry_pending" in event_types
+    assert "shadow_entry_assumed" not in event_types
 
 
 def test_execution_supervisor_does_not_register_assumed_shadow_entry_as_broker_fill(tmp_path) -> None:
@@ -3408,6 +3392,7 @@ class ExitRepriceCancelRaceOrderManager(StubOrderManager):
             last=bid + 0.02,
             open_interest=200,
             outcome="SUCCESS",
+            quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp",
         )
 
     async def get_order_status(self, order_id):

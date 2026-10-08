@@ -82,7 +82,7 @@ def summarize_evaluation_coverage(events: Iterable[dict[str, Any]], deployments=
     for event in events:
         payload = event.get("payload") or {}
         kind = event.get("event_type")
-        if kind in {"signal_evaluation", "signal_decision"} and payload.get("deployment_id"):
+        if kind == "signal_evaluation" and payload.get("deployment_id"):
             grouped[payload["deployment_id"]].append(payload)
             symbols.setdefault(payload["deployment_id"], str(payload.get("symbol") or ""))
         # These stages exclusively describe underlying feed IO. Broker quote,

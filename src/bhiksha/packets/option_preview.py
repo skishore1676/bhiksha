@@ -107,7 +107,7 @@ async def build_playbook_option_preview(
             order_manager=order_manager,
             position_tracker=PositionTracker(),
         )
-        plan = await planner.plan_entry(deployment, decision, dry_run=True, simulate_only=True)
+        plan = await planner.plan_entry(deployment, decision, dry_run=True, simulate_only=False)
         if plan is None:
             block_reasons.append("planner_returned_no_trade_plan")
         elif plan.quantity <= 0:

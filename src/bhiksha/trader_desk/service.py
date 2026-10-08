@@ -477,8 +477,8 @@ class _SimulatedChainService:
                 dte=0,
                 strike=286.0,
                 delta=-0.31 if self.contract_type == "PUT" else 0.31,
-                bid=2.70,
-                ask=2.90,
+                bid=2.40,
+                ask=2.60,
                 open_interest=500,
             )
         ]
@@ -491,11 +491,12 @@ class _SimulatedOrderManager:
     async def get_option_quote(self, option_symbol: str):
         return PublicQuote(
             symbol=option_symbol,
-            bid=2.70,
-            ask=2.90,
-            last=2.80,
+            bid=2.40,
+            ask=2.60,
+            last=2.50,
             open_interest=500,
             outcome="SIMULATED",
+            quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp",
         )
 
     async def close(self):

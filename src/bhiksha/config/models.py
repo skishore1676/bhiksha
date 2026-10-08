@@ -190,9 +190,9 @@ class AppConfig(BaseModel):
     order_fill_poll_seconds: int = 2
     order_fill_timeout_seconds: int = 20
     entry_reprice_enabled: bool = False
-    entry_reprice_checkpoints_seconds: list[int] = Field(default_factory=lambda: [30, 90])
+    entry_reprice_checkpoints_seconds: list[int] = Field(default_factory=lambda: [30])
     entry_reprice_cancel_after_seconds: int = 180
-    entry_reprice_spread_pcts: list[float] = Field(default_factory=lambda: [0.50, 1.00])
+    entry_reprice_spread_pcts: list[float] = Field(default_factory=lambda: [0.50, 1.00], exclude=True, deprecated="Retired by midpoint_entry_v2")
     generated_deployments_dir: str = "config/deployments/generated"
     strategy_catalog_dir: str = "config/strategy_catalog"
     deployment_selection_mode: Literal["all", "manual_only", "generated_only", "prefer_generated"] = "all"
@@ -209,6 +209,12 @@ class AppConfig(BaseModel):
     exit_edge_live_shadow_fill_latency_ms: int = Field(default=0, ge=0)
     exit_edge_live_shadow_max_freshness_ms: int = Field(default=5_000, ge=0)
     exit_edge_live_shadow_max_sequence_gap: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def validate_entry_checkpoint(self):
+        if len(self.entry_reprice_checkpoints_seconds) > 1:
+            raise ValueError("midpoint_entry_v2 permits one reprice checkpoint; migrate the retired second step")
+        return self
 
 
 class ProviderConfig(BaseModel):
@@ -244,20 +250,20 @@ class ExecutionSpec(BaseModel):
     preferred_max_bid_ask_spread_pct: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     entry_execution_profile: Literal["patient", "balanced", "urgent"] | None = None
     entry_pricing_mode: Literal["passive", "balanced", "urgent", "cross", "price_seeking"] = "urgent"
-    price_improvement_discount_pct: float = Field(default=0.10, ge=0, le=0.5, allow_inf_nan=False)
-    price_improvement_max_pct: float = Field(default=0.35, ge=0, le=0.5, allow_inf_nan=False)
-    price_improvement_curve: float = Field(default=0.85, gt=0, allow_inf_nan=False)
-    entry_pricing_urgent_spread_pct: float = 0.25
-    entry_pricing_passive_spread_pct: float = 0.25
-    entry_pricing_cross_tight_spread_pct: float = 0.03
-    entry_pricing_spread_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
-    entry_pricing_oi_percentile_scale: bool = False
+    price_improvement_discount_pct: float = Field(exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides", default=0.10, ge=0, le=0.5, allow_inf_nan=False)
+    price_improvement_max_pct: float = Field(exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides", default=0.35, ge=0, le=0.5, allow_inf_nan=False)
+    price_improvement_curve: float = Field(exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides", default=0.85, gt=0, allow_inf_nan=False)
+    entry_pricing_urgent_spread_pct: float = Field(default=0.25, exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides")
+    entry_pricing_passive_spread_pct: float = Field(default=0.25, exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides")
+    entry_pricing_cross_tight_spread_pct: float = Field(default=0.03, exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides")
+    entry_pricing_spread_fraction: float | None = Field(exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides", default=None, ge=0.0, le=1.0)
+    entry_pricing_oi_percentile_scale: bool = Field(default=False, exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides")
     entry_pricing_require_two_sided_quote: bool = True
     entry_pricing_require_open_interest: bool = True
     entry_reprice_enabled: bool | None = None
     entry_reprice_checkpoints_seconds: list[int] | None = None
     entry_reprice_cancel_after_seconds: int | None = Field(default=None, ge=0)
-    entry_reprice_spread_fractions: list[float] | None = None
+    entry_reprice_spread_fractions: list[float] | None = Field(default=None, exclude=True, deprecated="Retired by midpoint_entry_v2; migrate populated overrides")
     entry_reprice_max_chase_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     entry_window_start_et: str | None = None
     entry_window_end_et: str | None = None
@@ -313,14 +319,11 @@ class ExecutionSpec(BaseModel):
             raise ValueError("liquidity retry interval must not exceed its window")
         if self.dte_fallback_max is not None and self.dte_fallback_max <= self.dte_max:
             raise ValueError("dte_fallback_max must be greater than dte_max")
-        if self.price_improvement_max_pct < self.price_improvement_discount_pct:
-            raise ValueError("price improvement maximum must be >= base discount")
         if self.preferred_min_open_interest is not None and self.preferred_min_open_interest < self.min_open_interest:
             raise ValueError("preferred OI must be >= hard minimum OI")
         if self.preferred_max_bid_ask_spread_pct is not None and self.max_bid_ask_spread_pct is not None and self.preferred_max_bid_ask_spread_pct > self.max_bid_ask_spread_pct:
             raise ValueError("preferred spread must be <= hard maximum spread")
         checkpoints = self.entry_reprice_checkpoints_seconds
-        fractions = self.entry_reprice_spread_fractions
         profile_cancel_after: int | None = None
         if self.entry_execution_profile is not None:
             from bhiksha.execution.pricing import get_entry_execution_profile
@@ -328,16 +331,12 @@ class ExecutionSpec(BaseModel):
             profile = get_entry_execution_profile(self.entry_execution_profile)
             profile_cancel_after = profile.cancel_after_seconds if profile is not None else None
         if checkpoints is not None:
+            if len(checkpoints) > 1:
+                raise ValueError("midpoint_entry_v2 permits one reprice checkpoint; migrate the retired second step")
             if any(value < 0 for value in checkpoints):
                 raise ValueError("entry_reprice_checkpoints_seconds must be non-negative")
             if checkpoints != sorted(set(checkpoints)):
                 raise ValueError("entry_reprice_checkpoints_seconds must be sorted and unique")
-        if fractions is not None and any(value < 0.0 or value > 1.0 for value in fractions):
-            raise ValueError("entry_reprice_spread_fractions must stay between bid (0) and ask (1)")
-        if checkpoints is not None and fractions is not None and len(checkpoints) != len(fractions):
-            raise ValueError("entry_reprice checkpoints and spread fractions must have equal lengths")
-        if self.entry_execution_profile is not None and (checkpoints is None) != (fractions is None):
-            raise ValueError("named entry profile checkpoint overrides must include matching spread fractions")
         effective_cancel_after = (
             self.entry_reprice_cancel_after_seconds
             if self.entry_reprice_cancel_after_seconds is not None

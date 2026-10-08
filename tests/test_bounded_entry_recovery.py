@@ -51,7 +51,7 @@ def test_ambiguous_buy_keeps_client_identity_and_never_resubmits(failure):
 def test_affordable_alternative_stays_in_original_dte_cohort(monkeypatch):
     freeze(monkeypatch)
     dep=_enabled_deployment('market_impulse_qqq_short_v1')
-    dep.risk.max_trade_premium_usd=300
+    dep.risk.max_trade_premium_usd=400
     dep.execution.dte_min=0; dep.execution.dte_max=0
     dep.execution.dte_fallback_policy='allow_nearest_after'; dep.execution.dte_fallback_max=7
     class Chain(StubChainService):

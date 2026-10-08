@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import UTC, datetime
 
 from functools import partial
 import asyncio
@@ -333,7 +334,7 @@ class StubLifecycleOrderManager:
         return PreflightCheck(payload={"limitPrice": f"{limit_price:.2f}"})
 
     async def get_option_quote(self, option_symbol: str):
-        return PublicQuote(symbol=option_symbol, bid=2.70, ask=2.90, last=2.80, open_interest=500)
+        return PublicQuote(symbol=option_symbol, bid=2.70, ask=2.90, last=2.80, open_interest=500, quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp")
 
     async def place_entry_order(self, option_symbol: str, limit_price: float, quantity: int, *, order_id: str | None = None):
         self.entry_calls += 1

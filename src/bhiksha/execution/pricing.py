@@ -25,31 +25,25 @@ class EntryExecutionProfile:
 
 
 ENTRY_EXECUTION_PROFILES: dict[EntryExecutionProfileName, EntryExecutionProfile] = {
-    "patient": EntryExecutionProfile("patient", 0.25, (60, 180), (0.50, 0.70), 300, 0.10),
-    "balanced": EntryExecutionProfile("balanced", 0.35, (30, 90), (0.60, 0.85), 150, 0.15),
-    "urgent": EntryExecutionProfile("urgent", 0.50, (15, 30), (0.80, 1.00), 60, 0.25),
+    "patient": EntryExecutionProfile("patient", 0.50, (60,), (1.00,), 300, 0.10),
+    "balanced": EntryExecutionProfile("balanced", 0.50, (30,), (1.00,), 150, 0.15),
+    "urgent": EntryExecutionProfile("urgent", 0.50, (15,), (1.00,), 60, 0.25),
 }
 
 # The Sheet's OI and spread values describe the preferred market. Hard quote
 # sanity is separate and shared by every lane, without a second set of Sheet controls.
 MAX_ABSURD_ENTRY_SPREAD_PCT = 1.50
 PRICE_THROUGH_CONCESSION_USD = 0.10
+ENTRY_POLICY_VERSION = "midpoint_entry_v2"
 
 
 @dataclass(frozen=True, slots=True)
 class EntryPricingPolicy:
     mode: EntryPricingMode = "urgent"
-    urgent_spread_pct: float = 0.25
-    passive_spread_pct: float = 0.25
-    cross_tight_spread_pct: float = 0.03
-    spread_fraction: float | None = None
     require_two_sided_quote: bool = True
     require_open_interest: bool = True
     preferred_min_open_interest: int | None = None
     preferred_max_bid_ask_spread_pct: float | None = None
-    price_improvement_discount_pct: float = 0.10
-    price_improvement_max_pct: float = 0.35
-    price_improvement_curve: float = 0.85
 
     @classmethod
     def from_execution_params(cls, params: dict[str, Any] | None = None) -> "EntryPricingPolicy":
@@ -70,21 +64,6 @@ class EntryPricingPolicy:
             mode = "urgent"
         return cls(
             mode=mode,  # type: ignore[arg-type]
-            urgent_spread_pct=_as_float(
-                _first_present(raw, "entry_pricing_urgent_spread_pct", "urgent_spread_pct"),
-                0.25,
-            ),
-            passive_spread_pct=_as_float(
-                _first_present(raw, "entry_pricing_passive_spread_pct", "passive_spread_pct"),
-                0.25,
-            ),
-            cross_tight_spread_pct=_as_float(
-                _first_present(raw, "entry_pricing_cross_tight_spread_pct", "cross_tight_spread_pct"),
-                0.03,
-            ),
-            spread_fraction=_optional_fraction(
-                _first_present(raw, "entry_pricing_spread_fraction", "spread_fraction")
-            ),
             require_two_sided_quote=_as_bool(
                 _first_present(raw, "entry_pricing_require_two_sided_quote", "require_two_sided_quote"),
                 True,
@@ -95,12 +74,7 @@ class EntryPricingPolicy:
             ),
             preferred_min_open_interest=preferred_oi,
             preferred_max_bid_ask_spread_pct=preferred_spread,
-            price_improvement_max_pct=_as_float(raw.get("price_improvement_max_pct"), 0.35),
-            price_improvement_curve=_as_float(raw.get("price_improvement_curve"), 0.85),
-            price_improvement_discount_pct=_as_float(
-                _first_present(raw, "price_improvement_discount_pct", "entry_pricing_price_improvement_discount_pct"),
-                0.10,
-            ),
+
         )
 
 
@@ -112,6 +86,9 @@ class EntryPricingResult:
     block_reasons: list[str]
     price_improvement_applied: bool = False
     observed_at: datetime | None = None
+    max_entry_price: float | None = None
+    original_mid: float | None = None
+    wide_market: bool = False
 
     @property
     def approved(self) -> bool:
@@ -138,7 +115,12 @@ class EntryPricingResult:
             "quote_outcome": self.quote.outcome,
             "block_reasons": list(self.block_reasons),
             "liquidity_warnings": liquidity_warnings(self.quote, self.policy),
-            "liquidity_policy": "default_price_through_v1",
+            "liquidity_policy": ENTRY_POLICY_VERSION,
+            "entry_policy_version": ENTRY_POLICY_VERSION,
+            "max_entry_price": self.max_entry_price,
+            "original_mid": self.original_mid,
+            "wide_market": self.wide_market,
+            "chase_reference": "original_midpoint",
             "policy": asdict(self.policy),
             **quote_timestamp_evidence(self.quote, self.observed_at or datetime.now(UTC)),
         }
@@ -154,64 +136,44 @@ def select_entry_limit(
 ) -> EntryPricingResult:
     params = execution_params or {}
     active_policy = policy or EntryPricingPolicy.from_execution_params(params)
-    target = _optional_float(params.get("entry_price_through_target"))
-    pressure = bool(liquidity_warnings(quote, active_policy))
     observed_at = observed_at or datetime.now(UTC)
-    block_reasons = _quote_blocks(quote, params, active_policy, price_through=pressure or target is not None, observed_at=observed_at)
-    if block_reasons:
-        return EntryPricingResult(policy=active_policy, quote=quote, limit_price=None, block_reasons=block_reasons, observed_at=observed_at)
-
-    bid = float(quote.bid)  # guarded by _quote_blocks
-    ask = float(quote.ask)  # guarded by _quote_blocks
-    spread = ask - bid
+    blocks = _quote_blocks(quote, params, active_policy, observed_at=observed_at)
+    if blocks:
+        return EntryPricingResult(active_policy, quote, None, blocks, observed_at=observed_at)
+    bid, ask = float(quote.bid), float(quote.ask)
     mid = (bid + ask) / 2.0
+    original_mid = _optional_float(params.get("entry_original_mid")) or mid
+    wide = bool(params.get("entry_wide_market", is_wide_market(quote, active_policy)))
+    ceiling = _optional_float(params.get("entry_price_ceiling"))
+    if ceiling is None:
+        chase = resolve_entry_reprice_max_chase_pct(params)
+        ceiling = original_mid * (1.0 + (chase if chase is not None else .15))
+        if wide:
+            ceiling = min(ceiling, original_mid + PRICE_THROUGH_CONCESSION_USD)
+    # An explicit limit remains an additional ceiling, never permission to chase.
+    explicit = _optional_float(params.get("entry_price_through_target"))
+    if explicit is not None:
+        ceiling = min(ceiling, explicit)
+    replacement = bool(params.get("entry_reprice_step"))
+    proposed = (mid if wide else ask) if replacement else (bid + .25 * (ask-bid) if wide else mid)
+    if not math.isfinite(ceiling) or ceiling <= 0:
+        return EntryPricingResult(active_policy, quote, None, ["entry_price_ceiling_unusable"], observed_at=observed_at)
+    limit = floor_entry_price(min(proposed, ask, ceiling))
+    if limit <= 0:
+        return EntryPricingResult(active_policy, quote, None, ["entry_price_ceiling_unusable"], observed_at=observed_at)
+    return EntryPricingResult(active_policy, quote, limit, [], wide, observed_at,
+                              ceiling, original_mid, wide)
 
-    requires_price_seeking = active_policy.mode == "price_seeking" or pressure
 
-    price_improvement_applied = False
-    if target is not None:
-        limit_price = min(target, ask)
-        price_improvement_applied = True
-    elif requires_price_seeking:
-        # Convex width improvement below midpoint based on Kamandal
-        normal = active_policy.preferred_max_bid_ask_spread_pct or 0.20
-        pressure = max((quote.spread_pct / normal) - 1.0, 0.0) if quote.spread_pct else 0.0
-        if active_policy.preferred_min_open_interest and quote.open_interest is not None:
-            pressure = max(pressure, 1.0 - quote.open_interest / active_policy.preferred_min_open_interest)
-        bump = (active_policy.price_improvement_max_pct - active_policy.price_improvement_discount_pct) * (
-            1.0 - math.exp(-active_policy.price_improvement_curve * pressure)
-        )
-        eff_discount_pct = min(
-            active_policy.price_improvement_max_pct,
-            active_policy.price_improvement_discount_pct + bump,
-        )
-        discount = spread * eff_discount_pct
-        limit_price = max(bid, mid - discount)
-        price_improvement_applied = True
-    elif active_policy.spread_fraction is not None:
-        limit_price = bid + spread * active_policy.spread_fraction
-    elif active_policy.mode == "cross" or (
-        active_policy.mode == "urgent"
-        and quote.spread_pct is not None
-        and quote.spread_pct <= active_policy.cross_tight_spread_pct
-    ):
-        limit_price = ask
-    elif active_policy.mode == "balanced":
-        limit_price = mid
-    elif active_policy.mode == "passive":
-        limit_price = mid - spread * active_policy.passive_spread_pct
-    else:
-        limit_price = mid + spread * active_policy.urgent_spread_pct
+def floor_entry_price(value: float, increment: float = .01) -> float:
+    """Pure BUY-ceiling rounding, shared by broker and modeled decisions."""
+    from bhiksha.execution.order_manager import snap_price
+    return snap_price(value, increment, side="BUY")
 
-    return EntryPricingResult(
-        policy=active_policy,
-        quote=quote,
-        limit_price=(math.floor(max(0.01, min(limit_price, ask)) * 100 + 1e-9) / 100
-                     if price_improvement_applied else round_price(max(0.01, min(limit_price, ask)))) ,
-        block_reasons=[],
-        price_improvement_applied=price_improvement_applied,
-        observed_at=observed_at,
-    )
+
+def is_wide_market(quote: PublicQuote, policy: EntryPricingPolicy) -> bool:
+    threshold = policy.preferred_max_bid_ask_spread_pct or .20
+    return quote.spread_pct is not None and quote.spread_pct > threshold
 
 
 def get_entry_execution_profile(value: Any) -> EntryExecutionProfile | None:
@@ -219,14 +181,9 @@ def get_entry_execution_profile(value: Any) -> EntryExecutionProfile | None:
     return ENTRY_EXECUTION_PROFILES.get(normalized)  # type: ignore[arg-type]
 
 
-def resolve_initial_spread_fraction(
-    execution_params: dict[str, Any],
-) -> tuple[float | None, EntryExecutionProfile | None]:
-    profile = get_entry_execution_profile(execution_params.get("entry_execution_profile"))
-    explicit = _optional_fraction(execution_params.get("entry_pricing_spread_fraction"))
-    if explicit is not None:
-        return explicit, profile
-    return (profile.initial_spread_fraction if profile is not None else None), profile
+def resolve_initial_spread_fraction(execution_params: dict[str, Any]) -> tuple[float, EntryExecutionProfile | None]:
+    """Compatibility readback: normal markets now start at midpoint."""
+    return .5, get_entry_execution_profile(execution_params.get("entry_execution_profile"))
 
 
 def resolve_entry_reprice_max_chase_pct(execution_params: dict[str, Any]) -> float | None:
@@ -246,27 +203,20 @@ def build_entry_profile_comparison(
     """Price all named profiles from one quote without granting order authority."""
     comparison: dict[str, dict[str, Any]] = {}
     for name, profile in ENTRY_EXECUTION_PROFILES.items():
-        effective_fraction = scale_spread_fraction(
-            profile.initial_spread_fraction,
-            enabled=True,
-            open_interest_percentile=open_interest_percentile,
-        )
-        params = {**execution_params, "entry_pricing_spread_fraction": effective_fraction}
-        result = select_entry_limit(quote, params)
-        savings_vs_ask = None
-        if result.limit_price is not None and quote.ask is not None:
-            savings_vs_ask = round_price(float(quote.ask) - result.limit_price)
+        result = select_entry_limit(quote, {**execution_params, "entry_execution_profile": name,
+            "entry_reprice_max_chase_pct": profile.max_chase_pct})
         comparison[name] = {
-            "base_spread_fraction": profile.initial_spread_fraction,
-            "effective_spread_fraction": effective_fraction,
+            "base_spread_fraction": .5, "effective_spread_fraction": .25 if result.wide_market else .5,
             "quote_limit_price": result.limit_price,
-            "savings_vs_ask": savings_vs_ask,
+            "max_entry_price": result.max_entry_price,
+            "savings_vs_ask": round_price(float(quote.ask) - result.limit_price)
+                if result.limit_price is not None and quote.ask is not None else None,
             "block_reasons": list(result.block_reasons),
             "reprice_checkpoints_seconds": list(profile.reprice_checkpoints_seconds),
             "reprice_spread_fractions": list(profile.reprice_spread_fractions),
-            "cancel_after_seconds": profile.cancel_after_seconds,
-            "max_chase_pct": profile.max_chase_pct,
+            "cancel_after_seconds": profile.cancel_after_seconds, "max_chase_pct": profile.max_chase_pct,
         }
+
     return comparison
 
 
@@ -280,15 +230,6 @@ def quote_spread_abs(quote: PublicQuote) -> float | None:
     if quote.bid is None or quote.ask is None:
         return None
     return round_price(float(quote.ask) - float(quote.bid))
-
-
-def scale_spread_fraction(base_fraction: float, *, enabled: bool, open_interest_percentile: float | None) -> float:
-    """Moderate bid-to-ask movement using current-chain liquidity evidence."""
-    base = max(0.0, min(float(base_fraction), 1.0))
-    if not enabled:
-        return base
-    percentile = 0.0 if open_interest_percentile is None else float(open_interest_percentile)
-    return base * max(0.0, min(percentile, 1.0))
 
 
 def liquidity_warnings(quote: PublicQuote, policy: EntryPricingPolicy) -> list[str]:
@@ -309,19 +250,14 @@ def _quote_blocks(
     blocks: list[str] = []
     if any(value is not None and not math.isfinite(value) for value in (quote.bid, quote.ask, quote.open_interest)):
         return ["public_quote_nonfinite"]
-    if (policy.mode == "price_seeking" or price_through) and not (0 <= policy.price_improvement_discount_pct <= policy.price_improvement_max_pct <= .5 and math.isfinite(policy.price_improvement_curve) and policy.price_improvement_curve > 0):
-        return ["invalid_price_improvement_policy"]
-    if policy.mode == "price_seeking" or price_through:
-        status = quote_timestamp_evidence(quote, observed_at or datetime.now(UTC))["quote_timestamp_status"]
-        if status != "current":
-            blocks.append("public_quote_timestamp_missing" if status == "missing" else "public_quote_stale_or_unproven")
-    if policy.require_two_sided_quote or policy.mode == "price_seeking" or policy.preferred_min_open_interest is not None or policy.preferred_max_bid_ask_spread_pct is not None:
-        if quote.bid is None or quote.ask is None or quote.bid <= 0 or quote.ask <= 0:
-            blocks.append("public_quote_missing_bid_ask")
-        elif quote.ask < quote.bid:
-            blocks.append("public_quote_crossed_bid_ask")
-    elif quote.entry_reference_price is None:
-        blocks.append("public_quote_missing_price")
+    # Two-sided freshness is required for both initial and replacement decisions.
+    status = quote_timestamp_evidence(quote, observed_at or datetime.now(UTC))["quote_timestamp_status"]
+    if status != "current":
+        blocks.append("public_quote_timestamp_missing" if status == "missing" else "public_quote_stale_or_unproven")
+    if quote.bid is None or quote.ask is None or quote.bid <= 0 or quote.ask <= 0:
+        blocks.append("public_quote_missing_bid_ask")
+    elif quote.ask < quote.bid:
+        blocks.append("public_quote_crossed_bid_ask")
 
     if policy.require_open_interest and quote.open_interest is None:
         blocks.append("public_open_interest_missing")

@@ -128,16 +128,19 @@ def test_load_app_config_allows_entry_reprice_env_overrides(tmp_path: Path, monk
     path = tmp_path / "app.yaml"
     path.write_text(yaml.safe_dump({"app_name": "bhiksha"}), encoding="utf-8")
     monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_ENABLED", "true")
-    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CHECKPOINTS_SECONDS", "15,45,120")
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CHECKPOINTS_SECONDS", "15")
     monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CANCEL_AFTER_SECONDS", "240")
     monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_SPREAD_PCTS", "0.4,0.75,1.0")
 
     config = load_app_config(path)
 
     assert config.entry_reprice_enabled is True
-    assert config.entry_reprice_checkpoints_seconds == [15, 45, 120]
+    assert config.entry_reprice_checkpoints_seconds == [15]
     assert config.entry_reprice_cancel_after_seconds == 240
     assert config.entry_reprice_spread_pcts == [0.4, 0.75, 1.0]
+    monkeypatch.setenv("BHIKSHA_ENTRY_REPRICE_CHECKPOINTS_SECONDS", "15,45")
+    with pytest.raises(ValidationError, match="one reprice checkpoint"):
+        load_app_config(path)
 
 
 def test_load_active_plan_allows_duplicate_symbols_but_rejects_duplicate_ids(tmp_path: Path) -> None:
@@ -330,7 +333,7 @@ def test_load_deployments_rejects_patient_entry_ladder_after_cancel_deadline(tmp
     )
     (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="before the cancel deadline"):
+    with pytest.raises(ValidationError, match="one reprice checkpoint"):
         load_deployments(root)
 
 
@@ -347,7 +350,7 @@ def test_load_deployments_rejects_mismatched_patient_entry_ladder(tmp_path: Path
     )
     (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="equal lengths"):
+    with pytest.raises(ValidationError, match="one reprice checkpoint"):
         load_deployments(root)
 
 
@@ -363,7 +366,7 @@ def test_load_deployments_rejects_partial_named_profile_ladder_override(tmp_path
     )
     (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="must include matching spread fractions"):
+    with pytest.raises(ValidationError, match="one reprice checkpoint"):
         load_deployments(root)
 
 
@@ -380,7 +383,7 @@ def test_load_deployments_rejects_named_profile_checkpoint_at_profile_deadline(t
     )
     (root / "manual.yaml").write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="before the cancel deadline"):
+    with pytest.raises(ValidationError, match="one reprice checkpoint"):
         load_deployments(root)
 
 

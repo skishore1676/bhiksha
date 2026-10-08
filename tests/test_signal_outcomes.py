@@ -59,7 +59,7 @@ def _make_decision(deployment_id: str, symbol: str) -> SignalDecision:
     )
 
 
-def test_signal_outcome_shadow_filled(tmp_path) -> None:
+def test_signal_outcome_shadow_pending_before_later_quote(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     base = historical_deployment("market_impulse_qqq_short_v1")
     deployment = base.model_copy(
@@ -91,7 +91,7 @@ def test_signal_outcome_shadow_filled(tmp_path) -> None:
         rows = conn.execute("SELECT event_type, payload FROM events WHERE event_type = 'signal_outcome'").fetchall()
     assert len(rows) == 1
     payload = json.loads(rows[0][1])
-    assert payload["outcome"] == "filled"
+    assert payload["outcome"] == "pending_execution"
     assert payload["mode"] == "shadow"
     assert payload["attempted_contract"] == "QQQ260330C00550000"
     assert payload["attempted_quantity"] == 1

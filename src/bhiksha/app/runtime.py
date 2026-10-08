@@ -449,6 +449,7 @@ class BhikshaRuntime:
                 repository=cash_budget_repository,
             ),
             chain_snapshot_repository=chain_snapshot_repository,
+            entry_intent_repository=trade_state_repository,
         )
         manual_status_writer = await self._build_manual_status_writer(
             output=output,

@@ -1,199 +1,76 @@
-from datetime import UTC, datetime
+"""Frozen midpoint policy scenarios, independent of LIVE versus modeled fills."""
+from datetime import UTC, datetime, timedelta
 import pytest
-
 from bhiksha.execution.order_manager import PublicQuote
 from bhiksha.execution.pricing import (
-    ENTRY_EXECUTION_PROFILES,
-    EntryPricingPolicy,
-    build_entry_profile_comparison,
-    resolve_entry_reprice_max_chase_pct,
-    resolve_initial_spread_fraction,
-    scale_spread_fraction,
-    select_entry_limit,
+    ENTRY_EXECUTION_PROFILES, build_entry_profile_comparison,
+    resolve_entry_reprice_max_chase_pct, select_entry_limit, floor_entry_price,
 )
+NOW = datetime(2026, 10, 8, 14, tzinfo=UTC)
 
 
-def test_urgent_entry_pricing_improves_inside_wider_spread() -> None:
-    result = select_entry_limit(
-        PublicQuote(symbol="QQQ260330P00558000", bid=2.70, ask=2.90, last=2.80, open_interest=550),
-        {"max_bid_ask_spread_pct": 0.20, "min_open_interest": 100},
-    )
-
-    assert result.approved is True
-    assert result.limit_price == 2.85
-    assert result.evidence()["mid"] == 2.80
-    assert result.evidence()["spread_abs"] == 0.20
-    assert result.evidence()["pricing_mode"] == "urgent"
+def market(bid=2.7, ask=2.9, oi=550, at=NOW):
+    return PublicQuote('OPT', bid=bid, ask=ask, open_interest=oi,
+        quote_timestamp=at.isoformat(), quote_timestamp_field='quoteTimestamp')
 
 
-def test_urgent_entry_pricing_crosses_very_tight_spread() -> None:
-    result = select_entry_limit(
-        PublicQuote(symbol="IWM260330P00558000", bid=1.03, ask=1.06, last=1.05, open_interest=437),
-        {"max_bid_ask_spread_pct": 0.20, "min_open_interest": 100},
-    )
-
-    assert result.approved is True
-    assert result.limit_price == 1.06
-
-
-def test_entry_pricing_requires_two_sided_quote_and_open_interest() -> None:
-    result = select_entry_limit(
-        PublicQuote(symbol="IWM260330P00558000", bid=None, ask=1.06, last=1.05, open_interest=None),
-        {},
-    )
-
-    assert result.approved is False
-    assert result.block_reasons == ["public_quote_missing_bid_ask", "public_open_interest_missing"]
+def test_normal_market_starts_midpoint_even_with_low_oi():
+    for oi in (1, 550):
+        result=select_entry_limit(market(oi=oi), {'entry_execution_profile':'balanced',
+            'preferred_min_open_interest':100}, observed_at=NOW)
+        assert result.approved and result.limit_price==2.8
+        assert result.max_entry_price==pytest.approx(3.22)
+        assert not result.wide_market
 
 
-def test_balanced_entry_pricing_uses_mid() -> None:
-    result = select_entry_limit(
-        PublicQuote(symbol="QQQ260330P00558000", bid=2.70, ask=2.90, last=2.80, open_interest=550),
-        policy=EntryPricingPolicy(mode="balanced"),
-    )
-
-    assert result.limit_price == 2.80
-
-
-def test_explicit_spread_fraction_prices_from_bid_toward_ask() -> None:
-    result = select_entry_limit(
-        PublicQuote(symbol="SMH260717P00280000", bid=2.70, ask=2.90, last=2.80, open_interest=5310),
-        {"entry_pricing_spread_fraction": 0.25},
-    )
-
-    assert result.limit_price == 2.75
-    assert result.evidence()["policy"]["spread_fraction"] == 0.25
+def test_rblx_bargain_does_not_limit_midpoint_replacement():
+    params={'entry_execution_profile':'balanced'}
+    initial=select_entry_limit(market(.35,.89),params,observed_at=NOW)
+    assert initial.limit_price==.48 and initial.original_mid==pytest.approx(.62)
+    assert initial.max_entry_price==pytest.approx(.713)
+    later=select_entry_limit(market(.35,.89),{**params,'entry_reprice_step':True,
+        'entry_original_mid':initial.original_mid,'entry_price_ceiling':initial.max_entry_price,
+        'entry_wide_market':initial.wide_market},observed_at=NOW)
+    assert later.limit_price==.62
+    moved=select_entry_limit(market(.8,1.1),{**params,'entry_reprice_step':True,
+        'entry_original_mid':initial.original_mid,'entry_price_ceiling':initial.max_entry_price,
+        'entry_wide_market':True},observed_at=NOW)
+    assert moved.limit_price==.71  # clipped, never reset from the later midpoint
 
 
-def test_oi_percentile_scaling_never_makes_fraction_more_aggressive() -> None:
-    assert scale_spread_fraction(0.70, enabled=True, open_interest_percentile=0.25) == pytest.approx(0.175)
-    assert scale_spread_fraction(0.70, enabled=True, open_interest_percentile=None) == 0.0
-    assert scale_spread_fraction(0.70, enabled=False, open_interest_percentile=0.25) == 0.70
+def test_normal_reprice_clips_to_frozen_ceiling_and_current_ask():
+    result=select_entry_limit(market(1,1.1),{'entry_execution_profile':'balanced'},observed_at=NOW)
+    params={'entry_reprice_step':True,'entry_original_mid':result.original_mid,
+        'entry_price_ceiling':result.max_entry_price,'entry_wide_market':False}
+    assert select_entry_limit(market(1.3,1.6),params,observed_at=NOW).limit_price==1.2
+    assert select_entry_limit(market(.95,1),params,observed_at=NOW).limit_price==1
+    assert select_entry_limit(market(1,1.1),{**params,'entry_price_through_target':1.02},observed_at=NOW).limit_price==1.02
 
 
-def test_named_entry_profiles_have_distinct_bounded_ladders() -> None:
-    assert ENTRY_EXECUTION_PROFILES["patient"].reprice_checkpoints_seconds == (60, 180)
-    assert ENTRY_EXECUTION_PROFILES["balanced"].reprice_spread_fractions == (0.60, 0.85)
-    assert ENTRY_EXECUTION_PROFILES["urgent"].cancel_after_seconds == 60
-    assert ENTRY_EXECUTION_PROFILES["patient"].max_chase_pct == 0.10
-    assert ENTRY_EXECUTION_PROFILES["balanced"].max_chase_pct == 0.15
-    assert ENTRY_EXECUTION_PROFILES["urgent"].max_chase_pct == 0.25
+def test_smh_buy_ceiling_is_floored_to_valid_tick():
+    assert floor_entry_price(3.64,.05)==3.60
+    assert floor_entry_price(3.65,.05)==3.65
 
 
-def test_entry_profile_comparison_prices_all_profiles_without_order_authority() -> None:
-    comparison = build_entry_profile_comparison(
-        PublicQuote(symbol="SMH260717P00280000", bid=2.70, ask=2.90, last=2.80, open_interest=5310),
-        {"min_open_interest": 50, "max_bid_ask_spread_pct": 0.12},
-        open_interest_percentile=0.50,
-    )
-
-    assert set(comparison) == {"patient", "balanced", "urgent"}
-    assert comparison["patient"]["quote_limit_price"] == 2.73
-    assert comparison["balanced"]["quote_limit_price"] == 2.74
-    assert comparison["urgent"]["quote_limit_price"] == 2.75
-    assert comparison["patient"]["effective_spread_fraction"] == 0.125
-    assert comparison["patient"]["max_chase_pct"] == 0.10
+@pytest.mark.parametrize('change,reason',[
+    ({'at':NOW-timedelta(seconds=8.001)},'public_quote_stale_or_unproven'),
+    ({'bid':None},'public_quote_missing_bid_ask'),
+    ({'bid':3,'ask':2},'public_quote_crossed_bid_ask'),
+    ({'oi':0},'public_open_interest_missing'),
+    ({'oi':None},'public_open_interest_missing'),
+    ({'bid':.01,'ask':2},'public_spread_absurd'),
+])
+def test_real_quote_and_sanity_limits_still_block(change,reason):
+    result=select_entry_limit(market(**change),observed_at=NOW)
+    assert not result.approved and reason in result.block_reasons
 
 
-def test_explicit_initial_fraction_overrides_named_profile_default() -> None:
-    fraction, profile = resolve_initial_spread_fraction(
-        {
-            "entry_execution_profile": "patient",
-            "entry_pricing_spread_fraction": 0.40,
-        }
-    )
-
-    assert profile is not None
-    assert profile.name == "patient"
-    assert fraction == 0.40
-
-
-def test_explicit_reprice_chase_cap_overrides_named_profile_default() -> None:
-    assert resolve_entry_reprice_max_chase_pct(
-        {"entry_execution_profile": "patient", "entry_reprice_max_chase_pct": 0.05}
-    ) == 0.05
-    assert resolve_entry_reprice_max_chase_pct({"entry_execution_profile": "balanced"}) == 0.15
-    assert resolve_entry_reprice_max_chase_pct({}) is None
-
-
-def test_price_seeking_mode_prices_below_midpoint() -> None:
-    # bid=2.00, ask=2.50, mid=2.25, spread=0.50
-    # price-seeking discount should be below mid (2.25), but >= bid (2.00)
-    result = select_entry_limit(
-        PublicQuote(quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp", symbol="TEST260619C00100000", bid=2.00, ask=2.50, last=2.25, open_interest=500),
-        policy=EntryPricingPolicy(mode="price_seeking", price_improvement_discount_pct=0.10),
-    )
-    assert result.approved is True
-    assert result.price_improvement_applied is True
-    assert result.limit_price < 2.25
-    assert result.limit_price >= 2.00
-
-
-def test_price_seeking_triggers_when_spread_above_preferred_threshold() -> None:
-    # Hard max is 0.25 (allowed), but preferred max is 0.10.
-    # spread_pct = 0.50 / 2.25 = 0.222 > preferred_max (0.10)
-    result = select_entry_limit(
-        PublicQuote(quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp", symbol="TEST260619C00100000", bid=2.00, ask=2.50, last=2.25, open_interest=500),
-        {
-            "max_bid_ask_spread_pct": 0.30,
-            "entry_pricing_preferred_max_bid_ask_spread_pct": 0.10,
-        },
-    )
-    assert result.approved is True
-    assert result.price_improvement_applied is True
-    assert result.limit_price < 2.25
-
-
-def test_price_seeking_triggers_when_oi_below_preferred_threshold() -> None:
-    # Hard min is 50 (allowed), but preferred min is 500.
-    # open_interest = 100 < 500
-    result = select_entry_limit(
-        PublicQuote(quote_timestamp=datetime.now(UTC).isoformat(), quote_timestamp_field="quoteTimestamp", symbol="TEST260619C00100000", bid=2.00, ask=2.50, last=2.25, open_interest=100),
-        {
-            "min_open_interest": 50,
-            "entry_pricing_preferred_min_open_interest": 500,
-        },
-    )
-    assert result.approved is True
-    assert result.price_improvement_applied is True
-    assert result.limit_price < 2.25
-
-
-def test_sheet_liquidity_thresholds_default_to_patient_price_not_veto() -> None:
-    quote = PublicQuote(
-        quote_timestamp=datetime.now(UTC).isoformat(),
-        quote_timestamp_field="quoteTimestamp",
-        symbol="HLT260925C00280000",
-        bid=2.00,
-        ask=2.80,
-        last=2.40,
-        open_interest=40,
-    )
-    params = {"min_open_interest": 100, "max_bid_ask_spread_pct": 0.20}
-    initial = select_entry_limit(quote, params)
-
-    assert initial.approved is True
-    assert initial.limit_price < 2.40
-    assert initial.evidence()["liquidity_warnings"] == [
-        "open_interest_below_preferred", "spread_above_preferred",
-    ]
-    assert initial.evidence()["liquidity_policy"] == "default_price_through_v1"
-    assert select_entry_limit(quote, {**params, "entry_price_through_target": 2.40}).limit_price == 2.40
-    assert select_entry_limit(quote, {**params, "entry_price_through_target": 2.50}).limit_price == 2.50
-
-
-def test_absurd_spread_still_blocks_entry() -> None:
-    result = select_entry_limit(
-        PublicQuote(
-            quote_timestamp=datetime.now(UTC).isoformat(),
-            quote_timestamp_field="quoteTimestamp",
-            symbol="HLT260925C00280000",
-            bid=0.10,
-            ask=2.00,
-            last=1.05,
-            open_interest=40,
-        ),
-        {"min_open_interest": 100, "max_bid_ask_spread_pct": 0.20},
-    )
-    assert result.approved is False
-    assert "public_spread_absurd" in result.block_reasons
+def test_profiles_have_one_step_and_existing_patience_and_chase():
+    assert ENTRY_EXECUTION_PROFILES['patient'].reprice_checkpoints_seconds==(60,)
+    assert ENTRY_EXECUTION_PROFILES['balanced'].reprice_checkpoints_seconds==(30,)
+    assert ENTRY_EXECUTION_PROFILES['urgent'].reprice_checkpoints_seconds==(15,)
+    assert [ENTRY_EXECUTION_PROFILES[p].cancel_after_seconds for p in ('patient','balanced','urgent')]==[300,150,60]
+    assert resolve_entry_reprice_max_chase_pct({'entry_execution_profile':'patient','entry_reprice_max_chase_pct':.05})==.05
+    comparisons=build_entry_profile_comparison(market(at=datetime.now(UTC)),{},open_interest_percentile=.1)
+    assert all(v['quote_limit_price']==2.8 for v in comparisons.values())
+    assert comparisons['patient']['max_entry_price']==pytest.approx(3.08)

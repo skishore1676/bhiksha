@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 import uuid
 import time as clock
 
 from bhiksha.config.models import ConservativeRiskProfile, DeploymentManifest
-from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan
+from bhiksha.domain.models import OptionSelectionRequest, SignalDecision, TradePlan, TradeRecord
 from bhiksha.execution.native_orders import (
     decide_execution_route,
 )
@@ -18,8 +19,8 @@ from bhiksha.execution.pricing import (
     build_entry_profile_comparison,
     resolve_entry_reprice_max_chase_pct,
     resolve_initial_spread_fraction,
-    scale_spread_fraction,
     select_entry_limit,
+    ENTRY_POLICY_VERSION,
 )
 from bhiksha.market_data.session import as_et_time
 from bhiksha.options.chain_service import OptionChainService
@@ -56,6 +57,7 @@ class ExecutionPlanner:
         cash_guard: CashGuard | None = None,
         risk_manager: RiskManager | None = None,
         chain_snapshot_repository: ChainSnapshotRepository | None = None,
+        entry_intent_repository=None,
     ) -> None:
         self.chain_service = chain_service or PublicOptionChainService()
         self.vehicle_resolver = vehicle_resolver or VehicleResolver()
@@ -64,6 +66,7 @@ class ExecutionPlanner:
         self.cash_guard = cash_guard
         self.risk_manager = risk_manager
         self.chain_snapshot_repository = chain_snapshot_repository or NullChainSnapshotRepository()
+        self.entry_intent_repository = entry_intent_repository
 
     async def _fit_live_quantity(self, *, trade_id, deployment, timestamp, price,
                                  upper_quantity, premium_cap, extra_cash=0.0):
@@ -113,9 +116,9 @@ class ExecutionPlanner:
         await self.chain_service.close()
         await self.order_manager.close()
 
-    async def plan_entry(self, deployment, decision, *, dry_run, simulate_only=False, entry_guard=None):
+    async def plan_entry(self, deployment, decision, *, dry_run, simulate_only=False, entry_guard=None, pricing_references=None):
         """Bounded recovery before submission, within one frozen chain cohort."""
-        context = {"candidate_rank": 0}
+        context = {"candidate_rank": 0, "pricing_references": dict(pricing_references or {})}
         attempts = []
         fresh_rebuild_used = False
         previous = None
@@ -149,10 +152,12 @@ class ExecutionPlanner:
             contract_blocks = {"insufficient_budget_for_single_contract", "option_contract_already_owned_by_other_deployment",
                 "public_quote_stale_or_unproven", "public_quote_timestamp_missing", "public_quote_unavailable",
                 "public_quote_crossed_bid_ask", "public_quote_nonfinite", "public_open_interest_missing",
+                "public_quote_missing_bid_ask", "public_spread_absurd", "public_spread_unavailable",
                 "risk_prospective_loss_headroom_exceeded", "insufficient_internal_settled_cash_budget"}
             if not reasons or not reasons <= contract_blocks or context["candidate_rank"] >= 4:
                 break
             context["candidate_rank"] += 1
+        plan.risk_details["entry_pricing_references"] = context["pricing_references"]
         plan.risk_details["entry_recovery_attempts"] = attempts
         plan.risk_details["final_quote_rebuild_used"] = fresh_rebuild_used
         return plan
@@ -288,13 +293,47 @@ class ExecutionPlanner:
                 entry_timestamp=decision.timestamp,
             )
         execution_params = deployment.execution.model_dump()
-        base_spread_fraction, active_entry_profile = resolve_initial_spread_fraction(execution_params)
-        if base_spread_fraction is not None:
-            execution_params["entry_pricing_spread_fraction"] = scale_spread_fraction(
-                base_spread_fraction,
-                enabled=deployment.execution.entry_pricing_oi_percentile_scale or active_entry_profile is not None,
-                open_interest_percentile=selection.open_interest_percentile,
-            )
+        _, active_entry_profile = resolve_initial_spread_fraction(execution_params)
+        # Seek a normal fresh market only within the original top-five cohort.
+        # Quote requests are cached for this attempt; never switch after submission.
+        if select_entry_limit(quote, execution_params).wide_market:
+            alternatives = []
+            for rank in range(_context.get("candidate_rank", 0) + 1, 5):
+                try:
+                    request = replace(selection_request, execution_params={
+                        **selection_request.execution_params, "_entry_candidate_rank": rank})
+                    candidate = self.vehicle_resolver.resolve(request, contracts)
+                except SelectorEmptyError:
+                    break
+                if self.position_tracker.find_by_option_symbol(candidate.option_symbol):
+                    continue
+                try:
+                    started_at = datetime.now(UTC)
+                    started_clock = clock.monotonic()
+                    candidate_quote = await self.order_manager.get_option_quote(candidate.option_symbol)
+                    received_at = datetime.now(UTC)
+                    result = select_entry_limit(candidate_quote, execution_params, observed_at=received_at)
+                    alternatives.append({"option_symbol": candidate.option_symbol, "rank": rank,
+                        "wide_market": result.wide_market, "block_reasons": result.block_reasons})
+                    if result.approved and not result.wide_market:
+                        selection, quote = candidate, candidate_quote
+                        quote_fetch_started_at, quote_received_at = started_at, received_at
+                        quote_fetch_seconds = clock.monotonic() - started_clock
+                        _context["candidate_rank"] = rank
+                        snapshot_attempt, snapshot_persisted = await self._capture_chain_snapshot(
+                            snapshot_id, request, contracts, lane=lane, selection=selection, selector_error=None)
+                        selection_details = {**_selection_details(selection),
+                            **_selection_snapshot_details(snapshot_attempt, persisted=snapshot_persisted)}
+                        break
+                except Exception as exc:
+                    alternatives.append({"option_symbol": candidate.option_symbol, "rank": rank,
+                        "error_type": type(exc).__name__})
+            selection_details["narrower_market_search"] = alternatives
+        # Freeze each contract's first usable midpoint/ceiling for the entire attempt,
+        # including a final-freshness rebuild. A rejected quote never seeds a ceiling.
+        frozen = _context.setdefault("pricing_references", {}).get(selection.option_symbol)
+        if frozen:
+            execution_params.update(frozen)
         pricing = select_entry_limit(quote, execution_params)
         def attempt_evidence(result, started_at, received_at, fetch_seconds):
             return {**result.evidence(), "quote_fetch_started_at": started_at.isoformat(),
@@ -313,7 +352,7 @@ class ExecutionPlanner:
             if reason is None and deployment.strategy.key == "weekly_chart":
                 from bhiksha.strategy.weekly_chart import pending_block
                 reason = pending_block(deployment, current)
-            if reason is None and check_freshness and (refreshed_quote or not dry_run):
+            if reason is None and check_freshness and (refreshed_quote or not dry_run or simulate_only):
                 fresh_pricing = select_entry_limit(quote, execution_params, observed_at=current)
                 final_quote_validation = fresh_pricing.evidence()
                 pricing_evidence["final_quote_validation"] = final_quote_validation
@@ -356,12 +395,21 @@ class ExecutionPlanner:
             guarded = guarded_plan()
             if guarded is not None:
                 return guarded
+        if pricing.approved:
+            _context["pricing_references"].setdefault(selection.option_symbol, {
+                "entry_original_mid": pricing.original_mid, "entry_price_ceiling": pricing.max_entry_price,
+                "entry_wide_market": pricing.wide_market,
+                "entry_starting_bid": quote.bid, "entry_starting_ask": quote.ask,
+                "entry_starting_quote_at": pricing.evidence().get("effective_quote_at")})
         pricing_evidence = pricing.evidence()
         first_provider_at = parse_provider_timestamp(quote_attempts[0].get("effective_quote_at"))
         final_provider_at = parse_provider_timestamp(quote_attempts[-1].get("effective_quote_at"))
         pricing_evidence = {
             **pricing_evidence,
-            "initial_mid": pricing_evidence.get("mid"),
+            "initial_mid": pricing.original_mid,
+            "starting_bid": execution_params.get("entry_starting_bid", quote.bid),
+            "starting_ask": execution_params.get("entry_starting_ask", quote.ask),
+            "starting_quote_at": execution_params.get("entry_starting_quote_at", pricing_evidence.get("effective_quote_at")),
             "entry_execution_profile": active_entry_profile.name if active_entry_profile is not None else "legacy",
             "entry_reprice_max_chase_pct": resolve_entry_reprice_max_chase_pct(
                 deployment.execution.model_dump()
@@ -465,8 +513,9 @@ class ExecutionPlanner:
             "risk_envelope_cap_fraction": cap_fraction,
             "effective_max_trade_premium_usd": max_trade_premium,
         }
-        min_contract_cost = entry_price * 100
-        quantity = int(max_trade_premium // (entry_price * 100))
+        sizing_price = float(pricing.max_entry_price or entry_price)
+        min_contract_cost = sizing_price * 100
+        quantity = int(max_trade_premium // (sizing_price * 100))
         if deployment.risk.max_contracts is not None:
             quantity = min(quantity, int(deployment.risk.max_contracts))
         if quantity <= 0:
@@ -506,7 +555,7 @@ class ExecutionPlanner:
             total_open_positions=total_open_positions,
             symbol_open_positions=symbol_open_positions,
             deployment_open_positions=deployment_open_positions,
-            proposed_trade_premium_usd=entry_price * quantity * 100,
+            proposed_trade_premium_usd=sizing_price * quantity * 100,
             enforce_total_position_limit=not simulate_only,
             enforce_symbol_position_limit=not simulate_only,
         )
@@ -535,6 +584,33 @@ class ExecutionPlanner:
         guarded = guarded_plan(check_freshness=True)
         if guarded is not None:
             return guarded
+        if simulate_only:
+            try:
+                checked = await self.order_manager.preflight_entry(selection.option_symbol, entry_price, quantity)
+                if not checked.current_increment:
+                    raise ValueError("public_preflight_tick_metadata_unavailable")
+                normalized = float(checked.payload["limitPrice"])
+                if normalized > entry_price + 1e-9:
+                    raise ValueError("broker_entry_price_exceeds_limit")
+                entry_price = normalized
+                pricing_evidence.update({"initial_limit_price": entry_price,
+                    "preflight_limit_price": entry_price, "preflight_increment": checked.current_increment,
+                    "tick_validation_basis": "broker_preflight",
+                    "tick_metadata_status": "proved" if checked.current_increment else "unavailable",
+                    "sizing_price": sizing_price, "modeled_fill_basis": "later_fresh_ask_touch"})
+            except Exception as exc:
+                reason = "public_preflight_tick_metadata_unavailable" if str(exc) == "public_preflight_tick_metadata_unavailable" else "public_preflight_failed"
+                pricing_evidence["tick_metadata_status"] = "unavailable"
+                return TradePlan(trade_id=trade_id, deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol, direction=decision.direction, option_symbol=selection.option_symbol,
+                    quantity=quantity, estimated_entry_price=entry_price, risk_reasons=[reason],
+                    dry_run=True, order_id=None, underlying_entry_price=underlying_entry_price,
+                    entry_timestamp=decision.timestamp, risk_details={"entry_pricing": pricing_evidence,
+                        "pre_submission_retryable": preflight_failure_is_transient(exc),
+                        "error_type": type(exc).__name__, **premium_cap_receipt, **selection_details})
+            guarded = guarded_plan(check_freshness=True)
+            if guarded is not None:
+                return guarded
         if dry_run:
             if simulate_only:
                 return TradePlan(
@@ -594,7 +670,7 @@ class ExecutionPlanner:
         try:
             quantity, sizing_reason, receipt = await self._fit_live_quantity(
                 trade_id=trade_id, deployment=deployment, timestamp=decision.timestamp,
-                price=entry_price, upper_quantity=quantity, premium_cap=max_trade_premium)
+                price=sizing_price, upper_quantity=quantity, premium_cap=max_trade_premium)
             sizing_receipts.append(receipt)
             if sizing_reason:
                 raise _SizingBlocked(sizing_reason)
@@ -612,7 +688,7 @@ class ExecutionPlanner:
                                preflight.estimated_cost or 0.0, normalized_price * quantity * 100)
                 fitted, sizing_reason, receipt = await self._fit_live_quantity(
                     trade_id=trade_id, deployment=deployment, timestamp=decision.timestamp,
-                    price=normalized_price, upper_quantity=quantity, premium_cap=max_trade_premium,
+                    price=max(sizing_price, normalized_price), upper_quantity=quantity, premium_cap=max_trade_premium,
                     extra_cash=max(0.0, required - normalized_price * quantity * 100))
                 sizing_receipts.append(receipt)
                 if sizing_reason:
@@ -648,11 +724,11 @@ class ExecutionPlanner:
             )
 
         final_limit_price = float(preflight.payload["limitPrice"])
-        if pricing_evidence.get("price_improvement_applied") and final_limit_price > entry_price + 1e-9:
+        if final_limit_price > entry_price + 1e-9:
             return TradePlan(
                 trade_id=trade_id, deployment_id=deployment.deployment_id, symbol=deployment.symbol,
                 direction=decision.direction, option_symbol=selection.option_symbol, quantity=quantity,
-                estimated_entry_price=entry_price, risk_reasons=["price_seeking_tick_exceeds_limit"], dry_run=False,
+                estimated_entry_price=entry_price, risk_reasons=["broker_entry_price_exceeds_limit"], dry_run=False,
                 entry_timestamp=decision.timestamp, risk_details={"entry_pricing": pricing_evidence, **selection_details},
             )
         pricing_evidence = {
@@ -660,13 +736,17 @@ class ExecutionPlanner:
             "preflight_limit_price": final_limit_price,
             "initial_limit_price": final_limit_price,
             "preflight_increment": preflight.current_increment,
+            "tick_metadata_status": "proved" if preflight.current_increment else "unavailable",
+            "tick_validation_basis": "broker_preflight",
+            "sizing_price": sizing_price,
             "preflight_buying_power_requirement": preflight.buying_power_requirement,
             "preflight_estimated_cost": preflight.estimated_cost,
         }
         required_cash = max(
             preflight.buying_power_requirement or 0.0,
             preflight.estimated_cost or 0.0,
-            final_limit_price * quantity * 100,
+            sizing_price * quantity * 100 + max(0.0,
+                (preflight.estimated_cost or 0.0) - final_limit_price * quantity * 100),
         )
         sized_risk_details: dict[str, object] = {}
         cash_guard_details: dict[str, object] = {}
@@ -702,10 +782,32 @@ class ExecutionPlanner:
                         **cash_guard_details,
                     },
                 )
+        entry_intent = TradeRecord(trade_id=trade_id,
+                    deployment_id=deployment.deployment_id, symbol=deployment.symbol,
+                    option_symbol=selection.option_symbol, quantity=quantity, entry_price=final_limit_price,
+                    underlying_entry_price=underlying_entry_price, entry_timestamp=decision.timestamp,
+                    entry_order_id=trade_id, status="pending_entry_reconcile")
+        async def clear_unsubmitted_intent():
+            if self.entry_intent_repository is not None:
+                await self.entry_intent_repository.upsert_trade(replace(entry_intent,
+                    quantity=0, entry_price=None, entry_order_id=None, status="closed"))
+        if self.entry_intent_repository is not None:
+            try:
+                await self.entry_intent_repository.upsert_trade(entry_intent)
+            except Exception:
+                if self.cash_guard is not None:
+                    await self.cash_guard.release_entry(trade_id)
+                if self.risk_manager is not None:
+                    await self.risk_manager.release_sized_entry(trade_id)
+                return TradePlan(trade_id=trade_id, deployment_id=deployment.deployment_id,
+                    symbol=deployment.symbol, direction=decision.direction, option_symbol=selection.option_symbol,
+                    quantity=quantity, estimated_entry_price=final_limit_price,
+                    risk_reasons=["entry_intent_persistence_failed"], dry_run=False, order_id=None,
+                    entry_timestamp=decision.timestamp, risk_details={"entry_pricing": pricing_evidence})
         # Cash reservation can await broker/account state.  It must therefore
         # happen before the final sized-risk/canary reservation.  Once the
-        # final reservation returns, the next awaited operation is the broker
-        # submission itself: a latch or expiry observed while cash was being
+        # final reservation returns, only quote/permission checks precede broker
+        # submission: a latch or expiry observed while cash was being
         # reserved cannot slip through on a stale earlier approval.
         if self.risk_manager is not None:
             stop_loss_pct, stop_loss_source = resolve_planned_stop_loss_pct(deployment)
@@ -714,7 +816,7 @@ class ExecutionPlanner:
                     trade_id=trade_id,
                     deployment_id=deployment.deployment_id,
                     symbol=deployment.symbol,
-                    entry_price=final_limit_price,
+                    entry_price=sizing_price,
                     quantity=quantity,
                     stop_loss_pct=stop_loss_pct,
                 )
@@ -725,6 +827,7 @@ class ExecutionPlanner:
                 # failing during a later receipt/event write. Clean it up
                 # idempotently before returning a fail-closed plan.
                 await self.risk_manager.release_sized_entry(trade_id)
+                await clear_unsubmitted_intent()
                 return TradePlan(
                     trade_id=trade_id,
                     deployment_id=deployment.deployment_id,
@@ -756,6 +859,7 @@ class ExecutionPlanner:
             if not sized_risk.allowed:
                 if self.cash_guard is not None:
                     await self.cash_guard.release_entry(trade_id)
+                await clear_unsubmitted_intent()
                 return TradePlan(
                     trade_id=trade_id,
                     deployment_id=deployment.deployment_id,
@@ -788,6 +892,7 @@ class ExecutionPlanner:
                 await self.cash_guard.release_entry(trade_id)
             if self.risk_manager is not None:
                 await self.risk_manager.release_sized_entry(trade_id)
+            await clear_unsubmitted_intent()
             return guarded
         def submission_guard():
             blocked = guarded_plan(check_freshness=True, before_submission=True)
@@ -797,12 +902,11 @@ class ExecutionPlanner:
                 selection.option_symbol, final_limit_price, quantity, order_id=trade_id,
                 **({"submission_guard": submission_guard} if isinstance(self.order_manager, OrderManager) else {}),
             )
-        except Exception:
-            if self.cash_guard is not None:
-                await self.cash_guard.release_entry(trade_id)
-            if self.risk_manager is not None:
-                await self.risk_manager.release_sized_entry(trade_id)
-            raise
+        except Exception as exc:
+            result = OrderResult(order_id=trade_id, error=f"entry_submission_uncertain:{type(exc).__name__}",
+                                 submission_uncertain=True, actual_limit_price=final_limit_price)
+        if self.entry_intent_repository is not None and result.order_id is None:
+            await clear_unsubmitted_intent()
         if self.cash_guard is not None and (result.order_id is None or (result.error and not getattr(result, "submission_uncertain", False))):
             await self.cash_guard.release_entry(trade_id)
         if self.risk_manager is not None and (result.order_id is None or (result.error and not getattr(result, "submission_uncertain", False))):
