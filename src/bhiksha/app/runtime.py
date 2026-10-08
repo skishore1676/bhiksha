@@ -2329,6 +2329,13 @@ def _preserve_newer_pending_exit_state(
             broker_position.option_symbol,
         )
         current = current_by_identity.get(identity)
+        if broker_position.source in NON_LIVE_POSITION_SOURCES:
+            # Paper state is owned by the current tracker, not a snapshot
+            # taken before the portfolio await. A modeled close/protection
+            # change during that await must not be undone by reconciliation.
+            if current is not None:
+                merged.append(current)
+            continue
         if current is None or not _position_has_pending_exit(current):
             merged.append(broker_position)
             continue
@@ -2352,6 +2359,11 @@ def _preserve_newer_pending_exit_state(
                 exit_reprice_count=current.exit_reprice_count,
             )
         )
+    snapshot_identities = {
+        (p.trade_id, p.deployment_id, p.option_symbol) for p in broker_positions
+    }
+    merged.extend(p for p in current_positions if p.source in NON_LIVE_POSITION_SOURCES
+                  and (p.trade_id, p.deployment_id, p.option_symbol) not in snapshot_identities)
     return merged
 
 

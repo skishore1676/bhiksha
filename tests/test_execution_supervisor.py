@@ -31,6 +31,20 @@ def _enabled_deployment(deployment_id: str):
     return deployment.model_copy(update={"enabled": True})
 
 
+@pytest.fixture
+def entry_market_clock(monkeypatch):
+    # These working-order scenarios must run during their authorized session
+    # even when the release suite is run after the real market close.
+    at = datetime(2026, 10, 8, 14, tzinfo=UTC)
+    class MarketDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at.astimezone(tz) if tz else at.replace(tzinfo=None)
+    monkeypatch.setattr(__name__ + ".datetime", MarketDatetime)
+    for module in ("supervisor", "planner", "pricing", "order_manager"):
+        monkeypatch.setattr("bhiksha.execution." + module + ".datetime", MarketDatetime)
+
+
 class StubOrderManager:
     supports_concurrent_exit_orders = False
     allows_exit_submission_before_cancel_confirmation = True
@@ -447,6 +461,7 @@ def test_execution_supervisor_tags_can_ladder_at_live_entry_and_survives_partial
     assert residual.can_ladder is True  # the entry-time tag survives
 
 
+@pytest.mark.usefixtures("entry_market_clock")
 def test_execution_supervisor_reprices_unfilled_entry_before_protection(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=2, replacement_fill_price=2.88)
@@ -499,6 +514,7 @@ def test_execution_supervisor_reprices_unfilled_entry_before_protection(tmp_path
     assert filled['attempted_price'] == 2.88
 
 
+@pytest.mark.usefixtures("entry_market_clock")
 def test_execution_supervisor_uses_lane_patient_reprice_policy_when_global_policy_is_off(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=2, replacement_fill_price=2.73)
@@ -947,6 +963,7 @@ def test_filled_entry_commits_sized_risk_after_open_trade_is_persisted(tmp_path)
     assert risk_manager.commit_calls == ["TRADE_RISK_COMMIT"]
 
 
+@pytest.mark.usefixtures("entry_market_clock")
 def test_order_without_upward_step_is_cancelled_at_profile_deadline(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=3.00, quote_ask=3.20)
@@ -1040,6 +1057,7 @@ def test_execution_supervisor_lane_cancel_deadline_removes_unfilled_order(tmp_pa
     assert payload["cancel_after_seconds"] == 0
 
 
+@pytest.mark.usefixtures("entry_market_clock")
 def test_execution_supervisor_cancels_reprice_that_would_exceed_lane_premium_cap(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=2.90, quote_ask=3.10)
@@ -1262,6 +1280,7 @@ def test_entry_reprice_holds_reconciliation_for_overreported_fill_quantity(tmp_p
     assert payload["fill_quantity_ambiguous"] is True
 
 
+@pytest.mark.usefixtures("entry_market_clock")
 def test_execution_supervisor_holds_reconciliation_when_cancel_status_receipt_is_delayed(tmp_path) -> None:
     class SlowCancelReceiptOrderManager(RepricingOrderManager):
         async def get_order_status(self, order_id: str):
@@ -1355,6 +1374,7 @@ def test_execution_supervisor_cancels_unfilled_entry_after_reprice_ceiling(tmp_p
     assert "entry_reprice_cancel_after_timeout" in event_types
 
 
+@pytest.mark.usefixtures("entry_market_clock")
 def test_execution_supervisor_unusable_reprice_rests_then_cancels_at_deadline(tmp_path) -> None:
     repo = SQLiteEventRepository(str(tmp_path / "events.db"))
     order_manager = RepricingOrderManager(fill_after_orders=99, quote_bid=2.00, quote_ask=2.90)

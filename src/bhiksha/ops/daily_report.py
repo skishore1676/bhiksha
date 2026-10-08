@@ -1655,6 +1655,20 @@ def _app_running_row(report: dict[str, Any], *, app_status: dict[str, Any] | Non
         return ("App running", f"PID {pid} live since {started}" if pid else f"live since {started}", _ryg("GREEN"), "session active")
     if running:
         return ("App running", f"PID {pid} (not live) since {started}" if pid else f"running (dry) since {started}", _ryg("YELLOW"), "dry mode")
+    stop = app_status.get("session_stop_receipt") or {}
+    try:
+        from bhiksha.market_data.trading_calendar import regular_session_bounds
+        day = date.fromisoformat(report["trading_date"])
+        bounds = regular_session_bounds(day)
+        stopped_at = datetime.fromisoformat(stop["recorded_at"].replace("Z", "+00:00"))
+        checked_at = datetime.fromisoformat(app_status["checked_at"].replace("Z", "+00:00"))
+        if (bounds is not None and stop.get("status") == "ok" and stop.get("detail") == "stopped"
+                and stopped_at.astimezone(ZoneInfo("America/Chicago")).date() == day
+                and (not raw_started or datetime.fromisoformat(raw_started.replace("Z", "+00:00")) <= stopped_at)
+                and bounds[1] <= stopped_at <= checked_at):
+            return ("App running", "idle after session close", _ryg("GREEN"), "successful live-stop receipt")
+    except (KeyError, TypeError, ValueError):
+        pass
     return ("App running", "stopped", _ryg("RED"), "not running")
 
 

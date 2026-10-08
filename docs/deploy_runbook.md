@@ -148,6 +148,13 @@ If you change your mind during the day:
 
 Hot-reloading inside the same runtime is not the primary path yet. The intended operating model is sync plus restart.
 
+Direct `server_session` starts/restarts honor the installed observation marker at
+`artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled`, including its
+external-observer registration role. Read back the child `observation_flags` and
+`startup_config.app.exit_edge_live_shadow_enabled` after a cutover. A healthy
+external observer alone does not prove that new executor fills are registered.
+Preserve any explicit active-plan identity when recompiling during a restart.
+
 ## Server Process Commands
 
 - status:

@@ -344,6 +344,18 @@ def _session_report_job(args: argparse.Namespace) -> int:
         if not pid_path.is_absolute():
             pid_path = repo_root / pid_path
         app_status = _get_runtime_status(pid_path)
+        app_status["checked_at"] = datetime.now().astimezone().isoformat()
+        status_path = Path(runtime.app_config.playbook_artifacts_dir) / "launchd/latest_status.json"
+        if status_path.is_file():
+            try:
+                stop = json.loads(status_path.read_text()).get("jobs", {}).get("live-stop", {})
+            except (OSError, ValueError, TypeError):
+                stop = {}
+            payload = stop.get("payload") or {}
+            app_status["session_stop_receipt"] = {
+                "recorded_at": stop.get("recorded_at"),
+                "status": payload.get("status"), "detail": payload.get("detail"),
+            }
     except Exception as exc:  # noqa: BLE001 - report remains available with explicit probe failure.
         app_status = {
             "action": "status",

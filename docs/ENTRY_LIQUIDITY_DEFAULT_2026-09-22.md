@@ -1,8 +1,11 @@
 # Single-leg entry intent and implementation contract
 
 Updated October 8, 2026. This supersedes the September 22 pricing algorithm and
-original-opening-bid chase reference. Approved intent; implementation/deployment
-is pending. Production baseline is 0bab73a3, not this development checkout HEAD.
+original-opening-bid chase reference. The core policy was deployed October 8 at
+ce4fd043; its tests and loaded-owner/Sheet readback are recorded in
+`artifacts/observations/midpoint_entry_cutover_2026-10-08.json`. Natural broker
+conversion remains a separate acceptance check. The comparison-registration
+restart repair has its own receipt; the initial cutover receipt is preserved.
 
 ## Trader intent
 

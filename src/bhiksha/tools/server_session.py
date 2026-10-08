@@ -228,6 +228,15 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Direct restarts share the installer-owned observational mode with
+        # run_bhiksha_job.sh. Losing this flag leaves a healthy observer with
+        # no executor registrations. Preserve custom environments only when
+        # this checkout has no installed runtime-flags directory.
+        flags_dir = repo_root / "artifacts/playbook/runtime_flags"
+        if flags_dir.is_dir():
+            enabled = (flags_dir / "exit_edge_live_shadow.enabled").is_file()
+            env["BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED"] = str(enabled).lower()
+            env["BHIKSHA_EXIT_EDGE_OBSERVER_EXTERNAL_ENABLED"] = str(enabled).lower()
         with log_path.open("a", encoding="utf-8") as stdout_handle, err_log_path.open("a", encoding="utf-8") as stderr_handle:
             process = subprocess.Popen(  # noqa: S603
                 command,
@@ -248,6 +257,10 @@ def _start_runtime(args: argparse.Namespace) -> dict[str, object]:
             "max_bars": args.max_bars,
             "command": command,
             "repo_root": str(repo_root),
+            "observation_flags": {key: env.get(key) for key in (
+                "BHIKSHA_EXIT_EDGE_LIVE_SHADOW_ENABLED",
+                "BHIKSHA_EXIT_EDGE_OBSERVER_EXTERNAL_ENABLED",
+            )},
         }
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         pid_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")

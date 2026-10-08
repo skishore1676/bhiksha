@@ -3770,6 +3770,52 @@ class ExecutionSupervisor:
         )
         return restored
 
+    async def _persist_managed_position(self, updated: TrackedPosition) -> None:
+        self.planner.position_tracker.open_position(
+            updated.symbol,
+            updated.deployment_id,
+            trade_id=updated.trade_id,
+            option_symbol=updated.option_symbol,
+            quantity=updated.quantity,
+            entry_price=updated.entry_price,
+            underlying_entry_price=updated.underlying_entry_price,
+            entry_timestamp=updated.entry_timestamp,
+            source=updated.source,
+            order_id=updated.order_id,
+            stop_order_id=updated.stop_order_id,
+            stop_price=updated.stop_price,
+            target_order_id=updated.target_order_id,
+            target_price=updated.target_price,
+            exit_order_id=updated.exit_order_id,
+            exit_limit_price=updated.exit_limit_price,
+            exit_submitted_at=updated.exit_submitted_at,
+            exit_mode=updated.exit_mode,
+            exit_reprice_count=updated.exit_reprice_count,
+        )
+        if updated.trade_id is not None and updated.option_symbol is not None:
+            await self._upsert_trade_record(
+                TradeRecord(
+                    trade_id=updated.trade_id,
+                    deployment_id=updated.deployment_id,
+                    symbol=updated.symbol,
+                    option_symbol=updated.option_symbol,
+                    quantity=updated.quantity,
+                    entry_price=updated.entry_price,
+                    underlying_entry_price=updated.underlying_entry_price,
+                    entry_timestamp=updated.entry_timestamp,
+                    status=_tracked_trade_status(updated),
+                    entry_order_id=updated.order_id,
+                    stop_order_id=updated.stop_order_id,
+                    stop_price=updated.stop_price,
+                    target_order_id=updated.target_order_id,
+                    target_price=updated.target_price,
+                    exit_order_id=updated.exit_order_id,
+                    exit_limit_price=updated.exit_limit_price,
+                    exit_submitted_at=updated.exit_submitted_at,
+                    exit_mode=updated.exit_mode,
+                )
+            )
+
     async def _manage_open_position_locked(
         self,
         deployment: DeploymentManifest,
@@ -3879,6 +3925,8 @@ class ExecutionSupervisor:
                 quote = await self.planner.order_manager.get_option_quote(updated.option_symbol)
             return quote
         if dry_run and updated.source == "shadow" and deployment.exit.management_exit:
+            if updated != position:
+                await self._persist_managed_position(updated)
             return await self._record_profile_exit_shadow(deployment, updated, await ensure_quote(), dry_run=True)
         if dry_run and updated.source == "shadow":
             current_quote = await ensure_quote()
@@ -4248,50 +4296,7 @@ class ExecutionSupervisor:
             updated = ratcheted
 
         if updated != position:
-            self.planner.position_tracker.open_position(
-                updated.symbol,
-                updated.deployment_id,
-                trade_id=updated.trade_id,
-                option_symbol=updated.option_symbol,
-                quantity=updated.quantity,
-                entry_price=updated.entry_price,
-                underlying_entry_price=updated.underlying_entry_price,
-                entry_timestamp=updated.entry_timestamp,
-                source=updated.source,
-                order_id=updated.order_id,
-                stop_order_id=updated.stop_order_id,
-                stop_price=updated.stop_price,
-                target_order_id=updated.target_order_id,
-                target_price=updated.target_price,
-                exit_order_id=updated.exit_order_id,
-                exit_limit_price=updated.exit_limit_price,
-                exit_submitted_at=updated.exit_submitted_at,
-                exit_mode=updated.exit_mode,
-                exit_reprice_count=updated.exit_reprice_count,
-            )
-            if updated.trade_id is not None and updated.option_symbol is not None:
-                await self._upsert_trade_record(
-                    TradeRecord(
-                        trade_id=updated.trade_id,
-                        deployment_id=updated.deployment_id,
-                        symbol=updated.symbol,
-                        option_symbol=updated.option_symbol,
-                        quantity=updated.quantity,
-                        entry_price=updated.entry_price,
-                        underlying_entry_price=updated.underlying_entry_price,
-                        entry_timestamp=updated.entry_timestamp,
-                        status=_tracked_trade_status(updated),
-                        entry_order_id=updated.order_id,
-                        stop_order_id=updated.stop_order_id,
-                        stop_price=updated.stop_price,
-                        target_order_id=updated.target_order_id,
-                        target_price=updated.target_price,
-                        exit_order_id=updated.exit_order_id,
-                        exit_limit_price=updated.exit_limit_price,
-                        exit_submitted_at=updated.exit_submitted_at,
-                        exit_mode=updated.exit_mode,
-                    )
-                )
+            await self._persist_managed_position(updated)
 
         # PART A: SHADOW-RECORD DUAL-RUN + ARMED DISPATCH ROUTE. After the EXISTING
         # exit-management path has fully run, evaluate the operator exit profile for
