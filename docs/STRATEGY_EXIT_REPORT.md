@@ -34,7 +34,8 @@ report artifacts outside tracked source. Do not deploy this worktree implicitly.
    promotion. Names, figures, assessments and optional actions must be supported
    by that exact evidence snapshot.
 
-3. Stage `scripts/reports/render_strategy_exit_report.mjs` in a disposable
+3. Stage `scripts/reports/render_strategy_exit_report.mjs` and
+   `scripts/reports/hide_supporting_sheets.py` in a disposable
    rendering directory with a `node_modules` symlink to the configured
    `@oai/artifact-tool` dependency environment. Execute:
 
@@ -44,7 +45,7 @@ report artifacts outside tracked source. Do not deploy this worktree implicitly.
    ```
 
    The renderer exports one workbook, renders every worksheet, validates the
-   summary counts, and tests a disposable input change/restore before saving.
+   header/table contents, and preserves detail records before saving.
    Review the previews and error scan before delivery. Native Excel execution
    is a separate verification, not implied by successful export.
 
@@ -64,8 +65,12 @@ report artifacts outside tracked source. Do not deploy this worktree implicitly.
 - Evaluation receipts establish partial coverage, not a complete monitoring
   denominator. Without evaluations or positive receipts, signal counts are
   Unknown. Zero means no positive signal was recorded in the observed evidence.
-- The matrix includes no-signal configurations and unobserved latest-inventory
-  configurations. Active results are sorted first. The default window for the
+- The matrix uses daily signal/entry cohorts; Date and Monday Week starting
+  are filterable typed dates. It includes observed no-signal configurations,
+  not invented unobserved daily inventory. Recent dates are sorted first.
+  The visible tab begins with column names at row 1 and data at row 2; it has
+  no title or summary rows. Three detail tabs are hidden, not deleted.
+  The default window for the
   first artifact was the last completed trading week; there is no scheduler.
 - Live and shadow recorded outcomes are separate columns. P&L math reuses the
   application's partial-fill accounting and historical exclusions. Open
@@ -90,7 +95,8 @@ report artifacts outside tracked source. Do not deploy this worktree implicitly.
   are excluded from the window's terminal economics. This remains an entry
   cohort view, not a cash-flow-by-exit-date statement.
 
-After the report stabilizes through operator review, package these steps as a
-repository-owned skill. Orchestration may transport them, but calculations,
-evidence ownership, and interpretation contract stay here. No Lobster workflow,
-resident trader assignment, or recurring job has been installed by this prototype.
+The repository-owned skill is
+`.agents/skills/bhiksha-strategy-exit-review/SKILL.md`. Trading Lead receives
+this on-demand workflow and owns subsequent agent inference. Orchestration
+may transport it, but calculations and evidence ownership stay here. No
+Lobster workflow or recurring job is needed or installed.

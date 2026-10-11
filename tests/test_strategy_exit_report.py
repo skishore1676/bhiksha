@@ -1,6 +1,33 @@
 from copy import deepcopy
 import pytest
-from bhiksha.ops.strategy_exit_report import summarize, attach_inferences, report_digest
+from bhiksha.ops.strategy_exit_report import summarize, summarize_daily, attach_inferences, report_digest
+
+
+def test_daily_cohorts_preserve_economics_and_use_central_date_and_monday():
+    s = source()
+    s['window'] = {'start': '2026-10-04', 'end': '2026-10-06'}
+    s['trades'] = [trade('sunday', entry_timestamp='2026-10-05T02:00:00Z'),
+                   trade('monday', entry_timestamp='2026-10-05T14:00:00Z', realized_pnl_usd=20)]
+    s['cases'] = [case('sunday'), case('monday', a=30, b=40)]
+    s['events'] = [event('signal_evaluation', signal=False)]
+    report = summarize_daily(s)
+    rows = {r['date']: r for r in report['rows']}
+    assert rows['2026-10-04']['week_start'] == '2026-09-28'
+    assert rows['2026-10-05']['week_start'] == '2026-10-05'
+    assert rows['2026-10-04']['signals_fired'] is None
+    assert rows['2026-10-05']['signals_fired'] == 0
+    assert rows['2026-10-04']['recorded_pnl_usd'] == 10
+    assert rows['2026-10-05']['recorded_pnl_usd'] == 20
+    assert rows['2026-10-04']['modeled_pnl'] == {'A': 10, 'B': 20}
+    assert rows['2026-10-05']['modeled_pnl'] == {'A': 30, 'B': 40}
+    assert len({r['row_id'] for r in report['rows']}) == 2
+
+
+def test_daily_empty_window_does_not_invent_dated_activity():
+    report = summarize_daily(source())
+    assert report['rows'] == []
+    assert report['signals'] == []
+    assert report['trades'] == []
 
 
 def source():

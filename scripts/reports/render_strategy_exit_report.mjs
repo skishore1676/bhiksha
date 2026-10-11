@@ -2,6 +2,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { Workbook, SpreadsheetFile } from '@oai/artifact-tool';
 
 const [inputPath, outputPath] = process.argv.slice(2);
@@ -19,24 +21,27 @@ const available = x => x ?? 'Unknown';
 const col = i => { let s = ''; for (i++; i; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s; return s; };
 function format(sheet, title, headers, rows, widths) {
   sheet.showGridLines = false;
-  sheet.getRange('A2').values = [[title]];
-  sheet.getRange('A2').format.font = {name: 'Arial', size: 15, bold: true};
-  const last = col(headers.length - 1), end = Math.max(7, rows.length + 6);
-  sheet.getRange(`A6:${last}6`).values = [headers];
-  if (rows.length) sheet.getRange(`A7:${last}${end}`).values = rows;
-  sheet.getRange(`A6:${last}${end}`).format.font = {name: 'Arial', size: 10};
-  sheet.getRange(`A6:${last}6`).format = {fill: '#253858', font: {name: 'Arial', size: 10, bold: true, color: '#FFFFFF'},
+  const header = sheet === summary ? 1 : 6, first = header + 1;
+  if (sheet !== summary) {
+    sheet.getRange('A2').values = [[title]];
+    sheet.getRange('A2').format.font = {name: 'Arial', size: 15, bold: true};
+  }
+  const last = col(headers.length - 1), end = Math.max(first, rows.length + header);
+  sheet.getRange(`A${header}:${last}${header}`).values = [headers];
+  if (rows.length) sheet.getRange(`A${first}:${last}${end}`).values = rows;
+  sheet.getRange(`A${header}:${last}${end}`).format.font = {name: 'Arial', size: 10};
+  sheet.getRange(`A${header}:${last}${header}`).format = {fill: '#253858', font: {name: 'Arial', size: 10, bold: true, color: '#FFFFFF'},
     wrapText: true, rowHeight: 56, horizontalAlignment: 'center', verticalAlignment: 'center'};
-  sheet.getRange(`A7:${last}${end}`).format.rowHeight = 38;
-  sheet.getRange(`A7:${last}${end}`).format.verticalAlignment = 'center';
-  sheet.getRange(`A7:${last}${end}`).format.wrapText = true;
-  widths.forEach((width, i) => {sheet.getRange(`${col(i)}6:${col(i)}${end}`).format.columnWidth = width;});
+  sheet.getRange(`A${first}:${last}${end}`).format.rowHeight = 38;
+  sheet.getRange(`A${first}:${last}${end}`).format.verticalAlignment = 'center';
+  sheet.getRange(`A${first}:${last}${end}`).format.wrapText = true;
+  widths.forEach((width, i) => {sheet.getRange(`${col(i)}${header}:${col(i)}${end}`).format.columnWidth = width;});
   if (rows.length) {
-    const table = sheet.tables.add(`A6:${last}${end}`, true, sheet.name.replaceAll(' ', '') + 'Table');
+    const table = sheet.tables.add(`A${header}:${last}${end}`, true, sheet.name.replaceAll(' ', '') + 'Table');
     table.style = 'TableStyleLight1';
     table.showFilterButton = true;
   }
-  sheet.freezePanes.freezeRows(6);
+  sheet.freezePanes.freezeRows(header);
   sheet.freezePanes.freezeColumns(sheet === summary ? 4 : 2);
   return end;
 }
@@ -70,57 +75,41 @@ signals.getRange('A3').values = [[`Source: trading events through event ${d.sour
 signals.getRange('A4').values = [['Captured = signal_decision or signal_outcome persisted. Fired = unique positive signal receipts, not guaranteed upstream totals.']];
 signals.getRange('C7:C'+signalEnd).setNumberFormat('mm/dd/yy hh:mm');
 
-const headers = ['Strategy','Source','Underlying','Lane','Direction','Version','Entry profile','Default exit',
+const headers = ['Date','Week starting','Strategy','Source','Underlying','Lane','Direction','Version','Entry profile','Default exit',
   'Signals fired\nrecorded','Signals\ncaptured','Filled\ntrades','Closed\ntrades','Observed\nsessions',
   'Live recorded\nP&L USD','Shadow recorded\nP&L USD','Common clean\ncomparisons',
   ...d.exit_columns.map(p => `${pretty(p)}\nModeled USD`),
   'Coverage','Record ID','Inference author','Inference'];
-const reviewed = [...d.rows].sort((a,b) => b.common_comparisons-a.common_comparisons || b.filled-a.filled || (b.signals_fired||0)-(a.signals_fired||0) || a.strategy.localeCompare(b.strategy));
-const rows = reviewed.map(r => [pretty(r.strategy),pretty(r.source),r.symbol,r.lane,r.direction,r.version,pretty(r.entry_profile),pretty(r.default_exit),
+const reviewed = [...d.rows].sort((a,b) => b.date.localeCompare(a.date) || b.common_comparisons-a.common_comparisons || b.filled-a.filled || (b.signals_fired||0)-(a.signals_fired||0) || a.strategy.localeCompare(b.strategy));
+const rows = reviewed.map(r => [new Date(r.date+'T00:00:00Z'),new Date(r.week_start+'T00:00:00Z'),pretty(r.strategy),pretty(r.source),r.symbol,r.lane,r.direction,r.version,pretty(r.entry_profile),pretty(r.default_exit),
   available(r.signals_fired),available(r.signals_captured),r.filled,r.closed,r.observed_sessions,
   r.lane === 'live' ? available(r.recorded_pnl_usd) : 'n.a.',r.lane === 'shadow' ? available(r.recorded_pnl_usd) : 'n.a.',r.common_comparisons,
   ...d.exit_columns.map(p => available(r.modeled_pnl[p])),r.coverage,r.row_id,r.inference?.author || 'Not written',
   r.inference ? `Assessment: ${r.inference.assessment}.\nReason: ${r.inference.reason}\nNext step: ${r.inference.next_step}` : 'Inference not written.']);
-const widths = [38,24,12,12,12,10,18,30,13,13,12,12,13,18,18,15,...d.exit_columns.map(()=>22),14,38,16,75];
+const widths = [14,16,38,24,12,12,12,10,18,30,13,13,12,12,13,18,18,15,...d.exit_columns.map(()=>22),14,38,16,75];
 const summaryEnd = format(summary,'Bhiksha strategy and exit review',headers,rows,widths);
+summary.getRange(`A2:B${summaryEnd}`).setNumberFormat('mm/dd/yy');
 summary.tabColor = '#253858';
-summary.getRange('A3').values = [[`${d.window.start} to ${d.window.end} (Central). Modeled columns use the same clean trades across that row's frozen exit set. Fees $0.`]];
-summary.getRange('A4').values = [['Confirmed trades']];
-summary.getRange('B4').formulas = [[`=COUNTIFS('Trades'!C7:C${tradeEnd},1)`]];
-summary.getRange('D4').values = [['Live']];
-summary.getRange('E4').formulas = [[`=COUNTIFS('Trades'!C7:C${tradeEnd},1,'Trades'!D7:D${tradeEnd},"live")`]];
-summary.getRange('F4').values = [['Shadow']];
-summary.getRange('G4').formulas = [[`=COUNTIFS('Trades'!C7:C${tradeEnd},1,'Trades'!D7:D${tradeEnd},"shadow")`]];
-summary.getRange('H4').values = [['Unique signal receipts']];
-summary.getRange('J4').formulas = [[`=COUNTA('Signal detail'!B7:B${signalEnd})`]];
-summary.getRange('L4').values = [['Partial coverage does not prove a full monitored session. Counts repeat if a group has multiple frozen exit sets; do not sum matrix rows.']];
-summary.getRange(`N7:O${summaryEnd}`).setNumberFormat('"$"#,##0;("$"#,##0)');
-if (d.exit_columns.length) summary.getRange(`Q7:${col(15 + d.exit_columns.length)}${summaryEnd}`).setNumberFormat('"$"#,##0;("$"#,##0)');
+trades.getRange('A5').values = [[`Report ${d.window.start} to ${d.window.end} (Central). Date = signal/entry cohort; week starts Monday. Outcomes through window end. Counts repeat across frozen exit sets; do not sum matrix context.`]];
+summary.getRange(`P2:Q${summaryEnd}`).setNumberFormat('"$"#,##0;("$"#,##0)');
+if (d.exit_columns.length) summary.getRange(`S2:${col(17 + d.exit_columns.length)}${summaryEnd}`).setNumberFormat('"$"#,##0;("$"#,##0)');
 const lastCol = col(headers.length-1);
-summary.getRange(`${lastCol}7:${lastCol}${summaryEnd}`).format.rowHeight = 78;
-summary.getRange(`${lastCol}7:${lastCol}${summaryEnd}`).format.verticalAlignment = 'top';
-summary.getRange(`${lastCol}7:${lastCol}${summaryEnd}`).conditionalFormats.add('containsText', {text: 'Assessment: evidence blocked',format:{fill:'#FFF2CC'}});
-summary.getRange(`${lastCol}7:${lastCol}${summaryEnd}`).conditionalFormats.add('containsText', {text: 'Assessment: collecting',format:{fill:'#E8EEF6'}});
+summary.getRange(`${lastCol}2:${lastCol}${summaryEnd}`).format.rowHeight = 78;
+summary.getRange(`${lastCol}2:${lastCol}${summaryEnd}`).format.verticalAlignment = 'top';
+summary.getRange(`${lastCol}2:${lastCol}${summaryEnd}`).conditionalFormats.add('containsText', {text: 'Assessment: evidence blocked',format:{fill:'#FFF2CC'}});
+summary.getRange(`${lastCol}2:${lastCol}${summaryEnd}`).conditionalFormats.add('containsText', {text: 'Assessment: collecting',format:{fill:'#E8EEF6'}});
 w.recalculate();
 const confirmed = d.trades.filter(t=>t.fill_confirmed);
-assert.equal(summary.getRange('B4').values[0][0], confirmed.length);
-assert.equal(summary.getRange('E4').values[0][0], confirmed.filter(t=>t.lane==='live').length);
-assert.equal(summary.getRange('G4').values[0][0], confirmed.filter(t=>t.lane==='shadow').length);
-// Meaningful disposable edit/restore verifies formula dependencies.
-if (tradeRows.length && tradeRows[0][2]) {
-  trades.getRange('C7').values = [[0]];
-  w.recalculate();
-  assert.equal(summary.getRange('B4').values[0][0], confirmed.length-1);
-  trades.getRange('C7').values = [[1]];
-  w.recalculate();
-}
-const inspection = await w.inspect({kind:'table',range:'Strategy review!A4:J4',include:'values,formulas',tableMaxRows:1,tableMaxCols:10,maxChars:2000});
+assert.deepEqual(summary.getRange(`A1:${lastCol}1`).values[0], headers);
+if (rows.length) assert.equal(summary.getRange(`C2:C${summaryEnd}`).values.filter(r => r[0] != null).length, rows.length);
+const inspection = await w.inspect({kind:'table',range:'Strategy review!A1:F3',include:'values,formulas',tableMaxRows:3,tableMaxCols:6,maxChars:2000});
 const errorScan = await w.inspect({kind:'match',searchTerm:'#REF!|#DIV/0!|#VALUE!|#NAME\\?|#NUM!|#NULL!|#SPILL!|#CALC!',options:{useRegex:true,maxResults:30},maxChars:2000});
 await fs.writeFile(path.join(outDir,'excel-verification.json'),JSON.stringify({inspection:inspection.ndjson,errorScan:errorScan.ndjson,rows:rows.length,confirmedTrades:confirmed.length},null,2));
-for (const [sheet,range,name] of [[summary,'A2:M10','review-identity'],[summary,`N6:${lastCol}10`,'review-results'],[trades,'A2:N12','trades'],[exits,'A2:J12','exits'],[signals,'A2:F12','signals']]) {
+for (const [sheet,range,name] of [[summary,'A1:M5','review-identity'],[summary,`N1:${lastCol}5`,'review-results'],[trades,'A2:N12','trades'],[exits,'A2:J12','exits'],[signals,'A2:F12','signals']]) {
   const png = await w.render({sheetName:sheet.name,range,scale:1.3,format:'png'});
   await fs.writeFile(path.join(outDir,`${name}.png`),new Uint8Array(await png.arrayBuffer()));
 }
 const xlsx = await SpreadsheetFile.exportXlsx(w);
 await xlsx.save(outputPath);
+execFileSync('python3', [fileURLToPath(new URL('./hide_supporting_sheets.py', import.meta.url)), outputPath]);
 console.log(JSON.stringify({status:'ok',output:outputPath,rows:rows.length,confirmedTrades:confirmed.length}));

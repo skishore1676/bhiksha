@@ -304,3 +304,48 @@ def report_digest(report):
     stable = {k: v for k, v in report.items() if k != "generated_at"}
     stable["rows"] = [{k: v for k, v in r.items() if k != "inference"} for r in report["rows"]]
     return hashlib.sha256(json.dumps(stable, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def summarize_daily(inputs):
+    """Daily entry/signal cohorts; outcomes retain the full report as-of cutoff."""
+    days = defaultdict(lambda: {"events": [], "trades": [], "cases": []})
+    for event in inputs["events"]:
+        payload = event["payload"]
+        at = payload.get("timestamp") or event["created_at"]
+        day = _stamp(at).astimezone(CT).date().isoformat()
+        if inputs["window"]["start"] <= day <= inputs["window"]["end"]:
+            days[day]["events"].append(event)
+    trade_dates = {}
+    for trade in inputs["trades"]:
+        day = _stamp(trade["entry_timestamp"]).astimezone(CT).date().isoformat()
+        days[day]["trades"].append(trade)
+        trade_dates[trade["trade_id"]] = day
+    for case in inputs["cases"]:
+        day = trade_dates.get(case["trade_id"])
+        if day is None:
+            day = _stamp(case["entry_timestamp"]).astimezone(CT).date().isoformat()
+        days[day]["cases"].append(case)
+    result = None
+    for day, records in sorted(days.items()):
+        daily = summarize({**inputs, **records, "inventory_revision": "daily-observed-only"})
+        if result is None:
+            result = {**daily, "rows": [], "trades": [], "signals": [], "exits": []}
+        for row in daily["rows"]:
+            row["date"] = day
+            dt = date.fromisoformat(day)
+            row["week_start"] = (dt - timedelta(days=dt.weekday())).isoformat()
+            row["row_id"] = day + ":" + row["row_id"]
+            row["group_id"] = day + ":" + row["group_id"]
+        for key in ("trades", "signals", "exits"):
+            for detail in daily[key]:
+                detail["row_id"] = day + ":" + detail["row_id"]
+        for key in ("rows", "trades", "signals", "exits"):
+            result[key].extend(daily[key])
+    if result is None:
+        result = {**summarize(inputs), "rows": [], "signals": [], "trades": [], "exits": []}
+    result["schema"] = "bhiksha.strategy-exit-report.daily.v1"
+    result["exit_columns"] = sorted({e["policy"] for e in result["exits"]})
+    for row in result["rows"]:
+        for policy in result["exit_columns"]:
+            row["modeled_pnl"].setdefault(policy, None)
+    return result

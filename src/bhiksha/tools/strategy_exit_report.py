@@ -3,7 +3,7 @@ import argparse
 from datetime import date
 import json
 from pathlib import Path
-from bhiksha.ops.strategy_exit_report import extract, summarize, attach_inferences, report_digest
+from bhiksha.ops.strategy_exit_report import extract, summarize_daily, attach_inferences, report_digest
 
 
 def main(argv=None):
@@ -20,7 +20,7 @@ def main(argv=None):
     if a.db_path:
         if not all((a.exit_db_path, a.start, a.end)):
             p.error("--db-path requires --exit-db-path, --start and --end")
-        report = summarize(extract(a.db_path, a.exit_db_path, a.start, a.end))
+        report = summarize_daily(extract(a.db_path, a.exit_db_path, a.start, a.end))
     else:
         report = json.loads(Path(a.report_json).read_text())
     if a.inferences:
