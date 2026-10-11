@@ -860,7 +860,7 @@ def test_observer_resumes_after_rejection_write_failure_with_honest_gap(tmp_path
         def try_record_quote_rejection(self, *args, **kwargs):
             return False
 
-    registration = _recorder(tmp_path, role="registration")
+    registration = _recorder(tmp_path, role="registration", max_freshness_ms=5_000)
     _, payload = registration._registration_payloads(
         deployment=_deployment(), trade_id="rejection-write-failure",
         option_symbol=OPTION, entry_timestamp=ENTRY, entry_premium=2.0, quantity=10,

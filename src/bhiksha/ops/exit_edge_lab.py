@@ -61,16 +61,20 @@ FILL_MODEL = (
 )
 EVALUATOR_VERSION = "profile-evaluator-v1"
 FILL_MODEL_VERSION = "next-fresh-natural-bid-v2"
-# Generation 5 keeps the quote tape alive outside the execution process.
+SAMPLED_FILL_MODEL_VERSION = "next-sampled-natural-bid-v3"
+# Generation 6 measures sampled exits at receipt time, with 30-second quotes.
+# Historical cohorts retain their frozen timing and freshness rules.
 # Any change to these dimensions must create a new generation id.
 # Includes freshness/sequence/latency which materially affect pairing.
 CURRENT_MEASUREMENT_GENERATION = {
-    "generation_id": "gen5-independent-public-observer-2026-09-23",
-    "quote_feed": "independent_public_option_observer_v1",
+    "generation_id": "gen6-sampled-public-observer-2026-10-11",
+    "quote_feed": "independent_public_option_observer_v2",
     "quote_source": "public_api",
-    "fill_model_version": FILL_MODEL_VERSION,
+    "fill_model_version": SAMPLED_FILL_MODEL_VERSION,
     "evaluator_version": EVALUATOR_VERSION,
-    "max_freshness_ms": 5_000,
+    "decision_clock": "received_at",
+    "poll_seconds": 15,
+    "max_freshness_ms": 30_000,
     "max_sequence_gap": 1,
     "fill_latency_ms": 0,
     "max_observation_gap_seconds": 65,
@@ -978,11 +982,15 @@ def load_fixture_cases(path: str | Path) -> list[ExitEdgeCase]:
     return [_case_from_mapping(item) for item in items]
 
 
-def analyze_cases(cases: list[ExitEdgeCase]) -> dict[str, Any]:
+def analyze_cases(cases: list[ExitEdgeCase], *, quote_sensitivity: bool = False) -> dict[str, Any]:
     rows = [
         _analyze_case(case)
         for case in cases
     ]
+    if quote_sensitivity:
+        for case, row in zip(cases, rows):
+            if "named_profiles" in case.experiment:
+                row["quote_sensitivity"] = _strict_quote_sensitivity(case, row)
     paired = [row for row in rows if row["status"] == "paired"]
     specs = sorted({row["experiment_spec_hash"] for row in rows})
     legacy_rows = [row for row in rows if "named_profiles" not in row["experiment_spec"]]
@@ -1556,6 +1564,43 @@ def _analyze_case(case: ExitEdgeCase) -> dict[str, Any]:
             )}
 
 
+def _decision_at(case: ExitEdgeCase, quote: QuoteTapeMark) -> datetime:
+    return quote.received_at if case.experiment.get("decision_clock") == "received_at" else quote.quote_at
+
+
+def _strict_quote_sensitivity(case: ExitEdgeCase, primary: dict[str, Any]) -> dict[str, Any]:
+    """Read-only five-second replay on the same collected tape and decision clock.
+
+    Removing observations creates real gaps. Renumber the retained sequence so
+    dropped stale observations do not masquerade as writer loss. Never persist
+    this derived case or claim it recovers observations outside the saved tape.
+    """
+    limit = min(5_000, int(case.experiment["max_freshness_ms"]))
+    if not primary.get("arm_evidence_status") or int(case.experiment["max_freshness_ms"]) <= limit:
+        strict = primary
+    else:
+        quotes = tuple(replace(q, sequence=i + 1) for i, q in enumerate(
+            q for q in case.quotes if 0 <= (q.received_at - q.quote_at).total_seconds() * 1000 <= limit))
+        gaps = list(case.observation_gaps)
+        previous = None
+        for q in quotes:
+            anchor = previous.received_at if previous else case.entry_timestamp
+            if _observable_seconds(anchor, q.received_at) > float(case.experiment.get("max_observation_gap_seconds", 65)):
+                gaps.append(ObservationGap(previous.sequence if previous else None, q.sequence,
+                    previous.quote_at if previous else None, previous.received_at if previous else None,
+                    q.quote_at, q.received_at, "strict_sensitivity_observation_gap"))
+            previous = q
+        experiment = {**case.experiment, "max_freshness_ms": limit}
+        derived = replace(case, quotes=quotes, observation_gaps=tuple(gaps), experiment=experiment,
+            experiment_spec_hash=experiment_spec_hash(case.profile_config, case.legacy_config, experiment))
+        strict = _analyze_named_case(derived)
+    return {"max_freshness_ms": limit, "source_experiment_hash": case.experiment_spec_hash,
+            "basis": "same saved tape and decision clock; no reconstructed quotes",
+            "arm_evidence_status": strict.get("arm_evidence_status", {}),
+            "named_exit_outcomes": strict.get("named_exit_outcomes", {}),
+            "insufficient_reason": strict.get("insufficient_reason")}
+
+
 def _replay(case: ExitEdgeCase, policy: str, latency_ms: int, max_freshness_ms: int) -> PolicyOutcome | None:
     state = ProfileExitState.new(case.entry_premium, seed_quantity=case.quantity)
     remaining = case.quantity; pnl = 0.0; legs: list[dict[str, Any]] = []
@@ -1587,8 +1632,8 @@ def _replay(case: ExitEdgeCase, policy: str, latency_ms: int, max_freshness_ms: 
             decision = evaluate_profile_exit(
                 fields=case.profile, entry_premium=case.entry_premium, quantity=case.quantity,
                 market=ProfileMarketView(current_premium=bid,
-                    bar_time_et=quote.quote_at.astimezone(ET).time().replace(tzinfo=None), bid=bid, ask=quote.ask, last=quote.last),
-                entry_time=case.entry_timestamp, now=quote.quote_at, state=state, require_bar_time_for_eod=True)
+                    bar_time_et=_decision_at(case, quote).astimezone(ET).time().replace(tzinfo=None), bid=bid, ask=quote.ask, last=quote.last),
+                entry_time=case.entry_timestamp, now=_decision_at(case, quote), state=state, require_bar_time_for_eod=True)
             if decision.exit:
                 partial = decision.fsm_action is ProfileFsmAction.PARTIAL_SCALE
                 pending = (quote, decision.rule.value, decision.exit_quantity or remaining, partial)
@@ -1596,7 +1641,7 @@ def _replay(case: ExitEdgeCase, policy: str, latency_ms: int, max_freshness_ms: 
             rule = None
             if bid <= case.entry_premium*(1-stop_pct): rule = "legacy_option_stop"
             elif target_pct is not None and bid >= case.entry_premium*(1+float(target_pct)): rule = "legacy_full_target"
-            elif quote.quote_at.astimezone(ET).strftime("%H:%M") >= str(case.legacy_config.get("hard_flat_time_et", "15:55")):
+            elif _decision_at(case, quote).astimezone(ET).strftime("%H:%M") >= str(case.legacy_config.get("hard_flat_time_et", "15:55")):
                 rule = "legacy_eod_flat"
             if rule: pending = (quote, rule, remaining, False)
     return None
@@ -1623,13 +1668,13 @@ def _control_observations(
                 quantity=case.quantity,
                 market=ProfileMarketView(
                     current_premium=float(quote.bid),
-                    bar_time_et=quote.quote_at.astimezone(ET).time().replace(tzinfo=None),
+                    bar_time_et=_decision_at(case, quote).astimezone(ET).time().replace(tzinfo=None),
                     bid=quote.bid,
                     ask=quote.ask,
                     last=quote.last,
                 ),
                 entry_time=case.entry_timestamp,
-                now=quote.quote_at,
+                now=_decision_at(case, quote),
                 state=state,
                 require_bar_time_for_eod=True,
             )
@@ -1867,13 +1912,13 @@ def _replay_envelope_candidate(
             quantity=case.quantity,
             market=ProfileMarketView(
                 current_premium=float(quote.bid),
-                bar_time_et=quote.quote_at.astimezone(ET).time().replace(tzinfo=None),
+                bar_time_et=_decision_at(case, quote).astimezone(ET).time().replace(tzinfo=None),
                 bid=quote.bid,
                 ask=quote.ask,
                 last=quote.last,
             ),
             entry_time=case.entry_timestamp,
-            now=quote.quote_at,
+            now=_decision_at(case, quote),
             state=profile_state,
             require_bar_time_for_eod=True,
         )
@@ -1984,7 +2029,7 @@ def _tape_problem(case: ExitEdgeCase, max_freshness_ms: int, max_sequence_gap: i
         return "experiment_spec_hash_mismatch"
     if (
         case.experiment["evaluator_version"] != EVALUATOR_VERSION
-        or case.experiment["fill_model_version"] != FILL_MODEL_VERSION
+        or case.experiment["fill_model_version"] not in {FILL_MODEL_VERSION, SAMPLED_FILL_MODEL_VERSION}
     ):
         return "unsupported_evaluator_or_fill_model_version"
     if len(case.quotes) < 2: return "quote_tape_too_short_for_next_tick_fill"
@@ -2178,6 +2223,14 @@ def _normalized_experiment(value: dict[str, Any]) -> dict[str, Any]:
         "quote_source": str(value["quote_source"]),
         "quote_feed": str(value["quote_feed"]),
     }
+    if "decision_clock" in value:
+        if value["decision_clock"] not in {"quote_at", "received_at"}:
+            raise ValueError("unsupported observation decision clock")
+        normalized["decision_clock"] = value["decision_clock"]
+    if "poll_seconds" in value:
+        if float(value["poll_seconds"]) <= 0:
+            raise ValueError("poll_seconds must be positive")
+        normalized["poll_seconds"] = float(value["poll_seconds"])
     if "max_observation_gap_seconds" in value:
         gap_limit = float(value["max_observation_gap_seconds"])
         if gap_limit <= 0:
@@ -2324,7 +2377,7 @@ def _normalized_risk_envelope_experiment(value: Any) -> dict[str, Any]:
 
 
 def classify_measurement_generation(experiment: dict[str, Any]) -> str:
-    """Return 'current' if the experiment matches the frozen Gen4 protocol, else 'legacy'."""
+    """Return 'current' if the experiment matches the current frozen protocol, else 'legacy'."""
     exp = _normalized_experiment(experiment) if experiment else {}
     cur = CURRENT_MEASUREMENT_GENERATION
     # Catalog fingerprint — six-arm overlay hashes are part of generation
@@ -2350,6 +2403,8 @@ def classify_measurement_generation(experiment: dict[str, Any]) -> str:
         and exp.get("quote_source") == cur["quote_source"]
         and exp.get("fill_model_version") == cur["fill_model_version"]
         and exp.get("evaluator_version") == cur["evaluator_version"]
+        and exp.get("decision_clock") == cur["decision_clock"]
+        and exp.get("poll_seconds") == cur["poll_seconds"]
         and int(exp.get("max_freshness_ms", cur["max_freshness_ms"])) == int(cur["max_freshness_ms"])
         and int(exp.get("max_sequence_gap", cur["max_sequence_gap"])) == int(cur["max_sequence_gap"])
         and int(exp.get("fill_latency_ms", cur["fill_latency_ms"])) == int(cur["fill_latency_ms"])

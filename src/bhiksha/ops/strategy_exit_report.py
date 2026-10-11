@@ -141,10 +141,21 @@ def summarize(inputs: dict) -> dict:
             clean = status == "complete_clean" and _finite(outcome.get("realized_pnl_usd"))
             if case.get("insufficient_reason", "") and str(case["insufficient_reason"]).startswith("persisted_censor:"):
                 clean = False
+            strict = case.get("quote_sensitivity") or {}
+            strict_outcome = (strict.get("named_exit_outcomes") or {}).get(policy) or {}
+            strict_clean = (strict.get("arm_evidence_status") or {}).get(policy) == "complete_clean" and _finite(strict_outcome.get("realized_pnl_usd"))
+            spec = case.get("experiment_spec") or {}
             record = {"row_id": g["row_id"], "trade_id": case["trade_id"], "policy": policy,
                 "experiment_hash": case["experiment_spec_hash"], "evidence_status": status,
                 "pnl_usd": outcome.get("realized_pnl_usd") if clean else None,
                 "clean": clean, "exit_at": outcome.get("exit_timestamp"),
+                "diagnostic_pnl_usd": outcome.get("realized_pnl_usd") if status == "gap_affected_diagnostic" else None,
+                "strict_clean": strict_clean,
+                "strict_pnl_usd": strict_outcome.get("realized_pnl_usd") if strict_clean else None,
+                "max_quote_age_seconds": spec.get("max_freshness_ms", 0) / 1000,
+                "poll_seconds": spec.get("poll_seconds"),
+                "decision_clock": spec.get("decision_clock", "quote_at"),
+                "measurement": "sampled estimate" if spec.get("decision_clock") == "received_at" else "historical strict estimate",
                 "limitation": case.get("insufficient_reason"),
                 "baseline": profiles[0]["policy_id"]}
             g["exit_sets"][case["experiment_spec_hash"]].append(record)
@@ -179,6 +190,9 @@ def summarize(inputs: dict) -> dict:
             r["modeled_pnl"] = {p: round(sum(arms[p]["pnl_usd"] for arms in common), 2)
                                 if common and p in policies else None for p in exit_columns}
             r["modeled_completed"] = {p: sum(d["clean"] for d in details if d["policy"] == p) for p in exit_columns}
+            r["pairwise_comparisons"] = _pairwise_comparisons(by_trade, policies)
+            r["measurement"] = ({k: details[0][k] for k in
+                ("max_quote_age_seconds", "poll_seconds", "decision_clock", "measurement")} if details else None)
             r["inference"] = None
             rows.append(r)
     return {"schema": "bhiksha.strategy-exit-report.v1", "window": inputs["window"],
@@ -186,6 +200,39 @@ def summarize(inputs: dict) -> dict:
             "exit_columns": exit_columns, "rows": sorted(rows, key=lambda r: (r["strategy"], r["symbol"], r["lane"], r["row_id"])),
             "signals": signal_details, "trades": trade_details, "exits": exit_details,
             "source_receipt": inputs.get("source_receipt", {})}
+
+
+def _pairwise_comparisons(by_trade, policies):
+    """Each challenger uses its own matched baseline sample, never other arms' P&L."""
+    result = {}
+    baseline = next((d["baseline"] for arms in by_trade.values() for d in arms.values()), None)
+    for policy in sorted(policies - {baseline}):
+        pairs = [(arms[baseline], arms[policy]) for arms in by_trade.values()
+                 if baseline in arms and policy in arms]
+        clean = [(b, a) for b, a in pairs if b["clean"] and a["clean"]]
+        common = [(b, a) for b, a in clean if b["strict_clean"] and a["strict_clean"]]
+        def total(items, side, field):
+            return round(sum(pair[side][field] for pair in items), 2) if items else None
+        def delta(items, field):
+            return round(sum(a[field] - b[field] for b, a in items), 2) if items else None
+        sampled_delta, strict_delta = delta(common, "pnl_usd"), delta(common, "strict_pnl_usd")
+        sensitive = bool(common and ((sampled_delta > 0 and strict_delta <= 0)
+                                    or (sampled_delta < 0 and strict_delta >= 0)
+                                    or (sampled_delta == 0 and strict_delta != 0)))
+        gaps = sum(any(str(d["evidence_status"]).startswith("gap_affected") for d in (b, a)) for b, a in pairs)
+        result[policy] = {"baseline": baseline, "registered_pairs": len(pairs), "paired_count": len(clean),
+            "baseline_pnl_usd": total(clean, 0, "pnl_usd"), "candidate_pnl_usd": total(clean, 1, "pnl_usd"),
+            "delta_pnl_usd": delta(clean, "pnl_usd"),
+            "trade_ids": [a["trade_id"] for b, a in clean],
+            "gap_affected_count": gaps,
+            "pending_count": sum(any(d["evidence_status"] in {"still_collecting", "gap_affected_collecting"} for d in (b,a)) for b,a in pairs),
+            "unavailable_count": len(pairs) - len(clean),
+            "strict_common_count": len(common), "additional_sampled_count": len(clean) - len(common),
+            "sampled_common_delta_usd": sampled_delta, "strict_common_delta_usd": strict_delta,
+            "strict_common_trade_ids": [a["trade_id"] for b, a in common],
+            "sensitivity": "sensitive to quote quality" if sensitive else
+                "same direction on common sample" if common else "strict comparison unavailable"}
+    return result
 
 
 def extract(db_path, edge_db_path, start: date, end: date) -> dict:
@@ -270,7 +317,7 @@ def extract(db_path, edge_db_path, start: date, end: date) -> dict:
     # Reuse the application's pure replay evaluator. Bound to the report as-of.
     with repository._connect() as c:
         cohort_ids = [r[0] for r in c.execute("SELECT cohort_id FROM exit_edge_cohorts WHERE entry_timestamp>=? AND entry_timestamp<?", (lower.isoformat(), upper.isoformat()))]
-    cases = analyze_cases([repository.load_case(i, observed_at_end=upper) for i in cohort_ids])["cases"]
+    cases = analyze_cases([repository.load_case(i, observed_at_end=upper) for i in cohort_ids], quote_sensitivity=True)["cases"]
     return {"window": {"start": start.isoformat(), "end": end.isoformat(), "timezone": "America/Chicago", "basis": "entry cohort; outcomes observed through window end"},
             "events": events, "configs": list(configs.values()), "trades": trades, "cases": cases,
             "inventory_revision": inventory_revision,

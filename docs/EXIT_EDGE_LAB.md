@@ -275,3 +275,13 @@ To disable the scheduled collector, reinstall without the opt-in so the
 installer removes both plist environments and the runtime marker. Removing an
 interactive environment variable alone does not disable a marker-owned
 scheduled context.
+
+
+### Generation 6 sampled comparison policy (2026-10-11)
+
+Authorized new-cohort policy: 15-second polls, 30-second quote age, 65-second
+regular-session continuity limit, receipt-time decisions and later-observation
+bid fills. Existing cohorts retain frozen rules. The observer has one bounded
+refresh batch per cycle. Entry/execution quote validation is unchanged. See
+[the report contract](STRATEGY_EXIT_REPORT.md#sampled-measurement-generation-6-authorized-2026-10-11)
+for paired populations and five-second sensitivity semantics.

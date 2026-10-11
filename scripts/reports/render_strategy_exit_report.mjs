@@ -11,6 +11,7 @@ if (!inputPath || !outputPath) throw new Error('Usage: node renderer.mjs report.
 const d = JSON.parse(await fs.readFile(inputPath, 'utf8'));
 const w = Workbook.create();
 const summary = w.worksheets.add('Strategy review');
+const pairs = w.worksheets.add('Exit pairs');
 const trades = w.worksheets.add('Trades');
 const exits = w.worksheets.add('Exit detail');
 const signals = w.worksheets.add('Signal detail');
@@ -21,8 +22,8 @@ const available = x => x ?? 'Unknown';
 const col = i => { let s = ''; for (i++; i; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s; return s; };
 function format(sheet, title, headers, rows, widths) {
   sheet.showGridLines = false;
-  const header = sheet === summary ? 1 : 6, first = header + 1;
-  if (sheet !== summary) {
+  const header = (sheet === summary || sheet === pairs) ? 1 : 6, first = header + 1;
+  if (sheet !== summary && sheet !== pairs) {
     sheet.getRange('A2').values = [[title]];
     sheet.getRange('A2').format.font = {name: 'Arial', size: 15, bold: true};
   }
@@ -42,7 +43,7 @@ function format(sheet, title, headers, rows, widths) {
     table.showFilterButton = true;
   }
   sheet.freezePanes.freezeRows(header);
-  sheet.freezePanes.freezeColumns(sheet === summary ? 4 : 2);
+  sheet.freezePanes.freezeColumns((sheet === summary || sheet === pairs) ? 4 : 2);
   return end;
 }
 
@@ -61,10 +62,10 @@ trades.getRange('F7:F'+tradeEnd).setNumberFormat('mm/dd/yy hh:mm');
 trades.getRange('A4').values = [['Live = recorded broker lane. Shadow = recorded modeled lane. Fees assumed $0. Open outcomes are not full closed-trade P&L.']];
 
 const exitRows = d.exits.map(e => [e.row_id,e.trade_id,pretty(e.policy),e.clean,
-  available(e.pnl_usd),e.evidence_status,e.exit_at ? new Date(e.exit_at) : null,e.baseline,e.experiment_hash,e.limitation || 'None']);
-const exitEnd = format(exits,'Modeled exit evidence', ['Group ID','Trade ID','Exit policy','Clean result','Modeled P&L USD','Evidence status','Exit time UTC','Comparison baseline','Frozen experiment','Limitation'],exitRows,[24,38,32,14,18,32,22,32,56,60]);
+  available(e.pnl_usd),e.evidence_status,e.exit_at ? new Date(e.exit_at) : null,e.baseline,e.experiment_hash,e.limitation || 'None',available(e.diagnostic_pnl_usd),e.measurement || 'Historical estimate',available(e.max_quote_age_seconds),e.decision_clock || 'quote_at']);
+const exitEnd = format(exits,'Modeled exit evidence', ['Group ID','Trade ID','Exit policy','Clean result','Modeled P&L USD','Evidence status','Exit time UTC','Comparison baseline','Frozen experiment','Limitation','Gap-affected diagnostic USD','Measurement','Quote age limit seconds','Decision clock'],exitRows,[24,38,32,14,18,32,22,32,56,60,24,28,18,18]);
 exits.getRange('A3').values = [[`Source: ${d.source_receipt.exit_db}; application named-exit replay evaluator`]];
-exits.getRange('A4').values = [['Model: next fresh executable bid after trigger and configured latency. Fees $0. Gaps and unfinished exits remain unavailable.']];
+exits.getRange('A4').values = [['Model: next eligible observed bid after trigger. New sampled estimates use receipt time and quotes up to 30 seconds old; historical rules remain frozen. Gap diagnostics are excluded from comparable totals. Fees $0.']];
 exits.getRange('E7:E'+exitEnd).setNumberFormat('"$"#,##0.00;("$"#,##0.00)');
 exits.getRange('G7:G'+exitEnd).setNumberFormat('mm/dd/yy hh:mm');
 
@@ -77,22 +78,40 @@ signals.getRange('C7:C'+signalEnd).setNumberFormat('mm/dd/yy hh:mm');
 
 const headers = ['Date','Week starting','Strategy','Source','Underlying','Lane','Direction','Version','Entry profile','Default exit',
   'Signals fired\nrecorded','Signals\ncaptured','Filled\ntrades','Closed\ntrades','Observed\nsessions',
-  'Live recorded\nP&L USD','Shadow recorded\nP&L USD','Common clean\ncomparisons',
+  'Live recorded\nP&L USD','Shadow recorded\nP&L USD','All-exit common\ncomparisons',
   ...d.exit_columns.map(p => `${pretty(p)}\nModeled USD`),
-  'Coverage','Record ID','Inference author','Inference'];
+  'Measurement','Coverage','Record ID','Inference author','Inference'];
 const reviewed = [...d.rows].sort((a,b) => b.date.localeCompare(a.date) || b.common_comparisons-a.common_comparisons || b.filled-a.filled || (b.signals_fired||0)-(a.signals_fired||0) || a.strategy.localeCompare(b.strategy));
 const rows = reviewed.map(r => [new Date(r.date+'T00:00:00Z'),new Date(r.week_start+'T00:00:00Z'),pretty(r.strategy),pretty(r.source),r.symbol,r.lane,r.direction,r.version,pretty(r.entry_profile),pretty(r.default_exit),
   available(r.signals_fired),available(r.signals_captured),r.filled,r.closed,r.observed_sessions,
   r.lane === 'live' ? available(r.recorded_pnl_usd) : 'n.a.',r.lane === 'shadow' ? available(r.recorded_pnl_usd) : 'n.a.',r.common_comparisons,
-  ...d.exit_columns.map(p => available(r.modeled_pnl[p])),r.coverage,r.row_id,r.inference?.author || 'Not written',
+  ...d.exit_columns.map(p => available(r.modeled_pnl[p])),r.measurement ? `${r.measurement.measurement}; age ≤${r.measurement.max_quote_age_seconds}s` : 'No comparison',r.coverage,r.row_id,r.inference?.author || 'Not written',
   r.inference ? `Assessment: ${r.inference.assessment}.\nReason: ${r.inference.reason}\nNext step: ${r.inference.next_step}` : 'Inference not written.']);
-const widths = [14,16,38,24,12,12,12,10,18,30,13,13,12,12,13,18,18,15,...d.exit_columns.map(()=>22),14,38,16,75];
+const widths = [14,16,38,24,12,12,12,10,18,30,13,13,12,12,13,18,18,15,...d.exit_columns.map(()=>22),32,14,38,16,75];
 const summaryEnd = format(summary,'Bhiksha strategy and exit review',headers,rows,widths);
 summary.getRange(`A2:B${summaryEnd}`).setNumberFormat('mm/dd/yy');
 summary.tabColor = '#253858';
 trades.getRange('A5').values = [[`Report ${d.window.start} to ${d.window.end} (Central). Date = signal/entry cohort; week starts Monday. Outcomes through window end. Counts repeat across frozen exit sets; do not sum matrix context.`]];
 summary.getRange(`P2:Q${summaryEnd}`).setNumberFormat('"$"#,##0;("$"#,##0)');
 if (d.exit_columns.length) summary.getRange(`S2:${col(17 + d.exit_columns.length)}${summaryEnd}`).setNumberFormat('"$"#,##0;("$"#,##0)');
+const pairHeaders = ['Date','Strategy','Underlying','Lane','Primary exit','Alternative exit',
+  'Registered pairs','Completed pairs','Primary modeled USD','Alternative modeled USD','Difference USD',
+  'Gap affected pairs','Pending pairs','Strict common pairs','Additional sampled pairs',
+  'Sampled difference USD\nstrict-common trades','5s difference USD\nsame trades','Quote sensitivity','Measurement','Frozen experiment'];
+const pairRows = reviewed.flatMap(r => Object.entries(r.pairwise_comparisons || {}).map(([policy,p]) => [
+  new Date(r.date+'T00:00:00Z'),pretty(r.strategy),r.symbol,r.lane,pretty(p.baseline),pretty(policy),
+  p.registered_pairs,p.paired_count,available(p.baseline_pnl_usd),available(p.candidate_pnl_usd),available(p.delta_pnl_usd),
+  p.gap_affected_count,p.pending_count,p.strict_common_count,p.additional_sampled_count,
+  available(p.sampled_common_delta_usd),available(p.strict_common_delta_usd),p.sensitivity,
+  r.measurement ? `${r.measurement.measurement}; age ≤${r.measurement.max_quote_age_seconds}s; ${r.measurement.decision_clock === 'received_at' ? 'receipt time' : 'provider time'}` : 'Unknown',r.experiment_hash]));
+const pairEnd = format(pairs,'Exit pairs',pairHeaders,pairRows,[14,36,12,12,30,30,15,15,20,20,18,15,15,15,18,23,23,38,48,55]);
+pairs.tabColor = '#356859';
+pairs.getRange(`A2:A${pairEnd}`).setNumberFormat('mm/dd/yy');
+pairs.getRange(`I2:K${pairEnd}`).setNumberFormat('"$"#,##0.00;("$"#,##0.00)');
+pairs.getRange(`P2:Q${pairEnd}`).setNumberFormat('"$"#,##0.00;("$"#,##0.00)');
+pairs.getRange(`R2:R${pairEnd}`).conditionalFormats.add('containsText', {text:'sensitive to quote quality',format:{fill:'#FFF2CC'}});
+assert.deepEqual(pairs.getRange('A1:T1').values[0],pairHeaders);
+exits.getRange('A5').values = [['Exit pairs match each alternative to its primary on the same trades; pair populations can differ. All-exit columns use one common population. Strict sensitivity uses only trades comparable under both age limits. Pending and gap counts may overlap.']];
 const lastCol = col(headers.length-1);
 summary.getRange(`${lastCol}2:${lastCol}${summaryEnd}`).format.rowHeight = 78;
 summary.getRange(`${lastCol}2:${lastCol}${summaryEnd}`).format.verticalAlignment = 'top';
@@ -104,8 +123,8 @@ assert.deepEqual(summary.getRange(`A1:${lastCol}1`).values[0], headers);
 if (rows.length) assert.equal(summary.getRange(`C2:C${summaryEnd}`).values.filter(r => r[0] != null).length, rows.length);
 const inspection = await w.inspect({kind:'table',range:'Strategy review!A1:F3',include:'values,formulas',tableMaxRows:3,tableMaxCols:6,maxChars:2000});
 const errorScan = await w.inspect({kind:'match',searchTerm:'#REF!|#DIV/0!|#VALUE!|#NAME\\?|#NUM!|#NULL!|#SPILL!|#CALC!',options:{useRegex:true,maxResults:30},maxChars:2000});
-await fs.writeFile(path.join(outDir,'excel-verification.json'),JSON.stringify({inspection:inspection.ndjson,errorScan:errorScan.ndjson,rows:rows.length,confirmedTrades:confirmed.length},null,2));
-for (const [sheet,range,name] of [[summary,'A1:M5','review-identity'],[summary,`N1:${lastCol}5`,'review-results'],[trades,'A2:N12','trades'],[exits,'A2:J12','exits'],[signals,'A2:F12','signals']]) {
+await fs.writeFile(path.join(outDir,'excel-verification.json'),JSON.stringify({inspection:inspection.ndjson,errorScan:errorScan.ndjson,rows:rows.length,pairRows:pairRows.length,confirmedTrades:confirmed.length},null,2));
+for (const [sheet,range,name] of [[summary,'A1:M5','review-identity'],[summary,`N1:${lastCol}5`,'review-results'],[pairs,'A1:K6','exit-pairs'],[pairs,'L1:T6','pair-sensitivity'],[trades,'A2:N12','trades'],[exits,'A2:J12','exits'],[signals,'A2:F12','signals']]) {
   const png = await w.render({sheetName:sheet.name,range,scale:1.3,format:'png'});
   await fs.writeFile(path.join(outDir,`${name}.png`),new Uint8Array(await png.arrayBuffer()));
 }

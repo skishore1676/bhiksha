@@ -1,4 +1,4 @@
-# Strategy and exit report prototype
+# Strategy and exit report
 
 This is an on-demand, broker-inert report owned by Bhiksha. It is not wired to
 the live runtime, any publisher, arming surface, or scheduler. Keep private
@@ -68,7 +68,7 @@ report artifacts outside tracked source. Do not deploy this worktree implicitly.
 - The matrix uses daily signal/entry cohorts; Date and Monday Week starting
   are filterable typed dates. It includes observed no-signal configurations,
   not invented unobserved daily inventory. Recent dates are sorted first.
-  The visible tab begins with column names at row 1 and data at row 2; it has
+  Both visible tabs, Strategy review and Exit pairs, begin with column names at row 1 and data at row 2; it has
   no title or summary rows. Three detail tabs are hidden, not deleted.
   The default window for the
   first artifact was the last completed trading week; there is no scheduler.
@@ -77,12 +77,13 @@ report artifacts outside tracked source. Do not deploy this worktree implicitly.
   outcomes do not become full closed-trade results. Missing eligible economics
   blocks the group's recorded P&L aggregate instead of producing zero.
 - Modeled exit columns all use the same intersection of clean trades within
-  that frozen experiment. Completed individual arms remain traceable in Exit
-  detail even if there is no full common set. Persisted censors, gaps and
+  that frozen experiment. Exit pairs separately shows each challenger against its primary on matched trades,
+  even when another arm is unfinished. Its pair populations may differ; do not
+  rank challengers across different samples. Individual outcomes remain in Exit detail. Persisted censors, gaps and
   unfinished arms cannot become clean wins. Legacy non-named evaluators are
   retained as issues and are not pooled with named-exit experiments.
 - Fee assumption is explicitly zero. Modeled execution prices still use the
-  existing next-fresh-executable-bid evaluator and its latency constraints.
+  frozen next-observation-bid evaluator and its latency constraints.
   This does not alter the existing Sheet's stress-cost assumption.
 - Matrix funnel/actual counts can repeat across different frozen exit sets.
   Headline trade/signal totals use unique detail records, never summed matrix
@@ -100,3 +101,37 @@ The repository-owned skill is
 this on-demand workflow and owns subsequent agent inference. Orchestration
 may transport it, but calculations and evidence ownership stay here. No
 Lobster workflow or recurring job is needed or installed.
+
+
+## Sampled measurement, generation 6 (authorized 2026-10-11)
+
+New independent-observer cohorts freeze a 15-second regular poll cadence,
+30-second maximum provider quote age, 65-second observable-time gap limit,
+and receipt-time exit decisions. The next eligible later observation supplies
+the modeled bid fill. This is a sampled estimate, not proof of execution or of
+all intrapoll stop/target crossings. Live entry and execution freshness rules
+remain five seconds. Existing cohorts retain their original specification,
+provider decision clock and freshness limit; they are never re-signed or pooled
+with the new generation.
+
+The existing observer may make one extra batch of at most 20 stale/missing
+contracts after two seconds, rotating candidates across cycles. That refresh
+has a ten-second deadline within the existing 45-second total cycle budget.
+Invalid timestamp lineage and prices stay excluded; no order path is added.
+Per-batch receipt timestamps prevent later batches from aging earlier responses.
+
+Strategy review keeps all-exit common-sample totals. Exit pairs shows registered,
+completed, gap-affected and pending pair counts, primary/candidate P&L and delta.
+Gap and pending counts can overlap. A later gap in a still-running arm does not
+invalidate an already completed pair. Diagnostic continuation P&L is available
+only in Exit detail and never contributes to comparable totals.
+
+The on-demand report also replays the saved tape at a five-second age limit,
+using the same decision clock and reconstructing gaps after filtering. It does
+not fetch historical quotes or write this derived tape to production. Strict
+versus sampled deltas use the intersection of clean pairs under both limits;
+additional sampled pairs are disclosed separately. A sign reversal or a lost
+positive advantage is labeled sensitive to quote quality. Same direction is
+not a significance claim. An unavailable strict result remains unavailable.
+The strict replay may be unfinished when the original collection has stopped;
+that limitation is not filled with a synthetic price.

@@ -75,7 +75,7 @@ class ExitEdgeLiveRecorder:
         status_path: str | Path,
         queue_capacity: int = 512,
         fill_latency_ms: int = 0,
-        max_freshness_ms: int = 5_000,
+        max_freshness_ms: int | None = None,
         max_sequence_gap: int = 1,
         continuation_min_interval_seconds: float = 30.0,
         role: str = "embedded",
@@ -88,7 +88,8 @@ class ExitEdgeLiveRecorder:
         self.db_path = Path(db_path)
         self.status_path = Path(status_path)
         self.fill_latency_ms = int(fill_latency_ms)
-        self.max_freshness_ms = int(max_freshness_ms)
+        self.max_freshness_ms = int(max_freshness_ms if max_freshness_ms is not None else (
+            CURRENT_MEASUREMENT_GENERATION["max_freshness_ms"] if role in {"registration", "observer"} else 5_000))
         self.max_sequence_gap = int(max_sequence_gap)
         self.continuation_min_interval_seconds = max(
             float(continuation_min_interval_seconds), 1.0
@@ -114,6 +115,8 @@ class ExitEdgeLiveRecorder:
             "enabled": True,
             "mode": "observational_shadow_only",
             "role": role,
+            "new_cohort_measurement": dict(CURRENT_MEASUREMENT_GENERATION),
+            "existing_cohort_policy": "frozen per trade",
             "enforcement_authority": False,
             "promotion_eligible": False,
             "inference_eligible": False,
@@ -358,13 +361,14 @@ class ExitEdgeLiveRecorder:
         self._write_status_best_effort()
 
     def record_observation_poll(
-        self, requested: int, received: int, *, quote_request_ms: float | None = None,
+        self, requested: int, received: int, *, quote_request_ms: float | None = None, refresh: bool = False,
     ) -> None:
         with self._lock:
             self._health["collection_state"] = "observing"
             self._health["last_successful_poll_at"] = datetime.now(UTC).isoformat()
             self._health["heartbeat_at"] = datetime.now(UTC).isoformat()
             self._health["observation_polls"] += 1
+            self._health["observation_refresh_polls"] = self._health.get("observation_refresh_polls", 0) + int(refresh)
             self._health["observation_quote_requests"] += int(requested)
             self._health["observation_quote_results"] += int(received)
             self._health["last_observation_queue_depth"] = self._queue.qsize()
@@ -628,7 +632,7 @@ class ExitEdgeLiveRecorder:
         ).total_seconds() * 1000
         if freshness_ms < 0:
             return "quote_received_before_provider_timestamp"
-        if freshness_ms > self.max_freshness_ms:
+        if freshness_ms > int(case.experiment["max_freshness_ms"]):
             return "stale_quote_gap"
         if observed.bid is None or observed.bid <= 0:
             return "missing_executable_bid"
@@ -933,7 +937,8 @@ class ExitEdgeLiveRecorder:
             "quote_feed": INDEPENDENT_QUOTE_FEED if self.role == "registration" else QUOTE_FEED,
         }
         if self.role == "registration":
-            experiment["max_observation_gap_seconds"] = CURRENT_MEASUREMENT_GENERATION["max_observation_gap_seconds"]
+            for key in ("max_observation_gap_seconds", "decision_clock", "poll_seconds", "fill_model_version"):
+                experiment[key] = CURRENT_MEASUREMENT_GENERATION[key]
         try:
             if getattr(deployment.exit, "management_exit", None):
                 policies = list(getattr(deployment.exit, "compare_exit_policies", []) or [])

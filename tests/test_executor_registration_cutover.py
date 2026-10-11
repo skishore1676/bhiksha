@@ -91,6 +91,7 @@ def test_native_start_real_runtime_modeled_fill_registers_frozen_comparison(tmp_
         from test_execution_planner import StubChainService
         supervisor = captured["supervisor"]
         assert supervisor.exit_edge_recorder.role == "registration"
+        assert supervisor.exit_edge_recorder.max_freshness_ms == 30_000
         supervisor.planner.chain_service = StubChainService()
         pending = await supervisor.handle_signal(dep, signal(dep), dry_run=True, simulate_only=True)
         captured["trade_id"] = pending.trade_id

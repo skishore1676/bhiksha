@@ -166,3 +166,42 @@ def test_real_sqlite_extraction_and_missing_source_are_read_only(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         extract(missing, edge, date(2026,10,5), date(2026,10,9))
     assert not missing.exists()
+
+
+def test_pairwise_survives_unfinished_third_arm_and_keeps_common_population_separate():
+    s = source();s["trades"] = [trade()]
+    c = case("t")
+    c["experiment_spec"]["named_profiles"].append({"policy_id":"C"})
+    c["arm_evidence_status"]["C"] = "still_collecting"
+    s["cases"]=[c]
+    row = summarize(s)["rows"][0]
+    assert row["common_comparisons"] == 0
+    assert row["modeled_pnl"] == {"A":None,"B":None,"C":None}
+    assert row["pairwise_comparisons"]["B"]["paired_count"] == 1
+    assert row["pairwise_comparisons"]["B"]["delta_pnl_usd"] == 10
+    assert row["pairwise_comparisons"]["C"]["pending_count"] == 1
+    assert row["pairwise_comparisons"]["C"]["delta_pnl_usd"] is None
+
+
+def test_strict_sensitivity_uses_same_trades_and_detects_reversal():
+    s = source();s["trades"] = [trade("t"),trade("u")]
+    c = case("t",a=10,b=20)
+    c["quote_sensitivity"]={"arm_evidence_status":{"A":"complete_clean","B":"complete_clean"},
+        "named_exit_outcomes":{"A":{"realized_pnl_usd":10},"B":{"realized_pnl_usd":5}}}
+    s["cases"]=[c,case("u",a=10,b=1000)]
+    pair=summarize(s)["rows"][0]["pairwise_comparisons"]["B"]
+    assert pair["paired_count"]==2 and pair["delta_pnl_usd"]==1000
+    assert pair["strict_common_count"]==1 and pair["additional_sampled_count"]==1
+    assert pair["sampled_common_delta_usd"]==10 and pair["strict_common_delta_usd"]==-5
+    assert pair["sensitivity"]=="sensitive to quote quality"
+    assert pair["strict_common_trade_ids"]==["t"]
+
+
+def test_gap_diagnostic_is_visible_but_never_pooled_with_comparable_results():
+    s=source();s["trades"]=[trade()];s["cases"]=[case("t",status_b="gap_affected_diagnostic")]
+    report=summarize(s)
+    arm=next(x for x in report["exits"] if x["policy"]=="B")
+    assert arm["pnl_usd"] is None and arm["diagnostic_pnl_usd"]==20
+    pair=report["rows"][0]["pairwise_comparisons"]["B"]
+    assert pair["paired_count"]==0 and pair["delta_pnl_usd"] is None
+    assert pair["gap_affected_count"]==1

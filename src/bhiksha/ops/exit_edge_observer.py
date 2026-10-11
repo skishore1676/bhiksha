@@ -25,14 +25,16 @@ import httpx
 
 from bhiksha.execution.brokers.public.auth import get_access_token
 from bhiksha.execution.brokers.public.settings import PublicBrokerSettings
-from bhiksha.execution.quote_lineage import extract_public_quote_timestamp
+from bhiksha.execution.quote_lineage import extract_public_quote_timestamp, proved_quote_timestamp_lineage
 from bhiksha.market_data.trading_calendar import regular_session_bounds
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder
-from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository
+from bhiksha.ops.exit_edge_lab import ProspectiveQuoteTapeRepository, CURRENT_MEASUREMENT_GENERATION
 
 CENTRAL = ZoneInfo("America/Chicago")
 POLL_SECONDS = 15.0
 MAX_BATCH = 20
+REFRESH_DELAY_SECONDS = 2.0
+REFRESH_DEADLINE_SECONDS = 10.0  # One extra batch per cycle, inside the total quote deadline.
 QUOTE_DEADLINE_SECONDS = 45.0
 PROGRESS_DEADLINE_SECONDS = 180.0
 IDLE_SECONDS = 60.0  # Lightweight status only; below the watchdog/freshness deadlines.
@@ -130,18 +132,22 @@ class PublicOptionQuoteReader:
         result: dict[str, Any] = {}
         for offset in range(0, len(symbols), MAX_BATCH):
             batch = symbols[offset:offset + MAX_BATCH]
+            request_started = clock.monotonic()
             response = await self.client.post(
                 f"/userapigateway/marketdata/{account}/quotes",
                 headers=await self._headers(),
                 json={"instruments": [{"symbol": symbol, "type": "OPTION"} for symbol in batch]},
             )
             response.raise_for_status()
+            received_at = datetime.now(UTC)
+            request_ms = (clock.monotonic() - request_started) * 1000
             for item in response.json().get("quotes") or []:
                 raw_symbol = str((item.get("instrument") or {}).get("symbol") or "").upper().replace(" ", "")
                 if raw_symbol not in batch:
                     continue
                 timestamp, field, bid_timestamp, ask_timestamp = extract_public_quote_timestamp(item)
                 result[raw_symbol] = SimpleNamespace(
+                    observed_received_at=received_at, request_ms=request_ms,
                     quote_timestamp=timestamp,
                     quote_timestamp_field=field,
                     bid_timestamp=bid_timestamp,
@@ -149,6 +155,66 @@ class PublicOptionQuoteReader:
                     bid=item.get("bid"), ask=item.get("ask"), last=item.get("last"),
                 )
         return result
+
+
+def _needs_refresh(quote: Any | None, received_at: datetime) -> bool:
+    if quote is None:
+        return True
+    lineage = proved_quote_timestamp_lineage(quote, observed_at=received_at)
+    return bool(lineage and (received_at - lineage.quote_at).total_seconds() * 1000
+                > CURRENT_MEASUREMENT_GENERATION["max_freshness_ms"])
+
+
+async def collect_observations(reader, recorder, symbols, *, stop, now_fn, refresh_cursor=0):
+    """One regular batch pass plus at most one rotating refresh batch.
+
+    The caller bounds the whole cycle. Per-batch receipt timestamps prevent a
+    slow later batch from artificially aging earlier results. Refreshes never
+    retry invalid lineage, bypass market close, or introduce order authority.
+    """
+    started = clock.monotonic()
+    quotes = await reader.quotes(symbols)
+    received = now_fn()
+    candidates = []
+    for symbol in symbols:
+        quote = quotes.get(symbol)
+        at = getattr(quote, "observed_received_at", received)
+        if quote is not None and _regular_session(at):
+            recorder.observe_quote(symbol, quote, at)
+        if _needs_refresh(quote, at):
+            candidates.append(symbol)
+    recorder.record_observation_poll(len(symbols), len(quotes),
+        quote_request_ms=(clock.monotonic() - started) * 1000)
+    if not candidates or stop.is_set():
+        return refresh_cursor
+    # One shared request budget, with rotation when more than 20 contracts need it.
+    offset = refresh_cursor % len(candidates)
+    batch = tuple((candidates[offset:] + candidates[:offset])[:MAX_BATCH])
+    remaining = QUOTE_DEADLINE_SECONDS - (clock.monotonic() - started) - REFRESH_DELAY_SECONDS
+    if remaining <= 0:
+        return refresh_cursor
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=REFRESH_DELAY_SECONDS)
+        return refresh_cursor
+    except TimeoutError:
+        pass
+    if stop.is_set() or not _regular_session(now_fn()):
+        return refresh_cursor
+    refresh_started = clock.monotonic()
+    try:
+        async with asyncio.timeout(min(REFRESH_DEADLINE_SECONDS, remaining)):
+            refreshed = await reader.quotes(batch)
+        received = now_fn()
+        if _regular_session(received):
+            for symbol in batch:
+                quote = refreshed.get(symbol)
+                if quote is not None:
+                    recorder.observe_quote(symbol, quote, getattr(quote, "observed_received_at", received))
+        recorder.record_observation_poll(len(batch), len(refreshed),
+            quote_request_ms=(clock.monotonic() - refresh_started) * 1000, refresh=True)
+    except Exception as exc:
+        recorder.record_observation_error("refresh:" + type(exc).__name__)
+    return offset + len(batch)
 
 
 def _regular_session(now: datetime) -> bool:
@@ -243,6 +309,7 @@ async def run_observer(
     watchdog.thread.start()
     started_worker = False
     last_intent_id = 0
+    refresh_cursor = 0
     try:
         while not stop.is_set():
             now = now_fn()
@@ -281,20 +348,11 @@ async def run_observer(
                     symbols = recorder.active_option_symbols()
                     if symbols and _regular_session(now):
                         reader = reader or PublicOptionQuoteReader()
-                        started = clock.monotonic()
                         watchdog.advance('request_quotes')
                         async with asyncio.timeout(QUOTE_DEADLINE_SECONDS):
-                            quotes = await reader.quotes(symbols)
+                            refresh_cursor = await collect_observations(reader, recorder, symbols,
+                                stop=stop, now_fn=now_fn, refresh_cursor=refresh_cursor)
                         watchdog.advance('persist_quotes')
-                        received = now_fn()
-                        for symbol in symbols:
-                            quote = quotes.get(symbol)
-                            if quote is not None:
-                                recorder.observe_quote(symbol, quote, received)
-                        recorder.record_observation_poll(
-                            len(symbols), len(quotes),
-                            quote_request_ms=(clock.monotonic() - started) * 1000,
-                        )
                     else:
                         recorder.heartbeat(mode="warming_market_open" if phase == "warmup" else "idle_no_cohorts")
                 except Exception as exc:
