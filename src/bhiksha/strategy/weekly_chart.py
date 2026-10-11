@@ -222,7 +222,7 @@ def observe(frame, params, now):
         if invalid and status != 'filled':
             if status != 'pending':
                 status = 'invalidated'
-            data['invalidated_at'] = min(invalid).isoformat()
+            data.setdefault('invalidated_at', min(invalid).isoformat())
         if triggers and 'confirmation_at' not in data:
             data['confirmation_at'] = min(triggers).isoformat()
         # A daily confirmation has exactly one following session in which to enter.

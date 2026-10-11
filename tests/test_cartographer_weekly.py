@@ -352,3 +352,14 @@ def test_daily_interior_recovery_preserves_prior_invalidation(params):
     bars=pl.concat([frame(minutes=390).slice(1),frame('2026-09-29',minutes=5)])
     data,status=observe(bars,params,datetime(2026,9,29,13,35,tzinfo=UTC))
     assert status=='invalidated' and data['invalidated_at']=='2026-09-28T20:00:00+00:00'
+
+
+def test_first_proved_invalidation_survives_later_close_observations(params):
+    first=datetime(2026,9,28,14,9,tzinfo=UTC)
+    initial=frame(price=90)
+    data,status=observe(initial,params,first)
+    assert status=='invalidated'
+    frozen=data['invalidated_at']
+    later=pl.concat([initial,frame('2026-09-29',price=90)])
+    data,status=observe(later,params,datetime(2026,9,29,14,9,tzinfo=UTC))
+    assert status=='invalidated' and data['invalidated_at']==frozen

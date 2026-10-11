@@ -21,7 +21,7 @@ TAB = "Exit_Comparisons"
 DETAIL_LIMIT = 8
 VISIBLE_COLUMNS = 8
 SHEET_COLUMNS = 12
-SIGNAL_HEADERS = ["Strategy", "Lane", "Positive attempts", "Captured", "Missed", "Pending / unknown", "Main miss reason", "Default exit", "Deployments"]
+SIGNAL_HEADERS = ["Strategy", "Lane", "Positive attempts", "Captured", "Not captured / terminal", "Enqueued / unresolved", "Terminal handling reason", "Default exit", "Deployments"]
 OPPORTUNITY_HEADERS = ["Symbol", "Lane", "Strategy", "First signal CT", "Attempts", "Outcome", "Reason category", "Entry / latest reason", "Opportunity"]
 EXIT_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Observed leader", "Clean / registered", "Sessions", "Δ $ / trade", "Why / evidence", "Frozen evaluator", "Frozen hash", "Deployments"]
 CUMULATIVE_HEADERS = ["Strategy", "Lane / entry", "Default exit", "Candidate", "Clean pairs", "Sessions", "Mean net Δ $", "Mean net Δ R", "Mean gross Δ $", "Frozen hash", "Window", "Deployment"]
@@ -127,9 +127,34 @@ def _actual_fills(db_path: str | Path, day: date) -> dict[str, Any]:
             "modeled": len(modeled_fills), "ambiguous_shadow": sorted(ambiguous_shadow)}
 
 
+def _handling_category(row, *, session_closed):
+    outcome = row.get("outcome")
+    reasons = row.get("reasons") or []
+    reason = " ".join(reasons).lower()
+    if outcome == "filled": return "Filled"
+    if outcome in {None, "unknown", "fill_unverified"}: return "Unresolved / evidence needed"
+    if outcome == "pending_execution":
+        return "Unresolved enqueue at close" if session_closed else "Enqueued; order state unproved"
+    # Failures are not valid limits that simply failed to find a counterparty.
+    if any(k in reason for k in ["price_seeking_tick", "broker_entry_price", "entry_planning_error"]):
+        return "Application failure"
+    if any(k in reason for k in ["preflight_failed", "rejected", "broker_error"]):
+        return "Execution service failure"
+    if "quote" in reason: return "Market / quote provider"
+    if outcome == "no_fill":
+        if any(k in reason for k in ["paper_limit_expired", "entry_reprice_no_fill_cancelled", "expired", "canceled", "cancelled"]):
+            return "Valid limit unfilled"
+        return "Unfilled / reason unproved"
+    if outcome in {"budget_block", "risk_block", "existing_position_block"}:
+        return "Risk / authorization block"
+    if "invalidat" in reason or "window" in reason or "expired" in reason:
+        return "Window / invalidation block"
+    return "Selection / other explained handling"
+
+
 def _signals(
     db_path: str | Path | None, day: date, plan: dict[str, dict[str, str]],
-    *, actual_fill_ids: set[str] | None = None,
+    *, actual_fill_ids: set[str] | None = None, now: datetime | None = None,
 ) -> dict[str, Any]:
     if db_path is None:
         raise ValueError("signal event database path unavailable")
@@ -141,6 +166,9 @@ def _signals(
             "SELECT created_at,event_type,payload FROM events WHERE created_at>=? AND created_at<? "
             "AND event_type IN ('signal_evaluation','signal_decision','signal_outcome') ORDER BY id", (start, end)
         ).fetchall()
+    from bhiksha.strategy.weekly_chart import session
+    bounds = session(day.isoformat())
+    session_closed = bool(bounds and (now or datetime.now(UTC)) >= bounds[1])
     signals: dict[str, dict[str, Any]] = {}
     latest = ""
     for created_at, event_type, raw in events:
@@ -211,14 +239,7 @@ def _signals(
         terminal = next((m for m in reversed(members) if m.get("outcome") == "filled"), members[-1])
         outcome = terminal.get("outcome") or "unknown"
         reason = ", ".join(terminal.get("reasons") or [])
-        if outcome == "filled": category = "Filled"
-        elif outcome in {"pending_execution", "unknown", "fill_unverified"}: category = "Waiting / working"
-        elif outcome == "no_fill": category = "Valid limit unfilled"
-        elif any(k in reason for k in ["price_seeking_tick", "broker_entry_price", "entry_planning_error"]): category = "Application failure"
-        elif "quote" in reason: category = "Market / quote provider"
-        elif "preflight_failed" in reason: category = "Execution service failure"
-        elif outcome in {"budget_block", "risk_block", "existing_position_block"}: category = "Risk / configuration"
-        else: category = "Expired / invalidated / selection"
+        category = _handling_category(terminal, session_closed=session_closed)
         execution = terminal.get("entry_execution") or next((m["entry_execution"] for m in reversed(members) if m.get("entry_execution")), {})
         if execution:
             def price(value):
@@ -238,7 +259,10 @@ def _signals(
             "pending": sum(row.get("outcome") in {None, "pending_execution", "unknown", "fill_unverified"} for row in signals.values()),
             "evaluated": sum(bool(row.get("evaluation")) for row in signals.values()),
             "decided": sum(bool(row.get("decision")) for row in signals.values()),
-            "missing_outcome": sum(row.get("outcome") in {None, "pending_execution", "unknown"} for row in signals.values()),
+            "missing_outcome": sum(row.get("outcome") in {None, "unknown"} or
+                (session_closed and row.get("outcome") == "pending_execution") for row in signals.values()),
+            "enqueued_pending": sum(row.get("outcome") == "pending_execution" for row in signals.values()),
+            "handling_categories": dict(Counter(_handling_category(row, session_closed=session_closed) for row in signals.values())),
             "unverified_fill_outcomes": sum(row.get("outcome") == "fill_unverified" for row in signals.values()),
             "latest": latest or None,
             "filled_trade_ids": sorted({str(row["trade_id"]) for row in signals.values()
@@ -473,7 +497,7 @@ def publish_exit_comparisons_scorecard(
     observer = scorecard.get("observer") or {}
     values: list[list[Any]] = [
         [f"Bhiksha session review · {scorecard['trading_date']}"],
-        ["Recorded signals", signals["recorded"], "Captured", signals["captured"], "Missed", signals["missed"], "Pending / unknown", signals["pending"]],
+        ["Recorded signals", signals["recorded"], "Captured", signals["captured"], "Not captured / terminal", signals["missed"], "Enqueued / unresolved", signals["pending"]],
         ["Published CT", _ct(scorecard["generated_at"]), "Age (hours)", '=ROUND((NOW()-DATEVALUE(LEFT(B3,10))-TIMEVALUE(MID(B3,12,8)))*24,1)',
          "Last signal CT", _ct(signals["latest"]), "Last exit quote CT", _ct(exits["latest"])],
         [f"Exit evidence: {exits['registered']} registered · {exits.get('fully_clean', 0)} fully complete · "
@@ -484,9 +508,9 @@ def publish_exit_comparisons_scorecard(
         [f"Independent fills: {fills.get('broker_confirmed', 0)} broker confirmed · {fills.get('modeled', 0)} modeled · "
          f"{len(fills.get('ambiguous_shadow') or [])} shadow classification unknown | "
          f"positive evaluations {signals.get('evaluated', 0)} · decisions {signals.get('decided', 0)} · "
-         f"missing outcomes {signals.get('missing_outcome', 0)} · unverified fill outcomes {signals.get('unverified_fill_outcomes', 0)} · "
+         f"unexplained positives {signals.get('missing_outcome', 0)} · enqueue receipts {signals.get('enqueued_pending', 0)} · unverified fill outcomes {signals.get('unverified_fill_outcomes', 0)} · "
          f"fills without outcome {len(fills.get('without_filled_outcome') or [])}"],
-        ["One-session leaders are provisional. Recorded signals only; downtime opportunities unknown. Shadow captures are modeled."],
+        ["Positive signals with unexplained handling need attention; valid blocks and unfilled limits are separate. Missing cadence means unknown opportunities. Clean pairs require comparable samples before an exit conclusion. Shadow fills are modeled."],
         [scorecard.get("entry_policy") or "Entry patience and DTE: active-plan readback unavailable"],
         [scorecard.get("strategy_entry_policy") or "Strategy entry patience: active-plan readback unavailable"],
         [f"Collector snapshot: {observer.get('collection_state', 'unknown')} | heartbeat CT {_ct(observer.get('updated_at'))} | "
@@ -558,7 +582,10 @@ def publish_exit_comparisons_scorecard(
     return {"status": "ok", "sheet_id": sheet_id, "spreadsheet_id": client.spreadsheet_id,
             "published_at": scorecard["generated_at"], "trading_date": scorecard["trading_date"],
             "recorded_signals": signals["recorded"], "captured_signals": signals["captured"],
-            "registered_cohorts": exits["registered"], "clean_trades": exits["clean"]}
+            "registered_cohorts": exits["registered"], "clean_trades": exits["clean"],
+            "clean_trades_definition": "at least one eligible clean pair; not all candidates complete",
+            "fully_complete_cohorts": exits.get("fully_clean", 0),
+            "still_collecting_cohorts": exits.get("collecting", 0)}
 
 
 def publish_exit_comparisons_best_effort(

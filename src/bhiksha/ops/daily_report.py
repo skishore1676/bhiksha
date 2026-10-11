@@ -181,7 +181,7 @@ def build_daily_report(
     return {
         "evaluation_coverage": evaluation_coverage,
         "coverage_status": {
-            "level": "YELLOW" if evaluation_coverage["status"] == "incomplete" else "NO_DATA",
+            "level": "YELLOW" if evaluation_coverage["status"] == "incomplete" else "GREEN" if evaluation_coverage["status"] == "complete" else "NO_DATA",
             "reason": evaluation_coverage["status"],
         },
         "trading_date": day.isoformat(),
@@ -262,6 +262,8 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
         "",
         f"- status: `{status.get('level', 'UNKNOWN')}`",
         f"- evaluation coverage: `{(report.get('evaluation_coverage') or {}).get('status', 'unknown')}`",
+        "- Evaluation totals count signal_evaluation only; positive signal_decision receipts are separate. Missing cadence is unknown opportunity evidence.",
+        f"- Blocking incomplete evaluations: {sum(r.get('blocking_incomplete_evaluation_count', 0) for r in (report.get('evaluation_coverage') or {}).get('lanes', []))}; terminal history diagnostics: {sum(r.get('terminal_diagnostic_count', 0) for r in (report.get('evaluation_coverage') or {}).get('lanes', []))}.",
         f"- live trades: `{summary.get('live_count', 0)}`",
         f"- shadow trades: `{summary.get('shadow_count', 0)}`",
         f"- open live positions: `{summary.get('live_open_count', 0)}`",
@@ -1787,7 +1789,9 @@ def _build_ryg_tables(report: dict[str, Any], *, app_status: dict[str, Any] | No
     funnel = _signal_funnel_by_lane(report)
     coverage = (report.get("evaluation_coverage") or {}).get("status", "unknown")
     app_rows: list[tuple[str, str, str, str]] = [
-        ("Evaluation coverage", coverage, _ryg("YELLOW" if coverage == "incomplete" else "NO_DATA"), "session cadence unproved"),
+        ("Evaluation coverage", coverage, _ryg("YELLOW" if coverage == "incomplete" else "GREEN" if coverage == "complete" else "NO_DATA"),
+         "runtime-ready intervals only; source ticks and dispatch receipts" if
+         (report.get("evaluation_coverage") or {}).get("expected_cadence_proved") else "historical or missing cadence unknown"),
         ("Signals evaluated (all lanes)", str((report.get("event_type_counts") or {}).get("signal_evaluation", 0)), _ryg("NO_DATA"), "coverage reported separately"),
         _app_running_row(report, app_status=app_status),
         _schwab_row(report, schwab_status=schwab_status),

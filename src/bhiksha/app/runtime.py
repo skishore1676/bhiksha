@@ -95,10 +95,13 @@ def _optional_identity_text(value: object) -> str | None:
     return text or None
 
 
-async def record_signal_evaluation(event_repository, decision: SignalDecision) -> None:
+async def record_signal_evaluation(event_repository, decision: SignalDecision, *, source=None, source_tick=None) -> None:
     """Persist every runtime signal evaluation, including false decisions."""
 
-    await event_repository.append("signal_evaluation", _signal_decision_payload(decision))
+    payload = _signal_decision_payload(decision)
+    if source is not None:
+        payload.update(evaluation_source=source, source_tick=source_tick)
+    await event_repository.append("signal_evaluation", payload)
 
 
 async def record_coalesced_signal(event_repository, dispatcher, deployment, decision):
@@ -654,6 +657,8 @@ class BhikshaRuntime:
                 output("Stopping after warm start because --max-bars=0")
                 return
 
+            await _append_event_best_effort(event_repository, "evaluation_runtime_ready", {
+                "config_fingerprint": startup_config_id, "source": "closed_bar_1m"}, output=output)
             output("Waiting for newly closed 1-minute bars...")
             public_token_task = asyncio.create_task(public_token_daemon.run())
             schwab_token_task = (
@@ -812,6 +817,8 @@ class BhikshaRuntime:
                 queue_.put_nowait(None)
             await _cancel_and_await([daemon_task, *background_tasks.values()])
             await execution_dispatcher.stop()
+            await _append_event_best_effort(event_repository, "evaluation_runtime_ended", {
+                "config_fingerprint": startup_config_id}, output=output)
             await supervisor.close()
             await source.close()
             try:
@@ -979,6 +986,10 @@ class BhikshaRuntime:
         if latest is not None and latest.timestamp >= bar.timestamp:
             return
         store.append(bar)
+        source_tick = bar.timestamp.isoformat()
+        await _append_event_best_effort(supervisor.event_repository, "evaluation_source_tick", {
+            "source": "closed_bar_1m", "source_tick": source_tick, "symbol": bar.symbol,
+            "deployment_ids": [d.deployment_id for d in deployments_by_symbol[bar.symbol]]}, output=output)
         output(f"BAR {bar.symbol} {bar.timestamp.isoformat()} close={bar.close}")
 
         expected_heartbeat_at = bar.timestamp + timedelta(minutes=1, seconds=1)
@@ -1107,6 +1118,10 @@ class BhikshaRuntime:
                     "unit": "ms",
                 },
             )
+            for deployment in deployments_by_symbol[bar.symbol]:
+                await _append_event_best_effort(supervisor.event_repository, "evaluation_inactive", {
+                    "deployment_id": deployment.deployment_id, "source": "closed_bar_1m",
+                    "source_tick": source_tick, "reason": "emergency_flat"}, output=output)
             return
 
         hard_flat_enqueued = execution_dispatcher.submit(
@@ -1246,11 +1261,20 @@ class BhikshaRuntime:
                 price = bar.low if deployment.strategy.params.get("direction") == "long" else bar.high
                 await supervisor.observe_entry_liquidity_retry(
                     deployment, price=price, timestamp=bar.timestamp + timedelta(minutes=1))
+                await _append_event_best_effort(supervisor.event_repository, "evaluation_inactive", {
+                    "deployment_id": deployment.deployment_id, "source": "closed_bar_1m",
+                    "source_tick": source_tick, "reason": "manual_retry_requires_intrabar"}, output=output)
                 continue
             if not supervisor.can_submit_deployment_entry(deployment):
+                await _append_event_best_effort(supervisor.event_repository, "evaluation_inactive", {
+                    "deployment_id": deployment.deployment_id, "source": "closed_bar_1m",
+                    "source_tick": source_tick, "reason": "existing_entry_or_position"}, output=output)
                 continue
             if deployment.deployment_id in exited_deployments:
                 output(f"{deployment.deployment_id}: entry_skipped_after_exit")
+                await _append_event_best_effort(supervisor.event_repository, "evaluation_inactive", {
+                    "deployment_id": deployment.deployment_id, "source": "closed_bar_1m",
+                    "source_tick": source_tick, "reason": "exit_on_same_bar"}, output=output)
                 continue
             enriched = enriched_frames.get(deployment.deployment_id)
             if deployment.strategy.key == "weekly_chart":
@@ -1259,7 +1283,8 @@ class BhikshaRuntime:
                 decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
             else:
                 decision = evaluator.evaluate_entry(deployment, frame)
-            await record_signal_evaluation(supervisor.event_repository, decision)
+            await record_signal_evaluation(supervisor.event_repository, decision,
+                source="closed_bar_1m", source_tick=source_tick)
             output(
                 f"{deployment.deployment_id}: signal={decision.signal} "
                 f"direction={decision.direction.value if decision.direction else None} "
@@ -1578,6 +1603,10 @@ class BhikshaRuntime:
         async with sync_lock:
             live_entry_block_reason = self._reconciliation_live_entry_block_reason(reconciliation_snapshot, now=snapshot_timestamp)
 
+        source_tick = snapshot_timestamp.isoformat()
+        await _append_event_best_effort(supervisor.event_repository, "evaluation_source_tick", {
+            "source": "manual_intrabar", "source_tick": source_tick, "symbol": symbol,
+            "deployment_ids": [d.deployment_id for d in active_deployments]}, output=output)
         for deployment in active_deployments:
             enriched = enriched_frames.get(deployment.deployment_id)
             if enriched is None:
@@ -1587,7 +1616,8 @@ class BhikshaRuntime:
                 # Recheck only the fresh price, preserving trigger/invalidation gates.
                 enriched = enriched.tail(1)
             decision = evaluator.evaluate_entry_on_enriched(deployment, enriched)
-            await record_signal_evaluation(supervisor.event_repository, decision)
+            await record_signal_evaluation(supervisor.event_repository, decision,
+                source="manual_intrabar", source_tick=source_tick)
             if not decision.signal:
                 continue
             output(

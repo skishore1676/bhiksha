@@ -10,7 +10,8 @@ persisted ``safe_to_close`` verdict derived from that same broker readback.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
 
 
@@ -92,16 +93,31 @@ def summarize_evaluation_coverage(events: Iterable[dict[str, Any]], deployments=
             source_issues.append({"event_id": event.get("event_id"), "event_type": kind,
                 "symbol": payload.get("symbol"), "stage": payload.get("stage"),
                 "error": payload.get("error"), "observed_at": event.get("created_at")})
+    schedule = _evaluation_schedule(events)
     rows = []
     for ident in sorted(enabled | grouped.keys()):
         evidence = grouped.get(ident, [])
         gaps = sum(evaluation_coverage(payload) == "incomplete" for payload in evidence)
+        terminal_gaps = sum(evaluation_coverage(payload) == "incomplete" and
+            bool(set(payload.get("reason") or []) & {"weekly_invalidated", "weekly_filled", "weekly_expired"})
+            for payload in evidence)
+        cadence = schedule["lanes"].get(ident, {
+            "scheduled_evaluation_count": None, "observed_scheduled_evaluation_count": None,
+            "intentional_inactive_count": None, "missing_evaluation_count": None,
+            "missing_source_tick_count": None, "unknown_evaluation_count": None,
+            "expected_source_tick_count": None, "expected_cadence_proved": False,
+            "schedule_status": "historical_schedule_unknown"})
         feed_issues = sum(issue["symbol"] in {None, "ALL", symbols.get(ident)} for issue in source_issues)
-        status = "incomplete" if gaps or feed_issues else "partial" if evidence else "unknown"
+        status = ("incomplete" if gaps - terminal_gaps or feed_issues or cadence.get("missing_evaluation_count")
+            or cadence.get("missing_source_tick_count") else
+            "complete" if cadence.get("expected_cadence_proved") else "partial" if evidence else "unknown")
         rows.append({"deployment_id": ident, "evaluation_count": len(evidence),
-            "incomplete_evaluation_count": gaps, "source_issue_count": feed_issues, "status": status})
+            "incomplete_evaluation_count": gaps, "terminal_diagnostic_count": terminal_gaps,
+            "blocking_incomplete_evaluation_count": gaps - terminal_gaps,
+            "source_issue_count": feed_issues, "status": status, **cadence})
     status = (
         "incomplete" if source_issues or any(row["status"] == "incomplete" for row in rows)
+        else "complete" if rows and all(row["status"] == "complete" for row in rows)
         else "partial" if rows and all(row["evaluation_count"] for row in rows)
         else "unknown"
     )
@@ -110,8 +126,124 @@ def summarize_evaluation_coverage(events: Iterable[dict[str, Any]], deployments=
         "provided_deployments" if deployments is not None else "evaluation_receipts_only"
     )
     return {"status": status, "lanes": rows, "source_issues": source_issues,
-            "expected_cadence_proved": False, "inventory_source": inventory_source}
+            "expected_cadence_proved": bool(rows) and all(row.get("expected_cadence_proved", False) for row in rows),
+            "inventory_source": inventory_source, "runtime_intervals": schedule["runtime_intervals"],
+            "cadence_method": "calendar_closed_minutes_during_recorded_runtime; manual_intrabar_conditional_on_fresh_snapshot",
+            "counting_contract": "signal_evaluation only; never subtract signal_decision positives"}
 
+
+
+def _evaluation_schedule(events):
+    """Match conditional dispatch receipts; missing source minutes have unknown lane eligibility.
+
+    Old ledgers without ready/end and source receipts stay explicitly unknown.
+    A restart or process loss never silently extends the prior runtime interval.
+    """
+    from bhiksha.strategy.weekly_chart import session
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    def stamp(value):
+        try:
+            t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return t.astimezone(UTC) if t.tzinfo else None
+        except (ValueError, TypeError):
+            return None
+    ticks, observed, inactive = set(), set(), set()
+    inactive_reasons = defaultdict(Counter)
+    source_ticks = defaultdict(set)
+    configs, intervals, open_intervals, startups = {}, [], [], []
+    lane_expected = defaultdict(set)
+    for event in events:
+        p = event.get("payload") or {}
+        kind = event.get("event_type")
+        key = p.get("config_fingerprint")
+        at = stamp(event.get("created_at"))
+        if kind == "startup_config":
+            configs[key] = p.get("deployments", [])
+            startups.append({"key": key, "at": at, "payload": p, "ready": False})
+        elif kind == "evaluation_runtime_ready" and key in configs and at:
+            open_intervals.append({"key": key, "ready_at": at, "deployments": configs[key]})
+            for startup in reversed(startups):
+                if startup["key"] == key:
+                    startup["ready"] = True
+                    break
+        elif kind == "evaluation_runtime_ended" and at:
+            for i in range(len(open_intervals) - 1, -1, -1):
+                if open_intervals[i]["key"] == key:
+                    interval = open_intervals.pop(i)
+                    interval["ended_at"] = at
+                    intervals.append(interval)
+                    break
+        if kind == "evaluation_source_tick":
+            source, tick = p.get("source"), p.get("source_tick")
+            tick = stamp(tick).isoformat() if stamp(tick) else None
+            if source and tick:
+                source_ticks[(source, p.get("symbol"))].add(tick)
+                for ident in p.get("deployment_ids", []):
+                    ticks.add((ident, source, tick))
+        elif kind in {"signal_evaluation", "evaluation_inactive"}:
+            triple = (p.get("deployment_id"), p.get("evaluation_source") or p.get("source"),
+                      stamp(p.get("source_tick")).isoformat() if stamp(p.get("source_tick")) else None)
+            if all(triple):
+                (observed if kind == "signal_evaluation" else inactive).add(triple)
+                if kind == "evaluation_inactive":
+                    inactive_reasons[triple[0]][p.get("reason", "unknown")] += 1
+    missing_source = Counter()
+    unknown_interval_lanes = set()
+    interval_rows = []
+    for startup in startups:
+        if not startup["ready"] and startup["payload"].get("session", {}).get("max_bars") != 0:
+            unknown_interval_lanes.update(d["deployment_id"] for d in startup["payload"].get("deployments", [])
+                                          if d.get("enabled", True))
+            interval_rows.append({"started_at": startup["at"].isoformat() if startup["at"] else None,
+                                  "ready_at": None, "ended_at": None, "status": "historical_readiness_unknown"})
+    for interval in [*intervals, *open_intervals]:
+        ready, ended = interval["ready_at"], interval.get("ended_at")
+        interval_rows.append({"ready_at": ready.isoformat(), "ended_at": ended.isoformat() if ended else None,
+                              "status": "bounded" if ended else "unknown_end"})
+        for d in interval["deployments"]:
+            if not d.get("enabled", True):
+                continue
+            ident = d["deployment_id"]
+            lane_expected[ident]  # Include holidays/zero-bar intervals explicitly.
+            if not ended:
+                unknown_interval_lanes.add(ident)
+                continue
+            day = ready.astimezone(et).date()
+            while day <= ended.astimezone(et).date():
+                bounds = session(day.isoformat())
+                if bounds:
+                    opening, closing = bounds
+                    minute = opening
+                    while minute < closing:
+                        # Only bars opened after readiness and closed before end.
+                        if ready <= minute and minute + timedelta(minutes=1) <= ended:
+                            lane_expected[ident].add((ident, "closed_bar_1m", minute.isoformat()))
+                        minute += timedelta(minutes=1)
+                day += timedelta(days=1)
+            missing_source[ident] = sum(tick not in source_ticks[(source, d.get("symbol"))]
+                                       for _, source, tick in lane_expected[ident])
+            if d.get("strategy", {}).get("key") in {"manual_trigger", "manual_breakout"}:
+                # Polls wait for IO; a nominal poll interval proves no fixed tick grid.
+                unknown_interval_lanes.add(ident)
+    rows = {}
+    ids = {t[0] for t in ticks} | set(lane_expected) | unknown_interval_lanes
+    for ident in ids:
+        expected = {t for t in ticks if t[0] == ident}
+        seen = expected & observed
+        skipped = (expected & inactive) - observed
+        missing = expected - observed - inactive
+        bounded = ident in lane_expected and ident not in unknown_interval_lanes
+        rows[ident] = {
+            "scheduled_evaluation_count": len(expected), "observed_scheduled_evaluation_count": len(seen),
+            "intentional_inactive_count": len(skipped), "intentional_inactive_reasons": dict(inactive_reasons[ident]),
+            "missing_evaluation_count": len(missing), "missing_source_tick_count": missing_source[ident] if bounded else None,
+            "unknown_evaluation_count": missing_source[ident] if bounded else None,
+            "expected_source_tick_count": len(lane_expected[ident]) if bounded else None,
+            "expected_cadence_proved": bounded and missing_source[ident] == 0 and not missing,
+            "schedule_status": "bounded" if bounded else "unknown_runtime_interval",
+        }
+    return {"lanes": rows, "runtime_intervals": interval_rows}
 
 def economics_summary(trades: Iterable[dict[str, Any]]) -> dict[str, Any]:
     trades = list(trades)
