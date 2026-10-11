@@ -109,8 +109,8 @@ New independent-observer cohorts freeze a 15-second regular poll cadence,
 30-second maximum provider quote age, 65-second observable-time gap limit,
 and receipt-time exit decisions. The next eligible later observation supplies
 the modeled bid fill. This is a sampled estimate, not proof of execution or of
-all intrapoll stop/target crossings. Live entry and execution freshness rules
-remain five seconds. Existing cohorts retain their original specification,
+all intrapoll stop/target crossings. The existing eight-second entry-pricing freshness limit remains unchanged.
+Other live execution safeguards are unchanged. Existing cohorts retain their original specification,
 provider decision clock and freshness limit; they are never re-signed or pooled
 with the new generation.
 

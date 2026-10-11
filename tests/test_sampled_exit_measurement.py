@@ -9,7 +9,7 @@ from bhiksha.ops import exit_edge_observer as observer
 from bhiksha.ops.exit_edge_lab import (CURRENT_MEASUREMENT_GENERATION, ProspectiveQuoteTapeRepository,
     QuoteTapeMark, analyze_cases, classify_measurement_generation, experiment_spec_hash)
 from bhiksha.ops.exit_edge_live import ExitEdgeLiveRecorder, _ObservedQuote
-from bhiksha.execution.quote_lineage import quote_timestamp_evidence
+from bhiksha.execution.quote_lineage import quote_timestamp_evidence, MAX_ENTRY_QUOTE_AGE_SECONDS
 from test_entry_exit_refactor import deployment
 
 ENTRY = datetime(2026, 10, 9, 14, tzinfo=UTC)
@@ -43,6 +43,7 @@ def test_new_generation_freezes_receipt_clock_and_leaves_execution_quote_rule_st
     assert classify_measurement_generation(case.experiment)=='current'
     mark=case.quotes[0]
     quote=SimpleNamespace(quote_timestamp=mark.quote_at.isoformat(),quote_timestamp_field='quoteTimestamp')
+    assert MAX_ENTRY_QUOTE_AGE_SECONDS == 8
     assert quote_timestamp_evidence(quote,mark.received_at)['quote_timestamp_status']=='stale'
     recorder=ExitEdgeLiveRecorder(db_path=tmp_path/'edge.db',status_path=tmp_path/'status.json',role='observer')
     observed=_ObservedQuote(case.option_symbol,mark.quote_at,'quoteTimestamp',mark.received_at,2,2.05,2.02)
