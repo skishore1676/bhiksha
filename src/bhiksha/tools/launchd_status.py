@@ -172,7 +172,7 @@ def build_status_snapshot(
             ]
         if spec.runner_job == "exit-edge-observer":
             semantic = _exit_edge_observer_status(
-                repo_root, launchd.get(spec.label, {}), generated_at,
+                repo_root, launchd.get(spec.label, {}), now,
             )
             job["last"] = {"domain": semantic, "recorded_at": semantic.get("updated_at")}
             job["last_run_status"] = semantic["status"]
@@ -217,10 +217,14 @@ def _cartographer_semantic_status(
 
 
 def _exit_edge_observer_status(
-    repo_root: Path, launchd: dict[str, Any], now: datetime,
+    repo_root: Path, launchd: dict[str, Any], now: datetime | None = None,
 ) -> dict[str, Any]:
     marker = repo_root / "artifacts/playbook/runtime_flags/exit_edge_live_shadow.enabled"
     health = _read_json(repo_root / "artifacts/observations/exit_edge_live_status.json")
+    # A resident heartbeat may advance during snapshot collection. Compare it
+    # with the receipt-read clock, not the earlier snapshot clock. Explicit
+    # timestamps remain authoritative for deterministic callers and tests.
+    now = now or datetime.now(UTC)
     updated_at = _parse_timestamp(health.get("updated_at"))
     enabled = marker.is_file()
     loaded = launchd.get("loaded") is True
