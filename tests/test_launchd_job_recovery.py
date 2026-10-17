@@ -176,7 +176,8 @@ def test_live_stop_exports_chart_evidence_only_after_successful_stop_stage(
         (tmp_path / "bhiksha.db", {"output_dir": tmp_path / "artifacts" / "chart-workbench" / "publications"})
     ]
     assert payloads[0]["detail"] == "not_running"
-    assert payloads[0]["chart_evidence"]["packet_id"] == "bhiksha-packet"
+    assert payloads[-1]["chart_evidence"]["packet_id"] == "bhiksha-packet"
+    assert payloads[0]["session_stop_receipt"] == payloads[-1]["session_stop_receipt"]
 
 
 def test_live_stop_reports_export_failure_without_claiming_stop_failed(
@@ -196,10 +197,33 @@ def test_live_stop_reports_export_failure_without_claiming_stop_failed(
     )
 
     assert result == 2
-    assert payloads == [{
+    assert payloads[0]["status"] == "running"
+    receipt = payloads[0]["session_stop_receipt"]
+    assert payloads[-1] == {
         "job": "live-stop", "status": "failed", "detail": "stopped; chart evidence export failed",
+        "session_stop_receipt": receipt,
         "runtime_stop_status": "ok", "chart_evidence": {"status": "failed", "reason": "chart_evidence_export_failed:ValueError"},
-    }]
+    }
+
+
+def test_independent_stop_proof_survives_backup_lifecycle_without_weakening_report():
+    from bhiksha.ops.daily_report import _app_running_row
+    receipt = {"recorded_at": "2026-10-15T20:10:06+00:00", "status": "ok", "detail": "stopped"}
+    for status in ("running", "failed", "ok"):
+        actual = launchd_job._session_stop_receipt({"recorded_at": "2026-10-15T20:15:00+00:00",
+            "payload": {"status": status, "session_stop_receipt": receipt}})
+        assert actual == receipt
+        row = _app_running_row({"trading_date": "2026-10-15"}, app_status={
+            "running": False, "checked_at": "2026-10-15T20:16:00+00:00", "session_stop_receipt": actual})
+        assert row[2] == "🟢"
+    for payload in ({}, {"status": "running", "detail": "stopped", "runtime_stop_status": "ok"},
+                    {"status": "failed", "detail": "stopped"},
+                    {"session_stop_receipt": {**receipt, "status": "failed"}},
+                    {"session_stop_receipt": {**receipt, "recorded_at": "2026-10-14T20:10:00+00:00"}}):
+        actual = launchd_job._session_stop_receipt({"recorded_at": "2026-10-15T20:15:00+00:00", "payload": payload})
+        row = _app_running_row({"trading_date": "2026-10-15"}, app_status={
+            "running": False, "checked_at": "2026-10-15T20:16:00+00:00", "session_stop_receipt": actual})
+        assert row[2] == "🔴"
 
 
 def test_recovered_google_retry_warning_does_not_alert(tmp_path: Path, monkeypatch) -> None:
