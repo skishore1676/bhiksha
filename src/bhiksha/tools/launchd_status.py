@@ -180,6 +180,13 @@ def build_status_snapshot(
             job["lifecycle"] = "armed" if semantic["ok"] else "stuck"
             job["findings"] = [] if job["lifecycle"] == "armed" else [str(semantic["status"])]
         details = _job_details(last)
+        if spec.runner_job == "live-stop" and ((last or {}).get("payload") or {}).get("backup"):
+            backup = last["payload"]["backup"]
+            job.update(attention_key="bhiksha:after-close-backup",
+                       summary=f"Recovery backup: {backup.get('status')}; last verified {backup.get('last_verified_at') or (backup.get('last_verified_backup') or {}).get('verified_at') or 'not yet verified'}; cleanup {'enabled' if backup.get('cleanup_enabled') else 'disabled'}.",
+                       human_action="Resolve the reported backup error, then use backup-recovery-now.",
+                       attention_exit="A downloaded backup passes checksums, SQLite integrity and watermark verification.",
+                       attention_mover="Bhiksha after-close owner")
         if details:
             job["details"] = details
         if spec.runner_job == "reconciliation-supervisor" and isinstance(last, dict):
@@ -665,6 +672,8 @@ def _job_findings(last: dict[str, Any] | None) -> list[str]:
     if status == "refresh_token_near_expiry":
         return [*findings, "Schwab authentication will not survive the next trading session."]
     if status == "needs_human":
+        if domain.get("reason") == "after_close_backup":
+            return [*findings, "Private recovery backup failed; inspect the backup receipt and last verified recovery. This does not establish an entry-reconciliation failure."]
         return [
             *findings,
             "Entry reconciliation could not finish safely; the affected deployment remains blocked.",
@@ -826,6 +835,36 @@ def _reconciliation_summary(supervision: dict[str, Any]) -> str:
 
 
 def _job_details(last: dict[str, Any] | None) -> list[dict[str, Any]]:
+    backup = ((last or {}).get("payload") or {}).get("backup") or {}
+    if backup:
+        verified = backup.get("last_verified_backup") or {}
+        remote = backup.get("remote") or verified.get("remote") or {}
+        retention = backup.get("retention") or {}
+        restore = backup.get("restore") or {}
+        return [{"kind": "after_close_backup", "title": "Private recovery backup",
+                 "surface": "Bhiksha after-close owner", "status": backup.get("status"),
+                 "updated_at": backup.get("updated_at"),
+                 "review_ref": backup.get("error") or remote.get("webViewLink"), "backup": backup},
+                {"kind": "backup_verification", "title": "Last verified off-device recovery",
+                 "surface": verified.get("session") or "No verified recovery yet",
+                 "status": verified.get("verified_at") or "pending",
+                 "review_ref": (verified.get("remote") or {}).get("webViewLink")},
+                {"kind": "backup_cutoff", "title": "Session close / snapshot boundary",
+                 "surface": "Independent DB snapshots; capture times are in snapshot.json",
+                 "status": backup.get("cutoff") or verified.get("cutoff") or "pending",
+                 "review_ref": backup.get("snapshot")},
+                {"kind": "backup_checksum", "title": "Downloaded checksum and SQLite restore",
+                 "surface": f"SHA-256 round trip: {(backup.get('remote_checksum') or {}).get('status') or 'pending'}; restore: {restore.get('status') or 'pending'}",
+                 "status": restore.get("checksums") or "pending",
+                 "review_ref": backup.get("archive_sha256") or verified.get("archive_sha256")},
+                {"kind": "backup_retention", "title": "Verified local retention",
+                 "surface": "Keep newest two verified bundles; cleanup " + ("enabled" if backup.get("cleanup_enabled") else "disabled"),
+                 "status": (f"{retention.get('status', 'preview')}; keep {len(retention.get('keep', []))}; deleted {retention.get('deleted_bytes', 0)} bytes; {retention.get('error', '')}"
+                            if retention else "preview pending; deleted 0 bytes")},
+                {"kind": "backup_recovery", "title": "Owner recovery action",
+                 "surface": "Control Tower: backup-recovery-now",
+                 "status": backup.get("recovery_action") or "Available after resolving a failure",
+                 "review_ref": backup.get("recovery_command")}]
     supervision = _reconciliation_payload(last)
     if not supervision:
         return []
@@ -893,6 +932,18 @@ def _next_fire(schedule: tuple[dict[str, int], ...], *, now: datetime) -> str | 
 
 
 def _domain_health(payload: dict[str, Any]) -> dict[str, Any]:
+    backup = payload.get("backup")
+    if payload.get("job") == "live-stop" and isinstance(backup, dict):
+        from bhiksha.ops.after_close_backup import close_stage_failed
+        if close_stage_failed(payload):
+            return {"ok": False, "status": "needs_human", "reason": "close_stage_failed",
+                    "attention_required": True, "backup": backup}
+        failed = backup.get("status") == "failed" or (backup.get("retention") or {}).get("status") == "failed"
+        unresolved = failed or bool(backup.get("unresolved_failure"))
+        return {"ok": payload.get("status") == "ok" and not unresolved,
+                "status": "needs_human" if failed else "recovering" if unresolved else backup.get("status"),
+                "reason": "after_close_backup", "attention_required": unresolved,
+                "attention_key": "bhiksha:after-close-backup", "backup": backup}
     if (
         payload.get("status") == "skipped"
         and payload.get("reason") == "non_trading_day"

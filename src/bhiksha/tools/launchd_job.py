@@ -72,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Schwab browser-renewal policy; force is reserved for a confirmed operator action.",
     )
     parser.add_argument("--repo-root", default=None)
+    parser.add_argument("--backup-only", action="store_true", help="Retry the after-close backup without stopping or starting runtime")
     parser.add_argument("--active-plan", default="artifacts/playbook/active_plan.json")
     parser.add_argument("--report-label", default="scheduled")
     parser.add_argument(
@@ -238,6 +239,42 @@ def _server_session_job(
 
 
 def _stop_job(args: argparse.Namespace, *, repo_root: Path) -> int:
+    backup_only = getattr(args, "backup_only", False)
+    result = 0 if backup_only else _stop_and_export_job(args, repo_root=repo_root)
+    # Backup failures never prevent stopping the runtime; chart export failure
+    # does not prevent preservation of the completed session either.
+    from bhiksha.ops.after_close_backup import MARKER, run_backup, close_payload, close_stage_failed
+    upstream = close_payload(repo_root) if (repo_root / MARKER).is_file() else {}
+    if backup_only and close_stage_failed(upstream):
+        result = int(upstream.get("close_stage_return_code") or 2)
+    if result and (repo_root / MARKER).is_file():
+        upstream = {**upstream, "job": args.job, "status": "failed", "close_stage_return_code": result}
+        _print_result(upstream)
+    if (repo_root / MARKER).is_file():
+        try:
+            session = None
+            if backup_only:
+                from bhiksha.market_data.trading_calendar import previous_trading_day, regular_session_bounds
+                local_now = datetime.now(CENTRAL)
+                bounds = regular_session_bounds(local_now.date())
+                session = local_now.date() if bounds and local_now >= bounds[1] else previous_trading_day(local_now.date())
+            backup = run_backup(repo_root, session=session)
+        except Exception as exc:
+            if str(exc) == "backup_already_running":
+                # The active owner's receipt remains authoritative; a duplicate
+                # action must not replace it with a spurious failure.
+                return result
+            backup = {"status": "failed", "error": type(exc).__name__, "cleanup_enabled": False}
+        status = "failed" if result or backup.get("status") == "failed" else "ok"
+        if not result and backup.get("status") == "skipped":
+            status = "skipped"
+        _print_result({**upstream, "job": args.job, "status": status, "reason": backup.get("reason") or upstream.get("reason"),
+                       "close_stage_return_code": result, "backup": backup})
+        return 2 if result or backup.get("status") == "failed" else 0
+    return result
+
+
+def _stop_and_export_job(args: argparse.Namespace, *, repo_root: Path) -> int:
     status = _run_python_module(
         ["bhiksha.tools.server_session", "status"], repo_root=repo_root
     )
@@ -255,7 +292,11 @@ def _export_chart_evidence_after_stop(
     args: argparse.Namespace, *, repo_root: Path, stop_detail: str
 ) -> int:
     """Run only after the existing close-stage succeeds; export is read-only."""
-
+    stop_receipt = {"recorded_at": datetime.now(CENTRAL).isoformat(),
+                    "status": "ok", "detail": stop_detail}
+    # Publish before export: neither slow export nor backup owns stop authority.
+    _print_result({"job": args.job, "status": "running", "detail": stop_detail,
+                   "runtime_stop_status": "ok", "session_stop_receipt": stop_receipt})
     try:
         app_config = load_app_config(repo_root / "config" / "app.yaml")
         db_path = Path(app_config.sqlite_path)
@@ -272,6 +313,7 @@ def _export_chart_evidence_after_stop(
                 "status": "failed",
                 "detail": f"{stop_detail}; chart evidence export failed",
                 "runtime_stop_status": "ok",
+                "session_stop_receipt": stop_receipt,
                 "chart_evidence": {
                     "status": "failed",
                     "reason": f"chart_evidence_export_failed:{type(exc).__name__}",
@@ -284,6 +326,8 @@ def _export_chart_evidence_after_stop(
             "job": args.job,
             "status": "ok",
             "detail": stop_detail,
+            "runtime_stop_status": "ok",
+            "session_stop_receipt": stop_receipt,
             "chart_evidence": {
                 "packet_id": result.packet["id"],
                 "path": str(result.path),
@@ -323,6 +367,17 @@ def _schwab_refresh_job(args: argparse.Namespace) -> int:
     return 0 if result.ok else 2
 
 
+def _session_stop_receipt(stop: dict) -> dict:
+    payload = stop.get("payload") or {}
+    explicit = payload.get("session_stop_receipt")
+    if isinstance(explicit, dict):
+        return dict(explicit)
+    # Legacy receipts require actual aggregate success. Never reinterpret a
+    # running/failed backup as proof, or synthesize a fresh stop timestamp.
+    return {"recorded_at": stop.get("recorded_at"),
+            "status": payload.get("status"), "detail": payload.get("detail")}
+
+
 def _session_report_job(args: argparse.Namespace) -> int:
     report_label = _report_label(args.report_label)
     runtime = build_runtime(active_plan_path=args.active_plan)
@@ -351,11 +406,7 @@ def _session_report_job(args: argparse.Namespace) -> int:
                 stop = json.loads(status_path.read_text()).get("jobs", {}).get("live-stop", {})
             except (OSError, ValueError, TypeError):
                 stop = {}
-            payload = stop.get("payload") or {}
-            app_status["session_stop_receipt"] = {
-                "recorded_at": stop.get("recorded_at"),
-                "status": payload.get("status"), "detail": payload.get("detail"),
-            }
+            app_status["session_stop_receipt"] = _session_stop_receipt(stop)
     except Exception as exc:  # noqa: BLE001 - report remains available with explicit probe failure.
         app_status = {
             "action": "status",

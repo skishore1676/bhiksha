@@ -1,0 +1,9 @@
+{
+  "gog": "/path/to/gog",
+  "client": "existing-owner-client",
+  "account": "owner@example.com",
+  "folder_name": "Private recovery backups",
+  "cleanup_enabled": false,
+  "retain_verified": 2,
+  "reserve_bytes": 10737418240
+}

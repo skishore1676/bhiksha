@@ -22,6 +22,7 @@ from bhiksha.ops.launchd_registry import control_lock_dir
 CENTRAL = ZoneInfo("America/Chicago")
 
 RUNNER_ACTIONS: dict[str, list[str]] = {
+    "backup-recovery-now": ["live-stop", "--backup-only"],
     "session-report-now": ["session-report", "--force", "--report-label", "manual"],
     "weekly-trading-decisions-now": ["weekly-trading-decisions", "--force"],
     "schwab-guard-now": ["schwab-refresh", "--force", "--browser-renewal-mode", "off"],
@@ -118,6 +119,18 @@ def _run_runner_action(
     lock: dict[str, Any],
 ) -> dict[str, Any]:
     command = ["scripts/launchd/run_bhiksha_job.sh", *RUNNER_ACTIONS[action], "--action-id", action_id]
+    if action == "backup-recovery-now":
+        # A multi-gigabyte restore test outlives the Control Tower request. The
+        # existing owner keeps progress/terminal evidence; dispatch is not success.
+        log = repo_root / "artifacts/playbook/launchd/backup-recovery.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as output:
+            process = subprocess.Popen(command, cwd=repo_root, stdout=output, stderr=output,
+                                       start_new_session=True)
+        return _result(action=action, action_id=action_id, started_at=started_at,
+                       ok=True, status="dispatched", exit_code=0, command=command,
+                       pid=process.pid, confirmed=confirmed, confirmation=confirmation,
+                       lock=lock, detail="Acceptance requires the live-stop backup receipt to become verified.")
     completed = _run_control_command(
         command,
         cwd=str(repo_root),

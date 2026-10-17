@@ -23,5 +23,9 @@ Hard rules for this repo:
   first on PYTHONPATH plus the kernel's `src`; verify `bhiksha.__file__` resolves into
   the worktree.
 - Engineering lessons: `docs/lessons/` (read before touching the areas they cover).
+- Session-check monitoring must capture databases with
+  `python -m bhiksha.tools.monitoring_snapshot --output-dir <new-directory>`
+  before analytical SQL or comparison replay. Analyze only those copies; never
+  fall back to live cursors if capture fails. See `docs/REPORTING_EVIDENCE.md`.
 - Before changing launchd installers, schedules, commands, or status projection,
   read `docs/lessons/launchd-installers-must-render-one-owner-registry.md`.
